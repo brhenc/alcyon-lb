@@ -4,7 +4,7 @@
 #
 # Practical topology 05:  3 x node.js behind the proxy, roundrobin + HTTP health checks
 #
-#   ./run.sh              run against Ibex
+#   ./run.sh              run against Alcyon
 #   ./run.sh --haproxy    run against HAProxy (the oracle)
 #
 # Phases: kill one node under load / start it again / rolling restart of all three /
@@ -12,7 +12,7 @@
 # script and killed by PID at the end. Override any variable from the environment.
 
 # ---- settings you may want to change ---------------------------------------
-IBEX_BIN=${IBEX_BIN:-/home/bhenc/ibex-targets/t181/release/ibex}
+ALCYON_BIN=${ALCYON_BIN:-/home/bhenc/ibex-targets/t181/release/alcyon}
 HAPROXY_BIN=${HAPROXY_BIN:-/home/bhenc/reference/haproxy/haproxy}
 PROXY_PORT=${PROXY_PORT:-23080}     # plain (round-robin) frontend
 STICKY_PORT=${STICKY_PORT:-23081}   # cookie persistence frontend
@@ -27,9 +27,9 @@ SLACK_MS=${SLACK_MS:-500}           # allowed over inter*fall (one check may be 
 # -----------------------------------------------------------------------------
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-PROXY=ibex
+PROXY=alcyon
 [ "$1" = "--haproxy" ] && PROXY=haproxy
-if [ "$PROXY" = ibex ]; then PROXY_BIN=$IBEX_BIN; else PROXY_BIN=$HAPROXY_BIN; fi
+if [ "$PROXY" = alcyon ]; then PROXY_BIN=$ALCYON_BIN; else PROXY_BIN=$HAPROXY_BIN; fi
 
 WORK=$(mktemp -d /tmp/practical05-XXXXXX)
 SOCK=$WORK/stats.sock

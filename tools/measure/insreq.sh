@@ -3,7 +3,7 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 #
 # Instructions per request (perf stat instructions:u and instructions:k) of one proxy binary on one scenario.
-# Works for ibex and for haproxy, so the oracle can be measured with the same backend and client.
+# Works for alcyon and for haproxy, so the oracle can be measured with the same backend and client.
 #
 #   tools/measure/insreq.sh <label> <proxy-bin> <scenario.body> <client> <N> <rounds> <outdir>
 #   client: mb50|ab1|ab1s|hs1|nc1|h2s1|h3c1|h3best|h3worst|h3fit
@@ -15,31 +15,31 @@
 #   client nc1:  ab -c 1 without keep-alive: one new TCP connection per request (T459)
 #   client h2s1: h2load -c 1 -m 1 over TLS with ALPN h2: one HTTP/2 connection, one stream at a time
 #   client h3c1: h2load -c 1 -m 1 with ALPN h3 (QUIC). Not a result since T555: h2load's ACK-only
-#                datagrams vary 1.12-1.91 per request between rounds, and Ibex pays ~6k per one.
+#                datagrams vary 1.12-1.91 per request between rounds, and Alcyon pays ~6k per one.
 #   client h3best, h3worst: tools/measure/h3bench (T555), one HTTP/3 connection, N sequential
-#                GETs (IBEX_H3_METHOD=post: 32-byte POSTs), the client's ACK policy fixed. best
+#                GETs (ALCYON_H3_METHOD=post: 32-byte POSTs), the client's ACK policy fixed. best
 #                ACKs only with its next request (1.000 client datagrams/req); worst answers every
 #                server datagram at once (~2.02/req, the realistic one: curl 8.18 sends 1.99/req
 #                and h2load 1.96 to HAProxy dev10). Each round prints the client's datagrams/req.
 #                The client sends each datagram >= 200 us after its previous one, sent or received
 #                (H3BENCH_GAP_US), so the proxy takes each in a wakeup of its own.
 #   client h3fit: THE h3 figure (user decision D6). Each round runs h3best then h3worst and fits
-#                the line through the two points at IBEX_H3_FIT_RATE client datagrams/req (1.97,
+#                the line through the two points at ALCYON_H3_FIT_RATE client datagrams/req (1.97,
 #                h2load's steady rate to HAProxy); prints best, worst and fit per round and their
 #                medians, and the fit's spread (max-min over median). min-of-rounds is retired
-#                for h3. IBEX_MEASURE_JSONL=<file> appends one row (`"kind": "insreq-h3"`) with
+#                for h3. ALCYON_MEASURE_JSONL=<file> appends one row (`"kind": "insreq-h3"`) with
 #                all three; data/measurements.jsonl takes them (measure.py skips such rows).
-#                IBEX_MEASURE_BUILD=pgo marks the row as a tools/pgo-build.sh binary (the board's PGO
+#                ALCYON_MEASURE_BUILD=pgo marks the row as a tools/pgo-build.sh binary (the board's PGO
 #                column, `tools/measure/h3board.py`); default release-perf, haproxy by the path.
 #   The h3 scenario binds `quic4@` on the same port as its TCP `ssl` bind (h3.body).
 #
 # The scenario body is a config with @FE@ and @BE@ for the two ports (tools/measure/scenarios/),
-# and @CRT@ for a certificate and key (IBEX_MEASURE_CRT, else a self-signed P-256 one made in
+# and @CRT@ for a certificate and key (ALCYON_MEASURE_CRT, else a self-signed P-256 one made in
 # <outdir>), and @TP@ for a third free port (a hop inside the proxy, as tlsbackend.body's TLS
 # server, T538).
-# The proxy under test is a `cargo build --profile release-perf --bin ibex` binary
-# (target/release-perf/ibex, T518: the budget is judged on one fat-LTO layout, not `release`).
-# Pins the proxy to CPU 4, the client to 5, the backend to 6 (as measure.py); IBEX_MEASURE_CPUS
+# The proxy under test is a `cargo build --profile release-perf --bin alcyon` binary
+# (target/release-perf/alcyon, T518: the budget is judged on one fat-LTO layout, not `release`).
+# Pins the proxy to CPU 4, the client to 5, the backend to 6 (as measure.py); ALCYON_MEASURE_CPUS
 # "a,b,c" overrides. Warms up with 2000 requests, then counts the proxy process's user-space
 # and kernel instructions over each round (one perf stat, two events, T568) and prints
 # instructions per request. Per round: `<L> round N: <U> instructions, <u> ins/req[, D client
@@ -57,8 +57,8 @@ LABEL=$1; BIN=$2; BODY=$3; CL=$4; N=$5; ROUNDS=$6; OUT=$7
 mkdir -p "$OUT" || exit 1
 BENCH=${MEASURE_BENCH:-$HOME/ibex-targets/gate-slot1/release/measure-bench}
 H3BENCH=${H3BENCH:-$HOME/ibex-targets/h3bench/release/h3bench}
-H3M=${IBEX_H3_METHOD:-get}
-FIT_RATE=${IBEX_H3_FIT_RATE:-1.97}
+H3M=${ALCYON_H3_METHOD:-get}
+FIT_RATE=${ALCYON_H3_FIT_RATE:-1.97}
 case $CL in
   h3best|h3worst|h3fit)
     if [ ! -x "$H3BENCH" ]; then
@@ -66,11 +66,11 @@ case $CL in
         --manifest-path "$(dirname "$0")/h3bench/Cargo.toml" || exit 1
     fi ;;
 esac
-IFS=, read -r CPU_P CPU_C CPU_B <<< "${IBEX_MEASURE_CPUS:-4,5,6}"
+IFS=, read -r CPU_P CPU_C CPU_B <<< "${ALCYON_MEASURE_CPUS:-4,5,6}"
 port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 FE=$(port); BE=$(port); TP=$(port)
 CFG=$OUT/$LABEL.cfg
-CRT=${IBEX_MEASURE_CRT:-$OUT/insreq-cert.pem}
+CRT=${ALCYON_MEASURE_CRT:-$OUT/insreq-cert.pem}
 if grep -q @CRT@ "$BODY" && [ ! -s "$CRT" ]; then
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$CRT.key" -out "$CRT.crt" \
     -subj /CN=localhost -days 30 >/dev/null 2>&1 && cat "$CRT.crt" "$CRT.key" > "$CRT" || exit 1
@@ -128,7 +128,7 @@ print(f"{label} round {r}: best {b:.0f} ins/req at {db:.4f} dgrams/req, worst {w
       f"fit {fit:.0f} ins/req at {rate}")
 PY
   done
-  python3 - "$LABEL" "$OUT/$LABEL.fit" "$FIT_RATE" "$BIN" "$BODY" "$N" "${IBEX_MEASURE_JSONL:-}" "$H3M" "$(dirname "$0")" <<'PY'
+  python3 - "$LABEL" "$OUT/$LABEL.fit" "$FIT_RATE" "$BIN" "$BODY" "$N" "${ALCYON_MEASURE_JSONL:-}" "$H3M" "$(dirname "$0")" <<'PY'
 import json, re, statistics, subprocess, sys, datetime, os
 label, path, rate, binp, body, n, jsonl, method, here = sys.argv[1:]
 rows = [list(map(float, re.findall(r"best (\d+) ins/req at ([\d.]+) dgrams/req, worst (\d+) at ([\d.]+), fit (\d+)", l)[0]))
@@ -139,12 +139,12 @@ spread = (max(fits) - min(fits)) / statistics.median(fits) * 100
 print(f"{label} h3fit: fit {med(4):.0f} ins/req at {rate} client dgrams/req (median of {len(rows)}, spread "
       f"{spread:.2f}%); best {med(0):.0f} at {med(1):.4f}, worst {med(2):.0f} at {med(3):.4f}")
 if jsonl:
-    # The tree the measurement was made from (IBEX_MEASURE_SHA names the build's own commit).
-    sha = os.environ.get("IBEX_MEASURE_SHA") or subprocess.run(
+    # The tree the measurement was made from (ALCYON_MEASURE_SHA names the build's own commit).
+    sha = os.environ.get("ALCYON_MEASURE_SHA") or subprocess.run(
         ["git", "-C", here, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     row = {"kind": "insreq-h3", "sha": sha, "label": label, "at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
            "binary": binp, "scenario": os.path.basename(body), "method": method, "requests": int(n), "rounds": len(rows),
-           "build": os.environ.get("IBEX_MEASURE_BUILD") or ("haproxy" if "haproxy" in binp else "release-perf"),
+           "build": os.environ.get("ALCYON_MEASURE_BUILD") or ("haproxy" if "haproxy" in binp else "release-perf"),
            "fit_rate": float(rate), "h3_fit": round(med(4)), "h3_fit_spread_pct": round(spread, 3),
            "h3_best": round(med(0)), "h3_best_dgrams": med(1), "h3_worst": round(med(2)), "h3_worst_dgrams": med(3),
            "h3_fit_samples": [round(f) for f in fits]}

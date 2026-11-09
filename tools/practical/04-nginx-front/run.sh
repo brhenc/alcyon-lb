@@ -11,14 +11,14 @@
 #                X-Forwarded-For chain; the PROXY-protocol part is then covered only by
 #                the stand-in client ppclient.js (case proxy-v1-direct).
 #
-#   ./run.sh              run against Ibex
+#   ./run.sh              run against Alcyon
 #   ./run.sh --haproxy    run against HAProxy (the oracle)
 #
 # Needs node, curl, sha256sum, nginx. The clients use 127.0.0.2 as their source address so
 # that "the real client" differs from nginx's own address (127.0.0.1).
 
 # ---- settings you may want to change ---------------------------------------
-IBEX_BIN=${IBEX_BIN:-/home/bhenc/ibex-targets/t193/release/ibex}
+ALCYON_BIN=${ALCYON_BIN:-/home/bhenc/ibex-targets/t193/release/alcyon}
 HAPROXY_BIN=${HAPROXY_BIN:-/home/bhenc/reference/haproxy/haproxy}
 NGINX_BIN=${NGINX_BIN:-/usr/sbin/nginx}
 STREAM_MODULE=${STREAM_MODULE:-/usr/lib64/nginx/modules/ngx_stream_module.so}
@@ -32,9 +32,9 @@ WS_MESSAGES=${WS_MESSAGES:-100}
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 NODE_DIR=$HERE/../01-node           # app.js, wsclient.js (and the ws package) are reused
-PROXY=ibex
+PROXY=alcyon
 [ "$1" = "--haproxy" ] && PROXY=haproxy
-if [ "$PROXY" = ibex ]; then PROXY_BIN=$IBEX_BIN; else PROXY_BIN=$HAPROXY_BIN; fi
+if [ "$PROXY" = alcyon ]; then PROXY_BIN=$ALCYON_BIN; else PROXY_BIN=$HAPROXY_BIN; fi
 if [ -r "$STREAM_MODULE" ]; then MODE=stream; else MODE=http; fi
 
 WORK=$(mktemp -d /tmp/practical04-XXXXXX)

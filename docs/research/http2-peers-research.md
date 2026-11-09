@@ -1,20 +1,20 @@
-# Ibex HTTP/2 & Distributed Peers Protocol Architectural Research Report
+# Alcyon HTTP/2 & Distributed Peers Protocol Architectural Research Report
 
-**Researcher:** Ibex Protocol & Soft-Realtime Architecture Subagent  
+**Researcher:** Alcyon Protocol & Soft-Realtime Architecture Subagent  
 **Reference Codebase:** HAProxy 3.5-dev7 (`/home/bhenc/reference/haproxy` @ `e6f616af`)  
-**Target Crates:** `ibex-proto`, `ibex-parser`, `ibex-sched`, `ibex-stick-table`, `ibex-peers`, `ibex-rt`
+**Target Crates:** `alcyon-proto`, `alcyon-parser`, `alcyon-sched`, `alcyon-stick-table`, `alcyon-peers`, `alcyon-rt`
 
 ---
 
 ## Executive Summary
 
-This research report provides the technical analysis of HAProxy's HTTP/2 multiplexing architecture (`src/mux_h2.c`, `src/hpack-dec.c`, `src/hpack-enc.c`, `src/hpack-tbl.c`) and distributed stick-table synchronization wire protocol (`src/peers.c`, `include/haproxy/peers-t.h`), and synthesizes the implementation blueprints for **Milestone 5 (HTTP/2 Engine & HPACK)** and **Milestone 6 (Distributed Peers Sync Protocol v2.1)** in Project Ibex.
+This research report provides the technical analysis of HAProxy's HTTP/2 multiplexing architecture (`src/mux_h2.c`, `src/hpack-dec.c`, `src/hpack-enc.c`, `src/hpack-tbl.c`) and distributed stick-table synchronization wire protocol (`src/peers.c`, `include/haproxy/peers-t.h`), and synthesizes the implementation blueprints for **Milestone 5 (HTTP/2 Engine & HPACK)** and **Milestone 6 (Distributed Peers Sync Protocol v2.1)** in Project Alcyon.
 
-All designs adhere to Ibex’s core architectural tenets:
+All designs adhere to Alcyon’s core architectural tenets:
 1. **Zero-heap allocation on the hot path** (NASA JPL Rule 3) via preallocated index arenas and static ring buffers.
 2. **Hard thread affinity & lock-free L7 dispatch** (Decision D2).
 3. **Bounded execution loops & tree depths** (JPL Rule 2 & ebtree $O(32)$ depth).
-4. **Adversarial DoS resilience** (anti-Slowloris lazy timers, HTTP/2 Rapid Reset mitigation, class-budgeted scheduling via `ibex-sched`).
+4. **Adversarial DoS resilience** (anti-Slowloris lazy timers, HTTP/2 Rapid Reset mitigation, class-budgeted scheduling via `alcyon-sched`).
 5. **Bit-for-bit wire compatibility** with HAProxy 2.x/3.x peers and standard HTTP/2 (RFC 7540 / RFC 9113 / RFC 7541 / RFC 8441).
 
 ---
@@ -123,12 +123,12 @@ Stream State Machine (h2s->st):
 
 ## 2. Scheduler Mapping, Flow Control & HPACK Bounding
 
-### 2.1 Mapping H2 Streams to `ibex-sched`
+### 2.1 Mapping H2 Streams to `alcyon-sched`
 
-In Ibex, the threading model is **thread-per-core with hard connection affinity** (`design/002-threading-and-affinity.md`). An entire H2 connection and all its multiplexed child streams execute on a single worker core without cross-thread locking.
+In Alcyon, the threading model is **thread-per-core with hard connection affinity** (`design/002-threading-and-affinity.md`). An entire H2 connection and all its multiplexed child streams execute on a single worker core without cross-thread locking.
 
 ```
-                      Worker Core RunLoop (ibex-rt / ibex-sched)
+                      Worker Core RunLoop (alcyon-rt / alcyon-sched)
   ┌─────────────────────────────────────────────────────────────────────────────┐
   │                                                                             │
   │  Epoll Readiness Event ──> h2c I/O Tasklet (Class::Urgent, Weight 64)      │
@@ -160,7 +160,7 @@ In Ibex, the threading model is **thread-per-core with hard connection affinity*
    - Manages connection idle timeouts (`timeout.client`, `timeout.server`, `timeout.clientfin`).
    - Uses **lazy timer requeue** (`design/003-scheduler.md` §4): pushing connection timeouts further out on active frame traffic costs 0 tree modifications.
 3. **`H2Stream` L7 Stream Tasks (`Class::Normal`, Budget 60)**:
-   - Each stream transaction is represented by an L7 `Stream` owning an `ibex_sched::TaskId`.
+   - Each stream transaction is represented by an L7 `Stream` owning an `alcyon_sched::TaskId`.
    - Priority handling: HTTP/2 priority flags or stream `nice` settings adjust the run-queue ticket (`rq.key = ticks + nice * RUNQUEUE_DEPTH`), giving strict prioritized execution among concurrent streams.
 4. **Self-Waking Streams (`Class::Bulk`, Budget 4)**:
    - Large streaming downloads/uploads pumping buffers through HTX yield after their chunk budget and requeue as `Bulk`, preventing one fast stream from starving other streams on the same connection.
@@ -169,13 +169,13 @@ In Ibex, the threading model is **thread-per-core with hard connection affinity*
 
 ### 2.2 Memory Bounding & DDoS Protection
 
-| Attack Vector | Mechanism in HAProxy (`mux_h2.c`) | Ibex Realization & Soft-RT Bound |
+| Attack Vector | Mechanism in HAProxy (`mux_h2.c`) | Alcyon Realization & Soft-RT Bound |
 | :--- | :--- | :--- |
 | **HTTP/2 Rapid Reset**<br>(CVE-2023-44487) | `h2_fe_max_rst_at_once`, `glitches` counter (`mux_h2.c:498, 3600`) | Bounded RST rate limiter: connections exceeding 100 RST frames per pass without forwarding data trigger `GOAWAY(ENHANCE_YOUR_CALM)` and immediate closure. |
 | **Stream Multiplexing Flood** | `streams_hard_limit` (RFC 7540 `SETTINGS_MAX_CONCURRENT_STREAMS = 100`) | Static arena allocation: fixed pool of $N$ `H2Stream` slots per connection. Surplus stream attempts receive `REFUSED_STREAM` or `GOAWAY`. Zero dynamic heap allocation. |
 | **HPACK Bomb / Compression Bomb** | `HPACK_ERR_TOO_LARGE` + max header list size (RFC 7540 #6.5.6) | Hard cap on decompressed HTX header size (default 64 KB). Emits HTTP 431 / `COMPRESSION_ERROR` on overflow. |
 | **Buffer Exhaustion via Multiplexing** | `h2c->shared_rx_bufs` (`tune.h2.fe.rxbuf`, `mux_h2.c:495`) | Shared circular buffer pool (bounded to $16 \times \text{BUFSIZE}$). Individual streams cannot allocate infinite memory while waiting on slow upstreams. |
-| **Flow Control Window Starvation** | Connection & Stream Window tracking (`mws`, `sws`) | Credit-based sliding window: Ibex suspends tasklet polling when window is 0, moving the task to `fctl_list` / `blocked_list` without spinning. |
+| **Flow Control Window Starvation** | Connection & Stream Window tracking (`mws`, `sws`) | Credit-based sliding window: Alcyon suspends tasklet polling when window is 0, moving the task to `fctl_list` / `blocked_list` without spinning. |
 
 ---
 
@@ -212,7 +212,7 @@ HAProxy's HPACK dynamic table design is an engineering masterclass in memory eff
 
 The HAProxy Peers protocol is a soft-realtime, masterless distributed replication protocol designed to synchronize stick tables (session state, rate counters, SSL IDs, integer counters) across a cluster of load balancers.
 
-In HAProxy, the peers engine is implemented as an **applet** (`peer_applet`, `src/peers.c:3392`). In Ibex, it integrates directly as an `Endpoint::Applet(PeerApplet)` behind the `sedesc`/`stconn` pivot (`design/001-layering.md` §3), allowing it to leverage connection management, TLS, timeouts, and logging for free.
+In HAProxy, the peers engine is implemented as an **applet** (`peer_applet`, `src/peers.c:3392`). In Alcyon, it integrates directly as an `Endpoint::Applet(PeerApplet)` behind the `sedesc`/`stconn` pivot (`design/001-layering.md` §3), allowing it to leverage connection management, TLS, timeouts, and logging for free.
 
 ---
 
@@ -291,7 +291,7 @@ HAProxy uses a custom variable-length integer scheme (`src/peers.c:543-610`):
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Local as Ibex Node A (Joining)
+    participant Local as Alcyon Node A (Joining)
     participant Remote as HAProxy Node B (Active)
 
     Note over Local,Remote: Phase 1: TCP Connect & Text Handshake
@@ -324,16 +324,16 @@ sequenceDiagram
 
 ## 4. Architectural Roadmap for Milestones 5 and 6
 
-### Milestone 5: HTTP/2 Multiplexing Engine (`ibex-parser` & `ibex-proto`)
+### Milestone 5: HTTP/2 Multiplexing Engine (`alcyon-parser` & `alcyon-proto`)
 
 **Objective:** Complete RFC 7540 / RFC 9113 / RFC 7541 HTTP/2 engine, integrated into the five-layer model with zero heap allocation on the hot path.
 
 ```rust
-// Concrete Rust Types for ibex-proto / ibex-parser (Milestone 5)
+// Concrete Rust Types for alcyon-proto / alcyon-parser (Milestone 5)
 
 pub mod h2 {
-    use ibex_core::arena::ArenaIndex;
-    use ibex_sched::Tick;
+    use alcyon_core::arena::ArenaIndex;
+    use alcyon_sched::Tick;
 
     pub const H2_CONN_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     pub const DEFAULT_MAX_FRAME_SIZE: u32 = 16_384;
@@ -435,16 +435,16 @@ pub mod h2 {
 
 ---
 
-### Milestone 6: Distributed Peers Stick-Table Replication (`ibex-peers`)
+### Milestone 6: Distributed Peers Stick-Table Replication (`alcyon-peers`)
 
-**Objective:** Wire-compatible HAProxy Peers Protocol v2.1 synchronization engine, enabling seamless stick-table clustering between Ibex and existing HAProxy installations.
+**Objective:** Wire-compatible HAProxy Peers Protocol v2.1 synchronization engine, enabling seamless stick-table clustering between Alcyon and existing HAProxy installations.
 
 ```rust
-// Concrete Rust Types for ibex-peers (Milestone 6)
+// Concrete Rust Types for alcyon-peers (Milestone 6)
 
 pub mod peers {
-    use ibex_core::arena::ArenaIndex;
-    use ibex_sched::Tick;
+    use alcyon_core::arena::ArenaIndex;
+    use alcyon_sched::Tick;
 
     pub const PEER_PROTO_NAME: &str = "HAProxyS";
     pub const PEER_MAJOR_VERSION: u8 = 2;
@@ -566,16 +566,16 @@ pub mod peers {
 Following `design/005-sprint-plan.md` §2, every delegated component for Milestones 5 and 6 possesses an objective mechanical test oracle:
 
 1. **HPACK Decoder & Encoder**:
-   - Oracle: RFC 7541 Appendix C test vectors + differential test harness comparing `ibex-parser` output with HAProxy's `hpack-dec.c` on random valid/malformed header corpora.
+   - Oracle: RFC 7541 Appendix C test vectors + differential test harness comparing `alcyon-parser` output with HAProxy's `hpack-dec.c` on random valid/malformed header corpora.
 2. **HTTP/2 Rapid Reset Mitigation**:
-   - Oracle: Adversarial test suite driving 10,000 rapid RST frames; assert that Ibex clamps worker CPU, drops the connection with `GOAWAY(ENHANCE_YOUR_CALM)`, and maintains $< 2$ms latency for co-located streams.
+   - Oracle: Adversarial test suite driving 10,000 rapid RST frames; assert that Alcyon clamps worker CPU, drops the connection with `GOAWAY(ENHANCE_YOUR_CALM)`, and maintains $< 2$ms latency for co-located streams.
 3. **Peers Protocol Wire Serialization**:
-   - Oracle: Dual-instance wire vector replay. Ibex encodes stick table updates, passes bytes to a live HAProxy 3.0 instance; verify that HAProxy’s `show table` reflects identical key/counter values.
+   - Oracle: Dual-instance wire vector replay. Alcyon encodes stick table updates, passes bytes to a live HAProxy 3.0 instance; verify that HAProxy’s `show table` reflects identical key/counter values.
 4. **Resync / Teach-Learn Convergence**:
-   - Oracle: Spin up HAProxy with 100,000 stick table entries, boot an empty Ibex instance configured as a peer, assert complete synchronization within $< 500$ms and 0 memory reallocations.
+   - Oracle: Spin up HAProxy with 100,000 stick table entries, boot an empty Alcyon instance configured as a peer, assert complete synchronization within $< 500$ms and 0 memory reallocations.
 
 ---
 
 ## Conclusion
 
-The architecture of HAProxy's HTTP/2 multiplexing and Peers synchronization protocols maps directly onto Ibex's five-layer abstraction, memory arenas, and scheduler class budgets. Implementing these protocols in pure Rust provides CISA memory-safety guarantees while maintaining byte-for-byte wire compatibility with existing HAProxy infrastructures.
+The architecture of HAProxy's HTTP/2 multiplexing and Peers synchronization protocols maps directly onto Alcyon's five-layer abstraction, memory arenas, and scheduler class budgets. Implementing these protocols in pure Rust provides CISA memory-safety guarantees while maintaining byte-for-byte wire compatibility with existing HAProxy infrastructures.

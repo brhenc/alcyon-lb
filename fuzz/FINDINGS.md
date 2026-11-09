@@ -1,8 +1,8 @@
-# Differential Fuzzing Findings: Ibex vs HAProxy
+# Differential Fuzzing Findings: Alcyon vs HAProxy
 
 ## Executive Summary
 
-This report documents differential testing between the **Ibex HTTP/1 parser** (`crates/ibex-proto`) and the reference **HAProxy version 3.5-dev8-885761-29 2026/10/02 - https://haproxy.org/** oracle (`/home/bhenc/reference/haproxy/haproxy`); Ibex at commit `f974340`.
+This report documents differential testing between the **Alcyon HTTP/1 parser** (`crates/alcyon-proto`) and the reference **HAProxy version 3.5-dev8-885761-29 2026/10/02 - https://haproxy.org/** oracle (`/home/bhenc/reference/haproxy/haproxy`); Alcyon at commit `f974340`.
 
 - **Total Inputs Evaluated:** 295
 - **Accepted by Both Parsers:** 189
@@ -18,7 +18,7 @@ This report documents differential testing between the **Ibex HTTP/1 parser** (`
 1. **Category 1 (Acceptance):** One parser accepted the input as valid HTTP/1 while the other rejected it (HTTP 400 Bad Request or parse syntax error).
 2. **Category 2 (Framing):** Both parsers accepted the input, but disagreed on parsed method, URI, header count, or body length.
 3. **Category 3 (Smuggling Boundary):** Disagreements on message boundaries (where this request ends and the next begins), keep-alive connection reuse enforcement on ambiguous framing, or request smuggling desynchronization.
-4. **Self-Differential:** Discrepancies within Ibex itself across single-pass buffer evaluation versus incremental byte-by-byte streaming.
+4. **Self-Differential:** Discrepancies within Alcyon itself across single-pass buffer evaluation versus incremental byte-by-byte streaming.
 
 ---
 
@@ -42,7 +42,7 @@ This report documents differential testing between the **Ibex HTTP/1 parser** (`
 00000060: 0a 58                                             |.X|
 ```
 
-#### Ibex Behavior
+#### Alcyon Behavior
 
 - **Accepted:** `true`
 - **Phase:** `Done`
@@ -86,7 +86,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 00000060: 0a 58                                             |.X|
 ```
 
-#### Ibex Behavior
+#### Alcyon Behavior
 
 - **Accepted:** `true`
 - **Phase:** `Done`
@@ -126,7 +126,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 00000020: 78 61 6d 70 6c 65 2e 63  6f 6d 0d 0a 0d 0a        |xample.com....|
 ```
 
-#### Ibex Behavior
+#### Alcyon Behavior
 
 - **Accepted:** `true`
 - **Phase:** `Done`
@@ -170,7 +170,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 00000060: 6d 0d 0a 0d 0a                                    |m....|
 ```
 
-#### Ibex Behavior
+#### Alcyon Behavior
 
 - **Accepted:** `true`
 - **Phase:** `Done`
@@ -466,7 +466,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 00001020: 6d 0d 0a 0d 0a                                    |m....|
 ```
 
-#### Ibex Behavior
+#### Alcyon Behavior
 
 - **Accepted:** `true`
 - **Phase:** `Done`
@@ -486,7 +486,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 #### Security Analysis & Root Cause
 
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
+Alcyon: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
 
 ---
 
@@ -504,7 +504,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 00000020: 78 61 6d 70 6c 65 2e 63  6f 6d 0d 0a 0d 0a        |xample.com....|
 ```
 
-#### Ibex Behavior
+#### Alcyon Behavior
 
 - **Accepted:** `true`
 - **Phase:** `Done`
@@ -542,7 +542,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 00000020: 65 2e 63 6f 6d 0d 0a 0d  0a                       |e.com....|
 ```
 
-#### Ibex Behavior
+#### Alcyon Behavior
 
 - **Accepted:** `true`
 - **Phase:** `Done`
@@ -562,7 +562,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 #### Security Analysis & Root Cause
 
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
+Alcyon: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
 
 ---
 
@@ -580,7 +580,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 00000020: 65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a 0d 0a     |example.com....|
 ```
 
-#### Ibex Behavior
+#### Alcyon Behavior
 
 - **Accepted:** `true`
 - **Phase:** `Done`
@@ -600,7 +600,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 
 #### Security Analysis & Root Cause
 
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
+Alcyon: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Some(400), err=None
 
 ---
 
@@ -622,7 +622,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Som
 00000060: 30 0d 0a 0d 0a 30 0d 0a  0d 0a                    |0....0....|
 ```
 
-#### Ibex Behavior
+#### Alcyon Behavior
 
 - **Accepted:** `true`
 - **Phase:** `Done`
@@ -667,7 +667,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 00000070: 63 6f 6d 0d 0a 0d 0a                              |com....|
 ```
 
-#### Ibex Behavior
+#### Alcyon Behavior
 
 - **Accepted:** `true`
 - **Phase:** `Done`
@@ -708,7 +708,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 00000050: 0d 0a 68 65 6c 6c 6f                              |..hello|
 ```
 
-#### Ibex Behavior
+#### Alcyon Behavior
 
 - **Accepted:** `true`
 - **Phase:** `Done`
@@ -728,7 +728,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 
 #### Security Analysis & Root Cause
 
-Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=None, err=None
+Alcyon: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=None, err=None
 
 ---
 
@@ -748,7 +748,7 @@ Ibex: accepted=true, phase="Done", err=None. HAProxy: accepted=false, status=Non
 00000040: 62 2e 63 6f 6d 0d 0a 0d  0a                       |b.com....|
 ```
 
-#### Ibex Behavior
+#### Alcyon Behavior
 
 - **Accepted:** `true`
 - **Phase:** `Done`
@@ -790,7 +790,7 @@ HAProxy detected trailing data as part of request body or corrupted the subseque
 00000040: 3a 20 35 2c 20 31 30 0d  0a 0d 0a 68 65 6c 6c 6f  |: 5, 10....hello|
 ```
 
-#### Ibex Behavior
+#### Alcyon Behavior
 
 - **Accepted:** `true`
 - **Phase:** `Done`

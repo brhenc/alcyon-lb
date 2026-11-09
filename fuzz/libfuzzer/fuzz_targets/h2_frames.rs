@@ -2,7 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use ibex_proto::h2::{H2FrameParser, H2Multiplexer, H2Role};
+use alcyon_proto::h2::{H2FrameParser, H2Multiplexer, H2Role};
 
 fuzz_target!(|data: &[u8]| {
     let parser = H2FrameParser::new();

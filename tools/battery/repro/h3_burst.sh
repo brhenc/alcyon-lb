@@ -3,17 +3,17 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 #
 # T523 (M2 slice 3): 200 HTTP/3 connections opened at once, one GET / each, through a
-# Python ThreadingHTTPServer backend (listen backlog 5, as the M2 plan's be.py), on Ibex and
+# Python ThreadingHTTPServer backend (listen backlog 5, as the M2 plan's be.py), on Alcyon and
 # on HAProxy with QUIC, alternately, RUNS times at each nbthread; a fresh proxy and backend
 # per run. Prints one line per run: ok/fail of the 200 (each waits for its handshake, then
 # sends its request and gives it 10 s: the M2 plan's idle_h3.py, aioquic) and the
 # connections the backend accepted.
 #
-#   tools/battery/repro/h3_burst.sh <ibex-binary> [runs=3] [nbthread ...=1 16]
+#   tools/battery/repro/h3_burst.sh <alcyon-binary> [runs=3] [nbthread ...=1 16]
 #
 # HAProxy 3.5-dev7 QUIC (HAPROXY_QUIC overrides): 200/200 every run, about 120 backend
 # connections for 200 requests (every HTTP/3 stream is "not first" and reuses an idle one).
-# Ibex before T523: 143-198/200 at nbthread 1, 196-200 at 16, one backend connection per
+# Alcyon before T523: 143-198/200 at nbthread 1, 196-200 at 16, one backend connection per
 # request; the burst overflowed the backend's accept queue (TcpExtListenOverflows) and a
 # dropped SYN cost a connect timeout and a retry, past the client's 10 s.
 # Why a battery script and not the integration suite: the failure needs a backend whose
@@ -22,7 +22,7 @@
 # HTTP/3 request reuses an idle server connection) is tests/it/h3_backend_reuse.rs.
 # Takes about 2 s a run. Uses ports 61531-61533 and /tmp/h3_burst.$$.
 set -u
-IBEX=${1:?usage: h3_burst.sh <ibex-binary> [runs] [nbthread ...]}
+ALCYON=${1:?usage: h3_burst.sh <alcyon-binary> [runs] [nbthread ...]}
 RUNS=${2:-3}
 shift; shift 2>/dev/null
 NTS=${*:-1 16}
@@ -81,8 +81,8 @@ asyncio.run(main())
 EOF
 for nt in $NTS; do
   for r in $(seq 1 "$RUNS"); do
-    for who in ibex haproxy; do
-      if [ "$who" = ibex ]; then BIN=$IBEX; FE=61532; else BIN=$HAP; FE=61533; fi
+    for who in alcyon haproxy; do
+      if [ "$who" = alcyon ]; then BIN=$ALCYON; FE=61532; else BIN=$HAP; FE=61533; fi
       : > "$D/acc"
       python3 "$D/be.py" $BE "$D/acc" 2>/dev/null & B=$!
       printf 'global\n  nbthread %s\ndefaults\n  mode http\n  timeout connect 3s\n  timeout client 15s\n  timeout server 15s\nfrontend fe\n  bind quic4@127.0.0.1:%s ssl crt %s alpn h3\n  default_backend be\nbackend be\n  server s1 127.0.0.1:%s\n' \

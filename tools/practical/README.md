@@ -5,19 +5,19 @@ Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 # Practical topologies
 
 Each directory is one real-software setup (see "Practical testing" in
-`docs/milestones.md`). Every one is run against Ibex and against HAProxy; the PASS/FAIL
+`docs/milestones.md`). Every one is run against Alcyon and against HAProxy; the PASS/FAIL
 tables must be the same.
 
 ## 01-node: client -> proxy -> node.js
 
-Needs `node`, `npm`, `curl`, `sha256sum` (all installed). Ibex is built with:
+Needs `node`, `npm`, `curl`, `sha256sum` (all installed). Alcyon is built with:
 
-    CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t167 CARGO_INCREMENTAL=0 cargo build --release --bin ibex
+    CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t167 CARGO_INCREMENTAL=0 cargo build --release --bin alcyon
 
 Run:
 
     cd tools/practical/01-node
-    ./run.sh               # against Ibex
+    ./run.sh               # against Alcyon
     ./run.sh --haproxy     # against HAProxy (oracle)
     SIZE_MB=10 ./run.sh    # smaller upload/download
 
@@ -34,8 +34,8 @@ download (sha256), SSE (events arrive one per second, first byte at once), WebSo
 ## 06-browsers: Chrome / Firefox (headless) -> proxy (TLS, h2) -> node.js SPA
 
 Needs `node` 22 (built-in WebSocket/fetch), `openssl`, `/usr/bin/google-chrome`, `/usr/bin/firefox`; no npm
-packages (`app.js` hand-rolls the WebSocket echo). Ibex build:
-`CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t212 CARGO_INCREMENTAL=0 cargo build --release --bin ibex`.
+packages (`app.js` hand-rolls the WebSocket echo). Alcyon build:
+`CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t212 CARGO_INCREMENTAL=0 cargo build --release --bin alcyon`.
 
     ./tools/practical/06-browsers/run.sh [--haproxy]     # BROWSERS=chrome to run one; KEEP=1 keeps /tmp/practical06-*
 
@@ -48,11 +48,11 @@ Ports 26001 (node), 26080 (proxy), 26010/26011 (browser debug). About 25 s.
 
 ## 05-node-cluster: 3 x node.js, roundrobin + health checks
 
-Needs `node`, `curl`, `socat` (no npm packages, no wrk: the load is `load.js`). Build Ibex with
-`CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t181 CARGO_INCREMENTAL=0 cargo build --release --bin ibex`.
+Needs `node`, `curl`, `socat` (no npm packages, no wrk: the load is `load.js`). Build Alcyon with
+`CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t181 CARGO_INCREMENTAL=0 cargo build --release --bin alcyon`.
 
     cd tools/practical/05-node-cluster
-    ./run.sh               # against Ibex
+    ./run.sh               # against Alcyon
     ./run.sh --haproxy     # against HAProxy (oracle)
 
 Takes about 80 s. `proxy.cfg`: `option httpchk`, `inter 500ms fall 2 rise 2`, `retries 3` and
@@ -67,8 +67,8 @@ run ends with the `show stat` status changes over time. Ports 23001-23003 (nodes
 ## 02-nginx-h2: client -> proxy (TLS, h2) -> nginx -> node.js
 
 Needs `nginx` (`/usr/sbin/nginx`, run unprivileged inside the work dir), `h2load`, `openssl`, `curl`,
-`node`. `app.js` is reused from `01-node` (its `npm ci` runs there). Ibex build:
-`CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t193 CARGO_INCREMENTAL=0 cargo build --release --bin ibex`.
+`node`. `app.js` is reused from `01-node` (its `npm ci` runs there). Alcyon build:
+`CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t193 CARGO_INCREMENTAL=0 cargo build --release --bin alcyon`.
 The self-signed certificate and the 20 MB static file are generated into the work dir (nothing committed).
 
     ./tools/practical/02-nginx-h2/run.sh [--haproxy]
@@ -107,16 +107,16 @@ shows the PROXY source (`log stdout format raw`). Ports 24040 (nginx), 24041 (no
    connect to its port instead of `PROXY_PORT`).
 4. Add cases with `record NAME 0|1 "detail"`; keep each case one short block.
 5. Run with and without `--haproxy`. File every difference as `tasks/T17x-practical-*.md`
-   with the exact command, HAProxy's output and Ibex's.
+   with the exact command, HAProxy's output and Alcyon's.
 
 ## 03-httpd: proxy -> httpd (mod_proxy) -> node.js, plus static files and CGI
 
 Needs `node`, `curl`, `sha256sum`, `/usr/sbin/httpd` (2.4, modules in `/usr/lib64/httpd/modules`),
-`python3` (the CGI scripts) and `~/.local/bin/wrk2`. Build Ibex with
-`CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t201 CARGO_INCREMENTAL=0 cargo build --release --bin ibex`.
+`python3` (the CGI scripts) and `~/.local/bin/wrk2`. Build Alcyon with
+`CARGO_TARGET_DIR=/home/bhenc/ibex-targets/t201 CARGO_INCREMENTAL=0 cargo build --release --bin alcyon`.
 
     cd tools/practical/03-httpd
-    ./run.sh               # against Ibex
+    ./run.sh               # against Alcyon
     ./run.sh --haproxy     # against HAProxy (oracle)
 
 Takes about 40 s. httpd runs unprivileged in the foreground from `httpd.conf` (filled in under

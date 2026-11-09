@@ -36,7 +36,7 @@ fn is_write_zero<T: std::fmt::Debug>(r: Result<T, std::io::Error>) -> bool {
     matches!(r, Err(e) if e.kind() == ErrorKind::WriteZero)
 }
 
-/// The scanner's case (IBEX-SLZ-TRUNC-001).
+/// The scanner's case (ALCYON-SLZ-TRUNC-001).
 #[test]
 fn scanner_case_is_an_error() {
     let input = noise(1000, 7);

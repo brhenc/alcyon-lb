@@ -4,7 +4,7 @@
 """M1: RSS per idle keep-alive client connection (T180). 10k idle conns, RSS delta / 10k.
 
 Each client connection does one GET /small through the proxy and is then left idle
-(keep-alive). Proxy and origin share the config in m1lib. Binaries: IBEX, HAPROXY env.
+(keep-alive). Proxy and origin share the config in m1lib. Binaries: ALCYON, HAPROXY env.
     tools/measure/m1_idle_conn_rss.py [N=10000]
 """
 import socket
@@ -47,7 +47,7 @@ if __name__ == "__main__":
     m.wait_load()
     o, op = m.start_origin()
     try:
-        for kind in ("ibex", "haproxy"):
+        for kind in ("alcyon", "haproxy"):
             med, rs = m.median_of(lambda: once(kind, op))
             m.emit(param="idle_rss", kind=kind, n=N, **med, runs=[r["bytes_per_conn"] for r in rs])
     finally:

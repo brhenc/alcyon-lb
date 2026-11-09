@@ -2,10 +2,10 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 """End-to-end check of the differential harness's findings.
 
-usage: e2e.py <dir-of-.bin-inputs> [ibex-binary]
+usage: e2e.py <dir-of-.bin-inputs> [alcyon-binary]
 
-Starts the reference HAProxy and a real Ibex (default $CARGO_TARGET_DIR/release/ibex, build with
-`cargo build --release -p ibex-rt --bin ibex`) with the same config, each in front of its own
+Starts the reference HAProxy and a real Alcyon (default $CARGO_TARGET_DIR/release/alcyon, build with
+`cargo build --release -p alcyon-rt --bin alcyon`) with the same config, each in front of its own
 recording backend, sends every input over a raw socket (no half-close: a client FIN makes both
 proxies answer 400), and prints SAME/DIFF on the status lines plus the bytes the backend got.
 The harness itself compares parsers, not proxies; confirm a finding here before filing it.
@@ -13,8 +13,8 @@ The harness itself compares parsers, not proxies; confirm a finding here before 
 import os
 import socket,threading,subprocess,sys,time,glob,re
 HA='/home/bhenc/reference/haproxy/haproxy'
-IB=sys.argv[2] if len(sys.argv)>2 else os.path.join(os.environ.get('CARGO_TARGET_DIR','target'),'release','ibex')
-TMP=__import__('tempfile').mkdtemp(prefix='ibex-fuzz-e2e-')
+IB=sys.argv[2] if len(sys.argv)>2 else os.path.join(os.environ.get('CARGO_TARGET_DIR','target'),'release','alcyon')
+TMP=__import__('tempfile').mkdtemp(prefix='alcyon-fuzz-e2e-')
 def free():
     s=socket.socket();s.bind(('127.0.0.1',0));p=s.getsockname()[1];s.close();return p
 class Backend:
@@ -74,7 +74,7 @@ def send(fe,be,raw):
     return resp,b'|'.join(be.log[n:])
 RAW={}
 procs={}
-for nm,b in (('haproxy',HA),('ibex',IB)):procs[nm]=start(b,nm)
+for nm,b in (('haproxy',HA),('alcyon',IB)):procs[nm]=start(b,nm)
 try:
     files=sorted(glob.glob(sys.argv[1]+'/*.bin'))
     for f in files:
@@ -83,7 +83,7 @@ try:
             r,b=send(fe,be,raw)
             st=re.findall(rb'HTTP/1\.[01] (\d+)',r)
             out[nm]=(st,b);RAW[nm]=r
-        same=out['haproxy']==out['ibex']
+        same=out['haproxy']==out['alcyon']
         print(('SAME ' if same else 'DIFF ')+os.path.basename(f),len(raw))
         if not same:
             for nm in out:print('   ',nm,RAW[nm][:90],[x.decode() for x in out[nm][0]],'fwd=',out[nm][1][:300])

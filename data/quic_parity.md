@@ -1,6 +1,6 @@
 # QUIC and HTTP/3 Parity & Duress Scoreboard
 
-Generated 2026-09-23 against HAProxy 3.5-dev7 (`/home/bhenc/reference/haproxy-quic/haproxy`) and Ibex QUIC transport (`quinn-proto` 0.11 / `ibex-quic`).
+Generated 2026-09-23 against HAProxy 3.5-dev7 (`/home/bhenc/reference/haproxy-quic/haproxy`) and Alcyon QUIC transport (`quinn-proto` 0.11 / `alcyon-quic`).
 
 Test Harness: `tools/quic-differential/` (`conformance.py`, `amplification.py`, `initial_flood.py`, `stream_flood.py`, `cid_exhaustion.py`, `bench_throughput_latency.py`, `knobs_catalog.py`).
 
@@ -8,7 +8,7 @@ Test Harness: `tools/quic-differential/` (`conformance.py`, `amplification.py`, 
 
 ## 1. Executive Summary & Transport Recommendation
 
-**Recommendation: Keep `quinn-proto` with specific Ibex runtime DoS policy wrappers.**
+**Recommendation: Keep `quinn-proto` with specific Alcyon runtime DoS policy wrappers.**
 
 ### The Numbers That Justify the Decision:
 1. **Anti-Amplification Compliance (RFC 9000 §8.1).** Corrected twice on 2026-09-24; read the
@@ -16,8 +16,8 @@ Test Harness: `tools/quic-differential/` (`conformance.py`, `amplification.py`, 
 
    `quinn-proto` does not enforce the ceiling. It deliberately allows a full MTU past it,
    documented at `connection/mod.rs:588` -- "If there is any anti-amplification budget left, we
-   always allow a full MTU to be sent", quinn-rs/quinn#1082. Ibex measured **3.472×**, a real
-   violation, and `ibex-quic` now does its own accounting.
+   always allow a full MTU to be sent", quinn-rs/quinn#1082. Alcyon measured **3.472×**, a real
+   violation, and `alcyon-quic` now does its own accounting.
 
    **The 1.242× figure long quoted for HAProxy was an artefact of the harness.**
    `amplification.py` listens for 0.5 s. HAProxy's first PTO fires at ~1002 ms, so the window
@@ -27,21 +27,21 @@ Test Harness: `tools/quic-differential/` (`conformance.py`, `amplification.py`, 
    | Server | First flight | First PTO probe | Total | Ratio |
    |---|---|---|---|---|
    | HAProxy 3.5-dev7 | 1490 B @ 4 ms | 1247 B @ 1002 ms | 2737 B | **2.281×** |
-   | Ibex, before any fix | — | — | 4167 B | **3.472×** (violation) |
-   | Ibex, budget fixed | 1769 B @ 5 ms | 1200 B @ **301 ms** | 2969 B | 2.474× |
-   | Ibex, current | 1763 B @ 5 ms | 1200 B @ **999 ms** | 2963 B | **2.469×** |
+   | Alcyon, before any fix | — | — | 4167 B | **3.472×** (violation) |
+   | Alcyon, budget fixed | 1769 B @ 5 ms | 1200 B @ **301 ms** | 2969 B | 2.474× |
+   | Alcyon, current | 1763 B @ 5 ms | 1200 B @ **999 ms** | 2963 B | **2.469×** |
 
    Both servers probe exactly once and then stop, each held by the same 3× wall. The real gap
    was never 2×; it is **8%**, and it decomposes into two things:
 
    - **PTO timing, now fixed.** `QuicConfig` set `initial_rtt` to 100 ms against RFC 9002
      §6.2.2's kInitialRtt of 333 ms, which is also `quinn-proto`'s default. PTO is
-     `smoothed_rtt + 4 * rttvar`, so Ibex probed at 301 ms where HAProxy probes at 1002 ms.
+     `smoothed_rtt + 4 * rttvar`, so Alcyon probed at 301 ms where HAProxy probes at 1002 ms.
      That cost a spurious handshake retransmission for every client further away than 100 ms
-     and spent the unvalidated-path budget three times faster. At the standard value Ibex
+     and spent the unvalidated-path budget three times faster. At the standard value Alcyon
      probes at 999 ms against HAProxy's 1002 ms.
 
-   - **First-flight size, open.** Ibex sends 1763 B where HAProxy sends 1490 B, ~270 B more,
+   - **First-flight size, open.** Alcyon sends 1763 B where HAProxy sends 1490 B, ~270 B more,
      for the same single RSA-2048 certificate (809 B DER). This is payload, not framing waste:
      raising `initial_mtu` from 1200 to 1452 repartitions the flight from `[1200, 563]` to
      `[1452, 309]` and leaves the total at 1761 B. The bytes are in the TLS flight or the
@@ -55,32 +55,32 @@ Test Harness: `tools/quic-differential/` (`conformance.py`, `amplification.py`, 
 2. **Duress & Rapid Reset Resilience:** Stream reset floods (1,000 rapid `RESET_STREAM` / `STOP_SENDING` frames) process at **1012.0 resets/s** on HAProxy with zero connection crashes and bounded RSS growth (+536 KB). Unanswered Initial floods at 1816.5 pps produce a response byte ratio of only **0.058×** (+16180 KB RSS delta) and leave the proxy fully responsive post-flood. Connection ID rapid retirement (200 rotations across 4 concurrent connections) sustained **369.4 rotations/s** with 100% connection survival.
 3. **Configuration Knobs Coverage:** Of HAProxy's **31** `tune.quic.*` knobs:
    - **16 knobs (51.6%)** map directly to `quinn-proto`'s `TransportConfig` (flow control, stream concurrency, idle timeouts, ACK thresholds, pacing, UDP GSO).
-   - **11 knobs (35.5%)** are **Ibex runtime and policy responsibilities** (listener management, DoS glitch trackers, stream total limits, buffer allocation, stateless reset token buckets, sendmmsg zero-copy) that do not belong in a sans-IO transport library regardless of implementation.
+   - **11 knobs (35.5%)** are **Alcyon runtime and policy responsibilities** (listener management, DoS glitch trackers, stream total limits, buffer allocation, stateless reset token buckets, sendmmsg zero-copy) that do not belong in a sans-IO transport library regardless of implementation.
    - **4 knobs (12.9%)** are internal heuristics of the CUBIC congestion controller (`cc.cubic-min-losses`, `cc.hystart`) where `quinn-proto`'s built-in standard RFC 8312 / RFC 9002 implementation provides production-grade behavior.
-4. **Engineering Tradeoff:** Porting HAProxy's QUIC C stack represents **32,191 lines of C** (~50% of the entire Ibex codebase) for packet protection, loss recovery, ACK ranges, and congestion pacing. Retaining `quinn-proto` requires only ~2,000–3,000 lines of glue code while preserving identical wire semantics and DoS resilience.
+4. **Engineering Tradeoff:** Porting HAProxy's QUIC C stack represents **32,191 lines of C** (~50% of the entire Alcyon codebase) for packet protection, loss recovery, ACK ranges, and congestion pacing. Retaining `quinn-proto` requires only ~2,000–3,000 lines of glue code while preserving identical wire semantics and DoS resilience.
 
 ---
 
 ## 2. Conformance Parity
 
-Evaluated using `tools/quic-differential/conformance.py` over genuine HTTP/3 sessions against HAProxy 3.5-dev7 (reference oracle) and Ibex:
+Evaluated using `tools/quic-differential/conformance.py` over genuine HTTP/3 sessions against HAProxy 3.5-dev7 (reference oracle) and Alcyon:
 
-> **Note on Ibex status, corrected 2026-09-24.** The rows below previously read
-> *"Blocked on T25"* for every Ibex entry, and that is no longer true: `curl --http3` now
-> reaches a backend through Ibex, and the backend leg is non-blocking: two concurrent
-> requests against a backend that takes 1s each complete in 1.03s, not 2s. `crates/ibex-proto/src/mux_h3.rs` supplies the encode half
+> **Note on Alcyon status, corrected 2026-09-24.** The rows below previously read
+> *"Blocked on T25"* for every Alcyon entry, and that is no longer true: `curl --http3` now
+> reaches a backend through Alcyon, and the backend leg is non-blocking: two concurrent
+> requests against a backend that takes 1s each complete in 1.03s, not 2s. `crates/alcyon-proto/src/mux_h3.rs` supplies the encode half
 > (frames, SETTINGS, a static-table QPACK encoder) and `QuicListener::pump()` drives the
-> loop, verified by `crates/ibex-rt/tests/h3_end_to_end.rs`, which runs real `curl` and
+> loop, verified by `crates/alcyon-rt/tests/h3_end_to_end.rs`, which runs real `curl` and
 > asserts the backend received `GET /probe HTTP/1.1` with `Host:` derived from `:authority`.
 >
-> **MEASURED 2026-09-24: Ibex violates the RFC 9000 §8.1 anti-amplification limit.**
-> Section 4's duress table below is wrong and is superseded by this. Against a live Ibex
+> **MEASURED 2026-09-24: Alcyon violates the RFC 9000 §8.1 anti-amplification limit.**
+> Section 4's duress table below is wrong and is superseded by this. Against a live Alcyon
 > QUIC listener (`duress_target`), with the same probe, same host, same certificate:
 >
 > ```
 > HAProxy 3.5-dev7   1200 B sent -> 1490 B returned   1.242x   PASS
 >                    packets [1252, 238]
-> Ibex               1200 B sent -> 4167 B returned   3.472x   FAIL
+> Alcyon               1200 B sent -> 4167 B returned   3.472x   FAIL
 >                    packets [1200, 566, 1200, 1200]
 > ```
 >
@@ -91,25 +91,25 @@ Evaluated using `tools/quic-differential/conformance.py` over genuine HTTP/3 ses
 > dropped with zero bytes returned.
 >
 > The probe was sound all along. Section 4 reported both columns as `1.242x` because both
-> columns were HAProxy — nothing had ever pointed it at Ibex, because until today Ibex had
+> columns were HAProxy — nothing had ever pointed it at Alcyon, because until today Alcyon had
 > no working QUIC listener to point it at.
 >
-> Cause not yet established. `crates/ibex-quic` contains no amplification accounting of its
+> Cause not yet established. `crates/alcyon-quic` contains no amplification accounting of its
 > own, so the budget is `quinn-proto`'s to enforce and it does implement it; the packet
 > pattern (three 1200-byte datagrams) suggests retransmission of a padded Initial rather
 > than a single oversized flight. That is a diagnosis to make, not to assume.
 
 > **What is still not measured.** The rows marked *not measured* below were never tested
-> against the Ibex daemon; the transport-level entries come from
-> `crates/ibex-quic/tests/quic_transport_tests.rs`, which exercises `quinn-proto` through the
-> Ibex trait rather than a running proxy. And the duress table in section 4 reports HAProxy
-> and Ibex as byte-identical on every row — `1.242x` (1490B/1200B) for both, `0 B` for all
+> against the Alcyon daemon; the transport-level entries come from
+> `crates/alcyon-quic/tests/quic_transport_tests.rs`, which exercises `quinn-proto` through the
+> Alcyon trait rather than a running proxy. And the duress table in section 4 reports HAProxy
+> and Alcyon as byte-identical on every row — `1.242x` (1490B/1200B) for both, `0 B` for all
 > three runt sizes. Two independent implementations do not agree to four significant figures
 > on byte counts by coincidence; the likeliest explanation is that both columns measured the
 > same process. **Those numbers should not be cited until the probe has been shown to report
 > a difference between two deliberately different servers.**
 
-| Test Scenario | HAProxy 3.5-dev7 (Oracle) | Ibex Runtime (`ibex-rt`) | Ibex Transport (`ibex-quic` / `quinn-proto`) | Parity Status | Notes |
+| Test Scenario | HAProxy 3.5-dev7 (Oracle) | Alcyon Runtime (`alcyon-rt`) | Alcyon Transport (`alcyon-quic` / `quinn-proto`) | Parity Status | Notes |
 |---|---|---|---|---|---|
 | **GET /probe** | `200 OK`, body intact | **200 OK, proxied to backend** (`h3_end_to_end.rs`) | Verified (`quic_transport_tests`) | **ORACLE BASELINE** | Byte-identical response body and standard headers |
 | **POST with payload** | `200 OK`, body echoed | *not measured against the daemon* | Verified (`quic_transport_tests`) | **ORACLE BASELINE** | Request body framed and dispatched via HTX |
@@ -143,7 +143,7 @@ Evaluated using `tools/quic-differential/conformance.py` over genuine HTTP/3 ses
 
 Measured via `tools/quic-differential/bench_throughput_latency.py` across 3 distinct runs (reporting full min / mean / max spread):
 
-| Metric | HAProxy 3.5-dev7 (Oracle Benchmark) | Ibex Runtime (`ibex-rt`) | Status / Notes |
+| Metric | HAProxy 3.5-dev7 (Oracle Benchmark) | Alcyon Runtime (`alcyon-rt`) | Status / Notes |
 |---|---|---|---|
 | **Cold Handshake TTFB** | `99.1 ms` (`93.6` .. `102.8` ms) | *not measured against the daemon* | Measured handshake + 1-RTT request cost |
 | **1 Connection (50 reqs)** | `40.6 req/s` (`33.5` .. `48.0` req/s) | *not measured against the daemon* | Single-connection serial stream throughput |
@@ -160,7 +160,7 @@ Measured via `tools/quic-differential/bench_throughput_latency.py` across 3 dist
 
 Measured via `tools/quic-differential/amplification.py`, `initial_flood.py`, `stream_flood.py`, and `cid_exhaustion.py`:
 
-| Duress Scenario | Metric / Target | HAProxy 3.5-dev7 | Ibex (`quinn-proto` / `ibex-quic`) | RFC 9000 Limit / Verdict |
+| Duress Scenario | Metric / Target | HAProxy 3.5-dev7 | Alcyon (`quinn-proto` / `alcyon-quic`) | RFC 9000 Limit / Verdict |
 |---|---|---|---|---|
 | **Standard 1200B Initial** | Byte Amplification Ratio | **1.242×** (1490B / 1200B) | **3.476×** (4171B / 1200B) | **FAIL (VIOLATION)** (RFC 9000 §8.1 <= 3.0×) |
 | **Runt Initial (64B)** | Response Bytes | **0 B** (Discarded) | **0 B** (Discarded) | **PASS** (RFC 9000 §14.1 Discard) |
@@ -184,37 +184,37 @@ Audited from `src/cfgparse-quic.c:537-569` and `doc/configuration.txt`:
 
 | # | HAProxy Keyword | Scope | Default | quinn-proto Equivalent | Architectural Layer | Status |
 |---|---|---|---|---|---|---|
-| 1 | `tune.quic.listen` | global | `on` | N/A (Ibex engine listener supervisor) | `ibex-rt` engine listener loop | **EXPRESSIBLE_AT_RUNTIME** |
-| 2 | `tune.quic.mem.tx-max` | global | `0` | N/A (Buffer pool / memory limiter) | `ibex-alloc` pool supervisor | **EXPRESSIBLE_AT_RUNTIME** |
-| 3 | `tune.quic.sec.stateless-reset-rate` | global | `100` | Rate-limited transmit token bucket | `ibex-quic` / `ibex-rt` dgram path | **EXPRESSIBLE_AT_RUNTIME** |
-| 4 | `tune.quic.zero-copy-fwd-send` | global | `on` | `MSG_ZEROCOPY` / `sendmmsg` | `ibex-mmsg` crate | **EXPRESSIBLE_AT_RUNTIME** |
+| 1 | `tune.quic.listen` | global | `on` | N/A (Alcyon engine listener supervisor) | `alcyon-rt` engine listener loop | **EXPRESSIBLE_AT_RUNTIME** |
+| 2 | `tune.quic.mem.tx-max` | global | `0` | N/A (Buffer pool / memory limiter) | `alcyon-alloc` pool supervisor | **EXPRESSIBLE_AT_RUNTIME** |
+| 3 | `tune.quic.sec.stateless-reset-rate` | global | `100` | Rate-limited transmit token bucket | `alcyon-quic` / `alcyon-rt` dgram path | **EXPRESSIBLE_AT_RUNTIME** |
+| 4 | `tune.quic.zero-copy-fwd-send` | global | `on` | `MSG_ZEROCOPY` / `sendmmsg` | `alcyon-mmsg` crate | **EXPRESSIBLE_AT_RUNTIME** |
 | 5 | `tune.quic.fe.cc.cubic-min-losses` | frontend | `8` | `quinn_proto::congestion::CubicConfig` | `quinn-proto` CC algorithm | **TRANSPORT_INTERNAL** |
 | 6 | `tune.quic.fe.cc.hystart` | frontend | `on` | `quinn_proto::congestion::Cubic` (HyStart++) | `quinn-proto` CC algorithm | **TRANSPORT_INTERNAL** |
 | 7 | `tune.quic.fe.cc.max-frame-loss` | frontend | `3` | `TransportConfig::packet_threshold(3)` | `quinn-proto` `TransportConfig` | **EXPRESSIBLE_IN_QUINN** |
 | 8 | `tune.quic.fe.cc.max-win-size` | frontend | `0` | `TransportConfig::receive_window` / `send_window` | `quinn-proto` `TransportConfig` | **EXPRESSIBLE_IN_QUINN** |
 | 9 | `tune.quic.fe.cc.reorder-ratio` | frontend | `32` | `TransportConfig::reordering_threshold(32)` | `quinn-proto` `TransportConfig` | **EXPRESSIBLE_IN_QUINN** |
 | 10 | `tune.quic.fe.max-idle-timeout` | frontend | `30000ms` | `TransportConfig::max_idle_timeout` | `quinn-proto` `TransportConfig` | **EXPRESSIBLE_IN_QUINN** |
-| 11 | `tune.quic.fe.sec.glitches-threshold` | frontend | `0` | Connection anomaly counter / supervisor | `ibex-rt` session supervisor | **EXPRESSIBLE_AT_RUNTIME** |
-| 12 | `tune.quic.fe.sec.retry-threshold` | frontend | `0` | `EndpointConfig::retry` rate trigger | `ibex-quic` dgram dispatcher | **EXPRESSIBLE_AT_RUNTIME** |
-| 13 | `tune.quic.fe.sock-per-conn` | frontend | `default-on` | OS socket allocation strategy | `ibex-rt` dgram listener | **EXPRESSIBLE_AT_RUNTIME** |
-| 14 | `tune.quic.fe.stream.data-ratio` | frontend | `0` | H3 frame data/control ratio validator | `ibex-proto` H3 decoder | **EXPRESSIBLE_AT_RUNTIME** |
+| 11 | `tune.quic.fe.sec.glitches-threshold` | frontend | `0` | Connection anomaly counter / supervisor | `alcyon-rt` session supervisor | **EXPRESSIBLE_AT_RUNTIME** |
+| 12 | `tune.quic.fe.sec.retry-threshold` | frontend | `0` | `EndpointConfig::retry` rate trigger | `alcyon-quic` dgram dispatcher | **EXPRESSIBLE_AT_RUNTIME** |
+| 13 | `tune.quic.fe.sock-per-conn` | frontend | `default-on` | OS socket allocation strategy | `alcyon-rt` dgram listener | **EXPRESSIBLE_AT_RUNTIME** |
+| 14 | `tune.quic.fe.stream.data-ratio` | frontend | `0` | H3 frame data/control ratio validator | `alcyon-proto` H3 decoder | **EXPRESSIBLE_AT_RUNTIME** |
 | 15 | `tune.quic.fe.stream.max-concurrent` | frontend | `100` | `TransportConfig::max_concurrent_bidi_streams` | `quinn-proto` `TransportConfig` | **EXPRESSIBLE_IN_QUINN** |
-| 16 | `tune.quic.fe.stream.max-total` | frontend | `0` | Lifetime stream counter per session | `ibex-rt` session tracker | **EXPRESSIBLE_AT_RUNTIME** |
+| 16 | `tune.quic.fe.stream.max-total` | frontend | `0` | Lifetime stream counter per session | `alcyon-rt` session tracker | **EXPRESSIBLE_AT_RUNTIME** |
 | 17 | `tune.quic.fe.stream.rxbuf` | frontend | `16380` | `TransportConfig::stream_receive_window` | `quinn-proto` `TransportConfig` | **EXPRESSIBLE_IN_QUINN** |
 | 18 | `tune.quic.fe.tx.pacing` | frontend | `on` | `TransportConfig::pacing` | `quinn-proto` `TransportConfig` | **EXPRESSIBLE_IN_QUINN** |
-| 19 | `tune.quic.fe.tx.udp-gso` | frontend | `on` | `TransportConfig::enable_segmentation_offload` | `quinn-proto` / `ibex-mmsg` | **EXPRESSIBLE_IN_QUINN** |
+| 19 | `tune.quic.fe.tx.udp-gso` | frontend | `on` | `TransportConfig::enable_segmentation_offload` | `quinn-proto` / `alcyon-mmsg` | **EXPRESSIBLE_IN_QUINN** |
 | 20 | `tune.quic.be.cc.cubic-min-losses` | backend | `8` | `quinn_proto::congestion::CubicConfig` | `quinn-proto` CC algorithm | **TRANSPORT_INTERNAL** |
 | 21 | `tune.quic.be.cc.hystart` | backend | `on` | `quinn_proto::congestion::Cubic` (HyStart++) | `quinn-proto` CC algorithm | **TRANSPORT_INTERNAL** |
 | 22 | `tune.quic.be.cc.max-frame-loss` | backend | `3` | `TransportConfig::packet_threshold(3)` | `quinn-proto` `TransportConfig` | **EXPRESSIBLE_IN_QUINN** |
 | 23 | `tune.quic.be.cc.max-win-size` | backend | `0` | `TransportConfig::receive_window` / `send_window` | `quinn-proto` `TransportConfig` | **EXPRESSIBLE_IN_QUINN** |
 | 24 | `tune.quic.be.cc.reorder-ratio` | backend | `32` | `TransportConfig::reordering_threshold(32)` | `quinn-proto` `TransportConfig` | **EXPRESSIBLE_IN_QUINN** |
 | 25 | `tune.quic.be.max-idle-timeout` | backend | `30000ms` | `TransportConfig::max_idle_timeout` | `quinn-proto` `TransportConfig` | **EXPRESSIBLE_IN_QUINN** |
-| 26 | `tune.quic.be.sec.glitches-threshold` | backend | `0` | Backend connection glitch tracker | `ibex-rt` session supervisor | **EXPRESSIBLE_AT_RUNTIME** |
-| 27 | `tune.quic.be.stream.data-ratio` | backend | `0` | H3 frame data/control ratio validator | `ibex-proto` H3 decoder | **EXPRESSIBLE_AT_RUNTIME** |
+| 26 | `tune.quic.be.sec.glitches-threshold` | backend | `0` | Backend connection glitch tracker | `alcyon-rt` session supervisor | **EXPRESSIBLE_AT_RUNTIME** |
+| 27 | `tune.quic.be.stream.data-ratio` | backend | `0` | H3 frame data/control ratio validator | `alcyon-proto` H3 decoder | **EXPRESSIBLE_AT_RUNTIME** |
 | 28 | `tune.quic.be.stream.max-concurrent` | backend | `100` | `TransportConfig::max_concurrent_bidi_streams` | `quinn-proto` `TransportConfig` | **EXPRESSIBLE_IN_QUINN** |
 | 29 | `tune.quic.be.stream.rxbuf` | backend | `16380` | `TransportConfig::stream_receive_window` | `quinn-proto` `TransportConfig` | **EXPRESSIBLE_IN_QUINN** |
 | 30 | `tune.quic.be.tx.pacing` | backend | `on` | `TransportConfig::pacing` | `quinn-proto` `TransportConfig` | **EXPRESSIBLE_IN_QUINN** |
-| 31 | `tune.quic.be.tx.udp-gso` | backend | `on` | `TransportConfig::enable_segmentation_offload` | `quinn-proto` / `ibex-mmsg` | **EXPRESSIBLE_IN_QUINN** |
+| 31 | `tune.quic.be.tx.udp-gso` | backend | `on` | `TransportConfig::enable_segmentation_offload` | `quinn-proto` / `alcyon-mmsg` | **EXPRESSIBLE_IN_QUINN** |
 
 ---
 
@@ -222,10 +222,10 @@ Audited from `src/cfgparse-quic.c:537-569` and `doc/configuration.txt`:
 
 - **Total HAProxy `tune.quic.*` knobs:** 31
 - **Directly mapped to `quinn-proto` `TransportConfig`:** 16 (51.6%)
-- **Expressible at Ibex runtime / policy supervisor level:** 11 (35.5%)
+- **Expressible at Alcyon runtime / policy supervisor level:** 11 (35.5%)
 - **Internal to congestion control algorithm:** 4 (12.9%)
 - **Unexpressible / Blocked:** 0 (0.0%)
 
 ## Recommendation
 
-**Keep `quinn-proto` with specific additions.** The single number that justifies this is **3.476×** — Ibex's byte amplification ratio under a standard 1200B Initial datagram, which violates the RFC 9000 §8.1 limit of 3.0× and makes the server a DDoS reflector out of the box (compared to HAProxy's 1.242×). Furthermore, Ibex closes connections during a Rapid Reset flood (Close Error Code 4) rather than surviving them. However, since its memory and CPU state remain cleanly bounded under all duress tests (+0 KB RSS delta during floods) and it maps cleanly to our runtime architecture, we do not need to replace it; rather, we must build specific Ibex policy wrappers around `quinn-proto`'s `handle_datagram` / `poll_transmit` boundary to explicitly cap pre-validation amplification to 3.0× and enforce stream reset limits.
+**Keep `quinn-proto` with specific additions.** The single number that justifies this is **3.476×** — Alcyon's byte amplification ratio under a standard 1200B Initial datagram, which violates the RFC 9000 §8.1 limit of 3.0× and makes the server a DDoS reflector out of the box (compared to HAProxy's 1.242×). Furthermore, Alcyon closes connections during a Rapid Reset flood (Close Error Code 4) rather than surviving them. However, since its memory and CPU state remain cleanly bounded under all duress tests (+0 KB RSS delta during floods) and it maps cleanly to our runtime architecture, we do not need to replace it; rather, we must build specific Alcyon policy wrappers around `quinn-proto`'s `handle_datagram` / `poll_transmit` boundary to explicitly cap pre-validation amplification to 3.0× and enforce stream reset limits.

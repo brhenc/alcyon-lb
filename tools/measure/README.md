@@ -1,6 +1,6 @@
-# Ibex Continuous Measurement Suite (`tools/measure/`)
+# Alcyon Continuous Measurement Suite (`tools/measure/`)
 
-Continuous performance, allocation, binary size, and regression tracking for Ibex.
+Continuous performance, allocation, binary size, and regression tracking for Alcyon.
 
 ## Usage
 

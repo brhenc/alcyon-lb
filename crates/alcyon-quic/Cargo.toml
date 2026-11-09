@@ -1,0 +1,42 @@
+[package]
+name = "alcyon-quic"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+autotests = false
+
+[dependencies]
+# T461: no `rustls-ring`: QUIC's TLS is rustls 0.24 (`src/crypto.rs`), and neither quinn's rustls
+# 0.23 nor its *ring* is linked into the binary.
+quinn-proto = { version = "0.11", default-features = false, features = ["alcyon-pools"] }
+rustls24 = { workspace = true }
+rustls-pemfile = "2.2.0"
+alcyon-tls = { workspace = true }
+alcyon-alloc = { workspace = true }
+alcyon-config = { path = "../alcyon-config" }
+zeroize = "1"
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+
+[dev-dependencies]
+# quinn's own QUIC client on rustls 0.23. No alcyon-quic test uses it since T534: they run on
+# Alcyon's client (`src/crypto/client.rs`, over rustls 0.24's `build_quic`). It stays until the
+# alcyon-rt and alcyon-proto tests, which still build quinn's rustls 0.23 client, move too. Dev-only,
+# so the features reach test builds and not the binary (resolver 2).
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
+rustls = { workspace = true }
+rcgen = "0.13"
+alcyon-alloc = { workspace = true, features = ["test-probe"] }
+rustix = { version = "0.38", features = ["event", "net", "std"] }
+
+[lints]
+workspace = true
+
+# One integration-test binary (T260): tests/it/main.rs declares each test file as a module.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"

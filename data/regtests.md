@@ -2,7 +2,7 @@
 
 - **Oracle / Reference source:** `/home/bhenc/reference/haproxy` @ commit `e6f616af` (3.5-dev7)
 - **Total `.vtc` Files:** 312
-- **Target Feature Set (Ibex):** HTTP/1 only, TLS via rustls, no Lua, no filters, no SPOE, no QUIC/H3, no FCGI, no cache, plus HAProxy config syntax, ACLs/samples/converters, stick tables, health checks, and runtime socket.
+- **Target Feature Set (Alcyon):** HTTP/1 only, TLS via rustls, no Lua, no filters, no SPOE, no QUIC/H3, no FCGI, no cache, plus HAProxy config syntax, ACLs/samples/converters, stick tables, health checks, and runtime socket.
 
 ---
 
@@ -11,7 +11,7 @@
 | Bucket | Count | Percentage | Definition |
 |---|---|---|---|
 | **`REACHABLE_NOW`** | **51** | 16.35% | Uses only core HTTP/1 and TCP proxying, no excluded feature, no unbuilt feature |
-| **`REACHABLE_LATER`** | **147** | 47.12% | In scope for Ibex but requires features not yet built (TLS, checks, tables, CLI, converters) |
+| **`REACHABLE_LATER`** | **147** | 47.12% | In scope for Alcyon but requires features not yet built (TLS, checks, tables, CLI, converters) |
 | **`OUT_OF_SCOPE`** | **114** | 36.54% | Requires excluded features (HTTP/2, QUIC/H3, Cache, Lua, Compression, Peers, SPOE, FCGI, etc.) |
 | **Total** | **312** | **100.00%** | All `.vtc` regression tests under `reg-tests/` |
 
@@ -31,22 +31,22 @@
 
 | Excluded Feature | Test Count | Exclusion Reason |
 |---|---|---|
-| **QUIC / HTTP/3** | 33 | Excluded by Ibex specification |
-| **HTTP/2 (H2)** | 25 | Excluded by Ibex specification |
-| **Cache** | 14 | Excluded by Ibex specification |
-| **Lua** | 12 | Excluded by Ibex specification |
-| **Peers sync** | 6 | Excluded by Ibex specification |
-| **Compression / Decompression** | 5 | Excluded by Ibex specification |
-| **Filters** | 5 | Excluded by Ibex specification |
-| **Master CLI / Multi-process** | 3 | Excluded by Ibex specification |
-| **SPOE** | 2 | Excluded by Ibex specification |
-| **DNS Resolvers** | 2 | Excluded by Ibex specification |
-| **ABNS socket / Seamless reload** | 2 | Excluded by Ibex specification |
-| **TPROXY (Transparent proxying)** | 1 | Excluded by Ibex specification |
-| **TCP MD5 signature** | 1 | Excluded by Ibex specification |
-| **Prometheus exporter** | 1 | Excluded by Ibex specification |
-| **FCGI** | 1 | Excluded by Ibex specification |
-| **Protobuf** | 1 | Excluded by Ibex specification |
+| **QUIC / HTTP/3** | 33 | Excluded by Alcyon specification |
+| **HTTP/2 (H2)** | 25 | Excluded by Alcyon specification |
+| **Cache** | 14 | Excluded by Alcyon specification |
+| **Lua** | 12 | Excluded by Alcyon specification |
+| **Peers sync** | 6 | Excluded by Alcyon specification |
+| **Compression / Decompression** | 5 | Excluded by Alcyon specification |
+| **Filters** | 5 | Excluded by Alcyon specification |
+| **Master CLI / Multi-process** | 3 | Excluded by Alcyon specification |
+| **SPOE** | 2 | Excluded by Alcyon specification |
+| **DNS Resolvers** | 2 | Excluded by Alcyon specification |
+| **ABNS socket / Seamless reload** | 2 | Excluded by Alcyon specification |
+| **TPROXY (Transparent proxying)** | 1 | Excluded by Alcyon specification |
+| **TCP MD5 signature** | 1 | Excluded by Alcyon specification |
+| **Prometheus exporter** | 1 | Excluded by Alcyon specification |
+| **FCGI** | 1 | Excluded by Alcyon specification |
+| **Protobuf** | 1 | Excluded by Alcyon specification |
 
 ---
 

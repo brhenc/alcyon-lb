@@ -14,7 +14,7 @@
 # and 14 queued gates waited on a lock no gate held. Here the lock fds are closed in every
 # child (`{fd}>&-`), so a daemon a build or test leaves behind cannot keep a slot.
 #
-# Slots: IBEX_GATE_SLOTS (default 1) gates may run side by side. Slot K has its own lock
+# Slots: ALCYON_GATE_SLOTS (default 1) gates may run side by side. Slot K has its own lock
 # and its own target directory:
 #   slot 1:  /tmp/ibex-gate.lock          (the historical lock, so old-style
 #                                           `flock -o /tmp/ibex-gate.lock ...` waiters and
@@ -38,12 +38,12 @@
 #
 # --exclusive (the supervisor's measuring gate on main) takes every slot, in order, after
 # announcing itself on /tmp/ibex-gate.exclusive.lock so non-exclusive gates stop taking
-# slots that free up meanwhile. Without --exclusive, IBEX_GATE_SKIP_MEASURE=1 is forced.
+# slots that free up meanwhile. Without --exclusive, ALCYON_GATE_SKIP_MEASURE=1 is forced.
 #
-# Refuses (exit 3) when the target filesystem has less than IBEX_GATE_MIN_FREE_GB
+# Refuses (exit 3) when the target filesystem has less than ALCYON_GATE_MIN_FREE_GB
 # (default 40) free; it does not wait for disk.
 #
-# While waiting it prints, every IBEX_GATE_REPORT_SECS (default 300), who holds each slot:
+# While waiting it prints, every ALCYON_GATE_REPORT_SECS (default 300), who holds each slot:
 # PID, command, cwd and age, found by scanning /proc/*/fd read-only. A holder that is not
 # a gate (no argument naming checkin.sh or gate.sh in itself or its ancestors) is flagged in capitals.
 # It never kills or signals anything.
@@ -51,10 +51,10 @@
 # Ends with `gate: rc=N slot=K`, and exits N.
 #
 # Overrides used by tools/test_gate.sh only (not for normal use):
-#   IBEX_GATE_LOCK_PREFIX  (default /tmp/ibex-gate)  slot1 = <prefix>.lock, slotK = <prefix>.slot<K>.lock
-#   IBEX_GATE_TARGET_BASE  (default ~/ibex-targets)  slot K target = <base>/gate-slot<K>
-#   IBEX_GATE_CMD          a bash command run instead of ./tools/checkin.sh
-#   IBEX_GATE_POLL_SECS    (default 5) how often a waiting gate retries the slots
+#   ALCYON_GATE_LOCK_PREFIX  (default /tmp/ibex-gate)  slot1 = <prefix>.lock, slotK = <prefix>.slot<K>.lock
+#   ALCYON_GATE_TARGET_BASE  (default ~/ibex-targets)  slot K target = <base>/gate-slot<K>
+#   ALCYON_GATE_CMD          a bash command run instead of ./tools/checkin.sh
+#   ALCYON_GATE_POLL_SECS    (default 5) how often a waiting gate retries the slots
 set -uo pipefail
 
 usage() { sed -n '5,5p;7,10p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
@@ -90,13 +90,13 @@ fi
 cd "$(dirname "$0")/.." || exit 2
 REPO=$(pwd)
 
-SLOTS=${IBEX_GATE_SLOTS:-1}
-case "$SLOTS" in ''|*[!0-9]*|0) echo "gate: IBEX_GATE_SLOTS must be a positive integer" >&2; exit 2 ;; esac
-PREFIX=${IBEX_GATE_LOCK_PREFIX:-/tmp/ibex-gate}
-TARGET_BASE=${IBEX_GATE_TARGET_BASE:-$HOME/ibex-targets}
-MIN_FREE_GB=${IBEX_GATE_MIN_FREE_GB:-40}
-REPORT_SECS=${IBEX_GATE_REPORT_SECS:-300}
-POLL_SECS=${IBEX_GATE_POLL_SECS:-5}
+SLOTS=${ALCYON_GATE_SLOTS:-1}
+case "$SLOTS" in ''|*[!0-9]*|0) echo "gate: ALCYON_GATE_SLOTS must be a positive integer" >&2; exit 2 ;; esac
+PREFIX=${ALCYON_GATE_LOCK_PREFIX:-/tmp/ibex-gate}
+TARGET_BASE=${ALCYON_GATE_TARGET_BASE:-$HOME/ibex-targets}
+MIN_FREE_GB=${ALCYON_GATE_MIN_FREE_GB:-40}
+REPORT_SECS=${ALCYON_GATE_REPORT_SECS:-300}
+POLL_SECS=${ALCYON_GATE_POLL_SECS:-5}
 INTENT_LOCK=$PREFIX.exclusive.lock
 
 slot_lock() { if [ "$1" -eq 1 ]; then echo "$PREFIX.lock"; else echo "$PREFIX.slot$1.lock"; fi; }
@@ -107,7 +107,7 @@ ts() { date '+%F %T'; }
 mkdir -p "$TARGET_BASE" || { echo "gate: cannot create $TARGET_BASE" >&2; exit 2; }
 FREE_GB=$(df -BG --output=avail "$TARGET_BASE" | tail -1 | tr -dc '0-9')
 if [ "${FREE_GB:-0}" -lt "$MIN_FREE_GB" ]; then
-  echo "gate: REFUSED: ${FREE_GB}G free on the filesystem of $TARGET_BASE, need ${MIN_FREE_GB}G (IBEX_GATE_MIN_FREE_GB)."
+  echo "gate: REFUSED: ${FREE_GB}G free on the filesystem of $TARGET_BASE, need ${MIN_FREE_GB}G (ALCYON_GATE_MIN_FREE_GB)."
   echo "gate: free disk first; this script does not wait for it."
   echo "gate: rc=3 slot=none"
   exit 3
@@ -212,21 +212,21 @@ run_closed() {
 }
 
 # --- run ------------------------------------------------------------------------------
-export CARGO_TARGET_DIR IBEX_GATE_SLOT CARGO_INCREMENTAL
+export CARGO_TARGET_DIR ALCYON_GATE_SLOT CARGO_INCREMENTAL
 CARGO_INCREMENTAL=0
 CARGO_TARGET_DIR=$(slot_target "$SLOT")
 # Per-slot ports for stages with fixed ones (diff-fuzz): two gates side by side collided on
 # 18400 (2026-11-01, "Address already in use").
-IBEX_GATE_SLOT=$SLOT
+ALCYON_GATE_SLOT=$SLOT
 mkdir -p "$CARGO_TARGET_DIR"
-[ $EXCLUSIVE = 1 ] || export IBEX_GATE_SKIP_MEASURE=1
-echo "gate: CARGO_TARGET_DIR=$CARGO_TARGET_DIR IBEX_GATE_SKIP_MEASURE=${IBEX_GATE_SKIP_MEASURE:-} ${EXTRA_ENV[*]}"
+[ $EXCLUSIVE = 1 ] || export ALCYON_GATE_SKIP_MEASURE=1
+echo "gate: CARGO_TARGET_DIR=$CARGO_TARGET_DIR ALCYON_GATE_SKIP_MEASURE=${ALCYON_GATE_SKIP_MEASURE:-} ${EXTRA_ENV[*]}"
 
 # A measuring gate pauses the local-model queue (cores 32-47 and the GPU) at its next safe
 # point and resumes it on exit; without the harness on this machine this does nothing.
-# IBEX_MUSE_PAUSE names the command, empty to skip.
-MUSE_PAUSE=${IBEX_MUSE_PAUSE-$HOME/ibex-worktrees/qwen/muse-pause}
-if [ $EXCLUSIVE = 1 ] && [ -z "${IBEX_GATE_SKIP_MEASURE:-}" ] && [ -n "$MUSE_PAUSE" ] && [ -x "$MUSE_PAUSE" ]; then
+# ALCYON_MUSE_PAUSE names the command, empty to skip.
+MUSE_PAUSE=${ALCYON_MUSE_PAUSE-$HOME/ibex-worktrees/qwen/muse-pause}
+if [ $EXCLUSIVE = 1 ] && [ -z "${ALCYON_GATE_SKIP_MEASURE:-}" ] && [ -n "$MUSE_PAUSE" ] && [ -x "$MUSE_PAUSE" ]; then
   if MUSE_ID=$("$MUSE_PAUSE" on --reason "gate measure $REPO" --max-minutes 120); then
     trap '"$MUSE_PAUSE" off --id "$MUSE_ID" >/dev/null' EXIT
     echo "gate: local-model queue paused ($MUSE_ID)"
@@ -288,8 +288,8 @@ print("|".join(sorted(n)))') || return 0
   done
 }
 
-if [ -n "${IBEX_GATE_CMD:-}" ]; then
-  run_closed env "${EXTRA_ENV[@]}" bash -c "$IBEX_GATE_CMD" gate "${CHECKIN_ARGS[@]}"
+if [ -n "${ALCYON_GATE_CMD:-}" ]; then
+  run_closed env "${EXTRA_ENV[@]}" bash -c "$ALCYON_GATE_CMD" gate "${CHECKIN_ARGS[@]}"
 else
   run_closed env "${EXTRA_ENV[@]}" ./tools/checkin.sh "${CHECKIN_ARGS[@]}"
 fi

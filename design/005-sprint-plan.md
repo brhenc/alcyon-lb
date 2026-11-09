@@ -66,10 +66,10 @@ mechanical porting *where the C is the spec and the tests already exist*.
 ## 3. The dependency reality
 
 Parallelism is bounded by the dependency graph, not by the Antigravity quota. On day 1
-almost no Ibex code exists, so there is nothing to write tests against.
+almost no Alcyon code exists, so there is nothing to write tests against.
 
 **The unlock: on day 1, delegate _extraction_, not implementation.** There is a large
-body of mechanical HAProxy-source-mining that needs zero Ibex code to exist, has the C
+body of mechanical HAProxy-source-mining that needs zero Alcyon code to exist, has the C
 source as a perfect oracle, and directly unblocks design work — especially the sample
 lattice, which cannot be designed properly without knowing every fetch and its type.
 

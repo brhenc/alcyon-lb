@@ -169,12 +169,12 @@ header fetch is meaningless in a `tcp-request connection` rule, because no heade
 been read. HAProxy validates this at config-parse time, which is the right moment:
 a misplaced fetch is a config error, not a runtime surprise.
 
-Ibex keeps that, with the check expressed as a set intersection between the fetch's
+Alcyon keeps that, with the check expressed as a set intersection between the fetch's
 declared validity and the rule's evaluation context, performed during parsing.
 
 ## 5. Implementation plan
 
-### 5.1 Crate: `ibex-sample`
+### 5.1 Crate: `alcyon-sample`
 
 ```
 sample.rs     Sample, SampleType, TypeSpec, casts
@@ -215,7 +215,7 @@ pub struct Expr {
 ### 5.3 Validation
 
 - **Differential casts.** Build a tiny C harness against the reference tree calling
-  `sample_casts[i][j]` over a corpus, and assert Ibex agrees on every cell including
+  `sample_casts[i][j]` over a corpus, and assert Alcyon agrees on every cell including
   the failures. The reference binary is already built.
 - **Expression corpus** from `data/regtests.json` — 312 reg-tests contain real
   expressions, which is a better corpus than anything hand-written.

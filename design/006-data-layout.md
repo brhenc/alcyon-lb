@@ -3,7 +3,7 @@
 Reference: `/home/bhenc/reference/haproxy` @ `e6f616af` (3.5-dev7). Sizes measured by
 compiling the actual struct definitions on this machine (x86-64, gcc -O2).
 
-The governing constraint for Ibex: **pick representations by measured layout and cost,
+The governing constraint for Alcyon: **pick representations by measured layout and cost,
 not by what reads well.** Where idiomatic Rust and cache behaviour disagree on the data
 path, cache behaviour wins. Where they agree — which is more often than expected — take
 both.
@@ -210,7 +210,7 @@ little. Rust cannot patch its own instruction stream portably, but the same shap
 approximated with a `#[cold]` `#[inline(never)]` slow path behind the flag, which keeps
 the disabled path out of the hot instruction cache.
 
-### Adopted for Ibex
+### Adopted for Alcyon
 
 | Tier | Mechanism | Example |
 |---|---|---|
@@ -264,7 +264,7 @@ Three decisions inside that:
 Queued cost, for comparison — HAProxy pays 128 B whether queued or not, while ours pays
 only for the queues actually joined:
 
-| State | HAProxy | Ibex |
+| State | HAProxy | Alcyon |
 |---|---|---|
 | Not queued | 128 B | **32 B** |
 | In run queue | 128 B | 32 + 28 = **60 B** |

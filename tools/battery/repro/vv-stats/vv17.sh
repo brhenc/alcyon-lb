@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 # VV-17: `stats auth` in defaults is dropped. Config valid on HAProxy (stats + auth in defaults,
-# `stats admin if TRUE` in the frontend): HAProxy 401 on GET and on the admin POST; an Ibex that
+# `stats admin if TRUE` in the frontend): HAProxy 401 on GET and on the admin POST; an Alcyon that
 # drops the auth serves the page and lets an unauthenticated POST put s1 into MAINT.
 #   vv17.sh BIN [PORT=19970]     prints: GET no creds, POST maint no creds, s1 status after
 set -u

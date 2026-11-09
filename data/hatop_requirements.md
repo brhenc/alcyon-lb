@@ -1,4 +1,4 @@
-# HATop Protocol Requirements & Compatibility Specification for Ibex
+# HATop Protocol Requirements & Compatibility Specification for Alcyon
 
 **Task:** T06 — hatop Protocol Requirements  
 **Status:** Complete  
@@ -138,7 +138,7 @@ Instead:
 4. Fields are extracted **purely by positional index** `0` through `50` (`jhunt:1623-1646`, `feurix:1614-1637`).
 
 > [!IMPORTANT]
-> **T04 is a HARD CONSTRAINT.** Ibex MUST emit the first 51 stat CSV fields in the exact positional sequence defined in HAProxy 1.4+ / `stat_cols_px` (`haproxy:src/stats-proxy.c:79-131`). Any missing field, extra field inserted before index 51, or column permutation will cause integer parsing failures (`ValueError` -> `RuntimeError` -> crash) or data misattribution.
+> **T04 is a HARD CONSTRAINT.** Alcyon MUST emit the first 51 stat CSV fields in the exact positional sequence defined in HAProxy 1.4+ / `stat_cols_px` (`haproxy:src/stats-proxy.c:79-131`). Any missing field, extra field inserted before index 51, or column permutation will cause integer parsing failures (`ValueError` -> `RuntimeError` -> crash) or data misattribution.
 
 ### 5.2 Complete 51-Field CSV Index Table
 
@@ -231,9 +231,9 @@ The table below outlines how HATop responds to socket, parser, protocol, and dat
 
 ---
 
-## 7. Minimum Server-Side Surface for Ibex
+## 7. Minimum Server-Side Surface for Alcyon
 
-To achieve the goal of "unmodified hatop drives Ibex", Ibex must implement the following tiers of functionality.
+To achieve the goal of "unmodified hatop drives Alcyon", Alcyon must implement the following tiers of functionality.
 
 ### Tier 1: Minimum Read-Only Surface (HATop `-n` Mode)
 This is the absolute minimal surface required for HATop to launch, populate all 4 monitoring viewports (Status, Traffic, HTTP, Errors), and refresh periodically without errors.

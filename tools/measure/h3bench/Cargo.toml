@@ -3,8 +3,8 @@
 #
 # T555: the deterministic HTTP/3 client of `tools/measure/insreq.sh` (clients h3best, h3worst).
 # Its own workspace, as measure-bench: quinn-proto's `rustls-ring` client must not reach the
-# ibex binary's feature set (T461). The client itself is `src/client.rs`, which
-# crates/ibex-rt/tests/it/h3_bench_client.rs also compiles, to pin its ACK policy.
+# alcyon binary's feature set (T461). The client itself is `src/client.rs`, which
+# crates/alcyon-rt/tests/it/h3_bench_client.rs also compiles, to pin its ACK policy.
 [package]
 name = "h3bench"
 version = "0.1.0"

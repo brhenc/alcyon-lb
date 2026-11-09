@@ -70,8 +70,8 @@ V2    16.119 c2 <   2 0004 ; CTRL heartbeat
 #
 # V3: 300-request burst B -> A (h2load -c 8), relay 62013 -> 62003: incremental updates and the
 #     acks the oracle sends back. Acks after an inc-update carry a byte-swapped id
-#     (peers.c:1834, see the design doc 4.5): an Ibex sender must ignore ids outside
-#     (last_acked, last_pushed]; an Ibex receiver must ack the true id.
+#     (peers.c:1834, see the design doc 4.5): an Alcyon sender must ignore ids outside
+#     (last_acked, last_pushed]; an Alcyon receiver must ack the true id.
 V3     6.509 c1 >  27 484150726f78795320322e310a410a42203130373938373620310a ; HELLO 'HAProxyS 2.1\nA\nB 1079876 1\n'
 V3     6.510 c1 <   4 3230300a ; STATUS '200\n'
 V3     6.510 c1 <  21 0a821001022f740621f451f0eda3010af0e2030001 ; table-define id=1 name='/t' keytype=6 keylen=33 data=['gpc0', 'http_req_cnt', 'http_req_rate'] expire=600000ms frqp=['http_req_rate/10000ms'] ; CTRL resync-finished

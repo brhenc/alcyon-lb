@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
+//! T329: `*_is_local` fetches
+
+use crate::common;
+
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+struct Alcyon(Child, std::path::PathBuf);
+
+impl Drop for Alcyon {
+    fn drop(&mut self) {
+        common::stop(&mut self.0);
+        let _ = std::fs::remove_dir_all(&self.1);
+    }
+}
+
+/// Starts alcyon on `cfg` (`{sock}` is replaced by the stats socket path), waits for `addrs` and the
+/// socket, then lets the readiness probes slide out of the one-second windows and clears the maxima.
+fn start(tag: &str, cfg: &str, addrs: &[SocketAddr]) -> (Alcyon, String) {
+    let dir = std::env::temp_dir().join(format!("qh-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("cli.sock").display().to_string();
+    let path = dir.join("c.cfg");
+    std::fs::write(&path, cfg.replace("{sock}", &sock).replace("{dir}", &dir.display().to_string())).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    let alcyon = Alcyon(child, dir);
+    for a in addrs {
+        assert!(common::wait_listening(*a), "alcyon did not listen on {a}");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !std::path::Path::new(&sock).exists() {
+        assert!(Instant::now() < deadline, "no stats socket");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(2200));
+    cli(&sock, "clear counters");
+    (alcyon, sock)
+}
+
+fn cli(sock: &str, cmd: &str) -> String {
+    let mut s = UnixStream::connect(sock).expect("cli");
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    s.write_all(format!("{cmd}\n").as_bytes()).unwrap();
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
+}
+
+/// One request on a new connection; the whole raw answer.
+fn get(addr: SocketAddr, req: &[u8]) -> Vec<u8> {
+    let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    s.write_all(req).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    out
+}
+
+const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+
+fn http_cfg(global: &str, body: &str) -> String {
+    format!(
+        "global\n  stats socket {{sock}} level admin\n{global}\
+         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n{body}"
+    )
+}
+
+/// A server on a free port that reads each request head, answers `resp` and closes the connection.
+fn backend(resp: &'static [u8]) -> SocketAddr {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { continue };
+            let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
+            let (mut head, mut b) = (Vec::new(), [0u8; 4096]);
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match c.read(&mut b) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => head.extend_from_slice(&b[..n]),
+                }
+            }
+            let _ = c.write_all(resp);
+        }
+    });
+    addr
+}
+
+/// The body of the answer to `req` (what follows the first empty line).
+fn body(addr: SocketAddr, req: &[u8]) -> String {
+    let s = String::from_utf8_lossy(&get(addr, req)).into_owned();
+    s.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_else(|| panic!("no answer: {s:?}"))
+}
+
+#[test]
+fn test_is_local_fetches() {
+    // T329: src_is_local, dst_is_local, fc_src_is_local, fc_dst_is_local
+    let a = common::reserve_addr();
+    let b = backend(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    let cfg = http_cfg(
+        "",
+        &format!(
+            r#"frontend fe
+  bind {a}
+  http-request return status 200 content-type text/plain lf-string "[%[src_is_local]|%[dst_is_local]|%[fc_src_is_local]|%[fc_dst_is_local]]"
+  default_backend be
+backend be
+  server s1 {b}"#,
+        ),
+    );
+    let (_alcyon, _sock) = start("is_local", &cfg, &[a]);
+    let expected = body(a, GET);
+    // All should be 1 when connecting locally (localhost)
+    assert_eq!(expected, "[1|1|1|1]", "is_local fetches returned unexpected: {expected:?}");
+}
+
+/// The four fetches on addresses a PROXY header sets: `src` and `dst` are judged apart,
+/// `fc_*` stay the real (loopback) socket, and a broadcast address is not local (`HAProxy`'s
+/// `addr_is_local` binds, then connects, and a broadcast address binds but does not
+/// connect). Every expected value was measured on `HAProxy` 3.5-dev8.
+#[test]
+fn is_local_behind_a_proxy_header() {
+    let a = common::reserve_addr();
+    let p = common::reserve_addr();
+    let cfg = http_cfg(
+        "",
+        &format!(
+            r#"frontend fe
+  bind {a}
+  bind {p} accept-proxy
+  http-request return status 200 content-type text/plain lf-string "[%[src_is_local]|%[dst_is_local]|%[fc_src_is_local]|%[fc_dst_is_local]]""#
+        ),
+    );
+    let (_alcyon, _sock) = start("is_local_proxy", &cfg, &[a, p]);
+    assert_eq!(body(a, GET), "[1|1|1|1]");
+    for (proxy, want) in [
+        ("TCP4 192.0.2.1 8.8.8.8 1234 80", "[0|0|1|1]"),
+        ("TCP4 192.0.2.1 127.0.0.1 1234 80", "[0|1|1|1]"),
+        ("TCP4 127.0.0.1 8.8.8.8 1234 80", "[1|0|1|1]"),
+        ("TCP4 255.255.255.255 8.8.8.8 1234 80", "[0|0|1|1]"),
+        ("TCP4 127.255.255.255 8.8.8.8 1234 80", "[0|0|1|1]"),
+        ("TCP4 0.0.0.0 8.8.8.8 1234 80", "[1|0|1|1]"),
+        ("TCP6 2001:db8::1 ::1 1234 80", "[0|1|1|1]"),
+        ("TCP6 ::1 2001:db8::1 1234 80", "[1|0|1|1]"),
+        // A link-local address cannot be bound without a scope (EINVAL, neither "not available"
+        // nor connectable): `addr_is_local` fails and the fetch has no value.
+        ("TCP6 fe80::1 fe80::2 1234 80", "[||1|1]"),
+        ("TCP6 fe80::1 ::1 1234 80", "[|1|1|1]"),
+        ("TCP6 ::1 fe80::2 1234 80", "[1||1|1]"),
+    ] {
+        let mut req = format!("PROXY {proxy}\r\n").into_bytes();
+        req.extend_from_slice(GET);
+        assert_eq!(body(p, &req), want, "PROXY {proxy}");
+    }
+}

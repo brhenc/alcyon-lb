@@ -3,26 +3,26 @@
 
 # Release candidate 1: quickstart
 
-Running Ibex in front of a personal website. HAProxy 3.5 configuration syntax; the details of
+Running Alcyon in front of a personal website. HAProxy 3.5 configuration syntax; the details of
 the process layout are in [operating.md](operating.md).
 
 ## 1. Install
 
 ```
-cargo build --release -p ibex-rt --bin ibex
-install -m 0755 target/release/ibex /usr/local/sbin/ibex
-install -d /etc/ibex/certs
-install -m 0644 examples/personal-website.cfg /etc/ibex/ibex.cfg
-cat fullchain.pem privkey.pem > /etc/ibex/certs/site.pem && chmod 600 /etc/ibex/certs/site.pem
-$EDITOR /etc/ibex/ibex.cfg          # the crt path, the backend address
-ibex -f /etc/ibex/ibex.cfg -c       # "Configuration file is valid."
-install -m 0644 tools/systemd/ibex.service /etc/systemd/system/ibex.service
-systemctl daemon-reload && systemctl enable --now ibex
+cargo build --release -p alcyon-rt --bin alcyon
+install -m 0755 target/release/alcyon /usr/local/sbin/alcyon
+install -d /etc/alcyon/certs
+install -m 0644 examples/personal-website.cfg /etc/alcyon/alcyon.cfg
+cat fullchain.pem privkey.pem > /etc/alcyon/certs/site.pem && chmod 600 /etc/alcyon/certs/site.pem
+$EDITOR /etc/alcyon/alcyon.cfg          # the crt path, the backend address
+alcyon -f /etc/alcyon/alcyon.cfg -c       # "Configuration file is valid."
+install -m 0644 tools/systemd/alcyon.service /etc/systemd/system/alcyon.service
+systemctl daemon-reload && systemctl enable --now alcyon
 ```
 
 A faster binary (measured 2026-10-19, T435: about 13% fewer user instructions per proxied request than
 `release-perf`, which is itself about 4% below `release`) comes from a profile-guided build:
-`tools/pgo-build.sh --target-dir /var/tmp/ibex-pgo --out ./ibex-pgo` builds an instrumented ibex, drives a
+`tools/pgo-build.sh --target-dir /var/tmp/alcyon-pgo --out ./alcyon-pgo` builds an instrumented alcyon, drives a
 mixed training load against it (HTTP/1 keep-alive and close, TLS, h2, h2c, rules, logging, error
 paths; the config is `tools/pgo/train.cfg`), merges the profile and builds the final binary, whose path it
 prints. It needs `llvm-profdata` of the same LLVM version as `rustc -vV`, plus `h2load`, `socat`, `openssl`,
@@ -33,18 +33,18 @@ checked in: regenerate it for each release. `--bolt` adds a reorder-only BOLT pa
 HSTS, `option httplog` to stdout (the journal), a stats socket, the Prometheus exporter on
 `/metrics` from localhost only, timeouts, `maxconn`, `nbthread 2`. It also loads with HAProxy
 3.5-dev8 (`haproxy -c`) except the `use-service prometheus-exporter` line: the reference binary
-is built without PROMEX. Not in it, because Ibex refuses it at load: `compression` (use your
+is built without PROMEX. Not in it, because Alcyon refuses it at load: `compression` (use your
 backend's, or precompressed files). The unit is described in
 [../tools/systemd/README.md](../tools/systemd/README.md).
 
 ## 2. Reload and stop
 
 ```
-systemctl reload ibex                                   # ibex -c, then SIGUSR2 to the master
-echo reload | socat - /run/ibex/master.sock             # the same, answers Success=1/0 and the new worker's startup log
-echo "show proc" | socat - /run/ibex/master.sock        # master, worker, old workers
-systemctl stop ibex                                     # fast stop
-systemctl kill -s USR1 ibex                             # graceful: finish requests in flight, then exit
+systemctl reload alcyon                                   # alcyon -c, then SIGUSR2 to the master
+echo reload | socat - /run/alcyon/master.sock             # the same, answers Success=1/0 and the new worker's startup log
+echo "show proc" | socat - /run/alcyon/master.sock        # master, worker, old workers
+systemctl stop alcyon                                     # fast stop
+systemctl kill -s USR1 alcyon                             # graceful: finish requests in flight, then exit
 ```
 
 A reload starts a new worker that takes the listening sockets over; connections open on the
@@ -57,9 +57,9 @@ The first user reports will be leaks, so look at these after a day and after a w
 should be flat once traffic is steady, and fall back after a burst.
 
 ```
-echo "show info"  | socat - /run/ibex/admin.sock | grep -E 'Memmax|PoolAlloc|PoolUsed|PoolFailed|CurrConns|Tasks|Run_queue|BlockedTraffic'
-echo "show pools" | socat - /run/ibex/admin.sock       # per pool: allocated, used, failures
-ps -o pid,rss,vsz,nlwp -C ibex ; ls /proc/$(pgrep -n -x ibex)/fd | wc -l   # RSS, threads, open fds
+echo "show info"  | socat - /run/alcyon/admin.sock | grep -E 'Memmax|PoolAlloc|PoolUsed|PoolFailed|CurrConns|Tasks|Run_queue|BlockedTraffic'
+echo "show pools" | socat - /run/alcyon/admin.sock       # per pool: allocated, used, failures
+ps -o pid,rss,vsz,nlwp -C alcyon ; ls /proc/$(pgrep -n -x alcyon)/fd | wc -l   # RSS, threads, open fds
 ```
 
 - `PoolFailed` / `haproxy_process_pool_failures_total` must stay 0. `PoolAlloc_bytes` and
@@ -81,20 +81,20 @@ ps -o pid,rss,vsz,nlwp -C ibex ; ls /proc/$(pgrep -n -x ibex)/fd | wc -l   # RSS
 ## 4. Logs
 
 `log stdout format raw local0` puts the HAProxy-format access log (and the `[NOTICE]`,
-`[WARNING]`, `[ALERT]` lines on stderr) into the journal: `journalctl -u ibex -f`. Use
+`[WARNING]`, `[ALERT]` lines on stderr) into the journal: `journalctl -u alcyon -f`. Use
 `log 127.0.0.1:514 local0` for a UDP syslog daemon. Unix-socket syslog (`log /dev/log`) is
 not verified.
 
 ## 5. What to report
 
-- A crash or restart: `systemctl status ibex`, and `journalctl -u ibex --since ... | grep -B30 -E 'PANIC|WARNING! thread|panicked'`.
+- A crash or restart: `systemctl status alcyon`, and `journalctl -u alcyon --since ... | grep -B30 -E 'PANIC|WARNING! thread|panicked'`.
   The watchdog aborts the worker with **exit status 134** after a thread has been stuck for
   about a second; stderr then has `WARNING! thread N has stopped processing traffic for M
   milliseconds ...` lines (from ~200 ms) and `PANIC! Thread N is about to kill the process
   (pid P).` The master restarts it per `Restart=always`. A Rust panic or out-of-memory abort
   is also 134 (`thread ... panicked at ...` or `memory allocation of N bytes failed`).
-  `ibex.watchdog-warn-only` in `global` keeps the warnings and never aborts.
-- Include: the exact config (without the key), `ibex -v`, `show info`, `show pools`, `show proc`,
+  `alcyon.watchdog-warn-only` in `global` keeps the warnings and never aborts.
+- Include: the exact config (without the key), `alcyon -v`, `show info`, `show pools`, `show proc`,
   what traffic was on, how long it ran.
 - A response that differs from what your backend sends directly, or from what HAProxy sends for
   the same config: HAProxy is the reference.
@@ -126,8 +126,8 @@ User-visible ones; the full list is [differences.md](differences.md) and [../tra
   `HAPROXY_*` variables HAProxy exports, only `HAPROXY_LOCALPEER` (the host name) is set.
 - Variables keep their sample type and a keep-alive `set-var` allocates nothing (T364); the
   `tune.vars.*` accounting differs from HAProxy's in four small ways (`tradeoff.md` 6.17).
-- Memory: Ibex has one pool type since 2026-10-25 (`tradeoff.md` 6.13, 6.28); `show pools` lists them. A keep-alive
-  request allocates nothing; like HAProxy, Ibex keeps the peak of a burst until `pool_gc` (SIGQUIT,
+- Memory: Alcyon has one pool type since 2026-10-25 (`tradeoff.md` 6.13, 6.28); `show pools` lists them. A keep-alive
+  request allocates nothing; like HAProxy, Alcyon keeps the peak of a burst until `pool_gc` (SIGQUIT,
   soft stop) or `tune.memory.hot-size` eviction. Waiting for a buffer (S6) is not built: a stream past
   `tune.buffers.limit` fails instead of queueing. An
   HTTP/1 request gives its head buffer back once the head is forwarded (T371); an HTTP/2 or

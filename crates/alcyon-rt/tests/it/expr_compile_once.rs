@@ -1,0 +1,174 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
+//! Sample expressions, `%[...]` formats and regexes are compiled once, not on every
+//! request (T174). `HAProxy` compiles them when the configuration loads
+//! (`sample_parse_expr`, `build_acl_cond`, `regex_comp`); Alcyon was parsing anonymous ACL
+//! terms (`if { path_beg /x }`), rule expressions and every `%[...]` again per request, and
+//! compiling `replace-*` regexes per request. An ACL with `-f <file>` also `stat`ed its
+//! file on each parse.
+//!
+//! Counted on the thread that runs the engine: after a warm-up request, a second request
+//! parses no expression and compiles no regex.
+
+use crate::common;
+
+
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use alcyon_rt::engine::Engine;
+
+fn drive(fe: SocketAddr, e: &mut Engine, path: &str) -> String {
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.set_nonblocking(true).expect("nonblocking");
+    write!(c, "GET {path} HTTP/1.1\r\nHost: Localhost\r\nConnection: close\r\n\r\n").expect("write");
+    let st = Instant::now();
+    let mut r = Vec::new();
+    let mut b = [0u8; 512];
+    while st.elapsed() < Duration::from_secs(3) {
+        let _ = e.run_once();
+        match c.read(&mut b) {
+            Ok(0) => break,
+            Ok(n) => r.extend_from_slice(&b[..n]),
+            Err(_) => {}
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    String::from_utf8_lossy(&r).into_owned()
+}
+
+/// Parses and regex compiles of one request after a warm-up one, with `rules` in the
+/// frontend; the request must be answered `want`.
+fn compiles_per_request(rules: &str, path: &str, want: &str) -> (u64, u64) {
+    compiles_per_request_after(rules, (path, want), None, (path, want))
+}
+
+/// As [`compiles_per_request`], with `added` put in the `@LIST@` pattern file (`add acl`)
+/// between the warm-up request and the measured one.
+/// One measurement at a time: building an engine starts a new expression generation
+/// (`Expr::new_generation`), which empties every thread's cache, so a test that builds its
+/// engine while another is between its two requests would make that one parse again.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn compiles_per_request_after(rules: &str, warm: (&str, &str), added: Option<&str>, (path, want): (&str, &str)) -> (u64, u64) {
+    // Any other test in this binary that builds an engine starts a new generation, which
+    // empties the caches whatever `ONE_AT_A_TIME` says (it only covers this file): the
+    // measurement is then void and is made again.
+    for _ in 0..20 {
+        if let Some(got) = measure_once(rules, warm, added, (path, want)) {
+            return got;
+        }
+    }
+    panic!("another engine was built in every one of 20 attempts");
+}
+
+fn measure_once(rules: &str, warm: (&str, &str), added: Option<&str>, (path, want): (&str, &str)) -> Option<(u64, u64)> {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let sl = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let sa = sl.local_addr().expect("addr");
+    let fa = common::reserve_addr();
+    let run = Arc::new(AtomicBool::new(true));
+    let run2 = Arc::clone(&run);
+    sl.set_nonblocking(true).expect("nonblocking");
+    let be = thread::spawn(move || {
+        while run2.load(Ordering::Relaxed) {
+            if let Ok((mut s, _)) = sl.accept() {
+                s.set_nonblocking(false).ok();
+                let mut b = [0u8; 2048];
+                let _ = s.read(&mut b);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let list = std::env::temp_dir().join(format!("alcyon-t174-{}-{}.lst", std::process::id(), fa.port()));
+    std::fs::write(&list, "/blocked\n/also-blocked\n").expect("write list");
+    let cfg = format!(
+        "frontend fe\n  mode http\n  bind {fa}\n  timeout client 5s\n{}\n  default_backend be\n\
+         backend be\n  mode http\n  timeout connect 5s\n  timeout server 5s\n  server s1 {sa}\n",
+        rules.replace("@LIST@", &list.display().to_string())
+    );
+    let mut e = Engine::new(&alcyon_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let generation = alcyon_sample::expr::generation();
+    let first = drive(fa, &mut e, warm.0);
+    assert!(first.starts_with(warm.1), "warm-up request: want {:?}, got {first:?}", warm.1);
+    if let Some(key) = added {
+        let list = list.display().to_string();
+        let out = alcyon_sample::patref::command("add", alcyon_sample::patref::RefKind::Acl, &[&list, key], None);
+        assert_eq!(out, "", "add acl {list} {key}");
+    }
+    let (p0, r0) = (alcyon_sample::expr::parses_on_this_thread(), alcyon_regex::compiles_on_this_thread());
+    let second = drive(fa, &mut e, path);
+    let (p1, r1) = (alcyon_sample::expr::parses_on_this_thread(), alcyon_regex::compiles_on_this_thread());
+    assert!(second.starts_with(want), "measured request: want {want:?}, got {second:?}");
+    run.store(false, Ordering::Relaxed);
+    let _ = be.join();
+    let _ = std::fs::remove_file(&list);
+    (alcyon_sample::expr::generation() == generation).then_some((p1 - p0, r1 - r0))
+}
+
+#[test]
+fn an_anonymous_acl_is_not_parsed_per_request() {
+    let rules = "  http-request deny if { path_beg /x }\n  http-request deny if { path -f @LIST@ }\n  \
+                 http-request deny if !{ req.hdr(host),lower -m str localhost }";
+    assert_eq!(compiles_per_request(rules, "/api/t", "HTTP/1.1 200"), (0, 0));
+    // The `-f` term still matches what its file lists.
+    assert_eq!(compiles_per_request(rules, "/also-blocked", "HTTP/1.1 403"), (0, 0));
+}
+
+#[test]
+fn an_anonymous_acl_file_still_follows_add_acl() {
+    // Compiled once, the `-f` term still sees a pattern added at run time (T171).
+    let rules = "  http-request deny if { path -f @LIST@ }";
+    let got = compiles_per_request_after(rules, ("/new", "HTTP/1.1 200"), Some("/new"), ("/new", "HTTP/1.1 403"));
+    assert_eq!(got.0, 0, "parses");
+}
+
+#[test]
+fn rule_expressions_and_formats_are_not_parsed_per_request() {
+    let rules = "  http-request set-var(txn.p) path,lower\n  \
+                 http-request set-header X-A %[req.hdr(host),lower]-%[var(txn.p)]\n  \
+                 http-request capture req.hdr(host) len 10\n  \
+                 http-response set-header X-B %[var(txn.p)]";
+    assert_eq!(compiles_per_request(rules, "/api/t", "HTTP/1.1 200"), (0, 0));
+}
+
+#[test]
+fn rewrite_regexes_are_not_compiled_per_request() {
+    let rules = "  http-request replace-path ^/api/(.*) /v1/\\1\n  \
+                 http-request replace-uri ^(.*)$ \\1\n  \
+                 http-request replace-header Host (.*) \\1\n  \
+                 http-request del-header ^x-f -m reg";
+    assert_eq!(compiles_per_request(rules, "/api/t", "HTTP/1.1 200"), (0, 0));
+}
+
+#[test]
+fn a_replace_header_that_rewrites_compiles_no_pattern_from_the_value() {
+    // The value is the client's text: it must not become a pattern, compiled per request and
+    // kept in the 4096-entry per-thread cache (T241 item 2). The value changes between the
+    // two requests (it is the path), so a cache hit on the first one's cannot hide it.
+    let rules = "  http-request set-header X-P %[path]\n  \
+                 http-request replace-header X-P (.*) y\\1\n  \
+                 http-request set-header X-Q a,%[path],c\n  \
+                 http-request replace-value X-Q ([a-z/]+) <\\1>";
+    let got = compiles_per_request_after(rules, ("/one", "HTTP/1.1 200"), None, ("/two", "HTTP/1.1 200"));
+    assert_eq!(got, (0, 0));
+}
+
+#[test]
+fn session_and_counter_expressions_are_not_parsed_per_request() {
+    // Measured on HAProxy 3.5-dev8: x-src 10.9.8.7, x-dst 10.1.2.3, x-g 8.
+    let rules = "  stick-table type ip size 10 store gpt0\n  \
+                 tcp-request session set-src str(10.9.8.7)\n  \
+                 tcp-request session set-dst str(10.1.2.3)\n  \
+                 http-request track-sc0 src\n  \
+                 http-request sc-set-gpt0(0) int(7),add(1)\n  \
+                 http-request return status 200 hdr x-src %[src] hdr x-dst %[dst] hdr x-g %[sc_get_gpt0(0)]";
+    let want = "HTTP/1.1 200 OK\r\nx-src: 10.9.8.7\r\nx-dst: 10.1.2.3\r\nx-g: 8\r\n";
+    assert_eq!(compiles_per_request(rules, "/", want), (0, 0));
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-"""Generate crates/ibex-tls/src/cipher_names.rs from the host OpenSSL.
+"""Generate crates/alcyon-tls/src/cipher_names.rs from the host OpenSSL.
 
 Usage: python3 -I tools/gen_cipher_names.py [--stdout]
 
@@ -63,7 +63,7 @@ pub fn openssl_cipher_name_by_id(id: u16) -> Option<&'static str> {{
 """
     # keep the hand-written tests at the end of the file
     here = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(here, "..", "crates", "ibex-tls", "src", "cipher_names.rs")
+    path = os.path.join(here, "..", "crates", "alcyon-tls", "src", "cipher_names.rs")
     with open(path) as f:
         cur = f.read()
     i = cur.find("#[cfg(test)]")

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-# cases for cfgcmp.py (python3 cfgcmp.py IBEX t341.py)
+# cases for cfgcmp.py (python3 cfgcmp.py ALCYON t341.py)
 CASES = [
  # converter args in log-format family
  ("lf-conv-badarg",   'log-format "%[src,ipmask(abc)]"'),

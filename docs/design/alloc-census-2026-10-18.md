@@ -1,6 +1,6 @@
-# Allocation census, Ibex release binary, 2026-10-18
+# Allocation census, Alcyon release binary, 2026-10-18
 
-Tree: ~/ibex-worktrees/alloc-review, detached at batch 36ef460f. Binary: `cargo build --release -p ibex-rt --bin ibex`
+Tree: ~/ibex-worktrees/alloc-review, detached at batch 36ef460f. Binary: `cargo build --release -p alcyon-rt --bin alcyon`
 with `CARGO_PROFILE_RELEASE_DEBUG=true`, run `nbthread 1` under an LD_PRELOAD counter. Counts = malloc+calloc+realloc
 calls (aligned: 0); bytes = requested bytes. Each cell = min of 3 after 3 warm-up operations, one operation at a time,
 measured under `flock -s /tmp/ibex-load.lock`. No timing was taken. Counts are deterministic; the idle process
@@ -10,7 +10,7 @@ Tools (scratch, not committed): driver `scratchpad/census.py`, shim `scratchpad/
 plus `backtrace()` of every allocation while a flag byte is set), aggregation `agg.py`/`agg2.py`, all in
 /tmp/claude-1000/-home-bhenc-project-ibex/2c9bb267-2e19-4881-8a74-ff955698230a/scratchpad/ (raw trace `out/raw.pkl`,
 symbolised `out/census.json`). Call sites come from `backtrace()` + `addr2line -i` on the debug-info binary, not gdb: the
-first frame inside crates/ibex-* is reported, so `engine.rs:10058` is the line in Ibex that triggered the allocation, and
+first frame inside crates/alcyon-* is reported, so `engine.rs:10058` is the line in Alcyon that triggered the allocation, and
 the type is read off the source line. Ports 47580-47587 were used (47440 was busy: another session uses the 474xx range).
 
 Sanity check: the bare and blog counts reproduce the harness pins (bare/min 2, blog/curl 62 keep-alive, 64 close).
@@ -74,7 +74,7 @@ hello (pre-authentication); A = admin socket only.
 | 5 | engine.rs:12859 `add_req_header` `hdrs.push((name.to_string(), val.to_string()))` + finish_grow 192 B | String x2 + Vec grow | 5 | R,H | reuse |
 | 6 | engine.rs:10436/10438 `format!` / `write!` of the rebuilt response head | String grow (3 reallocs) | 5 | R | stack buffer / write into the response buffer |
 | 7 | engine.rs:10034-10043 status line split: `to_string`, `collect::<Vec<&str>>`, `join(" ")` | String, Vec | 5 | R | stack buffer (split in place) |
-| 8 | ibex-sample registry.rs:1648 + 6351 + 6356 + sample.rs:19 (`path` fetch -> `Sample::Str(String)` -> collect into Vec -> clone) per ACL | String + 2 Vec | 5 per request with an ACL (4 per extra rule on the 503/deny path) | R | needs the pool design (Sample owns its bytes; T364 typed variables is the vehicle) |
+| 8 | alcyon-sample registry.rs:1648 + 6351 + 6356 + sample.rs:19 (`path` fetch -> `Sample::Str(String)` -> collect into Vec -> clone) per ACL | String + 2 Vec | 5 per request with an ACL (4 per extra rule on the 503/deny path) | R | needs the pool design (Sample owns its bytes; T364 typed variables is the vehicle) |
 | 9 | engine.rs:12976 `del_req_header` `vec![name.to_string()]` -> Box<[String]> | String, Box | 2 | R | stack buffer |
 | 10 | proxy.rs:2234,2235,2317 `req.method.to_string()`, `req.uri.to_string()`, `from_utf8_lossy(..).into_owned()` | String x3 | 3 (2 in bare) | R | stack buffer / borrow (this is the whole bare-config cost) |
 | 11 | engine.rs:11601, 11614 `xff_excepts` Vec, `ip.to_string()` x2 | Vec, String | 3 | R | stack buffer (`itoa`-style IP write) |
@@ -108,10 +108,10 @@ is one design choice: request and response headers are mirrored into `Vec<(Strin
 (`CURRENT_RES_HEADERS` thread-local, `req_headers`, `hdrs`), cloned 4-5 times per request and re-serialised
 (`new_hdr = format!`). A borrowed view over the HTX/buffer (ranges, not Strings) removes it. This also removes the
 H-scaling: a request with 100 headers should cost 100x that group today (inferred).
-The bare config already is at the floor Ibex can reach without fixing 10 (2 allocs).
+The bare config already is at the floor Alcyon can reach without fixing 10 (2 allocs).
 
 Needs the pool design: site 8 (Sample owns a String; the ACL path), 17-20 (rustls: 120+ allocations per TLS
-connection, 313 for an h2 TLS request, dominated by library-internal allocation Ibex cannot reach without an allocator
+connection, 313 for an h2 TLS request, dominated by library-internal allocation Alcyon cannot reach without an allocator
 hook or an arena), 22-23 (HPACK dynamic table owns Strings), 28-29 (large buffers: HAProxy takes a bufsize chunk from
 the pool). H2 as a whole (131 allocs per extra stream, 175 for the first) is the largest non-TLS remaining consumer and
 needs both kinds of change.
@@ -127,7 +127,7 @@ Not removable by a local change: nothing found in the h1 path; every h1 site is 
 - The h2/TLS trace counts are not equal to the counter pass (505 vs 313): per-site numbers there are approximate; I did
   not find why (a timer or the second thread racing the flag are the candidates).
 - Another session (t371-inv) builds into the same CARGO_TARGET_DIR (/home/bhenc/ibex-targets/alloc-review) and
-  was relinking `release/ibex` during this run; I copied my binary to the scratchpad (`ibex-census`) and measured
+  was relinking `release/alcyon` during this run; I copied my binary to the scratchpad (`alcyon-census`) and measured
   that copy. The target directory is therefore not a reliable place for this tree's binary.
 - Health-check ticks per second: 33 checks in 6 s on a 200 ms interval; the per-tick figure divides by backend
   accepts, so it includes nothing else.

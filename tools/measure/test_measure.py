@@ -3,7 +3,7 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 """
-Unit tests for Ibex Continuous Measurement regression detector.
+Unit tests for Alcyon Continuous Measurement regression detector.
 """
 
 import os
@@ -42,7 +42,7 @@ class TestReferenceSha(unittest.TestCase):
         self.write("crates/x/src/lib.rs", "fn a() {}\nfn b() {}\n")
         _git(self.repo, "commit", "-q", "-am", "change")
         self.head = _git(self.repo, "rev-parse", "HEAD")
-        self.env = {k: v for k, v in os.environ.items() if k != "IBEX_MEASURE_REF"}
+        self.env = {k: v for k, v in os.environ.items() if k != "ALCYON_MEASURE_REF"}
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -144,7 +144,7 @@ class TestRegressionDetector(unittest.TestCase):
         self.assertEqual(d.previous, "10,000 (ref)")
 
     def test_cpu_per_request_is_the_tight_ab_check(self):
-        # ibex CPU per request at 50 connections varies about 2% between identical builds.
+        # alcyon CPU per request at 50 connections varies about 2% between identical builds.
         current = {"cpu_ns_per_req_50conn": 41800, "cpu_ns_per_req_50conn_ref": 40000}
         deltas, verdict = check_regressions(current, {"cpu_ns_per_req_50conn": 99999})
         self.assertEqual(verdict, Verdict.FAIL)
@@ -293,7 +293,7 @@ class TestHostProblems(unittest.TestCase):
 class TestH3Board(unittest.TestCase):
     """M1: the h3 board has a non-PGO column, a PGO ("shipped") column and HAProxy's."""
 
-    def row(self, label, fit, build=None, binary="/t/release-perf/ibex", sha="aaa", method="get"):
+    def row(self, label, fit, build=None, binary="/t/release-perf/alcyon", sha="aaa", method="get"):
         r = {"kind": "insreq-h3", "sha": sha, "label": label, "binary": binary, "scenario": "h3.body",
              "method": method, "h3_fit": fit, "fit_rate": 1.97, "at": "2026-11-01T00:00:00Z"}
         if build:

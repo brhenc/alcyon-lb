@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+#
+# systemd unit for Alcyon, modelled on HAProxy's admin/systemd/haproxy.service.in.
+# Install as /etc/systemd/system/alcyon.service; see docs/operating.md.
+
+[Unit]
+Description=Alcyon Load Balancer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=-/etc/default/alcyon
+EnvironmentFile=-/etc/sysconfig/alcyon
+Environment="CONFIG=/etc/alcyon/alcyon.cfg" "PIDFILE=/run/alcyon.pid" "EXTRAOPTS=-S /run/alcyon-master.sock"
+# -Ws: reload on SIGUSR2, and report READY=1 / RELOADING=1 / MAINPID= / STOPPING=1 to systemd.
+ExecStart=/usr/local/sbin/alcyon -Ws -f $CONFIG -p $PIDFILE $EXTRAOPTS
+# Refuse the reload when the new configuration does not parse, then ask for it.
+ExecReload=/usr/local/sbin/alcyon -Ws -f $CONFIG -c $EXTRAOPTS
+ExecReload=/bin/kill -USR2 $MAINPID
+# SIGTERM to the main process only, then SIGKILL to the rest after TimeoutStopSec.
+KillMode=mixed
+Restart=always
+Type=notify
+
+# Sandboxing, as in HAProxy's unit; uncomment what your setup allows.
+# A reload starts the new process from the same binary path, and it keeps its hand-over
+# socket in the temporary directory ($TMPDIR, default /tmp), so do not make that directory
+# unwritable for the service.
+# NoNewPrivileges=true
+# ProtectHome=true
+# ProtectSystem=true
+# ProtectKernelTunables=true
+# ProtectKernelModules=true
+# ProtectControlGroups=true
+# SystemCallFilter=~@cpu-emulation @keyring @module @obsolete @raw-io
+
+[Install]
+WantedBy=multi-user.target

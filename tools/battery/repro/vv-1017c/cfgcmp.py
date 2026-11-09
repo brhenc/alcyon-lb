@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-"""cfgcmp.py IBEX CASES.py: `-c` each config case on Ibex and HAProxy; print rc and core ALERT."""
+"""cfgcmp.py ALCYON CASES.py: `-c` each config case on Alcyon and HAProxy; print rc and core ALERT."""
 import os, re, subprocess, sys, tempfile
 IB, CASES = sys.argv[1], sys.argv[2]
 HA = "/home/bhenc/reference/haproxy/haproxy"
@@ -38,10 +38,10 @@ for name, fe, *rest in ns["CASES"]:
     f = os.path.join(d, name + ".cfg")
     open(f, "w").write(TPL.format(fe="\n".join("    " + x for x in fe.split("\n") if x), be="\n".join("    " + x for x in be.split("\n") if x)))
     r = {}
-    for nm, b in (("ibex", IB), ("haproxy", HA)):
+    for nm, b in (("alcyon", IB), ("haproxy", HA)):
         p = subprocess.run([b, "-c", "-f", f], capture_output=True, text=True, timeout=10)
         r[nm] = (p.returncode, core(p.stdout + p.stderr))
-    ok = r["ibex"][0] == r["haproxy"][0]
+    ok = r["alcyon"][0] == r["haproxy"][0]
     same += ok; diff += not ok
     print(("RC-SAME " if ok else "RC-DIFF ") + name)
     for nm in r: print("   %-7s rc=%d %s" % (nm, r[nm][0], r[nm][1][:240]))

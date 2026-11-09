@@ -1,7 +1,7 @@
-Ibex licensing
+Alcyon licensing
 ==============
 
-Ibex is a rewrite of HAProxy (https://www.haproxy.org/) in Rust, an
+Alcyon is a rewrite of HAProxy (https://www.haproxy.org/) in Rust, an
 experiment in whether that is doable. It is a derivative work of HAProxy as a
 whole and carries HAProxy's licences, file by file, as HAProxy applies them:
 
@@ -37,7 +37,7 @@ That grant does carry the "or later" option, hence GPL-2.0-or-later.
 Copyright
 ---------
 
-Ibex is Copyright (C) 2000-2026 Willy Tarreau and the HAProxy contributors,
+Alcyon is Copyright (C) 2000-2026 Willy Tarreau and the HAProxy contributors,
 whose code it rewrites; ebtree is Copyright (C) 2002-2011 Willy Tarreau, and slz
 Copyright (C) 2013-2015 Willy Tarreau. Every source file carries an SPDX
 identifier and that copyright line; a file ported from a specific upstream file

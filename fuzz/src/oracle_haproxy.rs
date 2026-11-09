@@ -77,7 +77,7 @@ impl HaproxyOracle {
         start_concurrent_backend(be_port, Arc::clone(&backend_running), Arc::clone(&received_requests))?;
 
         // Write HAProxy config
-        let cfg_file = std::env::temp_dir().join(format!("ibex_fuzz_haproxy_{}_{}.cfg", std::process::id(), fe_port));
+        let cfg_file = std::env::temp_dir().join(format!("alcyon_fuzz_haproxy_{}_{}.cfg", std::process::id(), fe_port));
         let cfg_content = format!(
             "global\n\
              \tlog stdout format raw local0\n\
@@ -251,7 +251,7 @@ impl HaproxyOracle {
         // A request before the sentinel is not: a pipelined test case legitimately
         // contains several requests, and the previous version flagged every one of
         // them, which produced 40 false Category 3 findings from correctly handled
-        // pipelining. Verified by hand that Ibex and HAProxy both forward
+        // pipelining. Verified by hand that Alcyon and HAProxy both forward
         // "GET /first" + "GET /second" identically.
         for req in be_reqs.iter().skip(1) {
             if req.uri == SENTINEL_URI {

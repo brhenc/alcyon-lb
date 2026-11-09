@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-"""Startup RSS of Ibex and HAProxy on N backends of one server each (T175).
+"""Startup RSS of Alcyon and HAProxy on N backends of one server each (T175).
 
 Milestone M1: "RSS at startup, 10 / 1k / 10k backends <= 1.5x HAProxy".
 
-    tools/measure/startup_rss.py [--ibex PATH] [--haproxy PATH] [--backends 10,1000,10000]
+    tools/measure/startup_rss.py [--alcyon PATH] [--haproxy PATH] [--backends 10,1000,10000]
                                  [--nbthread 1,16] [--no-haproxy]
 
 Starts each binary in the foreground on a generated config (`global maxconn 1000`,
 `nbthread T`, one frontend, N backends `server sK 127.0.0.1:port`), waits until it
 listens, sleeps 1 s, reads VmRSS from /proc/<pid>/status, stops it (SIGUSR1, then
-SIGTERM), and prints a table with the ratio. Use a release build of ibex
-(default: $CARGO_TARGET_DIR/release/ibex, else target/release/ibex).
+SIGTERM), and prints a table with the ratio. Use a release build of alcyon
+(default: $CARGO_TARGET_DIR/release/alcyon, else target/release/alcyon).
 Exit status 1 when the worst ratio exceeds 1.5.
 """
 import argparse
@@ -27,9 +27,9 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def default_ibex():
+def default_alcyon():
     tgt = os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target"))
-    return os.path.join(tgt, "release", "ibex")
+    return os.path.join(tgt, "release", "alcyon")
 
 
 def free_port():
@@ -99,17 +99,17 @@ def rss_kb(binary, backends, nbthread, extra):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--ibex", default=default_ibex())
+    ap.add_argument("--alcyon", default=default_alcyon())
     ap.add_argument("--haproxy", default="/home/bhenc/reference/haproxy/haproxy")
     ap.add_argument("--backends", default="10,1000,10000")
     ap.add_argument("--nbthread", default="1,16")
     ap.add_argument("--no-haproxy", action="store_true")
     a = ap.parse_args()
-    print(f"{'backends':>8} {'nbthread':>8} {'ibex MB':>9} {'haproxy MB':>11} {'ratio':>6}")
+    print(f"{'backends':>8} {'nbthread':>8} {'alcyon MB':>9} {'haproxy MB':>11} {'ratio':>6}")
     worst = 0.0
     for t in [int(x) for x in a.nbthread.split(",")]:
         for n in [int(x) for x in a.backends.split(",")]:
-            i = rss_kb(a.ibex, n, t, [])
+            i = rss_kb(a.alcyon, n, t, [])
             h = None if a.no_haproxy else rss_kb(a.haproxy, n, t, ["-db"])
             ratio = f"{i / h:6.2f}" if h else f"{'-':>6}"
             if h:

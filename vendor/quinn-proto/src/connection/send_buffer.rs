@@ -7,7 +7,7 @@ use crate::{
     range_set::{ArrayRangeSet, RangeSet},
 };
 
-/// Segments a `SendBuffer` keeps room for when its data is acknowledged (Ibex T543); 16 `Bytes`
+/// Segments a `SendBuffer` keeps room for when its data is acknowledged (Alcyon T543); 16 `Bytes`
 /// are 512 bytes, held while the stream (or its reuse, `Send::free`) lives
 const RETAINED_SEGMENTS: usize = 16;
 
@@ -40,7 +40,7 @@ impl SendBuffer {
         Self::default()
     }
 
-    /// Empty the buffer for another stream, keeping its allocations (Ibex T543)
+    /// Empty the buffer for another stream, keeping its allocations (Alcyon T543)
     pub(super) fn reinit(&mut self) {
         // NB: when adding or removing fields, update this
         let Self {
@@ -61,8 +61,8 @@ impl SendBuffer {
         retransmits.clear();
     }
 
-    /// Bytes this buffer holds for reuse: the segment queue's capacity (Ibex P1, pool footprint)
-    #[cfg(feature = "ibex-pools")]
+    /// Bytes this buffer holds for reuse: the segment queue's capacity (Alcyon P1, pool footprint)
+    #[cfg(feature = "alcyon-pools")]
     pub(super) fn footprint(&self) -> usize {
         self.unacked_segments.capacity() * std::mem::size_of::<Bytes>()
     }
@@ -100,7 +100,7 @@ impl SendBuffer {
                     self.front_trimmed = 0;
 
                     // Shrink a deque a burst grew, but not below `RETAINED_SEGMENTS`: an emptied
-                    // deque freed here was allocated again by the next write (Ibex T543)
+                    // deque freed here was allocated again by the next write (Alcyon T543)
                     let cap = self.unacked_segments.capacity();
                     if cap > RETAINED_SEGMENTS && self.unacked_segments.len() * 4 < cap {
                         self.unacked_segments

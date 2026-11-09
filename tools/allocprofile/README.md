@@ -1,7 +1,7 @@
 # allocprofile
 
 Answers "which call sites allocate, per request", which the counting allocator in
-`ibex-alloc` cannot: it counts allocations but does not attribute them.
+`alcyon-alloc` cannot: it counts allocations but does not attribute them.
 
 ```bash
 cd tools/allocprofile && cargo run -q

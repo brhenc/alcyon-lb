@@ -1,4 +1,4 @@
-# Summary for the user: T610 (Fable), "why Ibex copies" — 2026-11-02
+# Summary for the user: T610 (Fable), "why Alcyon copies" — 2026-11-02
 
 Full design: `docs/design/copies-2026-11-02.md` (409 lines, merged 91e96523). Decisions: all six
 §8 answers approved by the user 11-02 ~08:20 (`tasks/DECISIONS-pending.md`).
@@ -8,7 +8,7 @@ Full design: `docs/design/copies-2026-11-02.md` (409 lines, merged 91e96523). De
 HAProxy does *not* create the stream before decoding HEADERS either. It decodes HPACK/QPACK into
 a stack list, writes HTX blocks straight into a buffer allocated for a stream that does not exist
 yet, then creates the stream and hands it that buffer by value (later swapped into the channel).
-Its intermediate *is* the final representation, in memory that moves. Ibex's intermediate is a
+Its intermediate *is* the final representation, in memory that moves. Alcyon's intermediate is a
 private struct (`H2ReqHead`: `String`s and `Vec`s) that is later copied into blocks and
 re-validated: one decode, three writes. So the fix is "the mux writes blocks into a pooled buffer
 the stream adopts", not "streams live inside their connection".

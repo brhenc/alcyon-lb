@@ -17,7 +17,7 @@
 # from t452_ab.py); batch records ("kind": "batch") say what ran or why it was skipped.
 # Read the result with tools/measure/t452_report.py /tmp/t452/results.jsonl.
 #
-# Needs: the binaries in $T452_TARGET (release/ibex = candidate, measure-ref/ibex-<sha>,
+# Needs: the binaries in $T452_TARGET (release/alcyon = candidate, measure-ref/alcyon-<sha>,
 # release/measure-bench), copies in /tmp/t452/bins, `sudo -n` for perf stat (counting only).
 # Changes no system setting.
 

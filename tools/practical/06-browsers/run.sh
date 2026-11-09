@@ -4,7 +4,7 @@
 #
 # Practical topology 06:  Chrome / Firefox (headless) -> proxy (TLS, h2) -> node.js SPA
 #
-#   ./run.sh              run against Ibex
+#   ./run.sh              run against Alcyon
 #   ./run.sh --haproxy    run against HAProxy (the oracle)
 #   BROWSERS="chrome" ./run.sh   only one browser
 #
@@ -13,7 +13,7 @@
 # the system trust store is never touched. Everything is killed by PID and the work dir removed.
 
 # ---- settings you may want to change ---------------------------------------
-IBEX_BIN=${IBEX_BIN:-/home/bhenc/ibex-targets/t212/release/ibex}
+ALCYON_BIN=${ALCYON_BIN:-/home/bhenc/ibex-targets/t212/release/alcyon}
 HAPROXY_BIN=${HAPROXY_BIN:-/home/bhenc/reference/haproxy/haproxy}
 APP_PORT=${APP_PORT:-26001}
 PROXY_PORT=${PROXY_PORT:-26080}
@@ -24,9 +24,9 @@ KEEP=${KEEP:-0}                         # KEEP=1 leaves the work dir (logs) in /
 # -----------------------------------------------------------------------------
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-PROXY=ibex
+PROXY=alcyon
 [ "$1" = "--haproxy" ] && PROXY=haproxy
-if [ "$PROXY" = ibex ]; then PROXY_BIN=$IBEX_BIN; else PROXY_BIN=$HAPROXY_BIN; fi
+if [ "$PROXY" = alcyon ]; then PROXY_BIN=$ALCYON_BIN; else PROXY_BIN=$HAPROXY_BIN; fi
 
 WORK=$(mktemp -d /tmp/practical06-XXXXXX)
 PIDS=""

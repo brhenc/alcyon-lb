@@ -8,7 +8,7 @@ The QUIC analogue of HTTP/2 Rapid Reset (CVE-2023-44487):
 - Rapidly opens bidirectional streams and immediately sends RESET_STREAM and STOP_SENDING frames.
 - Tests server resilience against stream ID exhaustion and state allocation duress.
 - Measures server CPU ticks, RSS memory delta, error codes emitted, and connection survival.
-- Compares HAProxy (tune.quic.fe.stream.max-total, tune.quic.fe.sec.glitches-threshold) vs Ibex / quinn-proto.
+- Compares HAProxy (tune.quic.fe.stream.max-total, tune.quic.fe.sec.glitches-threshold) vs Alcyon / quinn-proto.
 """
 
 from __future__ import annotations

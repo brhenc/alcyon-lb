@@ -81,7 +81,7 @@ pub fn generate_findings_markdown(
     rejected_both: usize,
     findings: &[DiscrepancyFinding],
     haproxy_version: &str,
-    ibex_sha: &str,
+    alcyon_sha: &str,
 ) -> String {
     let mut cat1_count = 0;
     let mut cat2_count = 0;
@@ -98,11 +98,11 @@ pub fn generate_findings_markdown(
     }
 
     let mut md = String::new();
-    md.push_str("# Differential Fuzzing Findings: Ibex vs HAProxy\n\n");
+    md.push_str("# Differential Fuzzing Findings: Alcyon vs HAProxy\n\n");
     md.push_str("## Executive Summary\n\n");
     md.push_str(&format!(
-        "This report documents differential testing between the **Ibex HTTP/1 parser** (`crates/ibex-proto`) \
-         and the reference **{}** oracle (`/home/bhenc/reference/haproxy/haproxy`); Ibex at commit `{}`.\n\n\
+        "This report documents differential testing between the **Alcyon HTTP/1 parser** (`crates/alcyon-proto`) \
+         and the reference **{}** oracle (`/home/bhenc/reference/haproxy/haproxy`); Alcyon at commit `{}`.\n\n\
          - **Total Inputs Evaluated:** {}\n\
          - **Accepted by Both Parsers:** {}\n\
          - **Rejected by Both Parsers:** {}\n\
@@ -111,7 +111,7 @@ pub fn generate_findings_markdown(
            - **Category 2 (Framing Disagreements):** {}\n\
            - **Category 3 (Smuggling / Boundary Findings):** {}\n\
            - **Self-Differential (Streaming Consistency):** {}\n\n",
-        haproxy_version, ibex_sha, total_tested, accepted_both, rejected_both, findings.len(),
+        haproxy_version, alcyon_sha, total_tested, accepted_both, rejected_both, findings.len(),
         cat1_count, cat2_count, cat3_count, self_diff_count
     ));
 
@@ -119,7 +119,7 @@ pub fn generate_findings_markdown(
     md.push_str("1. **Category 1 (Acceptance):** One parser accepted the input as valid HTTP/1 while the other rejected it (HTTP 400 Bad Request or parse syntax error).\n");
     md.push_str("2. **Category 2 (Framing):** Both parsers accepted the input, but disagreed on parsed method, URI, header count, or body length.\n");
     md.push_str("3. **Category 3 (Smuggling Boundary):** Disagreements on message boundaries (where this request ends and the next begins), keep-alive connection reuse enforcement on ambiguous framing, or request smuggling desynchronization.\n");
-    md.push_str("4. **Self-Differential:** Discrepancies within Ibex itself across single-pass buffer evaluation versus incremental byte-by-byte streaming.\n\n");
+    md.push_str("4. **Self-Differential:** Discrepancies within Alcyon itself across single-pass buffer evaluation versus incremental byte-by-byte streaming.\n\n");
 
     md.push_str("---\n\n");
     md.push_str("## Detailed Findings\n\n");
@@ -139,19 +139,19 @@ pub fn generate_findings_markdown(
         md.push_str(&format_hexdump(&finding.test_case.raw_bytes));
         md.push_str("```\n\n");
 
-        md.push_str("#### Ibex Behavior\n\n");
-        md.push_str(&format!("- **Accepted:** `{}`\n", finding.ibex_result.accepted));
-        md.push_str(&format!("- **Phase:** `{}`\n", finding.ibex_result.phase));
-        md.push_str(&format!("- **Consumed Bytes:** `{} / {}`\n", finding.ibex_result.consumed_bytes, finding.test_case.raw_bytes.len()));
-        if let Some(ref m) = finding.ibex_result.method {
+        md.push_str("#### Alcyon Behavior\n\n");
+        md.push_str(&format!("- **Accepted:** `{}`\n", finding.alcyon_result.accepted));
+        md.push_str(&format!("- **Phase:** `{}`\n", finding.alcyon_result.phase));
+        md.push_str(&format!("- **Consumed Bytes:** `{} / {}`\n", finding.alcyon_result.consumed_bytes, finding.test_case.raw_bytes.len()));
+        if let Some(ref m) = finding.alcyon_result.method {
             md.push_str(&format!("- **Parsed Method:** `{m}`\n"));
         }
-        if let Some(ref u) = finding.ibex_result.uri {
+        if let Some(ref u) = finding.alcyon_result.uri {
             md.push_str(&format!("- **Parsed URI:** `{u}`\n"));
         }
-        md.push_str(&format!("- **Body Length:** `{} bytes`\n", finding.ibex_result.body_len));
-        md.push_str(&format!("- **Connection Close Set:** `{}`\n", finding.ibex_result.connection_close));
-        if let Some(ref err) = finding.ibex_result.error_message {
+        md.push_str(&format!("- **Body Length:** `{} bytes`\n", finding.alcyon_result.body_len));
+        md.push_str(&format!("- **Connection Close Set:** `{}`\n", finding.alcyon_result.connection_close));
+        if let Some(ref err) = finding.alcyon_result.error_message {
             md.push_str(&format!("- **Error Message:** `{err}`\n"));
         }
 

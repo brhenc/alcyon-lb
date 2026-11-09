@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-# Ibex Load Balancer Makefile
-# Copyright (C) 2000-2026 Willy Tarreau and Ibex contributors. See LICENSE.
+# Alcyon Load Balancer Makefile
+# Copyright (C) 2000-2026 Willy Tarreau and Alcyon contributors. See LICENSE.
 
 SHELL := /bin/bash
 
@@ -14,8 +14,8 @@ PYTHON           ?= python3
 
 # Target binaries and configurations
 TARGET_DIR       := target
-TARGET_RELEASE   := $(TARGET_DIR)/release/ibex
-TARGET_DEBUG     := $(TARGET_DIR)/debug/ibex
+TARGET_RELEASE   := $(TARGET_DIR)/release/alcyon
+TARGET_DEBUG     := $(TARGET_DIR)/debug/alcyon
 CANONICAL_CONFIG ?= examples/canonical_haproxy_35.cfg
 STATS_CONFIG     ?= examples/stats_dashboard.cfg
 RUN_FLAGS        ?=
@@ -48,17 +48,17 @@ RESET            := \033[0m
 
 all: build ## Build release binary (default target)
 
-build: $(TARGET_RELEASE) ## Build release binary (target/release/ibex)
+build: $(TARGET_RELEASE) ## Build release binary (target/release/alcyon)
 
-debug: $(TARGET_DEBUG) ## Build debug binary (target/debug/ibex)
+debug: $(TARGET_DEBUG) ## Build debug binary (target/debug/alcyon)
 
 $(TARGET_RELEASE): FORCE
-	@echo -e "$(CYAN)Building Ibex release binary ($(TARGET_RELEASE))...$(RESET)"
-	$(CARGO) build $(CARGO_FLAGS) --workspace --bin ibex
+	@echo -e "$(CYAN)Building Alcyon release binary ($(TARGET_RELEASE))...$(RESET)"
+	$(CARGO) build $(CARGO_FLAGS) --workspace --bin alcyon
 
 $(TARGET_DEBUG): FORCE
-	@echo -e "$(CYAN)Building Ibex debug binary ($(TARGET_DEBUG))...$(RESET)"
-	$(CARGO) build --workspace --bin ibex
+	@echo -e "$(CYAN)Building Alcyon debug binary ($(TARGET_DEBUG))...$(RESET)"
+	$(CARGO) build --workspace --bin alcyon
 
 ##@ Testing & Verification
 
@@ -70,7 +70,7 @@ difftest: ## Run differential test harness against reference HAProxy
 	@echo -e "$(GREEN)Running differential testing harness against reference HAProxy...$(RESET)"
 	$(PYTHON) harness/difftest.py --reference $(DIFFTEST_REF) $(DIFFTEST_EXTRA)
 
-difftest-candidate: build ## Run differential test harness comparing reference vs candidate (ibex)
+difftest-candidate: build ## Run differential test harness comparing reference vs candidate (alcyon)
 	@echo -e "$(GREEN)Running differential test comparison (reference vs candidate)...$(RESET)"
 	$(PYTHON) harness/difftest.py --reference $(DIFFTEST_REF) --candidate $(TARGET_RELEASE) $(DIFFTEST_EXTRA)
 
@@ -100,12 +100,12 @@ fmt-check: ## Check formatting without modifying files
 
 ##@ Execution & Operations
 
-run: build ## Run ibex with examples/canonical_haproxy_35.cfg
-	@echo -e "$(GREEN)Running Ibex with $(CANONICAL_CONFIG)...$(RESET)"
+run: build ## Run alcyon with examples/canonical_haproxy_35.cfg
+	@echo -e "$(GREEN)Running Alcyon with $(CANONICAL_CONFIG)...$(RESET)"
 	./$(TARGET_RELEASE) -f $(CANONICAL_CONFIG) $(RUN_FLAGS)
 
-run-stats: debug ## Run ibex with modern Web Stats Dashboard on port 8404
-	@echo -e "$(GREEN)Starting Ibex Stats Dashboard on http://127.0.0.1:8404/stats ...$(RESET)"
+run-stats: debug ## Run alcyon with modern Web Stats Dashboard on port 8404
+	@echo -e "$(GREEN)Starting Alcyon Stats Dashboard on http://127.0.0.1:8404/stats ...$(RESET)"
 	./$(TARGET_DEBUG) -f $(STATS_CONFIG) $(RUN_FLAGS)
 
 smoke: debug ## Run end-to-end HTTPS/TLS smoke test with curl and Nginx on port 8443
@@ -114,14 +114,14 @@ smoke: debug ## Run end-to-end HTTPS/TLS smoke test with curl and Nginx on port 
 
 ##@ Installation & Packaging
 
-install: build ## Install ibex binary into $(DESTDIR)$(PREFIX)/bin/ibex (mode 755)
-	@echo -e "$(GREEN)Installing $(TARGET_RELEASE) into $(DESTDIR)$(BINDIR)/ibex...$(RESET)"
+install: build ## Install alcyon binary into $(DESTDIR)$(PREFIX)/bin/alcyon (mode 755)
+	@echo -e "$(GREEN)Installing $(TARGET_RELEASE) into $(DESTDIR)$(BINDIR)/alcyon...$(RESET)"
 	$(INSTALL_DIR) $(DESTDIR)$(BINDIR)
-	$(INSTALL_PROGRAM) $(TARGET_RELEASE) $(DESTDIR)$(BINDIR)/ibex
+	$(INSTALL_PROGRAM) $(TARGET_RELEASE) $(DESTDIR)$(BINDIR)/alcyon
 
-uninstall: ## Remove $(DESTDIR)$(PREFIX)/bin/ibex
-	@echo -e "$(YELLOW)Removing $(DESTDIR)$(BINDIR)/ibex...$(RESET)"
-	$(RM) $(DESTDIR)$(BINDIR)/ibex
+uninstall: ## Remove $(DESTDIR)$(PREFIX)/bin/alcyon
+	@echo -e "$(YELLOW)Removing $(DESTDIR)$(BINDIR)/alcyon...$(RESET)"
+	$(RM) $(DESTDIR)$(BINDIR)/alcyon
 
 ##@ Cleanup & Help
 
@@ -131,11 +131,11 @@ clean: ## Remove target/ and temporary artifacts
 	$(RMDIR) $(TARGET_DIR)
 	$(RM) harness/*.json harness/__pycache__/*.pyc
 	$(RMDIR) harness/__pycache__
-	$(RM) /tmp/ibex.sock /tmp/ibex-test*.sock
+	$(RM) /tmp/alcyon.sock /tmp/alcyon-test*.sock
 
 help: ## Display this styled self-documenting help menu
 	@echo -e "$(CYAN)======================================================================$(RESET)"
-	@echo -e "$(CYAN)  Ibex High-Performance Load Balancer — Build Automation System       $(RESET)"
+	@echo -e "$(CYAN)  Alcyon High-Performance Load Balancer — Build Automation System       $(RESET)"
 	@echo -e "$(CYAN)======================================================================$(RESET)"
 	@echo -e "$(BOLD)Usage:$(RESET) make $(GREEN)<target>$(RESET) [$(YELLOW)VARIABLE=value$(RESET)]"
 	@awk 'BEGIN {FS = ":.*?## "}; \

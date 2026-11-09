@@ -4,14 +4,14 @@
 #
 # Practical topology 01:  client (curl / node) -> proxy -> node.js app
 #
-#   ./run.sh              run against Ibex
+#   ./run.sh              run against Alcyon
 #   ./run.sh --haproxy    run against HAProxy (the oracle)
 #
 # Everything is started by this script and killed by PID at the end.
 # Override any variable below from the environment, e.g.  SIZE_MB=10 ./run.sh
 
 # ---- settings you may want to change ---------------------------------------
-IBEX_BIN=${IBEX_BIN:-/home/bhenc/ibex-targets/t167/release/ibex}
+ALCYON_BIN=${ALCYON_BIN:-/home/bhenc/ibex-targets/t167/release/alcyon}
 HAPROXY_BIN=${HAPROXY_BIN:-/home/bhenc/reference/haproxy/haproxy}
 PROXY_PORT=${PROXY_PORT:-18080}     # where the proxy listens (clients connect here)
 APP_PORT=${APP_PORT:-13000}         # where the node.js app listens
@@ -21,9 +21,9 @@ WS_MESSAGES=${WS_MESSAGES:-100}     # WebSocket case: number of echoed messages
 # -----------------------------------------------------------------------------
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-PROXY=ibex
+PROXY=alcyon
 [ "$1" = "--haproxy" ] && PROXY=haproxy
-if [ "$PROXY" = ibex ]; then PROXY_BIN=$IBEX_BIN; else PROXY_BIN=$HAPROXY_BIN; fi
+if [ "$PROXY" = alcyon ]; then PROXY_BIN=$ALCYON_BIN; else PROXY_BIN=$HAPROXY_BIN; fi
 
 WORK=$(mktemp -d /tmp/practical01-XXXXXX)
 BASE=http://127.0.0.1:$PROXY_PORT

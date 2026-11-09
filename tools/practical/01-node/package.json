@@ -1,1 +1,1 @@
-{"name":"ibex-practical-01-node","version":"1.0.0","private":true,"description":"Test backend for Ibex practical topology 01","main":"app.js","dependencies":{"ws":"^8.18.0"}}
+{"name":"alcyon-practical-01-node","version":"1.0.0","private":true,"description":"Test backend for Alcyon practical topology 01","main":"app.js","dependencies":{"ws":"^8.18.0"}}

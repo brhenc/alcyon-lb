@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ibex-config = { path = "../../crates/ibex-config" }
-ibex-rt = { path = "../../crates/ibex-rt" }
+alcyon-config = { path = "../../crates/alcyon-config" }
+alcyon-rt = { path = "../../crates/alcyon-rt" }
 
 [workspace]
 

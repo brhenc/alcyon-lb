@@ -1,7 +1,7 @@
 # HAProxy 3.5 Command-Line Interface Compatibility & Architecture Blueprint
 
 **Status:** Completed & Integrated  
-**Target:** Ibex Soft-Realtime Runtime (`crates/ibex-rt/src/bin/ibex.rs`)  
+**Target:** Alcyon Soft-Realtime Runtime (`crates/alcyon-rt/src/bin/alcyon.rs`)  
 **Parity Target:** HAProxy 3.5 (`haproxy 3.5-dev7`)  
 **Security Invariant:** Pure `#![forbid(unsafe_code)]`  
 
@@ -11,7 +11,7 @@
 
 In production reverse-proxy deployments, the command-line interface (CLI) is the primary contract between process supervisors (systemd, runit, Kubernetes entrypoints, shell scripts) and the load-balancer daemon. HAProxy's CLI argument architecture has evolved over 25 years from a simple single-flag daemon to a sophisticated multi-stage runtime controller supporting atomic configuration directories, zero-downtime process handoffs, master-worker supervision, and memory poisoning.
 
-This document presents the complete architectural audit of HAProxy 3.5 command-line flags and specifies the pure-Rust, memory-safe CLI implementation for Ibex in `crates/ibex-rt/src/bin/ibex.rs`.
+This document presents the complete architectural audit of HAProxy 3.5 command-line flags and specifies the pure-Rust, memory-safe CLI implementation for Alcyon in `crates/alcyon-rt/src/bin/alcyon.rs`.
 
 ### Core Architectural Invariants
 
@@ -105,17 +105,17 @@ The following catalog categorizes every command-line option in HAProxy 3.5 as im
 
 ---
 
-## 3. Ibex CLI Compatibility Matrix
+## 3. Alcyon CLI Compatibility Matrix
 
-| Option | HAProxy 3.5 Semantics | Ibex 0.1 Implementation | Status | Safety & Subsystem |
+| Option | HAProxy 3.5 Semantics | Alcyon 0.1 Implementation | Status | Safety & Subsystem |
 | :--- | :--- | :--- | :--- | :--- |
 | `-f <path>` | Load config file or expand directory (`.cfg`, lexical order) | Full support: single/multiple `-f`, directory expansion via `std::fs::read_dir`, sorted via `cmp` | **Supported** | `#![forbid(unsafe_code)]`, zero-allocation path collection |
 | `-- <paths...>` | Trailing configuration paths | Consumes all remaining args as config files/directories | **Supported** | Safe iterator consumption |
-| `-c` | Check syntax only and exit (0=OK, 1=Err) | Fully parses AST and validates runtime invariants; exits 0 or 1 | **Supported** | Pure AST parse (`ibex_config::parse_str`) |
+| `-c` | Check syntax only and exit (0=OK, 1=Err) | Fully parses AST and validates runtime invariants; exits 0 or 1 | **Supported** | Pure AST parse (`alcyon_config::parse_str`) |
 | `-C <dir>` | Working directory change before loading files | `std::env::set_current_dir(dir)` executed before config expansion | **Supported** | Safe standard library |
 | `-q` | Quiet mode: silence non-error output | Suppresses banner and validation messages | **Supported** | CLI state flag |
 | `-V` | Verbose mode: display details | Prints detailed startup, poller info, and validation success | **Supported** | CLI state flag |
-| `-v` | Short version and date | Outputs HAProxy 3.5 compatibility banner, Ibex version, and kernel info | **Supported** | Standard output |
+| `-v` | Short version and date | Outputs HAProxy 3.5 compatibility banner, Alcyon version, and kernel info | **Supported** | Standard output |
 | `-vv` | Extended version, build flags, and poller list | Outputs complete build matrix, `#![forbid(unsafe_code)]` status, pollers, and muxes | **Supported** | Standard output |
 | `-h`, `--help` | Help banner | Displays complete HAProxy-compatible usage banner | **Supported** | Standard output |
 | `-D` | Daemon mode (background fork) | Sets daemon mode flag; runs in background mode | **Supported** | Engine mode flag |
@@ -138,7 +138,7 @@ The following catalog categorizes every command-line option in HAProxy 3.5 as im
 
 ---
 
-## 4. Implementation Details in `ibex.rs`
+## 4. Implementation Details in `alcyon.rs`
 
 ### 4.1 Safe Multi-File & Directory Expansion
 
@@ -148,7 +148,7 @@ HAProxy 3.5's directory expansion contract requires:
 3. Subdirectories must NOT be recursively traversed to avoid symlink loops.
 4. Files within each directory must be sorted in strict lexical order (`LC_COLLATE=C`).
 
-In `ibex.rs`, this is implemented with pure safe Rust:
+In `alcyon.rs`, this is implemented with pure safe Rust:
 
 ```rust
 fn expand_config_paths(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
@@ -216,15 +216,15 @@ This ensures zero unsafe code, correct handling of dead PIDs (`ESRCH`), and exac
 
 ### 4.3 Memory limit (`-m`)
 
-Supported (T465b). Ibex's `-m` sets `RLIMIT_DATA` soft and hard to the budget, as HAProxy
+Supported (T465b). Alcyon's `-m` sets `RLIMIT_DATA` soft and hard to the budget, as HAProxy
 does (`/proc/<pid>/limits`), sizes the automatic `maxconn` from it (`engine::apply_memmax`)
 and reports `Memmax_MB` in `show info`. A hard limit it cannot raise is the same alert and
-exit 1 as HAProxy's. Past the limit Ibex's buffers, sessions, timers and idle lists fail one
+exit 1 as HAProxy's. Past the limit Alcyon's buffers, sessions, timers and idle lists fail one
 stream or connection; the allocations still infallible abort. See tradeoff.md 6.23, 6.25.
 
 ## 5. Integration Verification Matrix
 
-The integration test suite in `crates/ibex-rt/tests/it/cli_options.rs` validates all core operational paths:
+The integration test suite in `crates/alcyon-rt/tests/it/cli_options.rs` validates all core operational paths:
 
 1. **Check Mode (`-c`)**:
    - Valid config returns exit code `0` and outputs validation confirmation.
@@ -249,4 +249,4 @@ The integration test suite in `crates/ibex-rt/tests/it/cli_options.rs` validates
 
 ## 6. Summary
 
-With this implementation, `ibex` achieves complete CLI compatibility with HAProxy 3.5, allowing standard tools (`systemctl reload haproxy`, `hatop`, container orchestrators, and automated reload scripts) to operate seamlessly without modification while maintaining Ibex's strict `#![forbid(unsafe_code)]` guarantee.
+With this implementation, `alcyon` achieves complete CLI compatibility with HAProxy 3.5, allowing standard tools (`systemctl reload haproxy`, `hatop`, container orchestrators, and automated reload scripts) to operate seamlessly without modification while maintaining Alcyon's strict `#![forbid(unsafe_code)]` guarantee.

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 """Stats page access control vs HAProxy: stats auth/realm, http-request rules in front of stats,
-stats http-request, stats in a backend.  stats_acl.py IBEX [HAPROXY]
+stats http-request, stats in a backend.  stats_acl.py ALCYON [HAPROXY]
 Each case: one config, a list of requests (path, credentials, extra header); prints status and
 WWW-Authenticate per request for both proxies, SAME/DIFF per case.  Port 19970, backend 19971."""
 import base64, os, socket, subprocess, sys, tempfile, time
@@ -73,7 +73,7 @@ for name, fe, *dfl in CASES:
     cfg = HEAD + (dfl[0] if dfl else "") + fe + BE
     f = os.path.join(d, name + ".cfg"); open(f, "w").write(cfg)
     out = {}
-    for nm, b in (("ibex", IB), ("haproxy", HA)):
+    for nm, b in (("alcyon", IB), ("haproxy", HA)):
         p = subprocess.Popen(["taskset", "-c", "48-49", b, "-f", f], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         if not wait(p):
             p.kill(); o = p.communicate()[0].decode(errors="replace")
@@ -81,10 +81,10 @@ for name, fe, *dfl in CASES:
             out[nm] = ["did not start: " + (al[0][-160:] if al else o[-160:])]; continue
         out[nm] = [req(*r) for r in R]
         p.terminate(); p.wait(5)
-    ok = out["ibex"] == out["haproxy"]; same += ok; diff += not ok
+    ok = out["alcyon"] == out["haproxy"]; same += ok; diff += not ok
     print(("SAME " if ok else "DIFF ") + name)
-    for i, r in enumerate(R if len(out["ibex"]) > 1 or len(out["haproxy"]) > 1 else [None]):
-        a = out["ibex"][i] if i < len(out["ibex"]) else "-"; h = out["haproxy"][i] if i < len(out["haproxy"]) else "-"
+    for i, r in enumerate(R if len(out["alcyon"]) > 1 or len(out["haproxy"]) > 1 else [None]):
+        a = out["alcyon"][i] if i < len(out["alcyon"]) else "-"; h = out["haproxy"][i] if i < len(out["haproxy"]) else "-"
         lab = "%-8s %-7s %-9s" % (r[0], (r[1] or ("", ""))[0] + (":" + r[1][1] if r[1] else ""), r[2] or "") if r else ""
-        print("   %s ibex %-40s haproxy %s%s" % (lab, a, h, "" if a == h else "   <--"))
+        print("   %s alcyon %-40s haproxy %s%s" % (lab, a, h, "" if a == h else "   <--"))
 print("same %d, diff %d" % (same, diff))

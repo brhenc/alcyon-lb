@@ -53,6 +53,190 @@ dependencies = [
 ]
 
 [[package]]
+name = "alcyon-alloc"
+version = "0.1.0"
+dependencies = [
+ "rustix 0.38.44",
+ "zeroize",
+]
+
+[[package]]
+name = "alcyon-config"
+version = "0.1.0"
+dependencies = [
+ "alcyon-crypt",
+ "alcyon-regex",
+ "nix",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "alcyon-crypt"
+version = "0.1.0"
+dependencies = [
+ "bcrypt",
+ "md-5",
+ "sha-crypt",
+ "subtle",
+]
+
+[[package]]
+name = "alcyon-dns"
+version = "0.1.0"
+dependencies = [
+ "hickory-proto",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "alcyon-h1-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "alcyon-mmsg"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "alcyon-proto"
+version = "0.1.0"
+dependencies = [
+ "alcyon-alloc",
+ "alcyon-h1-sys",
+ "alcyon-regex",
+ "alcyon-sample",
+ "alcyon-sched",
+ "memchr",
+ "proptest",
+ "quinn-proto",
+ "rustls 0.23.45",
+]
+
+[[package]]
+name = "alcyon-quic"
+version = "0.1.0"
+dependencies = [
+ "alcyon-alloc",
+ "alcyon-config",
+ "alcyon-tls",
+ "bytes",
+ "quinn-proto",
+ "rcgen",
+ "rustix 0.38.44",
+ "rustls 0.23.45",
+ "rustls 0.24.0-dev.2",
+ "rustls-pemfile",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
+name = "alcyon-regex"
+version = "0.1.0"
+dependencies = [
+ "fancy-regex",
+ "regex",
+]
+
+[[package]]
+name = "alcyon-rt"
+version = "0.1.0"
+dependencies = [
+ "alcyon-alloc",
+ "alcyon-config",
+ "alcyon-dns",
+ "alcyon-mmsg",
+ "alcyon-proto",
+ "alcyon-quic",
+ "alcyon-regex",
+ "alcyon-sample",
+ "alcyon-sched",
+ "alcyon-stick-table",
+ "alcyon-tls",
+ "ctrlc",
+ "memchr",
+ "nix",
+ "quinn-proto",
+ "rcgen",
+ "rustix 0.38.44",
+ "rustls 0.23.45",
+ "rustls 0.24.0-dev.2",
+ "rustls-ring",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "tempfile",
+]
+
+[[package]]
+name = "alcyon-sample"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "aes-gcm",
+ "alcyon-alloc",
+ "alcyon-crypt",
+ "alcyon-proto",
+ "alcyon-regex",
+ "alcyon-tls",
+ "cbc",
+ "ctr",
+ "getrandom 0.2.17",
+ "ghash",
+ "memchr",
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "alcyon-sched"
+version = "0.1.0"
+dependencies = [
+ "alcyon-alloc",
+ "ebtree",
+ "proptest",
+]
+
+[[package]]
+name = "alcyon-stick-table"
+version = "0.1.0"
+dependencies = [
+ "ebtree",
+ "proptest",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
+name = "alcyon-tls"
+version = "0.1.0"
+dependencies = [
+ "alcyon-alloc",
+ "alcyon-config",
+ "alcyon-crypt",
+ "alcyon-proto",
+ "alcyon-sched",
+ "ebtree",
+ "rcgen",
+ "rustix 0.38.44",
+ "rustls 0.23.45",
+ "rustls 0.24.0-dev.2",
+ "rustls-pemfile",
+ "rustls-ring",
+ "rustls-ringalcyon",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -575,190 +759,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ibex-alloc"
-version = "0.1.0"
-dependencies = [
- "rustix 0.38.44",
- "zeroize",
-]
-
-[[package]]
-name = "ibex-config"
-version = "0.1.0"
-dependencies = [
- "ibex-crypt",
- "ibex-regex",
- "nix",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "ibex-crypt"
-version = "0.1.0"
-dependencies = [
- "bcrypt",
- "md-5",
- "sha-crypt",
- "subtle",
-]
-
-[[package]]
-name = "ibex-dns"
-version = "0.1.0"
-dependencies = [
- "hickory-proto",
- "thiserror 1.0.69",
- "tracing",
-]
-
-[[package]]
-name = "ibex-h1-sys"
-version = "0.1.0"
-dependencies = [
- "cc",
- "libc",
-]
-
-[[package]]
-name = "ibex-mmsg"
-version = "0.1.0"
-dependencies = [
- "libc",
-]
-
-[[package]]
-name = "ibex-proto"
-version = "0.1.0"
-dependencies = [
- "ibex-alloc",
- "ibex-h1-sys",
- "ibex-regex",
- "ibex-sample",
- "ibex-sched",
- "memchr",
- "proptest",
- "quinn-proto",
- "rustls 0.23.45",
-]
-
-[[package]]
-name = "ibex-quic"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "ibex-alloc",
- "ibex-config",
- "ibex-tls",
- "quinn-proto",
- "rcgen",
- "rustix 0.38.44",
- "rustls 0.23.45",
- "rustls 0.24.0-dev.2",
- "rustls-pemfile",
- "thiserror 1.0.69",
- "zeroize",
-]
-
-[[package]]
-name = "ibex-regex"
-version = "0.1.0"
-dependencies = [
- "fancy-regex",
- "regex",
-]
-
-[[package]]
-name = "ibex-rt"
-version = "0.1.0"
-dependencies = [
- "ctrlc",
- "ibex-alloc",
- "ibex-config",
- "ibex-dns",
- "ibex-mmsg",
- "ibex-proto",
- "ibex-quic",
- "ibex-regex",
- "ibex-sample",
- "ibex-sched",
- "ibex-stick-table",
- "ibex-tls",
- "memchr",
- "nix",
- "quinn-proto",
- "rcgen",
- "rustix 0.38.44",
- "rustls 0.23.45",
- "rustls 0.24.0-dev.2",
- "rustls-ring",
- "serde",
- "serde_json",
- "signal-hook",
- "tempfile",
-]
-
-[[package]]
-name = "ibex-sample"
-version = "0.1.0"
-dependencies = [
- "aes",
- "aes-gcm",
- "cbc",
- "ctr",
- "getrandom 0.2.17",
- "ghash",
- "ibex-alloc",
- "ibex-crypt",
- "ibex-proto",
- "ibex-regex",
- "ibex-tls",
- "memchr",
- "proptest",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "ibex-sched"
-version = "0.1.0"
-dependencies = [
- "ebtree",
- "ibex-alloc",
- "proptest",
-]
-
-[[package]]
-name = "ibex-stick-table"
-version = "0.1.0"
-dependencies = [
- "ebtree",
- "proptest",
- "thiserror 1.0.69",
- "tracing",
-]
-
-[[package]]
-name = "ibex-tls"
-version = "0.1.0"
-dependencies = [
- "ebtree",
- "ibex-alloc",
- "ibex-config",
- "ibex-crypt",
- "ibex-proto",
- "ibex-sched",
- "rcgen",
- "rustix 0.38.44",
- "rustls 0.23.45",
- "rustls 0.24.0-dev.2",
- "rustls-pemfile",
- "rustls-ring",
- "rustls-ringibex",
- "tempfile",
- "tracing",
-]
-
-[[package]]
 name = "icu_collections"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1130,9 +1130,9 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 name = "quinn-proto"
 version = "0.11.18"
 dependencies = [
+ "alcyon-alloc",
  "bytes",
  "getrandom 0.4.3",
- "ibex-alloc",
  "lru-slab",
  "rand 0.10.3",
  "rand_pcg",
@@ -1289,7 +1289,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ringibex"
+name = "ringalcyon"
 version = "0.17.14"
 dependencies = [
  "cc",
@@ -1392,10 +1392,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-ringibex"
+name = "rustls-ringalcyon"
 version = "0.24.0-dev.2"
 dependencies = [
- "ringibex",
+ "ringalcyon",
  "rustls 0.24.0-dev.2",
  "rustls-pki-types",
  "subtle",

@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-# VV-20: a cross-site GET /st?b=app&s=s1&action=maint puts s1 into MAINT (Ibex-only admin query API,
+# VV-20: a cross-site GET /st?b=app&s=s1&action=maint puts s1 into MAINT (Alcyon-only admin query API,
 # no same-origin check). HAProxy has no GET admin action: s1 stays as it is.
 # vv20.sh BIN [PORT]   prints the GET's status and s1's status from ;csv, per Origin/Referer variant.
 B=$1; P=${2:-19970}; D=$(mktemp -d /tmp/vv-20.XXXXXX)

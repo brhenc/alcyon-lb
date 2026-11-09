@@ -9,7 +9,7 @@ keep-alive, pooled). Rounds 0-1 normal; in round 2 the slow backend is SIGKILLed
 default 20) ms after the round starts and restarted at once; round 3 checks the connection is still
 usable. Fixed behaviour (T324, as HAProxy): the GETs in flight get RST_STREAM(REFUSED_STREAM, code 7),
 the uploads and the connection go on. At 20 ms HAProxy's GETs can still miss the dead connection
-(all 200); at 60 ms they are in flight on HAProxy and already answered on Ibex.
+(all 200); at 60 ms they are in flight on HAProxy and already answered on Alcyon.
 """
 import os, subprocess, sys, threading, time
 PORT, BIGLOG, SLOW, CONNS = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])

@@ -3,9 +3,9 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 """VV-22: `timeout client` fires while the proxy is still connecting to the server.
 
-vv22.py IBEX [HAPROXY]
+vv22.py ALCYON [HAPROXY]
 The server 10.9.9.9 is unreachable (connects time out). One GET per case; prints the status, the time it
-took, and the log line. HAProxy waits for the connect retries and answers 503 `sC--`. Ibex answers
+took, and the log line. HAProxy waits for the connect retries and answers 503 `sC--`. Alcyon answers
 400 `cH--` at `timeout client` whenever timeout connect x (retries + 1) > timeout client.
 Port 19970, slow backend (2 s) on 127.0.0.1:19972."""
 import socket, subprocess, sys, tempfile, threading, time
@@ -42,7 +42,7 @@ d = tempfile.mkdtemp(prefix="vv22-")
 for name, conf in CASES:
     f = d + "/c.cfg"; open(f, "w").write(conf)
     print(name)
-    for tag, b in (("ibex", IB), ("haproxy", HA)):
+    for tag, b in (("alcyon", IB), ("haproxy", HA)):
         p = subprocess.Popen(["taskset", "-c", "48-51", b, "-f", f], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         time.sleep(0.4)
         t = time.time()

@@ -183,7 +183,7 @@ pub struct Connection {
     /// 1-RTT keys used prior to a key update
     prev_crypto: Option<PrevCrypto>,
     /// Emptied `Retransmits` boxes of acknowledged or lost packets, for the next packets'
-    /// control frames (Ibex T543)
+    /// control frames (Alcyon T543)
     spare_retransmits: RetransmitsSpares,
     /// 1-RTT keys to be used for the next key update
     ///

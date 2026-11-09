@@ -4,8 +4,8 @@
 //! parser and whether the server has closed; the rest is what it sent. LDAP and MySQL
 //! are in `check_ldap_mysql`, apart, so that their known panics (T238) do not stop this one.
 #![no_main]
-use ibex_config::ast::ResolvedTcpExpectPattern as P;
-use ibex_rt::check_reply as cr;
+use alcyon_config::ast::ResolvedTcpExpectPattern as P;
+use alcyon_rt::check_reply as cr;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

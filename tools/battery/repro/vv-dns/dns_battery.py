@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-"""Run-time DNS resolution, Ibex vs HAProxy (rc4, T483/T484). Functional only: no timing claims.
+"""Run-time DNS resolution, Alcyon vs HAProxy (rc4, T483/T484). Functional only: no timing claims.
 
-dns_battery.py IBEX [HAPROXY] [-k name,name] [-o OUTDIR] [-p OFFSET]
+dns_battery.py ALCYON [HAPROXY] [-k name,name] [-o OUTDIR] [-p OFFSET]
 
 Each case is one config plus a timeline of zone changes. Both proxies run it in turn against the same
 scripted nameservers (vvdns.py: ns1 127.0.0.1:19953, ns2 :19954, a dead one at :19959). The battery
@@ -73,7 +73,7 @@ CASES = [
  ("start-libc-none", cfg("", "    server s1 nosuch.invalid:80 init-addr libc,none\n"), z(), [], 1.5, "", "A.t1e: RMAINT forever"),
  ("start-init-ip", cfg("", "    server s1 nosuch.invalid:80 init-addr 10.9.9.9\n"), z(), [], 1.5, "", ""),
  ("start-init-last", cfg("", "    server s1 nosuch.invalid:80 init-addr last,libc,none\n"), z(), [], 1.5, "",
-  "expected DIFF: Ibex refuses `last` until T490 (design §2.8.3)"),
+  "expected DIFF: Alcyon refuses `last` until T490 (design §2.8.3)"),
  ("start-resolvers-libc", cfg(RS, "    server s1 a1.test:80 resolvers r init-addr libc\n"), z(), [], 1.5, "", "A.t1d: fatal"),
  ("start-nameserver-dup", cfg(RS + "    nameserver ns1 127.0.0.1:%d\n" % NS2, S1), z(), [], 1.5, "", "duplicate nameserver name"),
  ("start-hold-bad", cfg(RS + "    hold nx foo\n", S1), z(), [], 1.5, "", "A.t15d"),
@@ -232,7 +232,7 @@ def run_one(binary, name, conf, zone0, timeline, secs, flags):
     z1, z2 = os.path.join(d, "ns1.json"), os.path.join(d, "ns2.json")
     write_zone(z1, zone0)
     write_zone(z2, z() if "ns2delay" not in flags else z(a1_test=dict(A1, delay=0.3)))
-    tag = "ibex" if binary == IB else "haproxy"
+    tag = "alcyon" if binary == IB else "haproxy"
     l1, l2 = os.path.join(d, tag + ".ns1.log"), os.path.join(d, tag + ".ns2.log")
     for p in (l1, l2, SOCK):
         if os.path.exists(p):
@@ -299,15 +299,15 @@ def main():
     for name, conf, zone0, tl, secs, flags, note in CASES:
         if only and name not in only:
             continue
-        r = {tag: run_one(b, name, conf, zone0, tl, secs, flags) for tag, b in (("ibex", IB), ("haproxy", HA))}
+        r = {tag: run_one(b, name, conf, zone0, tl, secs, flags) for tag, b in (("alcyon", IB), ("haproxy", HA))}
         json.dump(r, open(os.path.join(out, name, "result.json"), "w"), indent=1)
-        a, h = r["ibex"], r["haproxy"]
+        a, h = r["alcyon"], r["haproxy"]
         seq = lambda x: [s for _, s in x["states"]]
         ok = (a["start"] == h["start"] and seq(a) == seq(h) and sorted(a["log"]) == sorted(h["log"])
               and a["http"] == h["http"] and a["alive"])
         same += ok; diff += not ok
         print("%s %s%s" % ("SAME" if ok else "DIFF", name, ("   (" + note + ")") if note else ""))
-        for tag in ("ibex", "haproxy"):
+        for tag in ("alcyon", "haproxy"):
             x = r[tag]
             print("   %-7s %s%s" % (tag, x["start"], "" if x["alive"] else "   ** NOT ALIVE at end, exit %s **" % x["exit"]))
         if a["start"] != "started" and h["start"] != "started":
@@ -324,16 +324,16 @@ def main():
                 flag = "   <-- t"
             elif not sa or not sh:
                 flag = "   <--"
-            print("   state  ibex %-46s haproxy %s%s" % (fmt(sa), fmt(sh), flag))
-        for tag in ("ibex", "haproxy"):
+            print("   state  alcyon %-46s haproxy %s%s" % (fmt(sa), fmt(sh), flag))
+        for tag in ("alcyon", "haproxy"):
             print("   dns    %-7s %s" % (tag, r[tag]["dns"]))
         if a["http"] or h["http"]:
-            print("   http   ibex    %s" % a["http"]); print("   http   haproxy %s" % h["http"])
+            print("   http   alcyon    %s" % a["http"]); print("   http   haproxy %s" % h["http"])
         la, lh = set(a["log"]), set(h["log"])
         for l in sorted(lh - la):
             print("   log    haproxy only: %s" % l[:200])
         for l in sorted(la - lh):
-            print("   log    ibex only:    %s" % l[:200])
+            print("   log    alcyon only:    %s" % l[:200])
     print("same %d, diff %d" % (same, diff))
 
 main()

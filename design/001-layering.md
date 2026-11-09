@@ -4,7 +4,7 @@ Reference: `/home/bhenc/reference/haproxy` @ `e6f616af` (3.5-dev7).
 
 HAProxy has five layers, and the discipline that makes it extensible is that
 **each layer is a vtable, and the layers above and below never learn each other's
-concrete types.** Ibex keeps this exactly; in Rust each vtable becomes a trait, and each
+concrete types.** Alcyon keeps this exactly; in Rust each vtable becomes a trait, and each
 `void *` context becomes an associated type, which removes an entire class of
 "wrong context for this vtable" bug that C cannot express away.
 
@@ -75,7 +75,7 @@ The stream cannot tell the difference and does not try. This is what makes the f
 all work through one code path: H1, H2, FCGI, the stats page, the CLI, the cache, the
 peers protocol, and DNS.
 
-**Consequence for Ibex:** implement `sedesc` early and the runtime socket + stats page
+**Consequence for Alcyon:** implement `sedesc` early and the runtime socket + stats page
 cost almost nothing extra — they become applets behind the same interface as a real
 backend, and they inherit ACLs, timeouts, logging, and TLS for free. Verified: every one
 of these is a `struct applet` in mainline —
@@ -92,9 +92,9 @@ of these is a `struct applet` in mainline —
 
 ---
 
-## 4. Translation notes for Ibex
+## 4. Translation notes for Alcyon
 
-| HAProxy | Ibex |
+| HAProxy | Alcyon |
 |---|---|
 | `const struct protocol *ctrl` + `void *ctx` | `Box<dyn Protocol>` |
 | `const struct xprt_ops *xprt` + `void *xprt_ctx` | `trait Transport { type Ctx; }` |

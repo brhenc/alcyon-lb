@@ -67,14 +67,14 @@ class Unreached(unittest.TestCase):
 # data/suite_baseline.json on main before T260 (94cc644), and what each entry is now. The
 # table is the migration: every old entry is here, and every entry here is in the baseline.
 OLD_TO_NEW = {
-    "ibex-dns/resolver_behavior::test_retry_and_failover":
-        "ibex-dns/it::resolver_behavior::test_retry_and_failover",
-    "ibex-rt/request_allocations::sixty_thousand_backends_with_checks_memory_bounded":
-        "ibex-rt/request_allocations::sixty_thousand_backends_with_checks_memory_bounded",
-    "ibex-rt/h3_end_to_end::curl_http3_is_proxied_to_a_backend":
-        "ibex-rt/it::h3_end_to_end::curl_http3_is_proxied_to_a_backend",
-    "ibex-rt/lib::proxy::tests::an_h2_body_left_when_the_passes_run_out_runs_the_session_again":
-        "ibex-rt/lib::proxy::tests::an_h2_body_left_when_the_passes_run_out_runs_the_session_again",
+    "alcyon-dns/resolver_behavior::test_retry_and_failover":
+        "alcyon-dns/it::resolver_behavior::test_retry_and_failover",
+    "alcyon-rt/request_allocations::sixty_thousand_backends_with_checks_memory_bounded":
+        "alcyon-rt/request_allocations::sixty_thousand_backends_with_checks_memory_bounded",
+    "alcyon-rt/h3_end_to_end::curl_http3_is_proxied_to_a_backend":
+        "alcyon-rt/it::h3_end_to_end::curl_http3_is_proxied_to_a_backend",
+    "alcyon-rt/lib::proxy::tests::an_h2_body_left_when_the_passes_run_out_runs_the_session_again":
+        "alcyon-rt/lib::proxy::tests::an_h2_body_left_when_the_passes_run_out_runs_the_session_again",
 }
 
 
@@ -100,8 +100,8 @@ class BaselineNames(unittest.TestCase):
             self.assertIsNotNone(layout.resolve_key(key), f"{key} names no test in the sources")
 
     def test_resolve_refuses_a_name_in_the_old_layout(self):
-        self.assertIsNone(layout.resolve_key("ibex-rt/h3_end_to_end::curl_http3_is_proxied_to_a_backend"))
-        self.assertIsNone(layout.resolve_key("ibex-rt/it::h3_end_to_end::no_such_test"))
+        self.assertIsNone(layout.resolve_key("alcyon-rt/h3_end_to_end::curl_http3_is_proxied_to_a_backend"))
+        self.assertIsNone(layout.resolve_key("alcyon-rt/it::h3_end_to_end::no_such_test"))
 
     def test_every_serial_entry_names_a_target_or_module(self):
         import suite

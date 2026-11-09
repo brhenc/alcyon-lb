@@ -42,8 +42,8 @@ PERF_LAUNCH_CPUS = "16-31"  # perf/sudo themselves run away from node0
 
 
 def binaries():
-    bins = {"cand": TARGET / "release" / "ibex"}
-    for p in (TARGET / "measure-ref").glob("ibex-*"):
+    bins = {"cand": TARGET / "release" / "alcyon"}
+    for p in (TARGET / "measure-ref").glob("alcyon-*"):
         bins[p.name[5:13]] = p
     if EXTRA_BINS.is_dir():
         for p in EXTRA_BINS.iterdir():

@@ -12,14 +12,14 @@ every stage's last attempt on that tree.
 The tree is the key, and nothing from another key is ever reused:
   - the commit, and a clean worktree (`git status --porcelain` empty apart from the files
     the gate itself writes, GATE_WRITES). A dirty tree gets no key: nothing is reusable.
-  - the env that changes a verdict: COVERCHECK, IBEX_GATE_SKIP_MEASURE, and the base
-    covercheck judges against (IBEX_COVERCHECK_BASE, or the default that follows the
+  - the env that changes a verdict: COVERCHECK, ALCYON_GATE_SKIP_MEASURE, and the base
+    covercheck judges against (ALCYON_COVERCHECK_BASE, or the default that follows the
     branch: the same commit judged against a base that moved is another verdict).
 
 Every attempt is kept, so a stage that failed and then passed is shown as such in the
 verdict ("PASS on attempt 2; attempt 1 FAIL ..."): a flake is reported, not laundered.
 
-State: $IBEX_GATE_STATE (default ~/.cache/ibex/gate-state)/<key>.json, the log excerpts
+State: $ALCYON_GATE_STATE (default ~/.cache/alcyon/gate-state)/<key>.json, the log excerpts
 under <key>/. Shared by every worktree: two worktrees on the same clean commit are the
 same tree.
 """
@@ -43,7 +43,7 @@ REPO = os.path.dirname(HERE)
 GATE_WRITES = {"data/measurements.jsonl"}
 
 # Dependencies between stages that are not cargo's business (cargo rebuilds what a stage
-# needs on its own: smoke's `cargo build --bin ibex` builds ibex when the target does not
+# needs on its own: smoke's `cargo build --bin alcyon` builds alcyon when the target does not
 # hold one from this tree). The one that is not: covercheck reads the profiles the suite's
 # instrumented run left in the instrumented target (T257). Run alone, it reuses them only
 # when PROFILES_MARK says the suite wrote them for this key and suite-run.json is still the
@@ -51,7 +51,7 @@ GATE_WRITES = {"data/measurements.jsonl"}
 DEPS = {"covercheck": "suite"}
 # T608: stages carried from the parent's full gate when the diff is only crates/*/tests/**.
 # Each one runs no file under crates/*/tests/ (checked by reading it): smoke runs the built
-# ibex on reg-test configs, diff-fuzz the built ibex against HAProxy, surface prints counts.
+# alcyon on reg-test configs, diff-fuzz the built alcyon against HAProxy, surface prints counts.
 # Not carried, whatever the diff: tripwire (hashes protected tests), suite, covercheck, oracles,
 # findings, haproxy (these run cargo test), lint (--all-targets compiles tests), harness-tests,
 # measure, stray.
@@ -66,7 +66,7 @@ DETAIL_RE = re.compile(r"FAIL|NO test|panicked|hung|flaky|error|fails alone|regr
 
 
 def state_dir() -> str:
-    return os.environ.get("IBEX_GATE_STATE") or os.path.expanduser("~/.cache/ibex/gate-state")
+    return os.environ.get("ALCYON_GATE_STATE") or os.path.expanduser("~/.cache/alcyon/gate-state")
 
 
 def _git(repo: str, *args: str) -> subprocess.CompletedProcess:
@@ -95,12 +95,12 @@ def tree_key(repo: str = REPO, env: dict | None = None,
     ident = {
         "commit": head,
         "COVERCHECK": env.get("COVERCHECK") or "1",
-        "IBEX_GATE_SKIP_MEASURE": env.get("IBEX_GATE_SKIP_MEASURE") or "",
+        "ALCYON_GATE_SKIP_MEASURE": env.get("ALCYON_GATE_SKIP_MEASURE") or "",
         "covercheck_base": base,
     }
     key = hashlib.sha256(json.dumps(ident, sort_keys=True).encode()).hexdigest()[:16]
     desc = (f"commit {head[:12]}, covercheck base {base[:12]}, COVERCHECK={ident['COVERCHECK']}"
-            f", IBEX_GATE_SKIP_MEASURE={ident['IBEX_GATE_SKIP_MEASURE'] or 'unset'}")
+            f", ALCYON_GATE_SKIP_MEASURE={ident['ALCYON_GATE_SKIP_MEASURE'] or 'unset'}")
     return key, desc
 
 

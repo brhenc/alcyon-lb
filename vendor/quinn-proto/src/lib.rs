@@ -42,8 +42,8 @@ mod bloom_token_log;
 #[cfg(feature = "bloom")]
 pub use bloom_token_log::BloomTokenLog;
 
-#[cfg(feature = "ibex-pools")]
-mod ibex_pools;
+#[cfg(feature = "alcyon-pools")]
+mod alcyon_pools;
 
 mod connection;
 pub use crate::connection::{

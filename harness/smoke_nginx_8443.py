@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 """
-Smoke test verifying that Project Ibex starts with a reference configuration,
+Smoke test verifying that Project Alcyon starts with a reference configuration,
 terminates TLS on https://localhost:8443/, and proxies requests to an upstream
 Nginx process, verified with curl.
 """
@@ -20,7 +20,7 @@ import time
 CERT_PEM = "examples/certs/localhost.pem"
 CONFIG_FILE = "examples/reference_nginx_8443.cfg"
 # The binary `cargo build` writes: CARGO_TARGET_DIR when it is set (T109).
-IBEX_BIN = os.path.join(os.environ.get("CARGO_TARGET_DIR") or "target", "debug", "ibex")
+ALCYON_BIN = os.path.join(os.environ.get("CARGO_TARGET_DIR") or "target", "debug", "alcyon")
 
 class MockNginxHandler(http.server.BaseHTTPRequestHandler):
     def version_string(self):
@@ -32,8 +32,8 @@ class MockNginxHandler(http.server.BaseHTTPRequestHandler):
             b"<html>\n"
             b"<head><title>Welcome to nginx!</title></head>\n"
             b"<body>\n"
-            b"<h1>Welcome to nginx proxied by Ibex!</h1>\n"
-            b"<p>If you see this page, the Ibex TLS reverse proxy successfully\n"
+            b"<h1>Welcome to nginx proxied by Alcyon!</h1>\n"
+            b"<p>If you see this page, the Alcyon TLS reverse proxy successfully\n"
             b"terminated HTTPS and proxied to this upstream Nginx process.</p>\n"
             b"</body>\n"
             b"</html>\n"
@@ -60,10 +60,10 @@ def wait_for_port(port, timeout=5.0):
     return False
 
 def main():
-    # 1. Build ibex if needed
-    if not os.path.exists(IBEX_BIN):
-        print("[smoke] Building ibex binary...")
-        subprocess.check_call(["cargo", "build", "--bin", "ibex"])
+    # 1. Build alcyon if needed
+    if not os.path.exists(ALCYON_BIN):
+        print("[smoke] Building alcyon binary...")
+        subprocess.check_call(["cargo", "build", "--bin", "alcyon"])
 
     # 2. Check cert
     if not os.path.exists(CERT_PEM):
@@ -76,20 +76,20 @@ def main():
     nginx_thread.start()
     print("[smoke] Upstream Nginx process listening on 127.0.0.1:8080")
 
-    # 4. Start Ibex daemon on port 8443
-    print(f"[smoke] Starting Ibex daemon with config {CONFIG_FILE}...")
-    ibex_proc = subprocess.Popen(
-        [IBEX_BIN, "-f", CONFIG_FILE],
+    # 4. Start Alcyon daemon on port 8443
+    print(f"[smoke] Starting Alcyon daemon with config {CONFIG_FILE}...")
+    alcyon_proc = subprocess.Popen(
+        [ALCYON_BIN, "-f", CONFIG_FILE],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
 
     try:
         if not wait_for_port(8443, timeout=5.0):
-            stdout, stderr = ibex_proc.communicate(timeout=1)
-            sys.exit(f"Error: Ibex failed to listen on port 8443.\nstderr: {stderr.decode()}")
+            stdout, stderr = alcyon_proc.communicate(timeout=1)
+            sys.exit(f"Error: Alcyon failed to listen on port 8443.\nstderr: {stderr.decode()}")
 
-        print("[smoke] Ibex is listening on https://localhost:8443/ (TLS terminated)")
+        print("[smoke] Alcyon is listening on https://localhost:8443/ (TLS terminated)")
 
         # 5. Execute curl
         curl_cmd = [
@@ -120,20 +120,20 @@ def main():
         assert curl_res.returncode == 0, f"curl exited with non-zero status {curl_res.returncode}"
         assert "200 OK" in stderr or "200 OK" in stdout, "Expected HTTP 200 OK"
         assert "Server: nginx/1.24.0" in stderr or "server: nginx/1.24.0" in stderr, "Expected Server: nginx header"
-        assert "Welcome to nginx proxied by Ibex!" in stdout, "Expected Nginx welcome body"
+        assert "Welcome to nginx proxied by Alcyon!" in stdout, "Expected Nginx welcome body"
         assert "TLSv1.3" in stderr or "SSL connection using TLSv1.3" in stderr, "Expected TLS 1.3 negotiated"
 
         print(">>> SMOKE TEST PASSED SUCCESSFULLY! <<<")
-        print("Ibex successfully terminated TLS on port 8443 and proxied request to Nginx backend.")
+        print("Alcyon successfully terminated TLS on port 8443 and proxied request to Nginx backend.")
         return 0
 
     finally:
         # Cleanup
-        ibex_proc.terminate()
+        alcyon_proc.terminate()
         try:
-            ibex_proc.wait(timeout=2)
+            alcyon_proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            ibex_proc.kill()
+            alcyon_proc.kill()
         httpd.shutdown()
         httpd.server_close()
 

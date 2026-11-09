@@ -1,7 +1,7 @@
-# Ibex Multi-Threaded Peers & Stick Table Replication Architecture Blueprint
+# Alcyon Multi-Threaded Peers & Stick Table Replication Architecture Blueprint
 
 **Status:** Research & Architecture Specification (Distributed Systems & Multi-Threaded Peers)  
-**Author:** Ibex Distributed Systems & Multi-Threaded Peers Protocol Researcher  
+**Author:** Alcyon Distributed Systems & Multi-Threaded Peers Protocol Researcher  
 **Safety & Concurrency Invariant:** `#![forbid(unsafe_code)]`, zero runtime allocations on hot paths (NASA JPL Rule 3), level-triggered non-blocking streaming I/O, `!Send` thread-local affinity with 256-shard lock-free inter-thread channels.
 
 ---
@@ -10,23 +10,23 @@
 
 Stick table replication is the foundational mechanism enabling cluster-wide rate limiting, distributed DDoS mitigation, global connection tracking, and stateful session stickiness across load balancers. In high-throughput cloud environments, a cluster of reverse proxies must exchange millions of stick table state mutations per second with sub-millisecond propagation latency and deterministic memory utilization.
 
-This document presents a comprehensive analysis of HAProxy 3.5's peers implementation (`src/peers.c`, `src/stick_table.c`, `include/haproxy/peers.h`) and establishes the architecture for a massively scalable, multi-threaded peers replication engine in Project Ibex.
+This document presents a comprehensive analysis of HAProxy 3.5's peers implementation (`src/peers.c`, `src/stick_table.c`, `include/haproxy/peers.h`) and establishes the architecture for a massively scalable, multi-threaded peers replication engine in Project Alcyon.
 
 ```
 +---------------------------------------------------------------------------------------------------+
-|                                     IBEX MULTI-THREADED PEERS                                     |
+|                                     ALCYON MULTI-THREADED PEERS                                     |
 +---------------------------------------------------------------------------------------------------+
 |  L7 / Stick Table Engine | 256-Shard Partitioned EbMbTree | Atomic Monotonic Update Counter (u64) |
-|  (ibex-stick-table)      | Lock-Free SPSC/MPMC RingBuffer | Zero-Isolation Snapshot Iterators     |
+|  (alcyon-stick-table)      | Lock-Free SPSC/MPMC RingBuffer | Zero-Isolation Snapshot Iterators     |
 +--------------------------+--------------------------------+---------------------------------------+
 |  Peer Sync Controller    | Multi-Core SO_REUSEPORT TCP    | Dedicated Worker Thread Engine Stream |
-|  (ibex-peers::sync)      | Credit-Based Sliding Window    | Drop-Oldest/Coalesce Backpressure SMR |
+|  (alcyon-peers::sync)      | Credit-Based Sliding Window    | Drop-Oldest/Coalesce Backpressure SMR |
 +--------------------------+--------------------------------+---------------------------------------+
 |  Wire Codec Engine       | HAProxyS 2.1 Protocol Framing  | HAProxy Varint (intencode/intdecode)  |
-|  (ibex-peers::protocol)  | 256-Slot LRU Dcache Tx/Rx      | Zero-Copy Safe Slice Parsing          |
+|  (alcyon-peers::protocol)  | 256-Slot LRU Dcache Tx/Rx      | Zero-Copy Safe Slice Parsing          |
 +--------------------------+--------------------------------+---------------------------------------+
 |  Topology & Discovery    | Deterministic Shard Hashing    | Hybrid Sharded-Mesh / Star Gateway    |
-|  (ibex-peers::cluster)   | Fast Resync Handshake State    | Anti-Entropy Exponential Backoff      |
+|  (alcyon-peers::cluster)   | Fast Resync Handshake State    | Anti-Entropy Exponential Backoff      |
 +---------------------------------------------------------------------------------------------------+
 ```
 
@@ -212,13 +212,13 @@ HAProxy batches peer updates using `tune.peers.max-updates-at-once` (default 100
 
 ---
 
-## 3. Scalable Multi-Threaded Peers Architecture for Project Ibex
+## 3. Scalable Multi-Threaded Peers Architecture for Project Alcyon
 
-Project Ibex eliminates the single-thread bottleneck by designing a fully decentralized, sharded, multi-threaded peers replication engine under strict `#![forbid(unsafe_code)]`.
+Project Alcyon eliminates the single-thread bottleneck by designing a fully decentralized, sharded, multi-threaded peers replication engine under strict `#![forbid(unsafe_code)]`.
 
 ```mermaid
 flowchart TD
-    subgraph "Ibex Multi-Threaded Peers Engine"
+    subgraph "Alcyon Multi-Threaded Peers Engine"
         subgraph "Worker Thread 0 (Core 0)"
             E0["Engine 0\n(Poller & Scheduler)"]
             S0["Stick Table Shard 0..63\n(EbMbTree + Slot Arena)"]
@@ -253,9 +253,9 @@ Rather than channeling all peer replication through a single TCP connection or s
    - Each worker thread `Engine` binds an independent `TcpListener` to the replication port using `SO_REUSEPORT`.
    - Incoming peer replication connections are distributed by the Linux kernel directly to the target core's `Poller` without inter-thread lock contention.
 2. **Multi-Channel Peer Topology**:
-   - For high-throughput peer pairs, Ibex establishes $C$ parallel TCP streams (where $C$ equals the number of worker threads or shard groups).
+   - For high-throughput peer pairs, Alcyon establishes $C$ parallel TCP streams (where $C$ equals the number of worker threads or shard groups).
    - Core $k$ on Node A connects directly to Core $k$ on Node B.
-   - Core $k$ processes both inbound frame parsing and outbound batch streaming directly inside its local `ibex-sched` quantum, maintaining strict `!Send` thread-local data structures.
+   - Core $k$ processes both inbound frame parsing and outbound batch streaming directly inside its local `alcyon-sched` quantum, maintaining strict `!Send` thread-local data structures.
 
 ### 3.2 256-Shard Partitioned Stick Table & Lock-Free Inter-Thread Channels
 
@@ -292,7 +292,7 @@ sequenceDiagram
 
 ## 4. HAProxyS 2.1 Wire Protocol Codec & Dictionary Compression
 
-Project Ibex implements full bidirectional wire compatibility with HAProxy Peers Protocol v2.1.
+Project Alcyon implements full bidirectional wire compatibility with HAProxy Peers Protocol v2.1.
 
 ### 4.1 Connection Handshake State Machine
 
@@ -504,14 +504,14 @@ To protect the server from memory exhaustion when replicating over degraded WAN 
    - `MAX_IN_FLIGHT_UPDATES` is bounded to 16,384 entries per peer channel.
    - When `in_flight >= MAX_IN_FLIGHT_UPDATES`, the sender suspends egress queueing and yields the tasklet.
 2. **Lossy Coalescing for Volatile Metrics**:
-   - If a peer becomes unresponsive (socket buffer full for $> 500\text{ms}$), Ibex enables intelligent delta coalescing:
+   - If a peer becomes unresponsive (socket buffer full for $> 500\text{ms}$), Alcyon enables intelligent delta coalescing:
      - Cumulative counters (`conn_cnt`, `http_req_cnt`, `bytes_out`) are merged into a single pending delta.
      - Ephemeral sliding rates (`conn_rate`, `http_req_rate`) drop intermediate tick samples, sending only the most recent calculated rate.
    - This ensures memory usage remains strictly $O(1)$ regardless of remote peer latency or disconnection duration.
 
 ### 5.3 Fast Resync State Machine for Node Restarts & Hot Reloads
 
-When an Ibex process starts, reloads, or reconnects after an outage, it executes a three-phase fast resync protocol without interrupting live forwarding traffic:
+When an Alcyon process starts, reloads, or reconnects after an outage, it executes a three-phase fast resync protocol without interrupting live forwarding traffic:
 
 ```
 PHASE 1: HANDSHAKE & DISCOVERY
@@ -532,14 +532,14 @@ PHASE 3: LIVE STREAMING TRANSITION
 
 ---
 
-## 6. Implementation Architecture in Project Ibex
+## 6. Implementation Architecture in Project Alcyon
 
 The multi-threaded peers architecture is organized across two crates:
 
-### 6.1 `crates/ibex-peers` Module Layout
+### 6.1 `crates/alcyon-peers` Module Layout
 
 ```
-crates/ibex-peers/
+crates/alcyon-peers/
 ├── Cargo.toml
 └── src/
     ├── lib.rs              # Crate root, feature exports, strict #![forbid(unsafe_code)]
@@ -559,15 +559,15 @@ crates/ibex-peers/
         └── listener.rs     # Per-core SO_REUSEPORT listener engine integration
 ```
 
-### 6.2 Interface Integration with `ibex-sched` and `ibex-stick-table`
+### 6.2 Interface Integration with `alcyon-sched` and `alcyon-stick-table`
 
 ```rust
-// crates/ibex-peers/src/sync/channel.rs
+// crates/alcyon-peers/src/sync/channel.rs
 
 use crate::protocol::frame::PeerMessage;
 use crate::protocol::varint::HaproxyVarint;
-use ibex_core::error::IbexResult;
-use ibex_sched::task::Task;
+use alcyon_core::error::AlcyonResult;
+use alcyon_sched::task::Task;
 use std::net::SocketAddr;
 
 pub struct PeerWorkerChannel {
@@ -596,7 +596,7 @@ impl PeerWorkerChannel {
     }
 
     /// Enqueues a shard update into the batch slab with zero heap allocations.
-    pub fn push_update(&mut self, msg: &PeerMessage) -> IbexResult<bool> {
+    pub fn push_update(&mut self, msg: &PeerMessage) -> AlcyonResult<bool> {
         if self.last_pushed - self.last_acked >= self.in_flight_limit {
             // Backpressure triggered: yield to prevent memory bloat
             return Ok(false);
@@ -610,7 +610,7 @@ impl PeerWorkerChannel {
     }
 
     /// Flushes staged batch to the non-blocking TCP socket.
-    pub fn flush_nonblocking(&mut self, stream: &mut std::net::TcpStream) -> IbexResult<usize> {
+    pub fn flush_nonblocking(&mut self, stream: &mut std::net::TcpStream) -> AlcyonResult<usize> {
         if self.tx_len == 0 {
             return Ok(0);
         }
@@ -641,10 +641,10 @@ To guarantee strict wire compatibility and high-concurrency correctness:
    - Test `HaproxyVarint` encode/decode across all integer boundary ranges ($0$, $239$, $240$, $2287$, $2288$, $264431$, $2^{32}-1$, $2^{64}-1$).
    - Verify invariant: `decode(encode(x)) == x` with 100% parity against HAProxy's C `intencode`/`intdecode`.
 2. **Differential Loopback Validation Against HAProxy 3.5**:
-   - Run HAProxy 3.5 in peer server mode (`peers mypeers; peer haproxy 127.0.0.1:10000; peer ibex 127.0.0.1:10001`).
-   - Run Ibex peer engine in client mode connecting to HAProxy.
-   - Perform 100,000 stick table increments on Ibex, verify HAProxy stick table reflects exact counters via CLI `show table`.
-   - Perform 100,000 stick table increments on HAProxy, verify Ibex stick table reflects exact counters.
+   - Run HAProxy 3.5 in peer server mode (`peers mypeers; peer haproxy 127.0.0.1:10000; peer alcyon 127.0.0.1:10001`).
+   - Run Alcyon peer engine in client mode connecting to HAProxy.
+   - Perform 100,000 stick table increments on Alcyon, verify HAProxy stick table reflects exact counters via CLI `show table`.
+   - Perform 100,000 stick table increments on HAProxy, verify Alcyon stick table reflects exact counters.
 3. **Multi-Thread Scalability & Backpressure Benchmarks**:
    - Benchmark 64-core throughput under 5,000,000 updates/sec.
    - Simulate WAN link latency (100ms delay, 1% loss) with `tc netem` to verify credit window backpressure and bounded memory consumption.

@@ -36,6 +36,6 @@ def once(kind):
 if __name__ == "__main__":
     print(m.header("m1_startup_10k"), f"backends={N}")
     m.wait_load()
-    for kind in ("ibex", "haproxy"):
+    for kind in ("alcyon", "haproxy"):
         med, rs = m.median_of(lambda: once(kind))
         m.emit(param="startup", kind=kind, backends=N, **med, runs=[r["seconds"] for r in rs])

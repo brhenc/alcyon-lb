@@ -25,7 +25,7 @@ int main(void){
     const char *hello="Hello, world!";
     static unsigned char rep[4096]; memset(rep,'A',sizeof rep);
     static unsigned char http[512];
-    strcpy((char*)http,"HTTP/1.1 200 OK\r\nServer: ibex\r\nContent-Type: text/html\r\n\r\n<html><body><h1>hi</h1></body></html>");
+    strcpy((char*)http,"HTTP/1.1 200 OK\r\nServer: alcyon\r\nContent-Type: text/html\r\n\r\n<html><body><h1>hi</h1></body></html>");
     static unsigned char inc[1024]; for(int i=0;i<1024;i++) inc[i]=i&0xff;
 
     static unsigned char b65534[65534]; memset(b65534, 'B', 65534);

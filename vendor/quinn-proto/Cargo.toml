@@ -51,9 +51,9 @@ aws-lc-rs-fips = [
     "aws-lc-rs?/fips",
 ]
 bloom = ["dep:fastbloom"]
-# Ibex P1: the per-stream objects (Send, Recv, Retransmits) come from ibex_alloc pools and show in
-# `show pools`; off, quinn keeps its own spare lists and links no Ibex code.
-ibex-pools = ["dep:ibex-alloc"]
+# Alcyon P1: the per-stream objects (Send, Recv, Retransmits) come from alcyon_alloc pools and show in
+# `show pools`; off, quinn keeps its own spare lists and links no Alcyon code.
+alcyon-pools = ["dep:alcyon-alloc"]
 default = [
     "rustls-ring",
     "log",
@@ -89,8 +89,8 @@ version = "1.0.1"
 features = ["derive"]
 optional = true
 
-[dependencies.ibex-alloc]
-path = "../../crates/ibex-alloc"
+[dependencies.alcyon-alloc]
+path = "../../crates/alcyon-alloc"
 optional = true
 
 [dependencies.aws-lc-rs]

@@ -7,9 +7,9 @@
 Run:  python3 -m unittest harness/test_vtc_quic_routing.py
 
 vtest does not speak h3, so a QUIC reg-test chains a second `haproxy` block as the QUIC client
-(`server ... quic4@...`, `ssl alpn h3`, `proto qmux`). Ibex refuses QUIC towards servers (out of
+(`server ... quic4@...`, `ssl alpn h3`, `proto qmux`). Alcyon refuses QUIC towards servers (out of
 M2 scope), so that block runs on the QUIC-enabled reference binary
-(`VTC_QUIC_CLIENT_BINARY`, default ~/reference/haproxy-quic/haproxy); the others on Ibex.
+(`VTC_QUIC_CLIENT_BINARY`, default ~/reference/haproxy-quic/haproxy); the others on Alcyon.
 """
 import asyncio
 import os
@@ -32,32 +32,32 @@ def vtc(*confs):
     return text
 
 
-def run(text, ibex, quic_client):
+def run(text, alcyon, quic_client):
     f = tempfile.NamedTemporaryFile("w", suffix=".vtc", delete=False)
     f.write(text)
     f.close()
     p = vtc_runner.VtcParser(text, f.name)
     p.parse()
-    ex = vtc_runner.VtcExecutor(p, ibex, timeout=5.0, quic_client_binary=quic_client)
+    ex = vtc_runner.VtcExecutor(p, alcyon, timeout=5.0, quic_client_binary=quic_client)
     return asyncio.run(ex.execute())
 
 
 class Routing(unittest.TestCase):
     def setUp(self):
-        self.ibex = FakeProxy("ibex")
+        self.alcyon = FakeProxy("alcyon")
         self.oracle = FakeProxy("haproxy")
-        self.addCleanup(self.ibex.tmp.cleanup)
+        self.addCleanup(self.alcyon.tmp.cleanup)
         self.addCleanup(self.oracle.tmp.cleanup)
 
     def ran(self, fp):
         return os.path.exists(fp.log + ".args")
 
-    def test_client_block_runs_on_the_oracle_the_other_on_ibex(self):
-        res = run(vtc(SERVER_BLOCK, CLIENT_BLOCK), self.ibex.path, self.oracle.path)
+    def test_client_block_runs_on_the_oracle_the_other_on_alcyon(self):
+        res = run(vtc(SERVER_BLOCK, CLIENT_BLOCK), self.alcyon.path, self.oracle.path)
         self.assertEqual(res.status, "PASS", res.error_message)
-        self.assertTrue(self.ran(self.ibex))
+        self.assertTrue(self.ran(self.alcyon))
         self.assertTrue(self.ran(self.oracle))
-        self.assertIn("bind quic4@127.0.0.1:", open(self.ibex.log + ".cfg").read())
+        self.assertIn("bind quic4@127.0.0.1:", open(self.alcyon.log + ".cfg").read())
         self.assertIn("quic4@", open(self.oracle.log + ".cfg").read())
 
     def test_ssl_alpn_h3_and_proto_qmux_on_a_server_line_need_the_client(self):
@@ -80,22 +80,22 @@ class Routing(unittest.TestCase):
         self.assertEqual(vtc_runner.quic_roles("# server s quic4@1.2.3.4:5\nbackend b\n"), (False, False))
 
     def test_without_a_client_block_the_oracle_is_not_needed(self):
-        res = run(vtc(SERVER_BLOCK), self.ibex.path, None)
+        res = run(vtc(SERVER_BLOCK), self.alcyon.path, None)
         self.assertEqual(res.status, "PASS", res.error_message)
         self.assertFalse(self.ran(self.oracle))
 
     def test_a_missing_client_binary_is_refused_by_name(self):
         for missing in (None, "/nonexistent/haproxy"):
-            res = run(vtc(SERVER_BLOCK, CLIENT_BLOCK), self.ibex.path, missing)
+            res = run(vtc(SERVER_BLOCK, CLIENT_BLOCK), self.alcyon.path, missing)
             self.assertEqual(res.status, "FAIL")
             self.assertIn("VTC_QUIC_CLIENT_BINARY", res.error_message or "")
-        self.assertFalse(self.ran(self.ibex))
+        self.assertFalse(self.ran(self.alcyon))
 
     def test_one_block_that_serves_quic_and_needs_the_client_is_out_of_scope(self):
-        res = run(vtc(SERVER_BLOCK + CLIENT_BLOCK), self.ibex.path, self.oracle.path)
+        res = run(vtc(SERVER_BLOCK + CLIENT_BLOCK), self.alcyon.path, self.oracle.path)
         self.assertEqual(res.status, "OUT_OF_SCOPE")
         self.assertIn("QUIC client", res.error_message or "")
-        self.assertFalse(self.ran(self.ibex))
+        self.assertFalse(self.ran(self.alcyon))
         self.assertFalse(self.ran(self.oracle))
 
     def test_force_features_runs_a_test_whose_feature_cmd_fails(self):
@@ -106,11 +106,11 @@ class Routing(unittest.TestCase):
         for force, want in ((False, "SKIP"), (True, "PASS")):
             p = vtc_runner.VtcParser(text, f.name)
             p.parse()
-            ex = vtc_runner.VtcExecutor(p, self.ibex.path, timeout=5.0, force_features=force)
+            ex = vtc_runner.VtcExecutor(p, self.alcyon.path, timeout=5.0, force_features=force)
             self.assertEqual(asyncio.run(ex.execute()).status, want)
 
     def test_a_plain_test_never_looks_at_the_client_binary(self):
-        res = run(vtc("frontend f\n  bind fd@1\n"), self.ibex.path, None)
+        res = run(vtc("frontend f\n  bind fd@1\n"), self.alcyon.path, None)
         self.assertEqual(res.status, "PASS", res.error_message)
 
 

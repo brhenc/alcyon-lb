@@ -3,7 +3,7 @@
 A standalone tool outside the workspace that measures proxy performance without modifying the core daemon.
 
 ## What it measures
-- **steady-state allocations per request**: Counts the number of allocations (and bytes) per request using `ibex-alloc`'s pattern with a backtrace-capturing `GlobalAlloc`.
+- **steady-state allocations per request**: Counts the number of allocations (and bytes) per request using `alcyon-alloc`'s pattern with a backtrace-capturing `GlobalAlloc`.
 - **bytes allocated per request**
 - **requests/second, 1 connection, keep-alive**: Throughput over a single HTTP keep-alive connection.
 - **requests/second, 50 concurrent connections**: Throughput using 50 concurrent threads driving the proxy.

@@ -1,6 +1,6 @@
 # Livepatch Cost
 
-This document measures the cost of livepatchability on Ibex.
+This document measures the cost of livepatchability on Alcyon.
 
 ## 1. The Stage-Boundary Survival Check
 
@@ -37,8 +37,8 @@ Pillar 2 requires 16-byte alignment and frame pointers. This check verifies that
 
 | Binary | 16-byte aligned symbols |
 |---|---:|
-| `target/release/ibex` | 98.05% |
-| `target/livepatch/ibex` | 99.92% |
+| `target/release/alcyon` | 98.05% |
+| `target/livepatch/alcyon` | 99.92% |
 
 ## 3. The True Cost of Livepatch Flags
 
@@ -46,10 +46,10 @@ To isolate the cost of livepatching, we define two builds that differ **only** b
 
 ```bash
 # Baseline release build
-CARGO_TARGET_DIR=/tmp/ibex-release cargo build --release
+CARGO_TARGET_DIR=/tmp/alcyon-release cargo build --release
 
 # Livepatch build (inherits release, adds flags)
-CARGO_TARGET_DIR=/tmp/ibex-livepatch cargo build --profile livepatch
+CARGO_TARGET_DIR=/tmp/alcyon-livepatch cargo build --profile livepatch
 ```
 
 Cargo profile:
@@ -79,7 +79,7 @@ As shown above, the massive drop in FUNC symbols and binary size, along with the
 
 Throughput measured on loopback. The load generator was fixed (disabling Nagle's algorithm via TCP_NODELAY) and validated against HAProxy:
 
-| Setup | HAProxy | Ibex (Release) | Ibex (Livepatch) | Cost |
+| Setup | HAProxy | Alcyon (Release) | Alcyon (Livepatch) | Cost |
 |---|---:|---:|---:|---:|
 | 1 connection | ~9.4k req/s | ~13.1k req/s | ~13.8k req/s | None |
 | 50 connections | ~267k req/s | ~33.3k req/s | ~33.7k req/s | None |

@@ -75,7 +75,7 @@ def main():
         env["CARGO_INCREMENTAL"] = "0"
         
         print("=> Rebuilding...")
-        subprocess.run(["cargo", "build", "--bin", "ibex"], cwd=repo_root, env=env, check=True)
+        subprocess.run(["cargo", "build", "--bin", "alcyon"], cwd=repo_root, env=env, check=True)
         
         print("=> Fingerprinting reverted tree...")
         fp_rev_str = subprocess.run(fp_cmd, cwd=repo_root, capture_output=True, text=True, check=True).stdout
@@ -96,7 +96,7 @@ def main():
                     os.utime(os.path.join(repo_root, m.name), None)
             
         print("=> Rebuilding restored tree...")
-        subprocess.run(["cargo", "build", "--bin", "ibex"], cwd=repo_root, env=env, check=True)
+        subprocess.run(["cargo", "build", "--bin", "alcyon"], cwd=repo_root, env=env, check=True)
 
         print("=> Verifying restore...")
         fp_restored_str = subprocess.run(fp_cmd, cwd=repo_root, capture_output=True, text=True, check=True).stdout

@@ -8,9 +8,9 @@ edition = "2021"
 license = "GPL-2.0-or-later"
 
 [dependencies]
-ibex-rt = { path = "../../crates/ibex-rt" }
-ibex-config = { path = "../../crates/ibex-config" }
-ibex-alloc = { path = "../../crates/ibex-alloc" }
+alcyon-rt = { path = "../../crates/alcyon-rt" }
+alcyon-config = { path = "../../crates/alcyon-config" }
+alcyon-alloc = { path = "../../crates/alcyon-alloc" }
 
 [workspace]
 

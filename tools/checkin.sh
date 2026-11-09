@@ -13,7 +13,7 @@
 # Rerunning a stage (T267). A gate is 6-15 minutes, and most failed gates failed one stage:
 # a flaky test, two uncovered lines, load noise in the measurement. Each stage's result is
 # kept per tree by harness/gatestate.py: the commit, a clean worktree (data/measurements.jsonl
-# apart) and the env that changes a verdict (COVERCHECK, IBEX_GATE_SKIP_MEASURE, the
+# apart) and the env that changes a verdict (COVERCHECK, ALCYON_GATE_SKIP_MEASURE, the
 # covercheck base). A result from another tree is never reused, and a dirty tree keeps
 # nothing. The verdict is every stage's last attempt on this tree -- PASS only when each one
 # passed -- with every failed attempt before it listed: a stage that passed on a rerun is
@@ -24,9 +24,9 @@
 #                          (T257). Alone, it reuses them only when the suite wrote them for
 #                          this tree in this target (gate-tree.json beside suite-run.json);
 #                          otherwise the suite runs with it.
-#   smoke       <- ibex    `cargo build --bin ibex` first: builds it when the target does
+#   smoke       <- alcyon    `cargo build --bin alcyon` first: builds it when the target does
 #                          not hold one from this tree, a no-op when it does.
-#   measure                builds and times its own plain release ibex, in the plain target
+#   measure                builds and times its own plain release alcyon, in the plain target
 #                          and the plain env (tools/measure/run.sh refuses an instrumented one).
 #   the rest               build what they test (cargo does), or need nothing.
 #
@@ -78,7 +78,7 @@ fi
 # last few runs: past the "stuck after" mark, look at the processes rather than wait. The
 # history is per machine, not per checkout, so a fresh worktree has it too.
 GATE_T0=$SECONDS
-GATE_HISTORY=${IBEX_GATE_HISTORY:-$HOME/.cache/ibex/checkin-sections.tsv}
+GATE_HISTORY=${ALCYON_GATE_HISTORY:-$HOME/.cache/alcyon/checkin-sections.tsv}
 mkdir -p "$(dirname "$GATE_HISTORY")" 2>/dev/null || true
 # From the section's last seven runs: the median, and "stuck" at twice the longest (at
 # least a minute). Sections that never take ten seconds get no hint.
@@ -101,7 +101,7 @@ section_hint() {
 GATE_NCPU=$(nproc 2>/dev/null || echo 1)
 gate_load_pct() { awk -v n="$GATE_NCPU" '{ printf "%d", 100 * $1 / n }' /proc/loadavg 2>/dev/null || echo 0; }
 gate_load_band() { if [ "$1" -lt 15 ]; then echo quiet; elif [ "$1" -lt 40 ]; then echo busy; else echo heavy; fi; }
-gate_kind() { if [ "${IBEX_GATE_SKIP_MEASURE:-}" = 1 ]; then echo nomeasure; else echo measured; fi; }
+gate_kind() { if [ "${ALCYON_GATE_SKIP_MEASURE:-}" = 1 ]; then echo nomeasure; else echo measured; fi; }
 # whole_hint KIND BAND LOADPCT -> two lines: the estimate for BAND, and the table of all three bands
 whole_hint() {
   awk -F'\t' -v k="$1" -v b="$2" -v lp="$3" -v ncpu="$GATE_NCPU" '
@@ -147,18 +147,18 @@ if [ -z "${CARGO_TARGET_DIR:-}" ] && [ "$(git rev-parse --git-dir)" != "$(git re
   echo "         (for example CARGO_TARGET_DIR=/home/bhenc/ibex-targets/<task> ./tools/checkin.sh)" >&2
   exit 2
 fi
-export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/tmp/ibex-checkin-target}
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/tmp/alcyon-checkin-target}
 
 # One build, one run of the tests (T257). Every section below builds and runs in the
 # instrumented build `cargo llvm-cov` makes (<target>/llvm-cov-target): the suite section's
 # run judges the tests and leaves the profiles covercheck reads. The gate used to build and
 # run every test target twice, plain and then instrumented, ~4.5 minutes of a 15-minute gate
 # and a second target directory. COVERCHECK=0 keeps the quick loop: plain build, no profiles.
-# The measurement builds and times a plain release ibex: it keeps the target from before.
+# The measurement builds and times a plain release alcyon: it keeps the target from before.
 PLAIN_TARGET_DIR=$CARGO_TARGET_DIR
 if [ "${COVERCHECK:-1}" = "1" ]; then
-  if [ -n "${IBEX_CHECKIN_FAKE:-}" ]; then
-    export IBEX_INSTRUMENTED=$CARGO_TARGET_DIR/llvm-cov-target CARGO_TARGET_DIR=$CARGO_TARGET_DIR/llvm-cov-target
+  if [ -n "${ALCYON_CHECKIN_FAKE:-}" ]; then
+    export ALCYON_INSTRUMENTED=$CARGO_TARGET_DIR/llvm-cov-target CARGO_TARGET_DIR=$CARGO_TARGET_DIR/llvm-cov-target
   elif ! INSTRUMENTED_ENV=$(python3 harness/covercheck.py --print-env); then
     echo "checkin: cannot set up the instrumented build (cargo llvm-cov show-env); COVERCHECK=0 skips it" >&2
     exit 2
@@ -166,21 +166,21 @@ if [ "${COVERCHECK:-1}" = "1" ]; then
     eval "$INSTRUMENTED_ENV"
   fi
 fi
-INSTR_DIR=${IBEX_INSTRUMENTED:-}
+INSTR_DIR=${ALCYON_INSTRUMENTED:-}
 # The plain env, for the measurement: run.sh refuses an instrumented one.
-run_plain() { env -u RUSTFLAGS -u LLVM_PROFILE_FILE -u IBEX_INSTRUMENTED CARGO_TARGET_DIR="$PLAIN_TARGET_DIR" "$@"; }
+run_plain() { env -u RUSTFLAGS -u LLVM_PROFILE_FILE -u ALCYON_INSTRUMENTED CARGO_TARGET_DIR="$PLAIN_TARGET_DIR" "$@"; }
 
 # --- which tree, which stages --------------------------------------------------------------
-RUN_DIR=$(mktemp -d /tmp/ibex-checkin-run.XXXXXX)
+RUN_DIR=$(mktemp -d /tmp/alcyon-checkin-run.XXXXXX)
 FAIL_FILE=$RUN_DIR/failed
 : > "$FAIL_FILE"
 gs() { python3 harness/gatestate.py "$@"; }
 if KEY=$(gs key); then
-  echo "checkin: tree $KEY: $(git log -1 --format='%h %s' | cut -c1-70); results kept in ${IBEX_GATE_STATE:-~/.cache/ibex/gate-state}"
+  echo "checkin: tree $KEY: $(git log -1 --format='%h %s' | cut -c1-70); results kept in ${ALCYON_GATE_STATE:-~/.cache/alcyon/gate-state}"
 else
   echo "checkin: not kept, nothing reusable: $KEY"
   KEY=dirty
-  export IBEX_GATE_STATE=$RUN_DIR/state
+  export ALCYON_GATE_STATE=$RUN_DIR/state
 fi
 STAGE_LIST=$(IFS=,; echo "${STAGES[*]}")
 # T608: a child whose diff from its parent is only crates/*/tests/** carries the stages that
@@ -225,7 +225,7 @@ note_skip() { echo "$1" > "$RUN_DIR/skipped"; }
 # 2026-10-02 by the user (no agent owns them any more) so their racy port helpers could be
 # replaced; the eight findings below still run them.
 SPEC_TESTS=(
-  crates/ibex-sample/tests/sample_semantics.rs
+  crates/alcyon-sample/tests/sample_semantics.rs
 )
 
 stage_tripwire() {
@@ -267,11 +267,11 @@ stage_harness-tests() {
 }
 
 stage_findings() {
-  cargo test -p ibex-sample --test sample_semantics 2>&1 | grep -E "^test |test result"
+  cargo test -p alcyon-sample --test sample_semantics 2>&1 | grep -E "^test |test result"
   check "${PIPESTATUS[0]}" "sample_semantics"
-  cargo test -p ibex-rt --test it tcp_request_rules:: 2>&1 | grep -E "^test |test result"
+  cargo test -p alcyon-rt --test it tcp_request_rules:: 2>&1 | grep -E "^test |test result"
   check "${PIPESTATUS[0]}" "tcp_request_rules"
-  cargo test -p ibex-rt --test it tcp_request_tracking:: 2>&1 | grep -E "^test |test result"
+  cargo test -p alcyon-rt --test it tcp_request_tracking:: 2>&1 | grep -E "^test |test result"
   check "${PIPESTATUS[0]}" "tcp_request_tracking"
 }
 
@@ -288,7 +288,7 @@ stage_oracles() {
 stage_suite() {
   # The three sections above name four test targets by hand. The workspace has 77, so 73 of
   # them -- including every file a task had added -- never ran here. That is how T48 shipped
-  # crates/ibex-rt/tests/load_balancing.rs with a red assertion and a SUCCESS report, past two
+  # crates/alcyon-rt/tests/load_balancing.rs with a red assertion and a SUCCESS report, past two
   # reviewers and a green check-in: nothing ran the file, so nothing could go red. A test that
   # exists and is never run is worse than no test, because it is counted as coverage.
   #
@@ -303,7 +303,7 @@ stage_covercheck() {
   # The recurring defect is one thing wearing several hats: the test does not execute the code
   # the feature lives in. T48's test called lb::balance_uri directly and never entered the
   # engine, so `balance uri` sent every request to one server while its test passed, through
-  # two reviewers and a green check-in. T40's module was never called. T26 never measured Ibex.
+  # two reviewers and a green check-in. T40's module was never called. T26 never measured Alcyon.
   # T51's first attempt changed nothing and reported SUCCESS.
   #
   # All four are the same mechanical question. The suite section ran every test in the
@@ -324,15 +324,15 @@ stage_smoke() {
   # appears in nearly every HAProxy reg-test -- and it survived two hours because every unit
   # test stayed green. This runs in about two seconds.
   #
-  # In the instrumented build this is the ibex the suite already built (T257), not a second
+  # In the instrumented build this is the alcyon the suite already built (T257), not a second
   # plain build (~20 s and a second target directory): its verdicts
   # match the plain one's (192/529 configs, 6/6 tests on 2026-10-10; 4.6 s against 3.2 s).
   # Its profiles go to a directory of their own, removed after: the
   # smoke run is not a test, and what it executes must not count as tested.
-  # Run alone (--only smoke), this build is what makes the ibex it needs.
-  cargo build -q --bin ibex 2>/dev/null
+  # Run alone (--only smoke), this build is what makes the alcyon it needs.
+  cargo build -q --bin alcyon 2>/dev/null
   local SMOKE_PROFILES
-  SMOKE_PROFILES=$(mktemp -d /tmp/ibex-smoke-profiles.XXXXXX)
+  SMOKE_PROFILES=$(mktemp -d /tmp/alcyon-smoke-profiles.XXXXXX)
   LLVM_PROFILE_FILE="$SMOKE_PROFILES/smoke-%4m.profraw" python3 harness/smoke.py 2>&1 | grep -vE "^$"
   check "${PIPESTATUS[0]}" "smoke"
   rm -rf "$SMOKE_PROFILES"
@@ -340,20 +340,20 @@ stage_smoke() {
 
 stage_diff-fuzz() {
   # T293: the request-line / bare-LF / chunk-extension classes T291 tracks showed up only
-  # when the repaired differential harness ran real ibex against real HAProxy. This keeps it
+  # when the repaired differential harness ran real alcyon against real HAProxy. This keeps it
   # running: a time-boxed (30 s budget, plus the baseline's replay) run of fuzz/difffuzz.py.
   # It fails on a DIFF not in fuzz/known_diffs.json, on a known input whose DIFF shape
   # changed, and on a known input that became SAME (T291 fixing it: remove the printed hash).
   # Takes its own ports (18400-18423). Usually ~40 s; stuck after 3 min (the budget and the
   # replay are bounded, the section hint above learns the real numbers from the history).
-  # Run alone (--only diff-fuzz), this builds the ibex and the generator it needs.
-  # Instrumented-build profiles of the ibex it runs go to a directory of their own, removed
+  # Run alone (--only diff-fuzz), this builds the alcyon and the generator it needs.
+  # Instrumented-build profiles of the alcyon it runs go to a directory of their own, removed
   # after, like smoke's.
-  cargo build -q --bin ibex 2>/dev/null
-  cargo build -q --manifest-path fuzz/Cargo.toml --bin ibex-fuzz 2>/dev/null
+  cargo build -q --bin alcyon 2>/dev/null
+  cargo build -q --manifest-path fuzz/Cargo.toml --bin alcyon-fuzz 2>/dev/null
   local PROF
-  PROF=$(mktemp -d /tmp/ibex-difffuzz-profiles.XXXXXX)
-  LLVM_PROFILE_FILE="$PROF/difffuzz-%4m.profraw" python3 fuzz/difffuzz.py gate --base-port $((18400 + 200 * (${IBEX_GATE_SLOT:-1} - 1))) 2>&1 | grep -vE "^$"
+  PROF=$(mktemp -d /tmp/alcyon-difffuzz-profiles.XXXXXX)
+  LLVM_PROFILE_FILE="$PROF/difffuzz-%4m.profraw" python3 fuzz/difffuzz.py gate --base-port $((18400 + 200 * (${ALCYON_GATE_SLOT:-1} - 1))) 2>&1 | grep -vE "^$"
   check "${PIPESTATUS[0]}" "diff-fuzz"
   rm -rf "$PROF"
 }
@@ -377,25 +377,25 @@ stage_lint() {
   # Warnings are not judged here, only errors. fuzz/ (the differential harness against
   # HAProxy) is its own crate too and rotted the same way (HtxSlice change), so it is
   # checked as well; its target dir is the shared one, so it costs a few seconds.
-  cargo check -q --manifest-path fuzz/libfuzzer/Cargo.toml --bins > /tmp/ibex-fuzz-check.$$ 2>&1
+  cargo check -q --manifest-path fuzz/libfuzzer/Cargo.toml --bins > /tmp/alcyon-fuzz-check.$$ 2>&1
   local FUZZ_RC=$?
-  cargo check -q --manifest-path fuzz/Cargo.toml --bins >> /tmp/ibex-fuzz-check.$$ 2>&1
+  cargo check -q --manifest-path fuzz/Cargo.toml --bins >> /tmp/alcyon-fuzz-check.$$ 2>&1
   [ $? -ne 0 ] && FUZZ_RC=1
-  grep -E "^error" /tmp/ibex-fuzz-check.$$ | head -20
-  rm -f /tmp/ibex-fuzz-check.$$
+  grep -E "^error" /tmp/alcyon-fuzz-check.$$ | head -20
+  rm -f /tmp/alcyon-fuzz-check.$$
   echo "fuzz/libfuzzer + fuzz/ check exit: $FUZZ_RC"
   check "$FUZZ_RC" "fuzz targets compile"
 }
 
 stage_measure() {
-  # IBEX_GATE_SKIP_MEASURE=1 is for agents working in a worktree. With a dozen of them on
+  # ALCYON_GATE_SKIP_MEASURE=1 is for agents working in a worktree. With a dozen of them on
   # one machine the throughput samples are noise (T99's gate failed on -10% at load 24 with
   # no hot-path change, then passed unchanged), and each re-run costs the agent a whole gate.
   # The supervisor runs the full gate, measurement included, on main before a merge counts.
   # A measurement that failed on load noise alone: --only measure (in the plain env too).
-  if [ "${IBEX_GATE_SKIP_MEASURE:-}" = 1 ]; then
-    echo "skipped (IBEX_GATE_SKIP_MEASURE=1): measured on main at merge, not here"
-    note_skip "IBEX_GATE_SKIP_MEASURE=1"
+  if [ "${ALCYON_GATE_SKIP_MEASURE:-}" = 1 ]; then
+    echo "skipped (ALCYON_GATE_SKIP_MEASURE=1): measured on main at merge, not here"
+    note_skip "ALCYON_GATE_SKIP_MEASURE=1"
   else
     run_plain tools/measure/run.sh --fast
     check "$?" "continuous measurement"
@@ -418,10 +418,10 @@ stage_stray() {
 }
 
 # harness/test_gatestate.py runs this script with every stage replaced by
-# $IBEX_CHECKIN_FAKE/<id> (missing: the stage passes); not for normal use.
+# $ALCYON_CHECKIN_FAKE/<id> (missing: the stage passes); not for normal use.
 fake_stage() {
-  local f=$IBEX_CHECKIN_FAKE/$1
-  echo "$1" >> "$IBEX_CHECKIN_FAKE/ran"
+  local f=$ALCYON_CHECKIN_FAKE/$1
+  echo "$1" >> "$ALCYON_CHECKIN_FAKE/ran"
   [ -f "$f" ] || return 0
   if [ "$1" = measure ]; then run_plain bash "$f"; else bash "$f"; fi
   check "$?" "$1"
@@ -439,7 +439,7 @@ for id in "${SELECTED[@]}"; do
   n0=$(wc -l < "$FAIL_FILE")
   rm -f "$RUN_DIR/skipped"
   t0=$SECONDS
-  if [ -n "${IBEX_CHECKIN_FAKE:-}" ]; then
+  if [ -n "${ALCYON_CHECKIN_FAKE:-}" ]; then
     (fake_stage "$id") 2>&1 | tee "$RUN_DIR/$id.log"
   else
     ("stage_$id") 2>&1 | tee "$RUN_DIR/$id.log"
@@ -456,7 +456,7 @@ for id in "${SELECTED[@]}"; do
   if [ "$KEY" != dirty ] && [ "$(gs key)" != "$KEY" ]; then
     echo "checkin: the tree changed during the gate: from here on nothing is kept"
     KEY=dirty
-    export IBEX_GATE_STATE=$RUN_DIR/state
+    export ALCYON_GATE_STATE=$RUN_DIR/state
   fi
   gs record --key "$KEY" --stage "$id" --status "$status" --secs "$secs" \
     --log "$RUN_DIR/$id.log" "${fails[@]/#/--fail=}"

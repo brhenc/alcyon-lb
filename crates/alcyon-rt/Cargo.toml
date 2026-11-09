@@ -1,0 +1,191 @@
+[package]
+name = "alcyon-rt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Alcyon runtime: thread-per-core poller, listeners, and the accept path"
+autotests = false
+
+[dependencies]
+alcyon-sched = { path = "../alcyon-sched" }
+alcyon-proto = { path = "../alcyon-proto" }
+alcyon-config = { path = "../alcyon-config" }
+alcyon-sample = { path = "../alcyon-sample" }
+alcyon-tls = { path = "../alcyon-tls" }
+alcyon-alloc = { workspace = true }
+rustls24 = { workspace = true }
+rustls24-ring = { workspace = true }
+alcyon-stick-table = { path = "../alcyon-stick-table" }
+rustix = { version = "0.38", features = ["event", "net", "fs", "process", "std", "system", "time"] }
+alcyon-mmsg = { path = "../alcyon-mmsg" }
+alcyon-quic = { path = "../alcyon-quic" }
+alcyon-dns = { path = "../alcyon-dns" }
+ctrlc = "3.5.2"
+nix = { version = "0.31", default-features = false, features = ["net", "user"] }
+alcyon-regex = { workspace = true }
+signal-hook = "0.3"
+memchr = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+disallowed_macros = "deny"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[dev-dependencies]
+tempfile = "3"
+# The TLS test clients (T461: no rustls 0.23 in the binary any more).
+rustls = { workspace = true }
+# The HTTP/3 test clients: quinn's own client on rustls 0.23 (rustls 0.24.0-dev.2 has no QUIC
+# client). Dev-only: the binary's quinn-proto has no `rustls-ring` (T461).
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
+rcgen = "0.13"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# One integration-test binary (T260): tests/it/main.rs declares each test file as a module.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+# Own process: counts the test process's allocations (#[global_allocator]) and RSS
+[[test]]
+name = "backend_memory"
+path = "tests/backend_memory.rs"
+
+# Own process: counts the test process's allocations (#[global_allocator])
+[[test]]
+name = "capture_rule_allocations"
+path = "tests/capture_rule_allocations.rs"
+
+# Own process: counts the test process's buffer-sized allocations (#[global_allocator])
+[[test]]
+name = "prealloc_allocations"
+path = "tests/prealloc_allocations.rs"
+
+# Own process: lowers the test process's RLIMIT_NOFILE (other tests would get EMFILE)
+[[test]]
+name = "cli_accept_emfile"
+path = "tests/cli_accept_emfile.rs"
+
+# Own process: measures the CPU use of the test process, which every other test in a shared binary adds to
+[[test]]
+name = "cpu_measurement"
+path = "tests/cpu_measurement.rs"
+
+# Own process: sets the process-global tune.bufsize through in-process engines and asserts on it
+[[test]]
+name = "cli_applet"
+path = "tests/cli_applet.rs"
+
+# Own process: counts the test process's allocations (#[global_allocator])
+[[test]]
+name = "h2_per_request_work"
+path = "tests/h2_per_request_work.rs"
+
+# Own process: lowers the test process's RLIMIT_NOFILE for one test (other tests would get EMFILE)
+[[test]]
+name = "h3_relay_streams"
+path = "tests/h3_relay_streams.rs"
+
+# Own process: counts the test process's allocations (#[global_allocator])
+[[test]]
+name = "h2_held_streams_memory"
+path = "tests/h2_held_streams_memory.rs"
+
+# Own process: counts the test process's allocations (#[global_allocator]) and RSS
+[[test]]
+name = "idle_conn_memory"
+path = "tests/idle_conn_memory.rs"
+
+# Own process: reads the child's VmRSS and times idle periods (process-wide state)
+# Own process: asserts on the process-wide buffer counters, which any other test's buffers move
+[[test]]
+name = "buf_counters"
+path = "tests/buf_counters.rs"
+
+[[test]]
+name = "memory_baseline"
+path = "tests/memory_baseline.rs"
+
+# Own process: lowers the test process's RLIMIT_NOFILE (other tests would get EMFILE)
+[[test]]
+name = "logfwd_accept_emfile"
+path = "tests/logfwd_accept_emfile.rs"
+
+# Own process: raises the test process's RLIMIT_NOFILE, which the alcyon processes of other tests inherit (global_maxconn_default predicts maxconn from it)
+[[test]]
+name = "maxconn_limits"
+path = "tests/maxconn_limits.rs"
+
+# Own process: sets RLIMIT_CORE 0 for the test process and re-executes itself by test name
+[[test]]
+name = "panic_policy"
+path = "tests/panic_policy.rs"
+
+# Own process: installs its own #[global_allocator] (and includes src/promex.rs by path)
+[[test]]
+name = "promex"
+path = "tests/promex.rs"
+
+# Own process: counts the test process's allocations and bytes (#[global_allocator])
+[[test]]
+name = "request_allocations"
+path = "tests/request_allocations.rs"
+
+# Own process: counts allocations (#[global_allocator]); HTTP/3 through the mux (T509)
+[[test]]
+name = "request_allocations_h3"
+path = "tests/request_allocations_h3.rs"
+
+# Own process: fails large allocations on demand (#[global_allocator])
+[[test]]
+name = "session_arena_trim_oom"
+path = "tests/session_arena_trim_oom.rs"
+
+# Own process: counts the engine thread's allocations (#[global_allocator])
+[[test]]
+name = "tls_request_allocations"
+path = "tests/tls_request_allocations.rs"
+
+# Own process: counts the test process's allocations (#[global_allocator])
+[[test]]
+name = "ring_log_allocations"
+path = "tests/ring_log_allocations.rs"
+
+# Own process: runs an in-process engine with tune.bufsize 4096, which is process-global (every other in-process engine sets 16384)
+[[test]]
+name = "tcp_proxy"
+path = "tests/tcp_proxy.rs"
+
+# Own process: counts the test process's allocations (#[global_allocator]) and RSS
+[[test]]
+name = "worker_proxy_memory"
+path = "tests/worker_proxy_memory.rs"
+
+[[test]]
+name = "stats_auth_userlists"
+path = "tests/stats_auth_userlists.rs"
+
+# Own process: sets the process-global tune.alcyon.zero-buffers and reads back pooled buffers
+[[test]]
+name = "zero_buffers"
+path = "tests/zero_buffers.rs"
+
+# Own process: sets the process-wide tune.memory.hot-size and tune.alcyon.zero-buffers, and
+# installs a #[global_allocator] that sees what a freed spare string left in memory
+[[test]]
+name = "spare_strings"
+path = "tests/spare_strings.rs"
+
+# Own process: its #[global_allocator] refuses buffer-sized allocations on demand (S5)
+[[test]]
+name = "buffer_alloc_failure"
+path = "tests/buffer_alloc_failure.rs"
+
+# Own process: the counting allocator refuses the wait queue's growth (S6); needs a pristine buffer pool
+[[test]]
+name = "buffer_wait_queue_alloc"
+path = "tests/buffer_wait_queue_alloc.rs"

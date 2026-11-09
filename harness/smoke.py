@@ -18,7 +18,7 @@ are about a daemon that does not start rather than a function that returns the w
 
 This checks both in a few seconds:
 
-  parse gate   `ibex -c` over every reg-test config in the suite, comparing the number
+  parse gate   `alcyon -c` over every reg-test config in the suite, comparing the number
                that parse against a recorded baseline. A drop is a regression even when
                no test's verdict changed, because it is the leading indicator -- the
                daemon stops starting before the assertions start failing.
@@ -50,7 +50,7 @@ REGTESTS = "/home/bhenc/reference/haproxy/reg-tests/"
 BASELINE = os.path.join(REPO, "data", "board_baseline.json")
 # The binary `tools/checkin.sh` just built: it builds into CARGO_TARGET_DIR, and a fixed
 # `target/` here checked whatever stale binary happened to be there (or none, in a worktree).
-BINARY = os.path.join(os.environ.get("CARGO_TARGET_DIR") or os.path.join(REPO, "target"), "debug", "ibex")
+BINARY = os.path.join(os.environ.get("CARGO_TARGET_DIR") or os.path.join(REPO, "target"), "debug", "alcyon")
 
 
 def _vtc_files() -> list[str]:
@@ -64,7 +64,7 @@ def _configs_from(path: str) -> list[str]:
     """The `haproxy ... { ... }` config blocks in a .vtc file, preprocessed.
 
     Reuses `vtc_runner`'s own `preprocess_haproxy_config`: it strips the `.if feature(...)`
-    blocks that Ibex's parser does not understand, and expands the `${...}` macros. Writing
+    blocks that Alcyon's parser does not understand, and expands the `${...}` macros. Writing
     a second, cruder version of that here produced 0/449 configs parsing and would have
     reported a permanent false regression -- a gate that always fires is as useless as one
     that never does.
@@ -90,7 +90,7 @@ def _configs_from(path: str) -> list[str]:
             continue
         macros = {"testdir": os.path.dirname(path), "tmpdir": "/tmp"}
         # vtest names servers s1..sN and proxies h1..hN, and a config referring to an
-        # unseeded one fails on the macro rather than on anything Ibex did. Seed generously:
+        # unseeded one fails on the macro rather than on anything Alcyon did. Seed generously:
         # an unseeded macro is a false regression, which is the failure mode that makes a
         # gate get ignored.
         for i in range(1, 10):
@@ -108,7 +108,7 @@ def _configs_from(path: str) -> list[str]:
 
 
 def parse_gate() -> tuple[int, int, list[str]]:
-    """How many reg-test configs does `ibex -c` accept?"""
+    """How many reg-test configs does `alcyon -c` accept?"""
     ok = 0
     total = 0
     rejected: list[str] = []
@@ -159,7 +159,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if not os.path.exists(BINARY):
-        print(f"smoke: {BINARY} does not exist -- run `cargo build --bin ibex` first")
+        print(f"smoke: {BINARY} does not exist -- run `cargo build --bin alcyon` first")
         return 2
 
     t0 = time.monotonic()
@@ -188,7 +188,7 @@ def main() -> int:
 
     prev = base.get("configs_parsed")
     print(f"=== smoke ({elapsed:.1f}s) ===")
-    print(f"configs accepted by `ibex -c`: {ok}/{total}" +
+    print(f"configs accepted by `alcyon -c`: {ok}/{total}" +
           (f"   (baseline {prev})" if prev is not None else "   (no baseline)"))
     print(f"tests still passing:           {len(still)}/{len(expected)}")
 

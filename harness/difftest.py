@@ -3,10 +3,10 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 """
-difftest.py — Differential Proxy Test Harness for Ibex vs HAProxy 3.5 Oracle.
+difftest.py — Differential Proxy Test Harness for Alcyon vs HAProxy 3.5 Oracle.
 
 Runs scenarios against a reference proxy binary (HAProxy 3.5-dev7 by default) and
-optionally a candidate proxy binary (Ibex), capturing observable behavior and
+optionally a candidate proxy binary (Alcyon), capturing observable behavior and
 reporting parity.
 
 Python 3 standard library only.
@@ -1459,7 +1459,7 @@ def format_differential_table(comparisons: List[Tuple[ObservableRecord, Observab
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Differential Proxy Test Harness (HAProxy 3.5 vs Ibex)")
+    parser = argparse.ArgumentParser(description="Differential Proxy Test Harness (HAProxy 3.5 vs Alcyon)")
     parser.add_argument(
         "--reference",
         default="/home/bhenc/reference/haproxy/haproxy",

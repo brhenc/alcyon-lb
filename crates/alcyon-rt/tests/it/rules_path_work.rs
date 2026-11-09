@@ -1,0 +1,339 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
+//! The operations a request costs on the rules path, pinned (S7,
+//! `docs/design/memory-2026-10-24.md` §1.3 and §6). The rules are `tools/measure/scenarios/rules.body`'s
+//! (T437's: two ACLs, set/del/add-header with `%[rand]`, `set-var`, a `deny if` that does not
+//! fire, two response header rules), on keep-alive connections to a keep-alive server.
+//!
+//! Instructions per request are what the slice is measured by (`tools/measure/insreq.sh`), and
+//! they move with the poller's passes; what this pins is the work behind them, counted on the
+//! thread that runs the engine ([`alcyon_sample::work`]): how often the request head is written out
+//! of its HTX again, how often a sample context is copied, how often an expression is looked up by
+//! its text, and how often the HTX reads a block as UTF-8.
+//!
+//! Before S7 (main fcab8c91), per request: 4 rebuilds (set-header is a delete and an add, then
+//! the del-header and the add-header), 3 context copies, 2 expression lookups (`rand`, `path`),
+//! 37 UTF-8 reads of HTX blocks (in a debug build).
+
+use crate::common;
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use alcyon_rt::engine::Engine;
+use alcyon_sample::work::Op;
+
+const RULES: &str = "  acl api path_reg ^/(api|v[0-9]+)/\n  acl hosty hdr(host) -m sub local\n  \
+    http-request set-header X-Forwarded-Proto http\n  http-request del-header X-Junk\n  \
+    http-request add-header X-Id %[rand]\n  http-request set-var(txn.p) path\n  \
+    http-request deny if api !hosty\n  http-response set-header X-Served alcyon\n  \
+    http-response del-header Server\n";
+
+/// `measure-bench backend`'s answer: a `Server` header for the response rule to remove.
+const RSP: &[u8] = b"HTTP/1.1 200 OK\r\nServer: be\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+
+/// The index in [`work`]'s counts of the HTX blocks read as UTF-8 ([`alcyon_proto::htx::utf8_checks_on_this_thread`]).
+const UTF8: usize = 3;
+
+/// A keep-alive server: one answer per request head, on every connection it accepted.
+fn backend(listener: TcpListener, running: Arc<AtomicBool>) -> thread::JoinHandle<Vec<Vec<u8>>> {
+    thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking");
+        let mut conns: Vec<TcpStream> = Vec::new();
+        let mut last = Vec::new();
+        let mut buf = [0u8; 4096];
+        while running.load(Ordering::Relaxed) {
+            if let Ok((s, _)) = listener.accept() {
+                s.set_nonblocking(true).expect("nonblocking");
+                conns.push(s);
+            }
+            conns.retain_mut(|s| match s.read(&mut buf) {
+                Ok(0) => false,
+                Ok(n) => {
+                    if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                        last = buf[..n].to_vec();
+                        let _ = s.write_all(RSP);
+                    }
+                    true
+                }
+                Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+            });
+            thread::sleep(Duration::from_micros(200));
+        }
+        vec![last]
+    })
+}
+
+thread_local! {
+    /// Spare strings taken during the measured rounds of the last [`work_with`] on this thread.
+    static TAKES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// One request on `client`, the engine run until its whole response is back; the response.
+fn request(client: &mut TcpStream, engine: &mut Engine) -> String {
+    client.write_all(b"GET /api/test HTTP/1.1\r\nHost: localhost\r\nX-Junk: 1\r\n\r\n").expect("write");
+    let start = Instant::now();
+    let mut rsp = [0u8; 1024];
+    let mut len = 0;
+    while start.elapsed() < Duration::from_secs(3) && !rsp[..len].ends_with(b"\r\n\r\nok") {
+        let _ = engine.run_once();
+        if let Ok(n) = client.read(&mut rsp[len..]) {
+            len += n;
+        }
+    }
+    String::from_utf8_lossy(&rsp[..len]).into_owned()
+}
+
+/// The counts of `rounds` requests on each of `clients` keep-alive connections (in turn), after
+/// a warm-up request on each; the last response, and the last request head the server saw.
+fn work(clients: usize, rounds: usize) -> ([u64; 4], String, String) {
+    work_with(RULES, clients, rounds)
+}
+
+/// [`work`] with the frontend's `rules`.
+fn work_with(rules: &str, clients: usize, rounds: usize) -> ([u64; 4], String, String) {
+    let srv = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let srv_addr = srv.local_addr().expect("addr");
+    let fe = common::reserve_addr();
+    let running = Arc::new(AtomicBool::new(true));
+    let be = backend(srv, Arc::clone(&running));
+    let cfg = format!(
+        "global\n  tune.alcyon.h1-lowercase-headers on\ndefaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend fe\n  bind {fe}\n{rules}  default_backend be\nbackend be\n  server s1 {srv_addr}\n"
+    );
+    let mut engine = Engine::new(&alcyon_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut conns: Vec<TcpStream> = (0..clients)
+        .map(|_| {
+            let c = TcpStream::connect(fe).expect("connect");
+            c.set_nonblocking(true).expect("nonblocking");
+            c
+        })
+        .collect();
+    let mut last = String::new();
+    for c in &mut conns {
+        last = request(c, &mut engine);
+    }
+    let before = alcyon_sample::work::on_this_thread();
+    let takes_before = alcyon_sample::spare::strings_taken_on_this_thread();
+    let utf8_before = alcyon_proto::htx::utf8_checks_on_this_thread();
+    for _ in 0..rounds {
+        for c in &mut conns {
+            last = request(c, &mut engine);
+        }
+    }
+    let after = alcyon_sample::work::on_this_thread();
+    TAKES.set(alcyon_sample::spare::strings_taken_on_this_thread() - takes_before);
+    let utf8 = alcyon_proto::htx::utf8_checks_on_this_thread() - utf8_before;
+    drop(conns);
+    for _ in 0..5 {
+        let _ = engine.run_once();
+    }
+    running.store(false, Ordering::Relaxed);
+    let seen = be.join().expect("backend").pop().unwrap_or_default();
+    (std::array::from_fn(|i| if i == UTF8 { utf8 } else { after[i] - before[i] }), last, String::from_utf8_lossy(&seen).into_owned())
+}
+
+/// Per request on one keep-alive connection: what the rules cost, and what they still do.
+#[test]
+fn the_rules_scenario_costs_what_is_pinned() {
+    const N: u64 = 50;
+    let (counts, rsp, seen) = work(1, 50);
+    let per = counts.map(|c| c / N);
+    println!("[MEASUREMENT S7] per request: rebuilds {}, context copies {}, expression lookups {}, UTF-8 reads {}", per[Op::ReqRebuild as usize], per[Op::CtxClone as usize], per[Op::ExprLookup as usize], per[UTF8]);
+    // The rules did what they say.
+    assert!(rsp.starts_with("HTTP/1.1 200") && rsp.contains("x-served: alcyon") && !rsp.to_ascii_lowercase().contains("server: be"), "response: {rsp:?}");
+    let seen_lc = seen.to_ascii_lowercase();
+    assert!(seen_lc.contains("x-forwarded-proto: http\r\n") && seen_lc.contains("x-id: ") && !seen_lc.contains("x-junk"), "request the server saw: {seen:?}");
+    assert_eq!(counts[Op::ReqRebuild as usize], N, "request head rebuilds: one per rule pass");
+    assert_eq!(counts[Op::CtxClone as usize], 0, "sample context copies");
+    assert_eq!(counts[Op::ExprLookup as usize], 0, "expressions looked up by text");
+    // X2: 24 before (the copying parse and `req_htx_init` reading every header as text).
+    // R2: 14 before, the 2 ACLs' and `set-var(txn.p) path`'s samples reading the request line
+    // and the headers as text (they are bytes now).
+    assert_eq!(counts[UTF8], 4 * N, "HTX blocks read as UTF-8");
+}
+
+/// Anonymous ACLs, `%[...]` in request and response formats, response `set-var` and
+/// `set-var-fmt`, an `http-after-response` format: compiled with the proxy, none is looked up by
+/// its text per request (before S7: 8 per request).
+#[test]
+fn rule_expressions_are_not_looked_up_per_request() {
+    let rules = "  http-request set-header X-A %[req.hdr(host)] if { path_beg /api }\n  \
+        http-request set-var-fmt(txn.f) %[path]-x\n  \
+        http-response set-header X-B %[var(txn.f)] if { status 200 } !{ res.hdr(x-none) -m found }\n  \
+        http-response set-var(txn.s) status\n  \
+        http-response set-var-fmt(txn.t) s%[var(txn.s)]\n  \
+        http-after-response add-header X-C %[var(txn.t)],%[var(txn.s)] if TRUE\n";
+    let (counts, rsp, seen) = work_with(rules, 1, 20);
+    assert!(rsp.contains("x-b: /api/test-x\r\n") && rsp.contains("x-c: s200,200\r\n"), "response: {rsp:?}");
+    assert!(seen.to_ascii_lowercase().contains("x-a: localhost\r\n"), "request the server saw: {seen:?}");
+    assert_eq!(counts[Op::ExprLookup as usize], 0, "expressions looked up by text");
+}
+
+/// X7: the response rules hold the head's strings in place. R2 counted 12 spare-string takes per
+/// request on this scenario (debug build): 1 for the request's `set-var` and 2 more on the
+/// request side, 11 for the response head held as `(String, String)` pairs. X7 left 4: the pair
+/// `set-header` adds and the one a header more than the last response had makes. X3b-1: the
+/// response head is HTX blocks the rules edit in the response buffer, and takes none.
+#[test]
+fn the_response_rules_take_no_spare_strings() {
+    const N: u64 = 50;
+    let (_, rsp, _) = work(1, 50);
+    assert!(rsp.contains("x-served: alcyon") && !rsp.to_ascii_lowercase().contains("server: be"), "response: {rsp:?}");
+    let per = TAKES.get() / N;
+    println!("[MEASUREMENT X3b-1] spare strings taken per request: {per}");
+    assert_eq!(per, 0, "spare strings taken per request");
+}
+
+/// A server that answers the request heads with `responses`, whole, in turn.
+fn serve(responses: &'static [&'static [u8]]) -> (std::net::SocketAddr, Arc<AtomicBool>) {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+    l.set_nonblocking(true).expect("nonblocking");
+    let addr = l.local_addr().expect("addr");
+    let running = Arc::new(AtomicBool::new(true));
+    let run = Arc::clone(&running);
+    thread::spawn(move || {
+        let mut conns: Vec<TcpStream> = Vec::new();
+        let mut buf = [0u8; 4096];
+        let mut turn = 0;
+        while run.load(Ordering::Relaxed) {
+            if let Ok((s, _)) = l.accept() {
+                s.set_nonblocking(true).expect("nonblocking");
+                conns.push(s);
+            }
+            conns.retain_mut(|s| match s.read(&mut buf) {
+                Ok(0) => false,
+                Ok(n) => {
+                    if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                        let _ = s.write_all(responses[turn % responses.len()]);
+                        turn += 1;
+                    }
+                    true
+                }
+                Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+            });
+            thread::sleep(Duration::from_micros(200));
+        }
+    });
+    (addr, running)
+}
+
+/// `rounds` requests on one connection through `rules` to a server answering `response`;
+/// the responses.
+fn answers(rules: &str, responses: &'static [&'static [u8]], rounds: usize) -> Vec<String> {
+    let (srv, running) = serve(responses);
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend fe\n  bind {fe}\n{rules}  default_backend be\nbackend be\n  server s1 {srv}\n"
+    );
+    let mut engine = Engine::new(&alcyon_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.set_nonblocking(true).expect("nonblocking");
+    let mut out = Vec::new();
+    for _ in 0..rounds {
+        c.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("write");
+        let start = Instant::now();
+        let mut rsp = vec![0u8; 32768];
+        let mut len = 0;
+        while start.elapsed() < Duration::from_secs(3) && !rsp[..len].ends_with(b"ok") {
+            let _ = engine.run_once();
+            if let Ok(n) = c.read(&mut rsp[len..]) {
+                len += n;
+            }
+        }
+        out.push(String::from_utf8_lossy(&rsp[..len]).into_owned());
+    }
+    running.store(false, Ordering::Relaxed);
+    out
+}
+
+/// The words of the status line are the server's when the rules rewrite the head: a version that
+/// is not 1.1, a reason that is not the usual one (several words, one space between).
+#[test]
+fn the_status_line_words_survive_the_rules() {
+    let rsp = answers("  http-response set-header X-A 1\n", &[b"HTTP/1.0 200 Fine   and dandy\r\nContent-Length: 2\r\n\r\nok"], 2);
+    for r in &rsp {
+        assert!(r.starts_with("HTTP/1.0 200 Fine and dandy\r\n") && r.to_ascii_lowercase().contains("x-a: 1\r\n"), "response: {r:?}");
+    }
+}
+
+/// `set-status` with a reason: set in the string the first request made, written over by the next.
+#[test]
+fn set_status_with_a_reason_is_written_over_per_request() {
+    let rsp = answers("  http-response set-status 201 reason Made\n", &[b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"], 3);
+    for r in &rsp {
+        assert!(r.starts_with("HTTP/1.1 201 Made\r\n"), "response: {r:?}");
+    }
+}
+
+/// A head that the rules leave larger than the room beside the body that came with it is
+/// written through a `Vec`.
+#[test]
+fn a_rewritten_response_head_larger_than_the_free_room_is_written_whole() {
+    static BIG: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+    let big = BIG.get_or_init(|| {
+        let mut v = b"HTTP/1.1 200 OK\r\nX-Pad: ".to_vec();
+        v.extend(std::iter::repeat_n(b'p', 8000));
+        v.extend_from_slice(b"\r\nContent-Length: 6002\r\n\r\n");
+        v.extend(std::iter::repeat_n(b'b', 6000));
+        v.extend_from_slice(b"ok");
+        Box::leak(v.into_boxed_slice())
+    });
+    let rsp = answers("  http-response set-header X-A 1\n", std::slice::from_ref(big), 1);
+    assert!(rsp[0].len() > 14_000 && rsp[0].contains(&"p".repeat(8000)) && rsp[0].to_ascii_lowercase().contains("x-a: 1\r\n"), "response of {} bytes", rsp[0].len());
+}
+
+/// A response with fewer headers than the one before it: the strings of the others are given back.
+#[test]
+fn a_response_with_fewer_headers_than_the_last_is_forwarded_whole() {
+    let rsp = answers(
+        "  http-response set-header X-A 1\n",
+        &[b"HTTP/1.1 200 OK\r\nX-1: a\r\nX-2: b\r\nX-3: c\r\nContent-Length: 2\r\n\r\nok", b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"],
+        4,
+    );
+    for (i, r) in rsp.iter().enumerate() {
+        let l = r.to_ascii_lowercase();
+        assert!(l.contains("x-a: 1\r\n") && l.contains("x-1: a\r\n") == (i % 2 == 0), "response {i}: {r:?}");
+    }
+}
+
+/// A header value that is not ASCII (a Latin-1 byte, UTF-8) goes through the response rules as
+/// the bytes it was.
+#[test]
+fn bytes_beyond_ascii_in_a_response_head_survive_the_rules() {
+    let rsp = answers("  http-response set-header X-A 1\n", &[b"HTTP/1.1 200 OK\r\nX-L: caf\xe9\r\nX-U: caf\xc3\xa9\r\nContent-Length: 2\r\n\r\nok"], 1);
+    let l = &rsp[0];
+    assert!(l.contains("X-L: caf\u{fffd}\r\n") || l.contains("x-l: caf\u{fffd}\r\n"), "response: {l:?}");
+    assert!(l.contains("caf\u{e9}\r\n"), "response: {l:?}");
+}
+
+/// X3b-1: the response fetches read the head's blocks as the rules leave them: a header with an
+/// empty value is one (and is written back), `res.hdr_names` lists the names, and a value that
+/// is not UTF-8 is read as its bytes (`res.cook` over a Latin-1 `Set-Cookie`).
+#[test]
+fn the_response_fetches_read_the_head_blocks() {
+    let rules = "  http-response set-header X-Names %[res.hdr_names]\n  \
+        http-response set-header X-Cook %[res.cook(a)]\n";
+    let rsp = answers(rules, &[b"HTTP/1.1 200 OK\r\nX-Empty:\r\nSet-Cookie: a=\xe9t\xe9\r\nContent-Length: 2\r\n\r\nok"], 1);
+    let rsp = rsp[0].to_ascii_lowercase();
+    assert!(rsp.contains("\r\nx-empty: \r\n"), "the empty header: {rsp:?}");
+    assert!(rsp.contains("\r\nx-names: x-empty,set-cookie,content-length\r\n"), "res.hdr_names: {rsp:?}");
+    assert!(rsp.contains("\r\nx-cook: \u{fffd}t\u{fffd}\r\n"), "res.cook of a Latin-1 value: {rsp:?}");
+}
+
+/// CP4a-2: what a rule assembles to evaluate a sample is the small per-rule part of the context,
+/// not the whole of it. Before CP4a-2 (main f4ba1fc5) a `SampleContext` was 1,184 bytes, put
+/// together for every rule that read a sample (4 a request here, ~375 instructions each); now
+/// it is a reference to the phase's facts ([`alcyon_sample::PhaseCtx`], built once a rule phase)
+/// and a reference to the live request, and the per-rule assembly is those few words.
+#[test]
+fn a_rule_assembles_only_the_small_part_of_the_context() {
+    let per_rule = std::mem::size_of::<alcyon_sample::SampleContext<'static>>();
+    assert!(per_rule <= 64, "the per-rule SampleContext is {per_rule} bytes, more than 64");
+}

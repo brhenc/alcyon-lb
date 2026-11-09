@@ -2,7 +2,7 @@
 
 ## Overview
 
-Project Ibex targets **feature and syntactic parity with modern HAProxy (HAProxy 3.5-dev7)**. This test harness (`difftest.py`) measures observable behavior differentials between the reference oracle (`/home/bhenc/reference/haproxy/haproxy` by default) and candidate implementations (such as Ibex).
+Project Alcyon targets **feature and syntactic parity with modern HAProxy (HAProxy 3.5-dev7)**. This test harness (`difftest.py`) measures observable behavior differentials between the reference oracle (`/home/bhenc/reference/haproxy/haproxy` by default) and candidate implementations (such as Alcyon).
 
 The harness runs independent test scenarios against a proxy binary (or pairs of binaries), instruments the backend and client endpoints, and records structured, comparable metrics.
 
@@ -100,18 +100,18 @@ Baseline summary: 14/14 scenarios passed against reference.
 
 ### 2. Differential Mode (Reference vs Candidate)
 
-Compares reference (HAProxy 3.5) and candidate (Ibex) binaries:
+Compares reference (HAProxy 3.5) and candidate (Alcyon) binaries:
 
 ```bash
 python3 harness/difftest.py \
     --reference /home/bhenc/reference/haproxy/haproxy \
-    --candidate target/debug/ibex \
+    --candidate target/debug/alcyon \
     --scenario all
 ```
 
 Output:
 ```
---- Differential Proxy Test Harness (Comparison: /home/bhenc/reference/haproxy/haproxy vs /home/bhenc/project-ibex/target/debug/ibex) ---
+--- Differential Proxy Test Harness (Comparison: /home/bhenc/reference/haproxy/haproxy vs /home/bhenc/project-ibex/target/debug/alcyon) ---
 
 ================================================================================================
 SCENARIO           | DIFF RESULT | REF STATUS | CAND STATUS | DISCREPANCIES
@@ -141,20 +141,20 @@ Differential summary: 11/14 scenarios in full feature parity.
 python3 harness/difftest.py --scenario echo
 
 # Emit machine-readable JSON:
-python3 harness/difftest.py --candidate target/debug/ibex --json
+python3 harness/difftest.py --candidate target/debug/alcyon --json
 ```
 
 ---
 
 ## Standalone VTC Regression Test Runner (`vtc_runner.py`)
 
-`harness/vtc_runner.py` is a standalone, dependency-free Varnish Test Case (`.vtc`) runner designed to execute HAProxy regression test suites directly against Ibex (or any HAProxy-compatible proxy binary).
+`harness/vtc_runner.py` is a standalone, dependency-free Varnish Test Case (`.vtc`) runner designed to execute HAProxy regression test suites directly against Alcyon (or any HAProxy-compatible proxy binary).
 
 ### Capabilities:
 - **Grammar & Directive Parsing**: Parses `vtest`/`varnishtest`, `feature`, `server sN { ... }`, `haproxy hN -conf { ... }`, `client cN -connect ... { ... }`, `barrier`, `delay`, `shell`, and `setenv`.
 - **Inner Actions**: Supports `rxreq`, `rxreqhdrs`, `txreq`, `rxresp`, `rxresphdrs`, `txresp`, `expect`, `send`, `sendhex`, `recv`, `barrier <id> sync`, `delay`, and `close`.
 - **Dynamic Macro Expansion**: Evaluates `${sN_addr}`, `${sN_port}`, `${sN_sock}`, `${hN_fe_addr}`, `${hN_fe_port}`, `${hN_fe_sock}`, `${testdir}`, `${tmpdir}`, and fallback syntax `${VAR-default}` / `${VAR:-default}`.
-- **Config Rewriting & Socket Port Allocation**: Intercepts `bind "fd@${fe}"` and `listen <id>` configurations, allocating ephemeral ports and adapting the config for Ibex.
+- **Config Rewriting & Socket Port Allocation**: Intercepts `bind "fd@${fe}"` and `listen <id>` configurations, allocating ephemeral ports and adapting the config for Alcyon.
 - **Detailed Assertions & Diff Reporting**: Formats assertion failures with ANSI colored diffs showing target, operator, expected, and actual values.
 - **JSON Suite Reporting**: Generates machine-readable test summaries via `--json <file>`.
 

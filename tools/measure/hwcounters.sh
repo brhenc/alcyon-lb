@@ -3,7 +3,7 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 #
 # T603: hardware counters per request and throughput of one proxy binary, same rig as insreq.sh
-# (same backend, client, pinning: proxy CPU a, client b, backend c from IBEX_MEASURE_CPUS, default 4,5,6).
+# (same backend, client, pinning: proxy CPU a, client b, backend c from ALCYON_MEASURE_CPUS, default 4,5,6).
 #
 #   tools/measure/hwcounters.sh <label> <proxy-bin> <scenario.body> <ab1|h2s1|tp1|tp50> <N> <rounds> <outdir>
 #
@@ -21,11 +21,11 @@ set -u
 LABEL=$1; BIN=$2; BODY=$3; CL=$4; N=$5; ROUNDS=$6; OUT=$7
 mkdir -p "$OUT" || exit 1
 BENCH=${MEASURE_BENCH:-$HOME/ibex-targets/gate-slot1/release/measure-bench}
-IFS=, read -r CPU_P CPU_C CPU_B <<< "${IBEX_MEASURE_CPUS:-4,5,6}"
+IFS=, read -r CPU_P CPU_C CPU_B <<< "${ALCYON_MEASURE_CPUS:-4,5,6}"
 port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 FE=$(port); BE=$(port); TP=$(port)
 CFG=$OUT/$LABEL.$CL.cfg
-CRT=${IBEX_MEASURE_CRT:-$OUT/insreq-cert.pem}
+CRT=${ALCYON_MEASURE_CRT:-$OUT/insreq-cert.pem}
 if grep -q @CRT@ "$BODY" && [ ! -s "$CRT" ]; then
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$CRT.key" -out "$CRT.crt" \
     -subj /CN=localhost -days 30 >/dev/null 2>&1 && cat "$CRT.crt" "$CRT.key" > "$CRT" || exit 1

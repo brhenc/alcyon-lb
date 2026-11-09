@@ -88,7 +88,7 @@ SV_STHEADERS -> Ready    SV_STSHUTR/SHUTW -> Closed SV_STCLOSE -> Closed
 So the skeleton already built is the right shape, and 1.0 tells us the minimum content
 needed to make it move.
 
-## 4. Ibex Milestone 0: "mode tcp"
+## 4. Alcyon Milestone 0: "mode tcp"
 
 **Goal: a working TCP proxy with 1.0's feature set, on the modern layering.**
 
@@ -139,7 +139,7 @@ scope we invent ourselves.
 
 - **Build `v1.0.2` and run it.** 3,000 lines of 2005 C may need minor fixes to compile
   on a modern toolchain; that is a contained cost for a behavioural reference.
-- **Differential proxying.** Drive Ibex and 1.0 with identical config and traffic;
+- **Differential proxying.** Drive Alcyon and 1.0 with identical config and traffic;
   compare bytes forwarded, connection lifecycle, and timeout behaviour.
 - **The 1.0 config file parses.** `examples/cfg` from the v1.0.2 tree is a real config;
   accepting it is a concrete, checkable milestone.
@@ -152,7 +152,7 @@ scope we invent ourselves.
 A finishable milestone that is demonstrably a proxy, exercising every architectural
 decision made so far, with a 3,000-line reference implementation to check against.
 
-It also reframes the project honestly. "Ibex reaches feature parity with HAProxy 1.0 in
+It also reframes the project honestly. "Alcyon reaches feature parity with HAProxy 1.0 in
 mode tcp, on a memory-safe modern architecture, and passes N of HAProxy's own
 reg-tests" is a claim that is true, verifiable, and complete. It is a far better thing
 to have built than an incomplete attempt at all of mainline.

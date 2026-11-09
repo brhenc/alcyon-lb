@@ -19,15 +19,15 @@ if __name__ == "__main__":
     o, op = m.start_origin()
     try:
         ports, procs, mx = {}, {}, {}
-        for kind in ("ibex", "haproxy"):
+        for kind in ("alcyon", "haproxy"):
             ports[kind] = m.free_port()
             procs[kind] = m.start(kind, m.write_file(f"lat-{kind}.cfg", m.proxy_cfg(ports[kind], op, 1)), ports[kind])
             mx[kind] = m.median_of(lambda: m.load(ports[kind], "/small", 50), 1)[0]["rps"]
         rate = int(min(mx.values()) / 2)
-        m.emit(param="latency_max", ibex_rps=mx["ibex"], haproxy_rps=mx["haproxy"], rate=rate)
+        m.emit(param="latency_max", alcyon_rps=mx["alcyon"], haproxy_rps=mx["haproxy"], rate=rate)
         base, _ = m.median_of(lambda: m.load(op, "/small", 50, rate=rate))
         m.emit(param="latency_direct_origin", rate=rate, **base)
-        for kind in ("ibex", "haproxy"):
+        for kind in ("alcyon", "haproxy"):
             med, rs = m.median_of(lambda: m.load(ports[kind], "/small", 50, rate=rate))
             m.emit(param="latency", kind=kind, rate=rate, **med, added_p50_us=med["p50_us"] - base["p50_us"],
                    added_p99_us=med["p99_us"] - base["p99_us"], p99_runs=[round(r["p99_us"]) for r in rs])

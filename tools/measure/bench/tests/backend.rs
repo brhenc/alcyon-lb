@@ -2,7 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 //! `measure-bench backend` answers each request once, a body that arrives in a read of its own
-//! included (T555: Ibex sends an h3 POST's head and body in two writes; the backend answered
+//! included (T555: Alcyon sends an h3 POST's head and body in two writes; the backend answered
 //! the body as a second request, and the proxy's server connection broke on the extra reply).
 
 use std::io::{BufRead, BufReader, Read, Write};

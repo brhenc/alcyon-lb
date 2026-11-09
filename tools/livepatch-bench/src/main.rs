@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ibex_config::ast::{BackendSection, Config, FrontendSection, Mode, Server};
-use ibex_rt::engine::Engine;
+use alcyon_config::ast::{BackendSection, Config, FrontendSection, Mode, Server};
+use alcyon_rt::engine::Engine;
 
 thread_local! {
     static IN_ALLOC: Cell<bool> = const { Cell::new(false) };

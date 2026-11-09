@@ -13,7 +13,7 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     for ci in [false, true] {
-        if let Ok(re) = ibex_regex::UserRegex::with_case(pattern, ci) {
+        if let Ok(re) = alcyon_regex::UserRegex::with_case(pattern, ci) {
             let _ = re.is_match(text);
             if let Some(c) = re.captures(text) {
                 let mut out = String::new();

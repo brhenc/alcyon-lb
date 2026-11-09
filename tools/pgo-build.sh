@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 #
-# Build a PGO-optimised ibex (profile `release-perf`).
-#   1. build an instrumented ibex            (-Cprofile-generate)
+# Build a PGO-optimised alcyon (profile `release-perf`).
+#   1. build an instrumented alcyon            (-Cprofile-generate)
 #   2. run a mixed training load against it  (tools/pgo/train.cfg)
 #   3. merge the raw profiles                (llvm-profdata)
 #   4. build the final binary                (-Cprofile-use)
@@ -63,10 +63,10 @@ export CARGO_INCREMENTAL=0
 # 1. Instrumented build.
 # A fixed raw-profile dir: it is part of RUSTFLAGS, so a per-run path would rebuild everything each time.
 PGDIR=$TD/pgo-raw
-log "building instrumented ibex in $TD/pgo-gen"
-RUSTFLAGS="-Cprofile-generate=$PGDIR" CARGO_TARGET_DIR="$TD/pgo-gen" $PFX cargo build --profile release-perf -p ibex-rt --bin ibex >"$W/build-gen.log" 2>&1 \
+log "building instrumented alcyon in $TD/pgo-gen"
+RUSTFLAGS="-Cprofile-generate=$PGDIR" CARGO_TARGET_DIR="$TD/pgo-gen" $PFX cargo build --profile release-perf -p alcyon-rt --bin alcyon >"$W/build-gen.log" 2>&1 \
   || { tail -20 "$W/build-gen.log" >&2; die "instrumented build failed (log $W/build-gen.log)"; }
-GEN=$TD/pgo-gen/release-perf/ibex
+GEN=$TD/pgo-gen/release-perf/alcyon
 BENCH_TD=$TD/pgo-bench
 log "building measure-bench"
 (cd "$ROOT/tools/measure/bench" || exit 1; CARGO_TARGET_DIR="$BENCH_TD" $PFX cargo build --release >"$W/build-bench.log" 2>&1) \
@@ -81,7 +81,7 @@ H3BENCH=$BENCH_TD/release/h3bench
 [ -x "$H3BENCH" ] || die "h3bench not found at $H3BENCH"
 
 # 2. Training load.
-# train <ibex-binary> <label>: start backend + log sink + proxy, drive the load, stop the proxy
+# train <alcyon-binary> <label>: start backend + log sink + proxy, drive the load, stop the proxy
 # with SIGUSR1 (graceful, so the profile is written at exit) and wait for it.
 train() {
   local BIN=$1 LABEL=$2
@@ -96,11 +96,11 @@ train() {
 
   "$BENCH" backend "$P_BE" >/dev/null 2>&1 & local BEP=$!; PIDS+=("$BEP")
   socat -u "UDP-RECV:$P_LOG,bind=127.0.0.1" /dev/null 2>/dev/null & local SOP=$!; PIDS+=("$SOP")
-  LLVM_PROFILE_FILE="$PGDIR/ibex-%p-%m.profraw" "$BIN" -db -f "$W/train.cfg" >"$W/ibex-$LABEL.log" 2>&1 & local IP=$!; PIDS+=("$IP")
+  LLVM_PROFILE_FILE="$PGDIR/alcyon-%p-%m.profraw" "$BIN" -db -f "$W/train.cfg" >"$W/alcyon-$LABEL.log" 2>&1 & local IP=$!; PIDS+=("$IP")
   local i
   for i in $(seq 1 100); do
     (exec 3<>"/dev/tcp/127.0.0.1/$P_H1") 2>/dev/null && break
-    kill -0 "$IP" 2>/dev/null || { cat "$W/ibex-$LABEL.log" >&2; die "ibex exited at startup"; }
+    kill -0 "$IP" 2>/dev/null || { cat "$W/alcyon-$LABEL.log" >&2; die "alcyon exited at startup"; }
     sleep 0.1
   done
   local H1=127.0.0.1:$P_H1 TLS=127.0.0.1:$P_TLS H2C=127.0.0.1:$P_H2C
@@ -146,7 +146,7 @@ train() {
   h2load --alpn-list=h3 -n 3000 -c 5 -m 1 "https://$H3/old" >/dev/null 2>&1
   kill -USR1 "$IP" 2>/dev/null
   for i in $(seq 1 100); do kill -0 "$IP" 2>/dev/null || break; sleep 0.1; done
-  kill -0 "$IP" 2>/dev/null && { log "[$LABEL] ibex ignored SIGUSR1, killing"; kill "$IP" 2>/dev/null; }
+  kill -0 "$IP" 2>/dev/null && { log "[$LABEL] alcyon ignored SIGUSR1, killing"; kill "$IP" 2>/dev/null; }
   wait "$IP" 2>/dev/null
   kill "$BEP" "$SOP" 2>/dev/null; wait "$BEP" "$SOP" 2>/dev/null
   PIDS=()
@@ -155,31 +155,31 @@ train() {
 rm -rf "$PGDIR"; mkdir -p "$PGDIR" || die "cannot create $PGDIR"
 log "training"
 train "${PGO_TRAIN_BIN:-$GEN}" pgo
-ls "$PGDIR"/*.profraw >/dev/null 2>&1 || die "no .profraw written (ibex did not exit cleanly?); see $W/ibex-pgo.log"
+ls "$PGDIR"/*.profraw >/dev/null 2>&1 || die "no .profraw written (alcyon did not exit cleanly?); see $W/alcyon-pgo.log"
 
 # 3. Merge.
-llvm-profdata merge -o "$W/ibex.profdata" "$PGDIR"/*.profraw || die "llvm-profdata merge failed"
-log "merged profile: $(du -h "$W/ibex.profdata" | cut -f1)"
+llvm-profdata merge -o "$W/alcyon.profdata" "$PGDIR"/*.profraw || die "llvm-profdata merge failed"
+log "merged profile: $(du -h "$W/alcyon.profdata" | cut -f1)"
 
 # 4. Final build. A profile mismatch is a warning, not an error.
-RF="-Cprofile-use=$W/ibex.profdata"
+RF="-Cprofile-use=$W/alcyon.profdata"
 [ "$BOLT" = 1 ] && RF="$RF -Clink-arg=-Wl,--emit-relocs"
 log "building final binary in $TD/pgo-use"
-RUSTFLAGS="$RF" CARGO_TARGET_DIR="$TD/pgo-use" $PFX cargo build --profile release-perf -p ibex-rt --bin ibex >"$W/build-use.log" 2>&1 \
+RUSTFLAGS="$RF" CARGO_TARGET_DIR="$TD/pgo-use" $PFX cargo build --profile release-perf -p alcyon-rt --bin alcyon >"$W/build-use.log" 2>&1 \
   || { tail -20 "$W/build-use.log" >&2; die "final build failed (log $W/build-use.log)"; }
-FINAL=$TD/pgo-use/release-perf/ibex
+FINAL=$TD/pgo-use/release-perf/alcyon
 
 # 5. Optional BOLT: instrument, train again, reorder only.
 if [ "$BOLT" = 1 ]; then
   log "BOLT: instrumenting"
   BF=$W/bolt.fdata
-  llvm-bolt "$FINAL" -instrument -instrumentation-file="$BF" -instrumentation-file-append-pid=0 -o "$W/ibex.inst" >"$W/bolt-inst.log" 2>&1 \
+  llvm-bolt "$FINAL" -instrument -instrumentation-file="$BF" -instrumentation-file-append-pid=0 -o "$W/alcyon.inst" >"$W/bolt-inst.log" 2>&1 \
     || { tail -5 "$W/bolt-inst.log" >&2; die "llvm-bolt -instrument failed"; }
-  train "$W/ibex.inst" bolt
+  train "$W/alcyon.inst" bolt
   [ -s "$BF" ] || die "BOLT profile $BF not written"
-  llvm-bolt "$FINAL" -o "$TD/pgo-use/release-perf/ibex.bolt" -data "$BF" -reorder-blocks=ext-tsp -reorder-functions=cdsort >"$W/bolt-opt.log" 2>&1 \
+  llvm-bolt "$FINAL" -o "$TD/pgo-use/release-perf/alcyon.bolt" -data "$BF" -reorder-blocks=ext-tsp -reorder-functions=cdsort >"$W/bolt-opt.log" 2>&1 \
     || { tail -5 "$W/bolt-opt.log" >&2; die "llvm-bolt optimisation failed"; }
-  FINAL=$TD/pgo-use/release-perf/ibex.bolt
+  FINAL=$TD/pgo-use/release-perf/alcyon.bolt
 fi
 
 if [ -n "$OUT" ]; then cp "$FINAL" "$OUT" || die "cannot copy to $OUT"; FINAL=$OUT; fi

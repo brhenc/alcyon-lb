@@ -3,7 +3,7 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 """
-vtc_runner.py — Standalone Varnish Test Case (VTC) Regression Test Runner for Ibex.
+vtc_runner.py — Standalone Varnish Test Case (VTC) Regression Test Runner for Alcyon.
 
 Parses and executes HAProxy .vtc regression test scripts without external C runtime
 dependencies (VTest/Varnish). Supports mock HTTP/TCP servers and clients, macro
@@ -1021,7 +1021,7 @@ def preprocess_haproxy_config(
 ) -> Tuple[str, Dict[str, int]]:
     """
     Allocate listening ports for bind "fd@${fe}" directives and rewrite config
-    into Ibex-compatible syntax.
+    into Alcyon-compatible syntax.
     """
     allocated_ports: Dict[str, int] = {}
     lines = raw_cfg.splitlines()
@@ -1030,7 +1030,7 @@ def preprocess_haproxy_config(
     cur_section_type = ""
     cur_section_name = ""
 
-    # .if / .elif / .else / .endif are Ibex's job now (crates/ibex-config/src/preproc.rs,
+    # .if / .elif / .else / .endif are Alcyon's job now (crates/alcyon-config/src/preproc.rs,
     # called from parse_str). This used to strip them, with a rule that kept any block whose
     # condition mentioned "feature" and dropped every other block wholesale -- so 46 tests
     # silently lost configuration HAProxy would have kept, .else fell through as a directive,
@@ -1041,7 +1041,7 @@ def preprocess_haproxy_config(
     # Which section headers already carry their own `bind`? A bare `listen <name>` gets a
     # synthetic bind below so the section has somewhere to listen, but `listen mysql1` +
     # `bind "fd@${mysql1}"` allocates the same port under the same key twice and emits the
-    # line twice. Ibex refuses the duplicate and the whole listener is lost, so the proxy's
+    # line twice. Alcyon refuses the duplicate and the whole listener is lost, so the proxy's
     # own health check reports "Connection refused" against a port it was meant to serve.
     _section_has_own_bind: Dict[int, bool] = {}
     _cur_header_idx = -1
@@ -1092,7 +1092,7 @@ def preprocess_haproxy_config(
             # A `bind` becomes a `bind`, in every section type. This used to comment the
             # line out inside a `listen` and fold the address into the section header
             # instead -- the HAProxy 1.x `listen <name> <addr>:<port>` form, which
-            # HAProxy has not accepted for years and which Ibex rejects with "please use
+            # HAProxy has not accepted for years and which Alcyon rejects with "please use
             # the 'bind' keyword". That single rewrite accounted for 36 of 133 reg-test
             # failures, all of them the harness generating a config style neither proxy
             # would load.
@@ -1233,7 +1233,7 @@ class SyslogRunner:
         already run never gets one: the proxy's check connects, sends, and waits for a
         reply from a server that cannot be scheduled. It then reports a protocol timeout
         that is entirely the harness's doing. That is what made `server s2` in
-        checks/redis-check.vtc look like an Ibex defect.
+        checks/redis-check.vtc look like an Alcyon defect.
         """
         if self._task:
             try:
@@ -1783,7 +1783,7 @@ def vtest_builtin_macros() -> Dict[str, str]:
 # which also holds whatever it forks, e.g. the workers of `-W`).  The groups and the
 # per-test temp dirs are recorded here and removed by `cleanup_all()`, which runs when a
 # test ends (`VtcExecutor.cleanup`), at interpreter exit (`atexit`) and on SIGTERM/SIGHUP/
-# SIGINT of the runner.  A board run once left `ibex -f /tmp/vtc_ibex_*/h1/cfg -d` alive
+# SIGINT of the runner.  A board run once left `alcyon -f /tmp/vtc_alcyon_*/h1/cfg -d` alive
 # for 9 hours because a test that raised, a timeout or a signal skipped the cleanup.
 
 _LIVE_GROUPS: set = set()
@@ -1869,8 +1869,8 @@ def quic_roles(conf: str, env: Optional[Dict[str, str]] = None) -> Tuple[bool, b
 
     vtest does not speak h3, so a QUIC reg-test chains a second `haproxy` block as the client:
     a `server`/`default-server` line to a QUIC address (`quic4@`), `ssl alpn h3` or
-    `proto qmux`. Ibex refuses those (QUIC towards servers is outside M2); a `bind` with the same
-    words is the side Ibex serves."""
+    `proto qmux`. Alcyon refuses those (QUIC towards servers is outside M2); a `bind` with the same
+    words is the side Alcyon serves."""
     needs = serves = False
     if env:  # `"${VTC_SOCK_TYPE}+${h1_ssl_sock}"` after a `setenv VTC_SOCK_TYPE quic`
         conf = re.sub(r"\$\{(\w+)\}", lambda m: env.get(m.group(1), m.group(0)), conf)
@@ -1899,7 +1899,7 @@ class VtcExecutor:
         self.verbose = verbose
 
         self.testdir = os.path.dirname(os.path.abspath(parser.filepath))
-        self.tmpdir = tempfile.mkdtemp(prefix="vtc_ibex_")
+        self.tmpdir = tempfile.mkdtemp(prefix="vtc_alcyon_")
         _LIVE_DIRS.add(self.tmpdir)
         self.macro_engine = MacroEngine({
             "testdir": self.testdir,
@@ -1952,7 +1952,7 @@ class VtcExecutor:
             return TestResult(
                 test_name=title, file_path=self.parser.filepath, status="FAIL",
                 elapsed_sec=time.monotonic() - start_time,
-                error_message="this test needs a QUIC client haproxy block, which Ibex refuses: set "
+                error_message="this test needs a QUIC client haproxy block, which Alcyon refuses: set "
                               "VTC_QUIC_CLIENT_BINARY to a QUIC-enabled haproxy "
                               f"(got {self.quic_client_binary!r}; default {DEFAULT_QUIC_CLIENT_BINARY})")
         return None
@@ -2001,7 +2001,7 @@ class VtcExecutor:
         # `-mcli` talks to the master socket (`-S`), `-cli` to the worker's `stats socket`.
         cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.master.sock" if master else f"{haproxy_id}.sock")
         # Like vtest, a new connection for every `send`: a non-interactive stats-socket
-        # connection runs one command line and closes, on HAProxy and on Ibex alike (T146).
+        # connection runs one command line and closes, on HAProxy and on Alcyon alike (T146).
 
         lines = block.splitlines()
         last_resp = ""
@@ -2542,7 +2542,7 @@ class TriageIndex:
 
     The suite contains 114 tests for features this project declined in `tradeoff.md` 4.2 --
     Lua, QUIC, filters, the cache, SPOE, FCGI. Counting those as failures measures a
-    decision as debt: thirteen `cache-use` failures said nothing about Ibex except that it
+    decision as debt: thirteen `cache-use` failures said nothing about Alcyon except that it
     does not have a cache, which was already written down.
 
     Out-of-scope tests are still **run**, not skipped. This project has already been bitten
@@ -2691,7 +2691,7 @@ def print_summary(results: List[TestResult], total_elapsed: float) -> int:
     in_scope_run = total - out_of_scope - skipped
 
     print("\n" + Color.bold("=" * 72))
-    print(Color.bold(" Ibex VTC Regression Test Suite Execution Summary"))
+    print(Color.bold(" Alcyon VTC Regression Test Suite Execution Summary"))
     print(Color.bold("=" * 72))
     print(f" Total Tests:   {total}")
     print(f" {Color.green('Passed:')}        {passed}")
@@ -2724,12 +2724,12 @@ def print_summary(results: List[TestResult], total_elapsed: float) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ibex Standalone VTC Regression Test Runner")
+    parser = argparse.ArgumentParser(description="Alcyon Standalone VTC Regression Test Runner")
     parser.add_argument("paths", nargs="+", help="Path(s) to .vtc file(s) or directories containing .vtc files")
     parser.add_argument(
         "--binary",
-        default=os.path.join(os.environ.get("CARGO_TARGET_DIR") or "target", "debug", "ibex"),
-        help="Path to Ibex proxy binary (default: $CARGO_TARGET_DIR/debug/ibex, else target/debug/ibex)",
+        default=os.path.join(os.environ.get("CARGO_TARGET_DIR") or "target", "debug", "alcyon"),
+        help="Path to Alcyon proxy binary (default: $CARGO_TARGET_DIR/debug/alcyon, else target/debug/alcyon)",
     )
     parser.add_argument("--timeout", type=float, default=15.0, help="Per-test timeout in seconds (default: 15s)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose execution trace")
@@ -2753,10 +2753,10 @@ def main() -> None:
 
     if not os.path.isfile(args.binary):
         print(f"{Color.red('Error:')} Target proxy binary not found: {args.binary}")
-        print("Build it first using: cargo build --bin ibex")
+        print("Build it first using: cargo build --bin alcyon")
         sys.exit(1)
 
-    print(f"{Color.bold('Running Ibex VTC Runner')} on {len(vtc_files)} test file(s)...")
+    print(f"{Color.bold('Running Alcyon VTC Runner')} on {len(vtc_files)} test file(s)...")
     print(f"Target Binary: {args.binary}\n")
 
     install_exit_handlers()

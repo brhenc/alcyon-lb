@@ -44,7 +44,7 @@ if __name__ == "__main__":
     m.wait_load()
     o, op = m.start_origin()
     try:
-        for kind in ("ibex", "haproxy"):
+        for kind in ("alcyon", "haproxy"):
             med, rs = m.median_of(lambda: once(kind, op))
             m.emit(param="active_rss", kind=kind, n=N, **med, runs=[r["bytes_per_conn"] for r in rs])
     finally:

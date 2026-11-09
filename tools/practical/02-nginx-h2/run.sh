@@ -6,14 +6,14 @@
 #   /static/*  -> nginx as a static-file server        (use_backend static)
 #   anything else -> nginx as a proxy to the node app  (default backend dyn)
 #
-#   ./run.sh              run against Ibex
+#   ./run.sh              run against Alcyon
 #   ./run.sh --haproxy    run against HAProxy (the oracle)
 #
 # Needs node, curl, openssl, sha256sum, h2load, nginx. Everything is started by this
 # script and killed by PID at the end. The certificate is generated into the work dir.
 
 # ---- settings you may want to change ---------------------------------------
-IBEX_BIN=${IBEX_BIN:-/home/bhenc/ibex-targets/t193/release/ibex}
+ALCYON_BIN=${ALCYON_BIN:-/home/bhenc/ibex-targets/t193/release/alcyon}
 HAPROXY_BIN=${HAPROXY_BIN:-/home/bhenc/reference/haproxy/haproxy}
 NGINX_BIN=${NGINX_BIN:-/usr/sbin/nginx}
 H2LOAD_BIN=${H2LOAD_BIN:-/usr/bin/h2load}
@@ -27,9 +27,9 @@ UPLOAD_MB=${UPLOAD_MB:-50}
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 NODE_DIR=$HERE/../01-node           # app.js (and its ws package) are reused
-PROXY=ibex
+PROXY=alcyon
 [ "$1" = "--haproxy" ] && PROXY=haproxy
-if [ "$PROXY" = ibex ]; then PROXY_BIN=$IBEX_BIN; else PROXY_BIN=$HAPROXY_BIN; fi
+if [ "$PROXY" = alcyon ]; then PROXY_BIN=$ALCYON_BIN; else PROXY_BIN=$HAPROXY_BIN; fi
 
 WORK=$(mktemp -d /tmp/practical02-XXXXXX)
 BASE=https://127.0.0.1:$PROXY_PORT

@@ -173,7 +173,7 @@ impl RangeSet {
     }
 
     /// Remove every range, keeping the map's root node (`BTreeMap::clear` frees it) so the set
-    /// can be refilled without allocating (Ibex T543)
+    /// can be refilled without allocating (Alcyon T543)
     pub fn clear(&mut self) {
         while self.0.pop_first().is_some() {}
     }

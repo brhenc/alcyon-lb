@@ -1,4 +1,4 @@
-# HAProxy VTC Regression Test Framework & Ibex Harness Architecture
+# HAProxy VTC Regression Test Framework & Alcyon Harness Architecture
 
 **Document Type:** Architectural Research & Test Harness Specification  
 **Oracle Baseline:** `/home/bhenc/reference/haproxy/reg-tests` @ commit `e6f616af` (HAProxy 3.5-dev7)  
@@ -8,7 +8,7 @@
 
 ## 1. Executive Summary & Problem Formulation
 
-Project Ibex's ultimate quality metric is **direct upstream compatibility**: proving that Ibex can pass the exact regression test cases (`.vtc` files) created by HAProxy core maintainers over the last 25 years.
+Project Alcyon's ultimate quality metric is **direct upstream compatibility**: proving that Alcyon can pass the exact regression test cases (`.vtc` files) created by HAProxy core maintainers over the last 25 years.
 
 HAProxy tests its binary using **VTest** (derived from Poul-Henning Kamp's Varnish Test Case tool, `varnishtest`). A `.vtc` test script specifies:
 1. Declarations of mock HTTP/TCP servers (`server s1 { ... }`).
@@ -21,10 +21,10 @@ HAProxy tests its binary using **VTest** (derived from Poul-Henning Kamp's Varni
 This document details:
 1. The formal grammar, execution semantics, and macro system of VTC test scripts.
 2. An architectural comparison between **Integration Path A** (Standard C `vtest`) and **Integration Path B** (Pure Python/Rust standalone VTC interpreter).
-3. The exact CLI binary flags and file-descriptor inheritance mechanisms Ibex must support.
+3. The exact CLI binary flags and file-descriptor inheritance mechanisms Alcyon must support.
 4. An exhaustive triage of all **312 `.vtc` regression tests** across 36 directories in HAProxy 3.5.
-5. An implementation blueprint for `harness/vtc_runner.py` and `crates/ibex-vtest`.
-6. A phased roadmap scaling Ibex test pass rates from **51 initial tests** to **198 in-scope tests**.
+5. An implementation blueprint for `harness/vtc_runner.py` and `crates/alcyon-vtest`.
+6. A phased roadmap scaling Alcyon test pass rates from **51 initial tests** to **198 in-scope tests**.
 
 ---
 
@@ -42,7 +42,7 @@ This document details:
 │             │ defines macros: ${s1_sock}, ${h1_px_sock}     │ sets env: px=7    │
 │             ▼                                               ▼                   │
 │  ┌──────────────────────┐                   ┌────────────────────────────────┐  │
-│  │  Mock Server (s1)    │                   │   Target Proxy (Ibex/HAProxy)  │  │
+│  │  Mock Server (s1)    │                   │   Target Proxy (Alcyon/HAProxy)  │  │
 │  │  • rxreq             │                   │   • bind "fd@${px}"            │  │
 │  │  • txresp            │                   │   • balance roundrobin         │  │
 │  └──────────▲───────────┘                   │   • server srv1 ${s1_sock}     │  │
@@ -74,7 +74,7 @@ server s1 {
     rxreq
     expect req.url == "/api/v1/data"
     expect req.http.X-Custom == "injected"
-    txresp -status 200 -hdr "Content-Type: text/plain" -body "Hello Ibex"
+    txresp -status 200 -hdr "Content-Type: text/plain" -body "Hello Alcyon"
 } -repeat 2 -start
 
 haproxy h1 -arg "-L A" -conf {
@@ -101,7 +101,7 @@ client c1 -connect ${h1_fe_sock} {
     rxresp
     expect resp.status == 200
     expect resp.http.Content-Type == "text/plain"
-    expect resp.body == "Hello Ibex"
+    expect resp.body == "Hello Alcyon"
 } -run
 ```
 
@@ -163,7 +163,7 @@ The VTC runner dynamically expands `${macro}` variables in config blocks and cli
 
 ---
 
-## 3. Evaluation of Integration Paths for Project Ibex
+## 3. Evaluation of Integration Paths for Project Alcyon
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -182,37 +182,37 @@ The VTC runner dynamically expands `${macro}` variables in config blocks and cli
 
 ### 3.1 Path A: Standard `vtest` Integration
 
-In Path A, Ibex is executed directly by HAProxy's official `vtest` binary:
+In Path A, Alcyon is executed directly by HAProxy's official `vtest` binary:
 
 ```bash
-HAPROXY_PROGRAM=/path/to/project-ibex/target/release/ibex \
+HAPROXY_PROGRAM=/path/to/project-ibex/target/release/alcyon \
 vtest -b 4194304 -k -t 10 -L -v reg-tests/balance/balance-rr.vtc
 ```
 
-#### Required Binary CLI Flags for `ibex`
+#### Required Binary CLI Flags for `alcyon`
 
-| Flag | Category | HAProxy Semantics | Ibex Handling |
+| Flag | Category | HAProxy Semantics | Alcyon Handling |
 | :--- | :--- | :--- | :--- |
-| `-vv` | Discovery | Dumps version, build targets, poller capabilities, and compiler options. | Ibex emits `HAProxy version 3.5.0-ibex`, `TARGET=linux-glibc`, `epoll` polling engine. |
-| `-f <path>` | Core Config | Specifies path to configuration file (repeatable). | Parsed by `ibex-config` AST parser. |
-| `-c` | Validation | Validates configuration file and exits (0 = OK, 1 = Error). | Runs `ibex_config::parse()` and validation passes; exits immediately. |
+| `-vv` | Discovery | Dumps version, build targets, poller capabilities, and compiler options. | Alcyon emits `HAProxy version 3.5.0-alcyon`, `TARGET=linux-glibc`, `epoll` polling engine. |
+| `-f <path>` | Core Config | Specifies path to configuration file (repeatable). | Parsed by `alcyon-config` AST parser. |
+| `-c` | Validation | Validates configuration file and exits (0 = OK, 1 = Error). | Runs `alcyon_config::parse()` and validation passes; exits immediately. |
 | `-cc <expr>` | Conditional | Evaluates conditional build expression; exits 0 if true, 1 if false. | Evaluates expression against built-in feature set (`THREAD`, `OPENSSL`, etc.). |
-| `-d` / `-db` | Runtime | Runs proxy in foreground debug mode (no daemonizing). | Ibex default execution mode (Tokio runtime stays in foreground). |
-| `-W` / `-Ws` | Process | Master-worker mode / systemd notification mode. | Ibex operates worker loop without master fork (or single master wrapper). |
+| `-d` / `-db` | Runtime | Runs proxy in foreground debug mode (no daemonizing). | Alcyon default execution mode (Tokio runtime stays in foreground). |
+| `-W` / `-Ws` | Process | Master-worker mode / systemd notification mode. | Alcyon operates worker loop without master fork (or single master wrapper). |
 | `-D` | Daemon | Forks into background as daemon. | Accepted for compatibility (ignored in test harnesses). |
 | `-q` / `-V` | Verbosity | Quiet / Verbose logging output. | Sets `tracing`/log level filter. |
 | `-L <peer>` | Clustering | Sets local peer name. | Populates `global.localpeer` for peers sync. |
 | `-dM`, `-dI`, `-dW` | Debugging | Memory pool debug, insecure fork, zero warning mode. | Recognized and safely ignored as no-ops. |
-| `-de`, `-dp` | Poller Tuning | Disables epoll / poll. | Recognized (Ibex poller configuration). |
+| `-de`, `-dp` | Poller Tuning | Disables epoll / poll. | Recognized (Alcyon poller configuration). |
 | `-p <pidfile>`| Process | Writes process PID to file. | Writes `std::process::id()` to target path. |
 
-### 3.2 Path B: Standalone Pure Interpreter (`harness/vtc_runner.py` / `crates/ibex-vtest`)
+### 3.2 Path B: Standalone Pure Interpreter (`harness/vtc_runner.py` / `crates/alcyon-vtest`)
 
 Path B implements a lightweight, native VTC interpreter without any C build tools or Varnish dependencies:
 1. **Parser Layer**: High-speed recursive descent parser for `.vtc` blocks, macro substitutions, and line continuations.
 2. **Server Engine**: Asynchronous mock HTTP/1.1 and TCP server managing mock request verification (`rxreq`, `expect req.*`) and response generation (`txresp`).
 3. **Client Engine**: Asynchronous HTTP client executing requests (`txreq`) and evaluating assertions (`expect resp.status`, `expect resp.http.*`, `expect resp.body`).
-4. **Proxy Manager**: Process supervisor launching `ibex` with generated configuration, managing temporary sockets, piping logs, and enforcing graceful shutdown.
+4. **Proxy Manager**: Process supervisor launching `alcyon` with generated configuration, managing temporary sockets, piping logs, and enforcing graceful shutdown.
 5. **Assertion Evaluator**: Rich difference highlighter comparing actual vs expected status codes, headers, and bodies.
 
 ---
@@ -229,7 +229,7 @@ Path B implements a lightweight, native VTC interpreter without any C build tool
 │ REACHABLE_LATER        │ 147 tests   │   47.12%   │ In-scope features (TLS/CLI) │
 │ OUT_OF_SCOPE           │ 114 tests   │   36.54%   │ Excluded features (QUIC/H2) │
 ├────────────────────────┼─────────────┼────────────┼─────────────────────────────┤
-│ Total In-Scope Target  │ 198 tests   │   63.46%   │ Total reachable for Ibex    │
+│ Total In-Scope Target  │ 198 tests   │   63.46%   │ Total reachable for Alcyon    │
 └────────────────────────┴─────────────┴────────────┴─────────────────────────────┘
 ```
 
@@ -268,7 +268,7 @@ Path B implements a lightweight, native VTC interpreter without any C build tool
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                          Ibex VTC Pass Rate Roadmap                             │
+│                          Alcyon VTC Pass Rate Roadmap                             │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
 │   200 ┼───────────────────────────────────────────────────────── 198 Target     │
@@ -288,7 +288,7 @@ Path B implements a lightweight, native VTC interpreter without any C build tool
    - Target: 51 `REACHABLE_NOW` tests in `balance/`, `connection/`, `http-rules/`, `http-messaging/`, `http-errorfiles/`, `stream/`.
    - Validates: Round-Robin, URI Hashing, `del-header`, `http-request return`, PROXY v2 forwarding, and chunked transfer decoding.
 2. **Phase 2: TLS, Converters & Health Checks Expansion (150+ Tests)**:
-   - Target: Additional 99 tests from `ssl/` (47 tests via `ibex-tls`), `checks/` (19 tests via HTTP/TCP health checker), `converter/` (19 tests), and `sample_fetches/` (11 tests).
+   - Target: Additional 99 tests from `ssl/` (47 tests via `alcyon-tls`), `checks/` (19 tests via HTTP/TCP health checker), `converter/` (19 tests), and `sample_fetches/` (11 tests).
    - Validates: SNI certificate dispatch, client certificate verification, HTTP monitor URIs, string concatenation, and IP CIDR masking.
 3. **Phase 3: Stick Tables & Runtime CLI Parity (198 Tests — 100% In-Scope Target)**:
    - Target: Additional 48 tests from `stick-table/`, `stickiness/`, `stats/`, `jwt/`, `stream/`, and `proxy/`.

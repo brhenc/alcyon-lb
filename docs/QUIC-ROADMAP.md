@@ -1,4 +1,4 @@
-# QUIC and HTTP/3 in Ibex — the plan
+# QUIC and HTTP/3 in Alcyon — the plan
 
 Written 2026-09-23. Supersedes the "declined" position in `tradeoff.md` §4.2 and §6.9 for
 scaffolding purposes; the reasons those entries give are still the reasons this is hard.
@@ -17,14 +17,14 @@ xprt_quic.c         283
                  32,191 lines of C
 ```
 
-Ibex in total is 65,579 lines of Rust. **Porting HAProxy's QUIC would be half the project
+Alcyon in total is 65,579 lines of Rust. **Porting HAProxy's QUIC would be half the project
 again**, and most of it is not proxy logic — it is packet protection, loss recovery,
 congestion control, ACK ranges, path validation and flow control. Writing that from scratch
 is not scaffolding; it is a year.
 
-So the plan does not write it. HAProxy delegates the cryptographic half to OpenSSL; Ibex
+So the plan does not write it. HAProxy delegates the cryptographic half to OpenSSL; Alcyon
 delegates the whole transport to a sans-IO state machine and writes only the parts that are
-Ibex's own: the datagram path, the connection table, and the HTTP/3-to-HTX conversion.
+Alcyon's own: the datagram path, the connection table, and the HTTP/3-to-HTX conversion.
 
 ## The oracle exists, and I built it
 
@@ -48,7 +48,7 @@ oracle: http_version=3 code=200
 ```
 
 `curl --http3-only` → HAProxy/QUIC → an HTTP/1 backend → 200. That command is the
-definition of done for this whole roadmap, with `ibex` substituted for `haproxy`.
+definition of done for this whole roadmap, with `alcyon` substituted for `haproxy`.
 
 `data/quic_handshake_capture.json` holds every datagram of one such session, captured
 through `tools/quic-oracle/dgram_relay.py`, with direction, timing, length and the first 64
@@ -73,22 +73,22 @@ real 1200-byte padding, produced by the client we have to satisfy.
 quinn-proto 0.11.18   "State machine for the QUIC transport protocol"
   tokio in its dependency tree : 0
   license                      : MIT OR Apache-2.0
-  rustls                       : 0.23, already Ibex's TLS stack
+  rustls                       : 0.23, already Alcyon's TLS stack
 ```
 
-It is sans-IO: you hand it datagrams and a clock, it hands you datagrams and timeouts. Ibex
+It is sans-IO: you hand it datagrams and a clock, it hands you datagrams and timeouts. Alcyon
 keeps its own scheduler, its own poller, its own buffers — which is the entire reason tokio
 was rejected and the reason quinn itself (the async wrapper) is not what we are using.
 
-**Licensing.** Ibex is GPL-2.0-or-later. `quinn-proto` and `rustls` both offer MIT, which is
+**Licensing.** Alcyon is GPL-2.0-or-later. `quinn-proto` and `rustls` both offer MIT, which is
 GPL-compatible. `ring` is `Apache-2.0 AND ISC`, and Apache-2.0 is incompatible with
-GPL-2.0-*only* — but "or later" permits GPL-3.0, with which Apache-2.0 is compatible. Ibex
+GPL-2.0-*only* — but "or later" permits GPL-3.0, with which Apache-2.0 is compatible. Alcyon
 already depends on `rustls` + `ring` today, so QUIC changes nothing here. Worth stating once
 rather than discovering later.
 
 ## What is actually ours to write
 
-| layer | HAProxy | Ibex |
+| layer | HAProxy | Alcyon |
 |---|---|---|
 | UDP datagram path, `recvmmsg`/`sendmmsg`, GSO/GRO | `quic_sock.c` | **ours** (T23) |
 | connection table keyed by connection ID | `quic_cid.c` | **ours** (T24) |
@@ -141,11 +141,11 @@ every datagram arrives intact with the right peer and length.
 **T24 — connection identity and the transport.** `quinn-proto` `Endpoint` and `Connection`
 driven from the datagram path and the timer wheel; a connection table keyed by destination
 connection ID; retry and version negotiation. Oracle: `curl --http3` completes the handshake
-against Ibex and reports a transport-level error for the missing HTTP layer rather than a
+against Alcyon and reports a transport-level error for the missing HTTP layer rather than a
 handshake failure.
 
 **T25 — HTTP/3 and QPACK.** Control stream, SETTINGS, the frame layer, QPACK static decode,
-HTX conversion, and the response path back. Oracle: `curl --http3-only ... ` against Ibex
+HTX conversion, and the response path back. Oracle: `curl --http3-only ... ` against Alcyon
 returns 200 with the backend's body — byte-identical to what `run_oracle.sh` gets from
 HAProxy.
 
@@ -157,7 +157,7 @@ listener.
 
 Every phase compares against `/home/bhenc/reference/haproxy-quic/haproxy`, not against the
 RFC. RFC 9000 and RFC 9114 say what is legal; the oracle says what nghttp3 and HAProxy
-actually do, and those are the two programs that have to interoperate with Ibex.
+actually do, and those are the two programs that have to interoperate with Alcyon.
 
 This project has already been bitten once by reasoning from an RFC — `GOAWAY
 ENHANCE_YOUR_CALM` was inferred from RFC 9113 and stated as HAProxy's behaviour when
@@ -168,7 +168,7 @@ surface for that mistake.
 
 ## On depending on `quinn-proto` at all
 
-The concern is fair: a third-party transport is one thing in Ibex that is not a faithful
+The concern is fair: a third-party transport is one thing in Alcyon that is not a faithful
 HAProxy port, and it may have to be replaced. Three things make that a manageable bet rather
 than a trap.
 
@@ -194,8 +194,8 @@ fe.stream.max-total         fe.stream.data-ratio         fe.sock-per-conn
 mem.tx-max                  zero-copy-fwd-send
 ```
 
-Every one of those is a **policy or buffer decision that is Ibex's regardless of which
-transport it drives** — the same shape as `tune.h2.fe.glitches-threshold`, which Ibex already
+Every one of those is a **policy or buffer decision that is Alcyon's regardless of which
+transport it drives** — the same shape as `tune.h2.fe.glitches-threshold`, which Alcyon already
 implements itself. Using `quinn-proto` does not take a single DoS control away.
 
 What it *does* own is congestion-control internals — `cc.hystart`, `cc.cubic-min-losses`,
@@ -216,7 +216,7 @@ trait definition now.
 
 ### 3. The decision gets made on evidence
 
-T26 answers it: run the same load against Ibex and against
+T26 answers it: run the same load against Alcyon and against
 `/home/bhenc/reference/haproxy-quic/haproxy`, and record where they differ under duress.
 Until that exists, "quinn-proto is fine" and "quinn-proto must go" are both guesses, and this
 project has a rule about those.

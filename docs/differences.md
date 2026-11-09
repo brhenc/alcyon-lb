@@ -1,14 +1,14 @@
-# Where Ibex differs from HAProxy
+# Where Alcyon differs from HAProxy
 
-What an operator can see: HAProxy 3.5-dev8-885761-29 does one thing, Ibex does another or
+What an operator can see: HAProxy 3.5-dev8-885761-29 does one thing, Alcyon does another or
 refuses. Each entry says what to do instead.
 
 ## `userlist`: hashed passwords (`user <u> password <hash>`)
 
-HAProxy hands the hash to glibc `crypt(3)`. Ibex has no `crypt(3)` (it needs `unsafe` or a C
-library) and verifies the formats it can in safe Rust, with the `ibex-crypt` crate.
+HAProxy hands the hash to glibc `crypt(3)`. Alcyon has no `crypt(3)` (it needs `unsafe` or a C
+library) and verifies the formats it can in safe Rust, with the `alcyon-crypt` crate.
 
-| format | prefix | HAProxy (glibc) | Ibex |
+| format | prefix | HAProxy (glibc) | Alcyon |
 |---|---|---|---|
 | MD5-crypt | `$1$` | verifies | verifies |
 | SHA-256-crypt | `$5$` (`rounds=1000..999999999`) | verifies | verifies |
@@ -21,7 +21,7 @@ library) and verifies the formats it can in safe Rust, with the `ibex-crypt` cra
 | anything glibc refuses (unknown id, malformed salt, rounds out of range, ...) | | alert "not supported by crypt(3)" | the same alert |
 
 Refused at load, the message is
-`the encrypted password used for user 'u' is in the yescrypt ($y$) format, which Ibex cannot verify
+`the encrypted password used for user 'u' is in the yescrypt ($y$) format, which Alcyon cannot verify
 (it verifies $1$, $5$, $6$, $2a$, $2b$ and $2y$); rehash it with one of those or use 'insecure-password'.`
 Rehash with `mkpasswd -m sha-512` (or `openssl passwd -6`), `mkpasswd -m bcrypt` or
 `htpasswd -B`.
@@ -43,16 +43,16 @@ bcrypt at cost 5 to 8 for a hash on the request path.
 
 Known gap against glibc: the characters allowed in a `$1$`/`$5$`/`$6$` salt were measured on a
 sample (`:`, space and non-ASCII bytes are refused by glibc, printable ASCII else is accepted);
-Ibex applies that rule and has not been compared on every byte. The 900 verdicts of
-`crates/ibex-crypt/tests/vectors.txt` (salts, rounds, password lengths, malformed settings) agree
+Alcyon applies that rule and has not been compared on every byte. The 900 verdicts of
+`crates/alcyon-crypt/tests/vectors.txt` (salts, rounds, password lengths, malformed settings) agree
 with glibc.
 
 ## Regular expressions
 
 HAProxy compiles every regular expression with PCRE2 (or the C library's POSIX regex).
-Ibex is memory-safe Rust and links no C regex library, by decision (T154, 2026-10-04):
-`pcre2` and its C bindings are out. Ibex compiles a pattern with the `regex` crate first and,
-only when `regex` refuses it, with the pure-Rust `fancy-regex` crate (crate `ibex-regex`,
+Alcyon is memory-safe Rust and links no C regex library, by decision (T154, 2026-10-04):
+`pcre2` and its C bindings are out. Alcyon compiles a pattern with the `regex` crate first and,
+only when `regex` refuses it, with the pure-Rust `fancy-regex` crate (crate `alcyon-regex`,
 type `UserRegex`). An ordinary pattern keeps `regex`'s guarantee of matching in time linear in
 the input and costs what it did before; a pattern with a PCRE-only feature is slower and can
 backtrack. This covers every place a configuration regex is used: ACL `-m reg` and the `*_reg`
@@ -66,15 +66,15 @@ Look-ahead and look-behind (`(?=..)`, `(?!..)`, `(?<=..)`, `(?<!..)`), back-refe
 `a*+`, `a?+`, `a{1,2}+`), named groups (`(?<n>..)`, `(?P<n>..)`), inline flags (`(?i)`,
 `(?s)`, `(?m)`, `(?x)`), conditionals (`(?(1)a|b)`), `\K`, `\G`, `\Z`, `\h`, `\R`, `\N`.
 Each of the first group was measured on HAProxy and is a test in
-`crates/ibex-rt/tests/it/pcre_regex.rs`, in an ACL, in `replace-header` and in `regsub`.
+`crates/alcyon-rt/tests/it/pcre_regex.rs`, in an ACL, in `replace-header` and in `regsub`.
 
 ### What is refused at load
 
 A pattern with a PCRE feature `fancy-regex` lacks is refused when the configuration is read
-(`ibex -c` fails; HAProxy accepts all of these), with a message that names the feature:
+(`alcyon -c` fails; HAProxy accepts all of these), with a message that names the feature:
 
 ```
-bad regular expression <(?R)>: PCRE feature not supported by Ibex: recursion and subroutine calls (see docs/differences.md)
+bad regular expression <(?R)>: PCRE feature not supported by Alcyon: recursion and subroutine calls (see docs/differences.md)
 ```
 
 - recursion and subroutine calls: `(?R)`, `(?1)`, `(?-1)`, `(?+1)`, `(?&name)`, `(?P>name)`, `\g<n>`, `\g'n'` (and `\gN`, which `fancy-regex` would compile as a call, not a back-reference),
@@ -97,14 +97,14 @@ An ACL pattern is now checked at load too, in `acl` lines and in inline `{ ... }
 
 A conditional on a group the pattern does not have, `(?(2))` with no group 2 or `(?(0)..)`, is
 refused as PCRE2 refuses it ("reference to non-existent subpattern"): `fancy-regex` 0.19.2
-compiles it and then panics at the first match, which aborted Ibex before T277. So are the
+compiles it and then panics at the first match, which aborted Alcyon before T277. So are the
 keys of a `map_reg`/`map_regm` file, at load, and `add map`/`add acl` on the CLI.
 
 ### Unnamed groups in ACL, `map_reg` and health-check regexes
 
 HAProxy compiles the regex of an ACL (`-m reg`, `*_reg`, pattern files, `add acl`), of
 `map_reg` (file and `add map`) and of `http-check expect rstring`/`rstatus` and `tcp-check
-expect rstring` with PCRE2_NO_AUTO_CAPTURE: only a named group captures and has a number. Ibex
+expect rstring` with PCRE2_NO_AUTO_CAPTURE: only a named group captures and has a number. Alcyon
 does the same (T274 J2): `(a)\1`, `((a))\2`, `(a)(?<n>b)\2` and `(a)(?(1)b|c)` are refused
 with `reference to non-existent subpattern`, `(?<n>a)\1` is a reference to `n`, and
 `(a)(?<n>b)\1` refers to `n` too. `map_regm`, `replace-header`, `replace-value`,
@@ -117,14 +117,14 @@ says `regex '<re>' is invalid (error=<why>, erroffset=<n>)`, and carries no offs
 
 ### Regexes PCRE2 refuses
 
-Ibex refuses, with PCRE2's text and `erroffset` (CLI), a quantifier after a quantifier
+Alcyon refuses, with PCRE2's text and `erroffset` (CLI), a quantifier after a quantifier
 (`a**`, `a{2}{3}`; `a*+`, `a*?` stay valid) or after an anchor or option setting (`^*`,
 `\b+`, `(?i)*`), `{n,m}` out of order or above 65535, an unknown POSIX class
 (`[[:foo:]]`), a collating element (`[[.a.]]`) and a group name used twice (T287). Remaining
 differences, measured on HAProxy 3.5-dev8-885761-29:
 
 * PCRE2 refuses an unbounded look-behind (`(?<=a*)b`, "length of lookbehind assertion is
-  not limited"); Ibex runs it.
+  not limited"); Alcyon runs it.
 * PCRE2 accepts a quantified look-ahead (`(?=a)+`, `(?!a){2}`) and `(?J)` duplicate names;
   `fancy-regex` refuses both.
 
@@ -144,27 +144,27 @@ there is no quoting. `set var` needs `experimental-mode on` (T287). Payload line
 ### The backtrack limit
 
 A `fancy-regex` match runs under a limit of 1,000,000 backtracking steps
-(`ibex_regex::BACKTRACK_LIMIT`). A match that exceeds it is a non-match, silently: nothing is
+(`alcyon_regex::BACKTRACK_LIMIT`). A match that exceeds it is a non-match, silently: nothing is
 logged per request. This is HAProxy's outcome, measured with `^/(a+)+(?=$)` against
-`/aaaa...ab` (28, 48, 100 and 3000 `a`): PCRE2 gives up and the ACL does not match. Ibex
+`/aaaa...ab` (28, 48, 100 and 3000 `a`): PCRE2 gives up and the ACL does not match. Alcyon
 answers in about 15 ms in a debug build, whatever the length. The limit bounds the cost of a
 hostile request, not the answer a legitimate pattern gets: a pattern that needs more than a
 million steps on a real header is a pattern to rewrite.
 
-The plain pattern `^/(a+)+$`, with no PCRE-only feature, is not backtracking at all on Ibex
+The plain pattern `^/(a+)+$`, with no PCRE-only feature, is not backtracking at all on Alcyon
 (it runs in `regex`, linear time) and gives the answer PCRE2 gives.
 
 ## `use_backend` with a log-format name
 
 `use_backend %[req.hdr(x)]` (a backend name built per request) is refused at load with
-`'use_backend' with a log-format backend name is not implemented by Ibex`. HAProxy accepts
+`'use_backend' with a log-format backend name is not implemented by Alcyon`. HAProxy accepts
 it, skips the rule when the built name is no backend, and does not check the name at load.
 `use-server` with a log-format server name is refused the same way. Name the backends in
 `use_backend ... if` rules instead.
 
 ## Out of Milestone 1 scope: refused at load (T164)
 
-These are refused by the parser with `'<keyword>' is not supported by Ibex (out of scope, see
+These are refused by the parser with `'<keyword>' is not supported by Alcyon (out of scope, see
 docs/differences.md)`, so a configuration that relies on one fails to load instead of running
 without it. HAProxy accepts them (when built with the feature).
 
@@ -180,8 +180,8 @@ without it. HAProxy accepts them (when built with the feature).
 
 Not refused, on purpose:
 
-- QUIC / HTTP/3 (`quic4@`, `quic6@`, `proto quic`, `alpn h3`): Ibex has a QUIC listener
-  (`ibex-quic`, exercised by `crates/ibex-config/tests/it/quic_bind.rs`); it is experimental.
+- QUIC / HTTP/3 (`quic4@`, `quic6@`, `proto quic`, `alpn h3`): Alcyon has a QUIC listener
+  (`alcyon-quic`, exercised by `crates/alcyon-config/tests/it/quic_bind.rs`); it is experimental.
   The reference HAProxy binary here is built without QUIC and refuses these.
 - `resolvers` sections: parsed and checked as HAProxy does (T483), and a server whose address is a
   name and that has `resolvers` (or inherits it from `default-server`) is re-resolved at run time
@@ -203,7 +203,7 @@ Not refused, on purpose:
   the worker's cache costs no lock and no allocation; a miss asks worker 0 (which owns the
   sections) through the mailbox and the stream waits; a server resolution of the same name
   younger than `hold valid` answers it, as in HAProxy. The cache is per worker (HAProxy's is the
-  resolution itself, shared), bounded by the Ibex-only `tune.resolvers.cache-size` (default
+  resolution itself, shared), bounded by the Alcyon-only `tune.resolvers.cache-size` (default
   1024 entries, about 290 KB a worker, allocated by the first `do-resolve` a worker runs); a
   stream waits at most 30 s for an answer worker 0 never sent. `tcp-request content
   do-resolve` waits only within the `inspect-delay` (as HAProxy, which asks nothing without
@@ -217,12 +217,12 @@ Not refused, on purpose:
   without fallback. The queries of a TCP connection are numbered 1, 2, 3 as in HAProxy (T489). A
   TCP port nobody listens on is not a `snd_error` (measured: the queries count `sent`, the
   resolution times out), as in HAProxy. HAProxy also
-  creates an implicit `default` section (from `/etc/resolv.conf`, used by its httpclient); Ibex has
+  creates an implicit `default` section (from `/etc/resolv.conf`, used by its httpclient); Alcyon has
   no httpclient and does not (user, 2026-10-25). `show resolvers` (T485) therefore lacks the block
   HAProxy 3.5-dev8 ends with, even for a configuration with no `resolvers` section at all:
   `Resolvers section default` / ` nameserver 127.0.0.53:` and the sixteen counters at 0 (the first
   `nameserver` of `/etc/resolv.conf`; `show stat domain resolvers` has the row `127.0.0.53,default,0,...`).
-  With no section Ibex prints `No resolvers found` (HAProxy never does). The counters are the
+  With no section Alcyon prints `No resolvers found` (HAProxy never does). The counters are the
   sixteen of `show resolvers` per nameserver, bumped where `resolv_process_responses` bumps them,
   also readable as `haproxy_resolver_<counter>{resolver=,nameserver=}` (the name `send_error` for
   `snd_error`; scrape with `scope=resolver`; the reference binary here has no exporter, so the
@@ -234,9 +234,9 @@ Not refused, on purpose:
   and `init-addr last|libc|none|<ip>` is applied in order; `last` (and so the default
   `last,libc`) is the `srv_addr` of the server's line in its server-state file (T490), read while
   the configuration loads. When the load then fails on an address, HAProxy has already printed
-  the state file's own messages ("Can't open ...") and Ibex has not; when it does not fail, Ibex
+  the state file's own messages ("Can't open ...") and Alcyon has not; when it does not fail, Alcyon
   prints the `init-addr` notices before them, HAProxy after. A server that starts without an address (`init-addr none`)
-  shows `srv_admin_state 32`; after `disable server` HAProxy shows 33 and Ibex still 32 (Ibex keeps
+  shows `srv_admin_state 32`; after `disable server` HAProxy shows 33 and Alcyon still 32 (Alcyon keeps
   one admin state per server, not HAProxy's flags), and in both it stays in `MAINT (resolution)`.
   `-dr` appends `none`, as in HAProxy.
 
@@ -246,7 +246,7 @@ Same as HAProxy (measured, 3.5-dev8-885761-29): `option httplog`, `httpslog`, `t
 
 Different, and what to do instead:
 
-| what | HAProxy | Ibex |
+| what | HAProxy | Alcyon |
 |---|---|---|
 | `fc_err` (in `option httpslog`) | the connection error code (48 for a client that reset) | always `0` |
 | `ssl_c_err`, `ssl_c_ca_err`, `ssl_fc_err` | the verify error and the last TLS error | `0` on a TLS connection, no sample otherwise |
@@ -259,18 +259,18 @@ Different, and what to do instead:
 
 ## TLS handshake failures: what is not matched (T272B)
 
-Measured on HAProxy 3.5-dev8-885761-29; pinned in `crates/ibex-rt/tests/tls_handshake_log.rs`.
+Measured on HAProxy 3.5-dev8-885761-29; pinned in `crates/alcyon-rt/tests/tls_handshake_log.rs`.
 
 - Frontend `smax` after probes that fail the handshake: HAProxy reports 1 to 6 for the same
   sequential probes, run after run, so it is not a concurrency maximum there (it looks like a
-  sum over threads). Ibex reports the real maximum of concurrent sessions: 1 at most, since a
+  sum over threads). Alcyon reports the real maximum of concurrent sessions: 1 at most, since a
   failed handshake never makes a session.
 - `strict-sni` is refused at load (HAProxy answers a ClientHello with no or an unknown SNI with
   alert `unrecognized_name` and logs `callback failed`). Implementing it needs the certificate
   resolver to refuse instead of falling back to the default certificate: a feature, not scheduled.
 - Whether a client that leaves mid-handshake is `Connection closed during SSL handshake` or a
   bare `SSL handshake failure` depends in HAProxy on whether the FIN came with the bytes or
-  alone. Ibex follows the same rule (a whole handshake record read, then a FIN in a read of its
+  alone. Alcyon follows the same rule (a whole handshake record read, then a FIN in a read of its
   own, not queued behind the data at `MSG_PEEK` time) and so can differ from HAProxy on a
   race between the two.
 
@@ -281,35 +281,35 @@ In `mode http` the automatic SNI of an `ssl` server is the Host header without i
 sends it in the ClientHello, which RFC 6066 does not allow; rustls sends no SNI for an address,
 so the server sees none (`ssl_fc_sni` empty) and picks its default certificate. The connection
 is still keyed by `127.0.0.1` for reuse, as HAProxy keys it (a Host `127.0.0.2` does not share
-it). Measured on HAProxy 3.5-dev8-885761-29; pinned in `crates/ibex-rt/tests/it/server_tls.rs`
+it). Measured on HAProxy 3.5-dev8-885761-29; pinned in `crates/alcyon-rt/tests/it/server_tls.rs`
 (`a_tls_connection_whose_sni_is_an_ip_address_*`).
 
 ## HTTP/2 to servers: one stream per connection (T540)
 
 `server ... proto h2` (h2c, and h2 over `ssl` whatever ALPN selects) and `ssl alpn h2` /
 `alpn h2,http/1.1` (h2 when the server selects it) speak HTTP/2 through
-`ibex_proto::h2_srv::H2SrvCodec`, one stream at a time per server connection, which is
+`alcyon_proto::h2_srv::H2SrvCodec`, one stream at a time per server connection, which is
 HAProxy's behaviour under the default `http-reuse safe` (an h2 server connection private to its
 client session: 26 connections for 26 client sessions, T533 A.3 row 6). Measured on HAProxy
-3.5-dev8-885761-29; pinned in `crates/ibex-rt/tests/it/server_h2.rs`. Where it differs:
+3.5-dev8-885761-29; pinned in `crates/alcyon-rt/tests/it/server_h2.rs`. Where it differs:
 
 - Under `aggressive` / `always` HAProxy multiplexes concurrent requests as streams of one
-  connection (A.3 row 7: 20 concurrent requests on 1 connection); Ibex opens one connection
+  connection (A.3 row 7: 20 concurrent requests on 1 connection); Alcyon opens one connection
   per concurrent request (sequential requests share one, as HAProxy's).
 - A refused stream (REFUSED_STREAM, a GOAWAY whose last id is below the stream) under `retry-on
   all-retryable-errors`: HAProxy retries it on the same connection while it lives (measured: 3
-  retries on one connection, then 502 `SH--`); Ibex retries on a new connection each time (its
+  retries on one connection, then 502 `SH--`); Alcyon retries on a new connection each time (its
   L7 retry closes the server connection). With `retry-on empty-response` both retry once on a
   new connection; without, both answer 502 `SH--`. `retry-on refused-stream` does not exist in
   dev8 (refused there too).
 - A GOAWAY whose last id is below the stream in progress: HAProxy waits for `timeout server` (504
-  `sH--`); Ibex ends the stream at once (502 `SH--`, retryable as above).
+  `sH--`); Alcyon ends the stream at once (502 `SH--`, retryable as above).
 - An HTTP check request without a Host (`option httpchk GET /`) goes without `:authority`, as
   HAProxy's: a server that requires one (nghttpd) refuses it, `SOCKERR` in both.
 - `%B` of an h2 response follows HAProxy's HTX count (no reason phrase; the `transfer-encoding:
   chunked` written for a response without a length counts 25 bytes less), measured equal for
   bodies of 2, 19, 1000 and 40000 bytes.
-- CONNECT to an h2 server: HAProxy tunnels it; Ibex's codec refuses it, 502, no stream opened
+- CONNECT to an h2 server: HAProxy tunnels it; Alcyon's codec refuses it, 502, no stream opened
   (CONNECT and WebSocket to h2 servers: T548).
 
 ## `tune.maxaccept`: the default is no limit (T295)
@@ -317,17 +317,17 @@ client session: 26 connections for 26 client sessions, T533 A.3 row 6). Measured
 `tune.maxaccept <n>` is accepted and applied: one listener wakeup accepts at most `n`
 connections in a row (`-1`: no limit; `0` or a non-number: the default, as `atol` gives
 HAProxy). HAProxy's default is `MAX_ACCEPT`, 4, after which its thread goes on to its other
-work and the connections left in the backlog wait for the next poll. Ibex's default is no
+work and the connections left in the backlog wait for the next poll. Alcyon's default is no
 limit: its listener is polled level-triggered and an accept loop drains the backlog it finds,
 which is what every measurement so far was made with. Set `tune.maxaccept 4` to get
 HAProxy's behaviour.
 
 ## Chunked bodies: chunks are not merged (T302)
 
-Like HAProxy, Ibex forwards a chunked body (either way) with each chunk-size line rewritten:
+Like HAProxy, Alcyon forwards a chunked body (either way) with each chunk-size line rewritten:
 the extension and blanks dropped, the size in upper-case hex without leading zeros (`0005;a=b`
 goes out as `5`, `a` as `A`). HAProxy also merges the chunks it holds in its buffer at once
-into one (`A` and `3` received in one read go out as `D`); Ibex keeps the chunks as received.
+into one (`A` and `3` received in one read go out as `D`); Alcyon keeps the chunks as received.
 Which chunks HAProxy merges depends on how the bytes arrive, and the payload is the same.
 
 ## Slow clients (slowloris) and timeouts (T349)
@@ -350,10 +350,10 @@ clients; scripts in T349). Open items are tracked in `tasks/T349-slow-client-def
 
 **A request body sent slowly is not cut by `timeout http-request` on either proxy.** That
 timeout ends with the request head. To close a client that trickles its body, use
-`http-request wait-for-body time <t>` or `option http-buffer-request` (both work in Ibex, as
+`http-request wait-for-body time <t>` or `option http-buffer-request` (both work in Alcyon, as
 in HAProxy).
 
-| | HAProxy | Ibex | what to do |
+| | HAProxy | Alcyon | what to do |
 |---|---|---|---|
 | `maxconnrate`, `maxsessrate` (global), `rate-limit sessions` (frontend) | accepted | **refused at load** (unknown keyword) | limit per source with a stick table (`sc_conn_rate`) until implemented (T349) |
 | `timeout client-fin` | accepted | **refused at load** | remove it; half-closed clients wait for `timeout client` (T349) |
@@ -371,40 +371,40 @@ in HAProxy).
 All eight normalizers give HAProxy's answers on the paths measured (`path-strip-dot` and
 `path-strip-dotdot`, with and without `full`, on 1451 paths since T359g, 2026-10-17). Each takes
 only its own option, with HAProxy's message for any other word. An unknown normalizer is
-refused, as HAProxy does. Ibex does not yet require `expose-experimental-directives` for
+refused, as HAProxy does. Alcyon does not yet require `expose-experimental-directives` for
 `normalize-uri` (HAProxy 3.5 does).
 
 ## `listen()` backlog: the `bind` option `maxconn` is refused (T360)
 
 The backlog of a bind follows HAProxy's `listener_backlog()`: the bind's `backlog`, else the
 proxy's `backlog` (frontend, listen or defaults), else the proxy's `maxconn` (the global one
-when the proxy sets none), else 1024, capped by `net.core.somaxconn`. The one step Ibex does
+when the proxy sets none), else 1024, capped by `net.core.somaxconn`. The one step Alcyon does
 not have is the `bind` option `maxconn` (between the proxy's `backlog` and its `maxconn`
 in HAProxy): `bind ... maxconn N` is refused at load, as before. A socket handed over by a
 reload keeps the backlog it was bound with, as in HAProxy.
 
-## `tune.ibex.zero-buffers on|off`: an Ibex-only global keyword (T437 5b)
+## `tune.alcyon.zero-buffers on|off`: an Alcyon-only global keyword (T437 5b)
 
-When a buffer goes back to its pool (or is freed), Ibex overwrites the bytes that were written to
+When a buffer goes back to its pool (or is freed), Alcyon overwrites the bytes that were written to
 it (up to a per-buffer high-water mark, not the whole 16 KB) with zeros, so the plaintext of one
 connection is not what the next one is handed, and a core dump or a memory-disclosure bug finds
 less. The overwrite is a `zeroize` write the compiler may not remove. Default **off** (since S1,
-2026-10-24: Ibex's per-request safety extras stay off while it is compared with HAProxy; `on`
+2026-10-24: Alcyon's per-request safety extras stay off while it is compared with HAProxy; `on`
 costs ~840 instructions per request on a rules benchmark). HAProxy has no such setting (its pools
 keep stale bytes; `-dM` poisoning is a debug option) and refuses the keyword as unknown. It takes
 exactly `on` or `off`; anything else, or a missing argument, is a configuration error. Limits:
 bytes written through `Buf::writable()` and never committed are not tracked, and buffers owned by
-rustls itself are not Ibex's to overwrite. The TLS record buffers (plaintext and ciphertext,
+rustls itself are not Alcyon's to overwrite. The TLS record buffers (plaintext and ciphertext,
 `rx_raw`/`tx_raw` included) are not covered by this setting: they have their own
-`tune.ibex.ssl-zero-buffers` (default on, below).
+`tune.alcyon.ssl-zero-buffers` (default on, below).
 
-## `tune.ibex.ssl-zero-buffers on|on-free|off`: an Ibex-only global keyword (S2)
+## `tune.alcyon.ssl-zero-buffers on|on-free|off`: an Alcyon-only global keyword (S2)
 
-When a TLS connection ends, Ibex overwrites the whole capacity of its TLS record buffers (the
+When a TLS connection ends, Alcyon overwrites the whole capacity of its TLS record buffers (the
 ciphertext read from and written to the socket, and the plaintext decrypted from it) with zeros,
 so session data does not stay in freed memory. Default **on** (user decision 2026-10-24: TLS keys
 and plaintext are a real target); `off` leaves them as HAProxy does. The plain I/O buffers
-follow `tune.ibex.zero-buffers` (default off) instead. HAProxy 3.5-dev8 refuses the keyword as
+follow `tune.alcyon.zero-buffers` (default off) instead. HAProxy 3.5-dev8 refuses the keyword as
 unknown. It takes exactly `on`, `on-free` or `off`; anything else, or a missing argument, is a
 configuration error. Limits: key material inside rustls/ring is not covered (`tradeoff.md` 6.27).
 
@@ -416,53 +416,53 @@ next one overwrites it. Only ciphertext, never read past its length by safe Rust
 dump or through a memory-disclosure defect. It saves about 1 instruction per 18 bytes of response
 (`tradeoff.md` 6.32). The default stays `on`.
 
-## `tune.ibex.h3-path relay|mux`: an Ibex-only global keyword (T509, temporary)
+## `tune.alcyon.h3-path relay|mux`: an Alcyon-only global keyword (T509, temporary)
 
 Which path an HTTP/3 request stream takes into the stream engine while the h3 mux is being
 brought in (`docs/design/h3-engine-2026-10-26.md`, slices H3a to H5): `mux` (the default since
 T536) makes each QUIC connection an owner session whose request streams are children served
 through the same bridge as HTTP/2 streams; `relay` is the HTTP/1 relay over a socket pair.
-Unset, the environment variable `IBEX_H3_PATH` (`mux` or `relay`) decides, then `mux`, so the
+Unset, the environment variable `ALCYON_H3_PATH` (`mux` or `relay`) decides, then `mux`, so the
 h3 tests run on either path. HAProxy refuses the keyword as unknown. It takes exactly `relay` or `mux`. The keyword is
 deleted with the relay (slice H5).
 
-## `tune.ibex.quic-ack-frequency on|off` and two parameters: Ibex-only global keywords (Q0)
+## `tune.alcyon.quic-ack-frequency on|off` and two parameters: Alcyon-only global keywords (Q0)
 
 `on` (default `off`) makes the server send an ACK_FREQUENCY frame (draft-ietf-quic-ack-frequency) to
 a QUIC peer that advertises `min_ack_delay`, asking it to acknowledge less often so fewer ACK-only
-datagrams arrive. `tune.ibex.quic-ack-frequency-threshold <n>` (0 to 255, default 2) is how many
+datagrams arrive. `tune.alcyon.quic-ack-frequency-threshold <n>` (0 to 255, default 2) is how many
 ack-eliciting packets the peer may receive before it acknowledges at once;
-`tune.ibex.quic-ack-frequency-max-delay <time>` (1ms to 16383ms, default 25ms) is how long it may
+`tune.alcyon.quic-ack-frequency-max-delay <time>` (1ms to 16383ms, default 25ms) is how long it may
 delay an acknowledgement. A value out of range is refused at parse time. It only asks the peer: a
 hostile client can ignore it, so it is not ACK-flood protection by itself. Off, nothing is sent,
 as HAProxy 3.5-dev10, which does not send ACK_FREQUENCY; HAProxy refuses all three keywords as unknown.
 
-## QUIC peers that ignore ACK_FREQUENCY: `ibex_fc_quic_ack_*`, `show quic ibex-acks`, `QuicAck*` (T569)
+## QUIC peers that ignore ACK_FREQUENCY: `alcyon_fc_quic_ack_*`, `show quic alcyon-acks`, `QuicAck*` (T569)
 
-Ibex extensions; HAProxy 3.5-dev10 has no equivalent (it sends no ACK_FREQUENCY, and neither its
+Alcyon extensions; HAProxy 3.5-dev10 has no equivalent (it sends no ACK_FREQUENCY, and neither its
 `quic_*` stats nor its fetches count a peer's ACK-only packets). Per QUIC connection, the vendored
 quinn-proto counts (`AckStats`, vendor change 8) the ack-eliciting 1-RTT packets sent, the 1-RTT
 packets received with an ACK frame and nothing ack-eliciting ("ACK-only"), and, once the peer has
-acknowledged an ACK_FREQUENCY frame (`tune.ibex.quic-ack-frequency on` and a peer that advertises
+acknowledged an ACK_FREQUENCY frame (`tune.alcyon.quic-ack-frequency on` and a peer that advertises
 `min_ack_delay`), the "excess": ACK-only packets that acknowledge at most the threshold's number of
 new ack-eliciting packets, all sent after that frame, sooner than the requested `max_ack_delay`
 (less 1 ms) after the first of them was sent, with no gap (a packet missing or acknowledged late,
 which draft-ietf-quic-ack-frequency 6.2 lets the peer acknowledge at once) and none of them an
 IMMEDIATE_ACK packet. Each of those would have let a compliant peer acknowledge; an ACK-only packet
 none explains is one it should not have sent. The bar is lenient: ECN-CE marks (which also allow an
-immediate ACK) are not seen, and are not needed as Ibex sends no ECN. A peer that never acknowledged
+immediate ACK) are not seen, and are not needed as Alcyon sends no ECN. A peer that never acknowledged
 an ACK_FREQUENCY frame is never judged: its excess has no value.
 
 - Fetches, on an HTTP/3 stream (mux path; no sample elsewhere, the relay path included), as the
-  stream's request head found them: `ibex_fc_quic_ack_eliciting_sent`, `ibex_fc_quic_ack_only_rcvd`,
-  `ibex_fc_quic_ack_ratio` (ACK-only received per 1000 ack-eliciting sent; no sample before one is
-  sent), `ibex_fc_quic_ack_excess` (no sample for a peer that is not judged). For example
-  `http-request deny if { ibex_fc_quic_ack_excess gt 100 }`, or `track-sc0` and a `gpc` on it.
-- `show quic ibex-acks [all|clo]`: the one-line head, then `ack_elic_sent ack_only_rcvd ratio_pm
+  stream's request head found them: `alcyon_fc_quic_ack_eliciting_sent`, `alcyon_fc_quic_ack_only_rcvd`,
+  `alcyon_fc_quic_ack_ratio` (ACK-only received per 1000 ack-eliciting sent; no sample before one is
+  sent), `alcyon_fc_quic_ack_excess` (no sample for a peer that is not judged). For example
+  `http-request deny if { alcyon_fc_quic_ack_excess gt 100 }`, or `track-sc0` and a `gpc` on it.
+- `show quic alcyon-acks [all|clo]`: the one-line head, then `ack_elic_sent ack_only_rcvd ratio_pm
   ackf_thr ackf_excess` per connection (`-` for a peer that is not judged).
-- `show info`, with `tune.ibex.quic-ack-frequency on` only (as the zero-on-free lines, not in
+- `show info`, with `tune.alcyon.quic-ack-frequency on` only (as the zero-on-free lines, not in
   `typed`/`json`): `QuicAckElicitingSent`, `QuicAckOnlyRcvd`, `QuicAckFreqExcess`, summed over
-  the connections that ended (a live one's are in `show quic ibex-acks`).
+  the connections that ended (a live one's are in `show quic alcyon-acks`).
 
 No setting closes a connection on these counts: a rule does it (`http-request deny`/`reject`).
 
@@ -472,7 +472,7 @@ No setting closes a connection on these counts: a rule does it (`http-request de
 close the connection with an application CONNECTION_CLOSE, code `H3_NO_ERROR` (0x100).
 HAProxy 3.5-dev7 sends a transport CONNECTION_CLOSE with `NO_ERROR` (0x0). quinn-proto gives an
 application no transport-level close; both tell the client the connection ended without an
-error, and nothing is served either way. (With `tune.ibex.h3-path relay` a session rule resets
+error, and nothing is served either way. (With `tune.alcyon.h3-path relay` a session rule resets
 the request stream with `H3_REQUEST_CANCELLED`, a 502 before T523: gone with the relay, slice H5.)
 
 ## HTTP/3 under the mux: interim responses, trailers and CONNECT (T520)
@@ -484,17 +484,17 @@ Measured on HAProxy 3.5-dev7 with QUIC (aioquic client) and, for h2, 3.5-dev8 (c
   from the server, then `200`; `expect: 100-continue`). When the server's `103` and `200` come
   in one segment it aborts (`BUG_ON htx.c:391`, SIGILL). Both are an HAProxy 3.5-dev regression
   fixed upstream by 76454cbbf (in 3.5-dev8; 3.0/3.2 unaffected): a QUIC oracle from current master
-  forwards `103` then `200` as Ibex does. Ibex (mux path) follows RFC 9114 4.1:
+  forwards `103` then `200` as Alcyon does. Alcyon (mux path) follows RFC 9114 4.1:
   an interim HEADERS without FIN, then the final response; both in one segment are forwarded.
   The relay path (the default until slice H5) drops interim responses and response trailers.
   `%B` of such a request: HAProxy counts the interim head (`B=119` for a 103 with one `link`
-  field and a 2-byte `200`), Ibex does not (`B=51`), on h2 and h3.
+  field and a 2-byte `200`), Alcyon does not (`B=51`), on h2 and h3.
 - **Interim responses to an h2 client** are forwarded as HAProxy does (they were dropped before).
 - **Response trailers to an h3 client** (mux path): a chunked response's trailer section is one
   HEADERS frame after the DATA, with the FIN, as HAProxy; `%B` counts the trailer names and
   values as HAProxy. With `option http-drop-response-trailers` the data ends with the FIN as on
   HAProxy, but `%B` is smaller by the dropped fields (HAProxy counts them: they are in its HTX
-  message when dropped; Ibex cuts them from the buffer first). **Response trailers to an h2
+  message when dropped; Alcyon cuts them from the buffer first). **Response trailers to an h2
   client are still not sent** (HAProxy sends them; known since T381).
 - **CONNECT** under the mux is reset with `H3_REQUEST_REJECTED` (0x10b), extended CONNECT and a
   `te` other than `trailers` with `H3_MESSAGE_ERROR` (0x10e), the connection staying usable, as
@@ -509,7 +509,7 @@ at `timeout http-keep-alive` (else `http-request`) from the end of its last stre
 default) only quinn's 30 s transport idle timeout ends a connection that sends nothing or a
 partial head (RV-16). Gone with the relay, slice H5.
 
-## `tune.ibex.zero-spares on|off`: an Ibex-only global keyword (S1)
+## `tune.alcyon.zero-spares on|off`: an Alcyon-only global keyword (S1)
 
 The header rules, samples and formats reuse per-thread spare strings and header lists (`show
 pools` `spare_str`, `spare_list`, `scratch_str`, `scratch_bytes`). With `on`, a string's used
@@ -519,7 +519,7 @@ not left in memory. Default **off**: the wipe costs ~1k instructions per request
 benchmark, and HAProxy wipes nothing either. HAProxy refuses the keyword as unknown. It takes
 exactly `on` or `off`; anything else, or a missing argument, is a configuration error.
 
-## `tune.ibex.counters shared|per-thread`: an Ibex-only global keyword (T582)
+## `tune.alcyon.counters shared|per-thread`: an Alcyon-only global keyword (T582)
 
 Who writes the counters a stream adds to when it ends (`hrsp_*`, `req_tot`, `stot`, `lbtot`,
 `connect`, `reuse`, `bin`, `bout`, the aborts and errors, the timing sums, `lastsess`, the
@@ -533,21 +533,21 @@ when the peaks were not simultaneous, exact with one thread, as `MaxConnRate`), 
 `qtime`/`ctime`/`rtime`/`ttime` are the mean of the threads' running averages (each over the
 thread's own requests, HAProxy's per-thread-group rule; exact with one thread). The rows are
 made when each thread starts, (2 x proxies + servers + 2) x 208 bytes per thread (10,000
-servers at 64 threads: ~128 MB); the start prints the size (`[NOTICE] tune.ibex.counters
+servers at 64 threads: ~128 MB); the start prints the size (`[NOTICE] tune.alcyon.counters
 per-thread: ...`), `show pools` lists them as pool `counters`, and a thread that cannot have
-them stops the start. `clear counters` works as with `shared`. `per-tgroup` is refused: Ibex
+them stops the start. `clear counters` works as with `shared`. `per-tgroup` is refused: Alcyon
 runs one thread group, so it would be `shared` under another name. Read at start: a reload
 applies a change. HAProxy refuses the keyword as unknown. Design:
 `docs/design/per-thread-counters-2026-11-02.md`.
 
-## `tune.ibex.zero-on-free off|soft|hard`: an Ibex-only global keyword (T459)
+## `tune.alcyon.zero-on-free off|soft|hard`: an Alcyon-only global keyword (T459)
 
 What the process's allocator does with every heap block that is freed (rustls and ring state,
-Ibex's own objects, std's): `off` (default) frees it as it is; `hard` overwrites it with zeros,
+Alcyon's own objects, std's): `off` (default) frees it as it is; `hard` overwrites it with zeros,
 then frees it (the old block of a reallocation too); `soft` puts it on the freeing thread's
 quarantine and wipes and frees it when the thread is idle, within bounds (at most 4 x
 `tune.memory.hot-size` bytes per thread, at most ~100 ms, emptied by `pool_gc` and a refused
-allocation; `tradeoff.md` 6.29). With `soft` or `hard`, `show info` ends with Ibex-only lines
+allocation; `tradeoff.md` 6.29). With `soft` or `hard`, `show info` ends with Alcyon-only lines
 `ZeroOnFree`, `ZeroOnFreeBytes`, `ZeroOnFreeBlocks`, `ZeroOnFreeOldest_ms`, `ZeroOnFreeQueued`,
 `ZeroOnFreeWiped`, `ZeroOnFreeForced`, `ZeroOnFreeExpired` (`typed` and `json` leave them out);
 with `off` it is HAProxy's list. Pooled objects are not freed and follow their pools' settings
@@ -560,23 +560,23 @@ with a changing pattern and checks it on reuse, `-dMuaf` gives every pool object
 unmaps them on free, and `fail`, `no-merge`, `cold-first`, `no-global`, `no-cache`, `caller`,
 `tag`, `backup` (and their `no-`/opposite forms) change caching and checks. They are debugging
 aids for pool objects, not a wipe of freed memory, and `malloc`'d memory outside the pools is not
-touched by any of them; OpenSSL wipes its own key material (`OPENSSL_cleanse`). Ibex accepts
+touched by any of them; OpenSSL wipes its own key material (`OPENSSL_cleanse`). Alcyon accepts
 `-dMfail` and `-dMno-fail` only (S5) and refuses the other `-dM` forms. The keyword takes exactly
 `off`, `soft` or `hard`; anything else, or a missing argument, is a configuration error.
 
-## `tune.ibex.crypto-provider ring|ring-ibex`, `set ssl crypto-provider` and `show ssl crypto-provider`: Ibex-only (T460)
+## `tune.alcyon.crypto-provider ring|ring-alcyon`, `set ssl crypto-provider` and `show ssl crypto-provider`: Alcyon-only (T460)
 
 The rustls crypto provider every TCP TLS configuration is built on: binds, server lines and
 their health checks, TLS 1.2 and 1.3; and since T461 every QUIC bind, log-forward TLS bind and
 ring TLS server, which are on rustls 0.24 too. `ring` (the default) is upstream ring through
-`rustls-ring`; `ring-ibex` is the vendored ring fork that wipes key material when it is freed
-(`vendor/ringibex`, built with its `zeroize` feature on; what it wipes: `vendor/ringibex/ZEROIZE.md`,
-`tradeoff.md` 6.27). Exactly one argument, `ring` or `ring-ibex`; anything else is a configuration
+`rustls-ring`; `ring-alcyon` is the vendored ring fork that wipes key material when it is freed
+(`vendor/ringalcyon`, built with its `zeroize` feature on; what it wipes: `vendor/ringalcyon/ZEROIZE.md`,
+`tradeoff.md` 6.27). Exactly one argument, `ring` or `ring-alcyon`; anything else is a configuration
 error. HAProxy refuses the keyword as unknown.
 
 The TLS binds of a `log-forward` section and the TLS servers of a `ring` section run on it too
-since T461 (they were on rustls 0.23, and T460 refused `ring-ibex` with them): every TLS user of
-the process is on rustls 0.24 and the chosen provider, and nothing refuses `ring-ibex`. Their
+since T461 (they were on rustls 0.23, and T460 refused `ring-alcyon` with them): every TLS user of
+the process is on rustls 0.24 and the chosen provider, and nothing refuses `ring-alcyon`. Their
 handshakes count in `show ssl crypto-provider`, and a swap reaches their new connections.
 
 QUIC (T461): the handshake, the packet and header protection keys, and what quinn-proto took from
@@ -589,9 +589,9 @@ handshakes completed on each provider since start, front and back, QUIC included
 
     current ring
     provider ring handshakes 12
-    provider ring-ibex handshakes 0
+    provider ring-alcyon handshakes 0
 
-`set ssl crypto-provider ring|ring-ibex` (CLI, admin level) changes the provider at run time, for
+`set ssl crypto-provider ring|ring-alcyon` (CLI, admin level) changes the provider at run time, for
 the handshakes that start after it. Every TLS configuration (each `bind ... ssl`, each `server ...
 ssl` and its checks) is built again on the new provider, reading its certificate, CA and CRL files
 again; only once all of them are built is the new provider published, so a file that no longer
@@ -612,27 +612,27 @@ HAProxy's `ssl-provider`, `ssl-provider-path` and `ssl-propquery` load OpenSSL 3
 (additively, `configuration.txt` "ssl-provider"), which is not this: they stay refused as
 OpenSSL-only (table above).
 
-## `ibex.watchdog-warn-only`: an Ibex-only global keyword (T361)
+## `alcyon.watchdog-warn-only`: an Alcyon-only global keyword (T361)
 
 HAProxy's watchdog warns about a thread that has stopped processing traffic and, once it has been stuck for a
-second, aborts the process (exit status 134); no HAProxy keyword turns the abort off. Ibex does the same by
-default. `ibex.watchdog-warn-only` (global, no argument; HAProxy refuses it as an unknown keyword) keeps the
+second, aborts the process (exit status 134); no HAProxy keyword turns the abort off. Alcyon does the same by
+default. `alcyon.watchdog-warn-only` (global, no argument; HAProxy refuses it as an unknown keyword) keeps the
 warnings and `BlockedTrafficWarnings` and never aborts, for an operator who prefers a slow process to a restart.
-The `ibex.` prefix keeps it from clashing with a future HAProxy keyword.
+The `alcyon.` prefix keeps it from clashing with a future HAProxy keyword.
 
-## `tune.memory.hot-size`: the buffer floor is an Ibex extension (S1, S2)
+## `tune.memory.hot-size`: the buffer floor is an Alcyon extension (S1, S2)
 
 `tune.memory.hot-size <bytes>` (default 524288) parses as HAProxy parses it (`mem_parse_global_hot_size`:
 one argument, `atol`, strictly positive) and bounds what each thread keeps in its pools together,
 with HAProxy's rule: past 3/4 of it a pool evicts down while it holds more than its share, past
 the whole of it the largest pools are evicted across (`pool_put_to_cache`,
-`pool_evict_from_local_caches`). Two differences. **Floors**: each Ibex pool declares a per-thread
+`pool_evict_from_local_caches`). Two differences. **Floors**: each Alcyon pool declares a per-thread
 floor that eviction never goes under, and floor objects do not count against `hot-size`; the three
 buffer pools (`buffer`, `small_buffer`, `large_buffer`) have a floor of 64 per thread
-(`crates/ibex-rt/src/buf.rs`), where HAProxy's `minavail` is 2. The reason is measured:
+(`crates/alcyon-rt/src/buf.rs`), where HAProxy's `minavail` is 2. The reason is measured:
 at HAProxy's default, with 50 keep-alive connections of 16 KiB buffers on a thread, the budget
 holds fewer buffers than the connections need and HAProxy mallocs about 0.5 buffer per request;
-Ibex with the floor makes none (`docs/design/memory-2026-10-24.md` 1.3, 3.3). Only `pool_gc`
+Alcyon with the floor makes none (`docs/design/memory-2026-10-24.md` 1.3, 3.3). Only `pool_gc`
 (SIGQUIT, SIGTTOU, SIGUSR1, the stop path, a refused allocation) goes below a floor. **Eviction
 order**: one object at a time, newest first, largest pool first across pools; HAProxy evicts
 clusters of 8 oldest first from a per-thread LRU (`tradeoff.md` 6.28). `show pools` counts can lag
@@ -652,10 +652,10 @@ as HAProxy. Differences that remain:
   the limit by `nbthread` x `n`, as HAProxy; a take the pool refuses may have one by its class
   (`left * 3 >= q * n`: a local reply down to the last, a client's first buffer only while the
   reserve is full), and a buffer given back refills the reserve first. The default is HAProxy's
-  4, but Ibex makes the reserve only when `tune.buffers.limit` is set (without a limit its pool
+  4, but Alcyon makes the reserve only when `tune.buffers.limit` is set (without a limit its pool
   refuses only when memory is short, where the stream fails as in S5; HAProxy makes the 4 per
   thread always). At start HAProxy also fills the pool to its `minavail` (3): `limit 3` shows 7
-  allocated from the start on HAProxy, 4 on Ibex; both reach 7. Ibex gates only the emergency take on the
+  allocated from the start on HAProxy, 4 on Alcyon; both reach 7. Alcyon gates only the emergency take on the
   reserve; HAProxy also refuses a pool take of queues 1-3 while its reserve is not full enough.
 - A thread's cache does not keep free buffers while another thread's streams wait: they go to
   the pool's shelf and the waiting thread is woken (S6b; HAProxy wakes waiters on the freeing
@@ -665,18 +665,18 @@ as HAProxy. Differences that remain:
   stream's buffers still fail as before the queue: 500 `IR--`/`IH--`, or a close.
 - Each queue is served in order; HAProxy's own order was not (fast GETs answered 5, 4, 2, 1,
   0, 3 in one run), an artefact of retrying every woken waiter in one pass.
-- Ibex's CLI does not wait for a buffer; HAProxy's answers nothing while they are exhausted.
+- Alcyon's CLI does not wait for a buffer; HAProxy's answers nothing while they are exhausted.
 - HAProxy 3.5-dev8 hit `BUG_ON` `stconn.c:1027` (`tick_is_expired(task->expire, now_ms)`, in
-  `sc_notify`) in 2 of 3 runs of a waiter that left with the CLI polling; Ibex has no such path.
+  `sc_notify`) in 2 of 3 runs of a waiter that left with the CLI polling; Alcyon has no such path.
 
 `tune.fail-alloc <0..100>` refuses that percentage of pool allocations at random, and, as on
-HAProxy, counts only under `-dMfail` (`-dMfail` alone is a rate of 1). Ibex honours exactly the
+HAProxy, counts only under `-dMfail` (`-dMfail` alone is a rate of 1). Alcyon honours exactly the
 `-dM` forms `fail` and `no-fail` (comma-separated lists of only these are accepted); every other
 form (`-dM`, `-dM<byte>`, `integrity`, `uaf`, `no-merge`, `cold-first`, ...) is refused at start
 with `... -dM (memory pool debugging) is not supported, except -dMfail and -dMno-fail` and exit 1,
-because Ibex's pools are not malloc-per-object chunks to poison, tag or unmap
-(`crates/ibex-rt/src/bin/ibex.rs`). Measured on 3.5-dev8 (400 requests, rate 5): a request gets
-`200`, `500` with `IR--` or `IC--`, or a closed connection; Ibex gives the same three (`IH--`
+because Alcyon's pools are not malloc-per-object chunks to poison, tag or unmap
+(`crates/alcyon-rt/src/bin/alcyon.rs`). Measured on 3.5-dev8 (400 requests, rate 5): a request gets
+`200`, `500` with `IR--` or `IC--`, or a closed connection; Alcyon gives the same three (`IH--`
 where HAProxy's refusal is of its server connection, `IC--`).
 
 ## `-m <megs>`: a connection budget and an rlimit, as on HAProxy
@@ -686,27 +686,27 @@ measured on 3.5-dev8, T453), shows the value as `Memmax_MB` / `Memmax_bytes` and
 `maxconn` from it (`STREAM_MAX_COST + 2 * tune.bufsize` per connection, 97% of the budget,
 TLS costs when a `bind` or `server` uses `ssl`; a configured `maxconn` that leaves no room for
 TLS is refused, exit 1). Past the limit its pools fail allocations and the streams that needed
-them, and the process goes on. Ibex does the same sizing and reporting and, since T465b, sets `RLIMIT_DATA` the same way.
+them, and the process goes on. Alcyon does the same sizing and reporting and, since T465b, sets `RLIMIT_DATA` the same way.
 Past the limit its buffers, sessions, timers and idle lists fail one stream or connection;
 an allocation that is still infallible (rustls, h2, std) aborts the process (tradeoff.md 6.23,
 6.25). Under `-m` the session arenas are presized for the budget rather than 65536 slots.
-Differences left: Ibex's per-connection cost is a constant calibrated on
-HAProxy's results (`sizeof(struct stream)` has no Ibex counterpart), `maxsslconn` and
+Differences left: Alcyon's per-connection cost is a constant calibrated on
+HAProxy's results (`sizeof(struct stream)` has no Alcyon counterpart), `maxsslconn` and
 `tune.ssl.cachesize` are not configurable, so `MaxSslConns` stays 0 and the
 `Automatically setting global.maxconn ...` notice is not printed.
 
 A budget too small for the threads themselves (T508) differs: HAProxy serves at every `-m` from 1
-to 8 (its `VmData` is already 43 MB), but Ibex's worker and watchdog threads each need a stack
-under `RLIMIT_DATA`. When one cannot be created, Ibex refuses the start with an
+to 8 (its `VmData` is already 43 MB), but Alcyon's worker and watchdog threads each need a stack
+under `RLIMIT_DATA`. When one cannot be created, Alcyon refuses the start with an
 `[ALERT] ... Failed to create thread N` or `Failed to start the watchdog thread` line and exit 1,
 instead of a panic or running without lockup detection. Measured here: `-m 1` and `-m 2`
 refuse (worker), `-m 3` refuses (watchdog), `-m 4` and up serve (`nbthread 1`).
 
-## `tune.memory.prealloc on|off`: an Ibex-only global keyword (T468)
+## `tune.memory.prealloc on|off`: an Alcyon-only global keyword (T468)
 
 HAProxy 3.5-dev8 refuses it as unknown (`did you mean 'prealloc-fd' maybe ?`), and nothing in
 HAProxy pre-fills a pool: pools grow on demand and keep what `tune.memory.hot-size` allows
-(`-dM` options are debugging aids; `prealloc-fd` pre-touches the fd table). Ibex grows and keeps
+(`-dM` options are debugging aids; `prealloc-fd` pre-touches the fd table). Alcyon grows and keeps
 too (design Q1); `tune.memory.prealloc on` (default off) instead sizes, at start, from `maxconn`:
 
 - the standard `buffer` pool: `2 * maxconn` buffers in the process (a request and a response
@@ -727,7 +727,7 @@ and task arenas. The share is per thread and the limit per process: a thread tha
 share takes no buffer while the others hold theirs, so with `nbthread` above 1 a stream can fail
 before `maxconn` connections when the connections are unevenly spread.
 
-## `ssl_fc_ja4`: an Ibex-only fetch (T344)
+## `ssl_fc_ja4`: an Alcyon-only fetch (T344)
 
 `ssl_fc_ja4` returns the JA4 TLS client fingerprint (`t13d1516h2_8daaf6152771_e5627efa2ab1`),
 built from the whole captured ClientHello: GREASE-free sorted cipher and extension lists,
@@ -739,16 +739,16 @@ sample, as for the other capture fetches). Only JA4 is implemented, not JA4S/JA4
 QUIC (`q`) fingerprints. The JA4 specification is by FoxIO; JA4 (TLS client fingerprinting only)
 is under the BSD 3-Clause licence in `LICENSE-JA4` of <https://github.com/FoxIO-LLC/ja4>:
 "Copyright (c) 2026 FoxIO. All rights reserved", redistribution with the notice permitted, the
-name of FoxIO not to be used to endorse. Ibex implements the specification text and uses FoxIO's
-published test vectors (`crates/ibex-sample/testdata/ja4_vectors.txt`); no FoxIO code is copied.
+name of FoxIO not to be used to endorse. Alcyon implements the specification text and uses FoxIO's
+published test vectors (`crates/alcyon-sample/testdata/ja4_vectors.txt`); no FoxIO code is copied.
 Where FoxIO's tools and the specification text differ, the default is the tools; see
-`ibex.ja4-compat` below.
+`alcyon.ja4-compat` below.
 
-### `ibex.ja4-compat foxio|spec` (Ibex-only global keyword; HAProxy refuses it as unknown)
+### `alcyon.ja4-compat foxio|spec` (Alcyon-only global keyword; HAProxy refuses it as unknown)
 
 Where FoxIO's published tools and the JA4 specification text disagree, `ssl_fc_ja4` follows the
 tools by default (`foxio`), because the fingerprint databases operators compare against are
-produced by those tools. `ibex.ja4-compat spec` follows the specification text. Any other value
+produced by those tools. `alcyon.ja4-compat spec` follows the specification text. Any other value
 is refused at load. The two differences:
 
 * A non-alphanumeric end of the first ALPN value. `foxio`: the character itself, or `9` for a
@@ -759,7 +759,7 @@ is refused at load. The two differences:
   come in an extension). `foxio`: the third part hashes `_` and the algorithms. `spec`: twelve
   zeros. Only a unit test reaches it.
 
-Of the 72 published vectors in `crates/ibex-sample/testdata/ja4_vectors.txt` (all FoxIO's values,
+Of the 72 published vectors in `crates/alcyon-sample/testdata/ja4_vectors.txt` (all FoxIO's values,
 all given by `foxio`), only `tls-non-ascii-alpn.pcapng` gives a different string under `spec`.
 
 ## `http-request use-service prometheus-exporter` (T368)
@@ -777,25 +777,25 @@ The numbers come from the CLI's sources: the `haproxy_process_*` families are `s
 `show stat` rows, so a value here is the value there. `Tasks` and `Run_queue` are those of the last
 pass of the engine loop (a request rule cannot reach the scheduler).
 
-Left out, because Ibex does not count them (printing 0 would pass a default for a measurement):
+Left out, because Alcyon does not count them (printing 0 would pass a default for a measurement):
 
 | families | why |
 |---|---|
 | `haproxy_{frontend,backend,server}_{req,res}_bytes_{in,out}_total` | bytes by direction are not tracked |
 | `haproxy_server_{idle,private_idle,unsafe_idle,safe_idle,used,need}_connections_current` | no per-server connection pool gauges |
 | `haproxy_{backend,server}_last_session_seconds` | `lastsess` is not tracked |
-| `haproxy_resolver_*` | present once a `resolvers` section is configured (T485); HAProxy always has the implicit `default` section, Ibex does not build it |
+| `haproxy_resolver_*` | present once a `resolvers` section is configured (T485); HAProxy always has the implicit `default` section, Alcyon does not build it |
 | `haproxy_frontend_intercepted_requests_total`, `haproxy_{frontend,backend}_http_cache_hint_hits_total` | not tracked |
-| `haproxy_backend_agg_server_status`, `_agg_server_check_status`, `_agg_check_status`, `haproxy_server_check_status`, `haproxy_server_agent_*` | per-state check/agent aggregates; Ibex has no agent checks |
+| `haproxy_backend_agg_server_status`, `_agg_server_check_status`, `_agg_check_status`, `haproxy_server_check_status`, `haproxy_server_agent_*` | per-state check/agent aggregates; Alcyon has no agent checks |
 
-Not done: `extra-counters` is accepted and adds nothing (Ibex has no stats-module counters: `h1`,
+Not done: `extra-counters` is accepted and adds nothing (Alcyon has no stats-module counters: `h1`,
 `h2`, `ssl`, ...), and `tcp-request content use-service` stays refused (HAProxy refuses it too,
 with another message). With several workers, check columns are those of the worker that answers
 the scrape (the same as `show stat`).
 
 A scrape allocates nothing (T369, `tasks/T369-prometheus-scrape-without-allocations.md`): it is
 produced a chunk at a time into the session's response buffer, resuming from a cursor, as HAProxy's
-applet does, so memory is one buffer whatever the number of servers; `crates/ibex-rt/tests/promex.rs`
+applet does, so memory is one buffer whatever the number of servers; `crates/alcyon-rt/tests/promex.rs`
 pins 0 allocations including the first scrape. Differences: `http-after-response` rules do not
 apply to the reply; a `metrics=` value over 512 bytes decoded, or more than 8 of them, is a 400;
 every sample of a family costs a regeneration of the object's `show stat` row, so a scrape of
@@ -813,13 +813,13 @@ GLOBAL.`). A name something else holds at that moment is reported with HAProxy's
 polls for it. Two differences:
 
 * HAProxy sends `SIGTTIN` and only then closes its sockets (`src/haproxy.c:2115-2116`), so the old
-  process's one bind can race the successor's exit (0 losses in 30 on an idle host; the Ibex
-  equivalent lost 1 in 3 under the gate's load). Ibex joins its workers, so every socket it bound
+  process's one bind can race the successor's exit (0 losses in 30 on an idle host; the Alcyon
+  equivalent lost 1 in 3 under the gate's load). Alcyon joins its workers, so every socket it bound
   is closed, before it signals.
 * `SIGTTOU` pauses every listener on both since T456 (`Paused frontend fe.` for each proxy,
   once a process; TCP frontends and TCP stats sockets refuse connections until `SIGTTIN`). Two
   gaps: QUIC listeners are not paused (HAProxy connects the UDP socket to itself, and its
-  connections have sockets of their own; an Ibex QUIC connection lives on the listening socket,
+  connections have sockets of their own; an Alcyon QUIC connection lives on the listening socket,
   which that would cut off), and a listener whose sockets `_getsocks` has handed to a successor
   is only no longer polled, as HAProxy does for an inherited socket.
   A unix socket file is renamed over by the successor on both and is lost to the old process if
@@ -829,7 +829,7 @@ polls for it. Two differences:
 
 `dump_all_vars` prints each variable by its stored type, as HAProxy does (string quoted and escaped, `bin`
 as upper-case hex, integer bare, `true`/`false`, address as text, method quoted), and CLI `get var`
-prints the stored type name. Within one scope Ibex lists the variables sorted by name; HAProxy walks its
+prints the stored type name. Within one scope Alcyon lists the variables sorted by name; HAProxy walks its
 hash tree, so its order differs between processes (it is seeded per process). A rule must not depend on
 the order in either.
 
@@ -845,15 +845,15 @@ messages for a bad argument, a bad level and a bad pointer). Differences:
 * The first column is the first eight bytes of the first Initial's destination CID, not a pointer; the
   `[NN]` is the worker (HAProxy's thread), the order is per worker.
 * `stream`, `full`, a level list (`tp,sock,pktns,cc,mux`) and a `0x...` connection filter are refused
-  with a message naming them. `be` lists nothing (Ibex has no QUIC to servers). `clo` and `all` show the
+  with a message naming them. `be` lists nothing (Alcyon has no QUIC to servers). `clo` and `all` show the
   connections quinn-proto still holds closing, which are removed sooner than HAProxy's.
 * `show info` has no QUIC field on HAProxy 3.5-dev7 (the field list is identical with and without a
-  `quic4@` bind), so Ibex has none either; the connection counters QUIC feeds are T504's.
+  `quic4@` bind), so Alcyon has none either; the connection counters QUIC feeds are T504's.
 
 ## `tune.quic.*` and the QUIC bind keywords (T525)
 
 Implemented, each measured on the QUIC oracle (HAProxy 3.5-dev7-e6f616-55) and tested in
-`crates/ibex-rt/tests/it/quic_knobs.rs` (both h3 paths) and `crates/ibex-config/tests/it/quic_tune.rs`:
+`crates/alcyon-rt/tests/it/quic_knobs.rs` (both h3 paths) and `crates/alcyon-config/tests/it/quic_tune.rs`:
 `tune.quic.fe.sec.retry-threshold` (T492), `tune.quic.fe.max-idle-timeout` (transport parameter and
 idle close), `tune.quic.fe.stream.max-concurrent` (`initial_max_streams_bidi`),
 `tune.quic.fe.stream.max-total` (credit is the smaller of the two; the connection is closed with
@@ -867,8 +867,8 @@ total); the connection is closed when the last allowed stream is done either way
 `max-concurrent` above 100 still queues at 100 on the `mux` path (`mux_h3::MAX_CONCURRENT`).
 The `quic_enabled` fetch still answers `false` whatever `tune.quic.listen` says.
 
-Refused at load, the message `'<keyword>' is not supported by Ibex.` (global) or the bind keyword
-refusal (bind): Ibex has nothing for them to tune (quinn-proto's congestion controller, pacing, GSO
+Refused at load, the message `'<keyword>' is not supported by Alcyon.` (global) or the bind keyword
+refusal (bind): Alcyon has nothing for them to tune (quinn-proto's congestion controller, pacing, GSO
 and socket-per-connection are not exposed).
 
 | keyword | HAProxy | why refused |

@@ -4,13 +4,13 @@
 
 set -euo pipefail
 
-# MC/DC and LLVM Source-Based Coverage Runner for Ibex
+# MC/DC and LLVM Source-Based Coverage Runner for Alcyon
 # Aerospace / DO-178C Level A & NASA JPL Verification
 
-echo "=== Running Ibex MC/DC & LLVM Source-Based Coverage Suite ==="
+echo "=== Running Alcyon MC/DC & LLVM Source-Based Coverage Suite ==="
 
 export RUSTFLAGS="-C instrument-coverage"
-export LLVM_PROFILE_FILE="ibex-%p-%m.profraw"
+export LLVM_PROFILE_FILE="alcyon-%p-%m.profraw"
 
 cargo test --workspace
 

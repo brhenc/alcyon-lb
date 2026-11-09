@@ -1,6 +1,6 @@
 # Subagent Execution & Research Registry
 
-This document records the work, findings, and deliverables produced by all background subagents executing across Project Ibex milestones.
+This document records the work, findings, and deliverables produced by all background subagents executing across Project Alcyon milestones.
 
 ---
 
@@ -12,24 +12,24 @@ This document records the work, findings, and deliverables produced by all backg
 | `5422d2cb` | TLS Architecture Researcher | `research` | Milestone 3 | **Complete** | Milestone 3 TLS Architecture Blueprint: `rustls 0.23`, `ebtree` SNI dispatch, `TlsArena` zero-allocation layout, `Class::Heavy` anti-DDoS throttling. |
 | `b564eba3` | HTX & HTTP/1.1 Mux Researcher | `research` | Milestone 4 | **Complete** | Milestone 4 Report: Native HTX bidirectional buffer (`HtxBuffer`), zero-allocation chunked transfer encoding, trailer ordering, and `mux_h1` layering. |
 | `5d24739a` | H2 & Peers Protocol Researcher | `research` | Milestones 5 & 6 | **Complete** | Milestones 5 & 6 Report: HTTP/2 multiplexing, 4096-byte contiguous HPACK dynamic table (`HpackDynamicTable`), and Distributed Peers Stick-Table Protocol v2.1 wire codec. |
-| `671898d8` | Property Test Engineer | `self` | Milestone 2 | **Complete** | 59 new property-based tests across `ibex-sample` and `ibex-stick-table`, IPv6 CIDR matchers, standard converters, 128-bit sliding rate calculation. |
+| `671898d8` | Property Test Engineer | `self` | Milestone 2 | **Complete** | 59 new property-based tests across `alcyon-sample` and `alcyon-stick-table`, IPv6 CIDR matchers, standard converters, 128-bit sliding rate calculation. |
 | `6f4d4837` | QUIC & HTTP/3 Architecture Researcher | `self` | Milestone 7 / Future Architecture | **Complete** | Milestone 7 Architecture Blueprint: RFC 9000/9001/9114 & HAProxy native QUIC analysis, `rustls::quic` `#![forbid(unsafe_code)]` integration, UDP `recvmmsg` batching, 256-shard `ebtree` CID routing, recorded in `docs/research/quic-http3.md`. |
 | `40481f62` | Principal Systems Architect Reviewer | `self` (Pro) | Whole Architecture Audit | **Complete** | Adversarial architectural review across all crates for safety, memory bounds, error handling, and test coverage (`docs/research/architect-review.md`). |
-| `2b0fc166` | TLS Implementation Engineer | `self` | Milestone 3 | **Complete** | Built `crates/ibex-tls` with pure `#![forbid(unsafe_code)]`, `rustls 0.23`, `ebtree::EbMbTree` exact/wildcard SNI resolution (`IbexCertResolver`), `TlsArena`/`TlsSlot`, and `RustlsTransport` (`Transport` + `TlsInfo`). |
-| `e5b16c84` | Filters, SPOE & Lua Researcher | `research` | Extensibility | **Complete** | Extensibility Blueprint: HAProxy filter engine (`src/filters.c`), binary SPOP v2.0 async offload (`src/flt_spoe.c`), cooperative Lua scheduler analysis (`src/hlua.c`), and Ibex `#![forbid(unsafe_code)]` filter/SPOE/sandboxing architecture recorded in `docs/research/filters-spoe-lua.md`. |
+| `2b0fc166` | TLS Implementation Engineer | `self` | Milestone 3 | **Complete** | Built `crates/alcyon-tls` with pure `#![forbid(unsafe_code)]`, `rustls 0.23`, `ebtree::EbMbTree` exact/wildcard SNI resolution (`AlcyonCertResolver`), `TlsArena`/`TlsSlot`, and `RustlsTransport` (`Transport` + `TlsInfo`). |
+| `e5b16c84` | Filters, SPOE & Lua Researcher | `research` | Extensibility | **Complete** | Extensibility Blueprint: HAProxy filter engine (`src/filters.c`), binary SPOP v2.0 async offload (`src/flt_spoe.c`), cooperative Lua scheduler analysis (`src/hlua.c`), and Alcyon `#![forbid(unsafe_code)]` filter/SPOE/sandboxing architecture recorded in `docs/research/filters-spoe-lua.md`. |
 | `5047f025` | Observability & OTel Researcher | `research` | Observability | **Complete** | Observability Blueprint: Zero-allocation native Prometheus exposition applet (`PrometheusApplet`), W3C Trace Context (`traceparent`/`tracestate`) parser and injector, `SpanRingBuffer` OTLP batch exporter, recorded in `docs/research/observability-otel.md`. |
-| `7e873073` | Stick Table Aggregator Researcher | `self` | Distributed State & Clustering | **Complete** | Distributed State Blueprint: Mathematical CRDT model (Delta-G, PN, LWW, Aggregated Sliding Rates), binary peer v2.1/SPOP/delta codecs, 256-shard `ebtree` arena aggregator (`ibex-aggregator`), recorded in `docs/research/stick-table-aggregator.md`. |
+| `7e873073` | Stick Table Aggregator Researcher | `self` | Distributed State & Clustering | **Complete** | Distributed State Blueprint: Mathematical CRDT model (Delta-G, PN, LWW, Aggregated Sliding Rates), binary peer v2.1/SPOP/delta codecs, 256-shard `ebtree` arena aggregator (`alcyon-aggregator`), recorded in `docs/research/stick-table-aggregator.md`. |
 | `d429bb91` | Multi-Threaded Peers Researcher | `research` | Distributed Systems & Peers Protocol | **Complete** | Multi-Threaded Peers Blueprint: HAProxy 3.5 single-thread pinning audit (`src/peers.c`), per-core `SO_REUSEPORT` TCP distribution, 256-shard lock-free stick table replication, wire codec v2.1 (`HAProxyS 2.1`, `intencode`/`intdecode`, `DcacheTx`/`DcacheRx`), sliding ACK window backpressure, recorded in `docs/research/multithreaded-peers.md`. |
 | `77f483d9` | PROXY Protocol Core Engineer | `self` | Connection Layer & Wire Protocol | **Complete** | Pure `#![forbid(unsafe_code)]` zero-allocation PROXY protocol v1 & v2 codec, zero-copy slice parser, TLV builder/iterator, Castagnoli CRC32-C validator, comprehensive property tests (`proptest`), recorded in `docs/research/proxy-protocol.md`. |
-| `73ed5e8f` | PROXY Protocol Integration & E2E Verification Engineer | `self` | Runtime Integration & E2E Verification | **Complete** | End-to-end integration of PROXY v1/v2 across `ibex-rt`, `ibex-config`, and `ibex-proto`: frontend `accept-proxy` / `accept-proxy-v2` non-blocking interception & header stripping, client IP extraction into stream context & stick table hashing, backend `send-proxy` / `send-proxy-v2` generation & TLV forwarding, chained proxy E2E test suite (11 tests passing), zero clippy warnings. |
-| `4355d1b6` | HAProxy Keyword Compatibility Researcher | `research` | Compatibility & Config Architecture | **Complete** | Comprehensive audit of HAProxy 1.0 -> 3.5 keyword evolution, catalog of obsolete/removed directives in 3.5 (`dispatch`, `transparent`, `master-worker`, `req*`/`rsp*`, `mode health`, legacy `tune.quic.*`), modern L4-L7 action rules matrix, and `ibex-config` native 3.5 AST/parser specification recorded in `docs/research/keyword-compatibility-matrix.md`. |
+| `73ed5e8f` | PROXY Protocol Integration & E2E Verification Engineer | `self` | Runtime Integration & E2E Verification | **Complete** | End-to-end integration of PROXY v1/v2 across `alcyon-rt`, `alcyon-config`, and `alcyon-proto`: frontend `accept-proxy` / `accept-proxy-v2` non-blocking interception & header stripping, client IP extraction into stream context & stick table hashing, backend `send-proxy` / `send-proxy-v2` generation & TLV forwarding, chained proxy E2E test suite (11 tests passing), zero clippy warnings. |
+| `4355d1b6` | HAProxy Keyword Compatibility Researcher | `research` | Compatibility & Config Architecture | **Complete** | Comprehensive audit of HAProxy 1.0 -> 3.5 keyword evolution, catalog of obsolete/removed directives in 3.5 (`dispatch`, `transparent`, `master-worker`, `req*`/`rsp*`, `mode health`, legacy `tune.quic.*`), modern L4-L7 action rules matrix, and `alcyon-config` native 3.5 AST/parser specification recorded in `docs/research/keyword-compatibility-matrix.md`. |
 | `04473986` | VTC & Regression Test Architect | `research` | Quality Assurance & Upstream Parity | **Complete** | Exhaustive analysis of HAProxy's 312 `.vtc` regression tests, dual integration path design (Path A `vtest` CLI flags / `fd@` inheritance + Path B standalone `vtc_runner.py`), and 3-phase roadmap from 51 initial reachable tests to 198 total target tests recorded in `docs/research/vtc-test-harness.md`. |
-| `958c8b16` | CLI & HAProxy 3.5 Compatibility Engineer | `self` | Runtime & CLI Compatibility | **Complete** | Complete HAProxy 3.5 CLI flag audit, memory-safe parser in `ibex-rt` (`bin/ibex.rs`), multi-config directory expansion, reload signal dispatching, and integration test suite recorded in `docs/research/cli-options-compatibility.md`. |
+| `958c8b16` | CLI & HAProxy 3.5 Compatibility Engineer | `self` | Runtime & CLI Compatibility | **Complete** | Complete HAProxy 3.5 CLI flag audit, memory-safe parser in `alcyon-rt` (`bin/alcyon.rs`), multi-config directory expansion, reload signal dispatching, and integration test suite recorded in `docs/research/cli-options-compatibility.md`. |
 | `fb2023df` | Build Automation Engineer | `self` | Developer Experience & Tooling | **Complete** | Root `Makefile` with standard Unix build, test, lint, format, difftest, vtc, install, and uninstall targets. |
 | `ce267c7a` | HAProxy 3.5 Keyword Cataloger | `research` | Compatibility & Roadmap | **Complete** | Exhaustive catalog of all sections, keywords, L4-L7 actions, sample fetches, and converters in HAProxy 3.5 recorded in `docs/research/haproxy-35-keywords-complete-catalog.md`. |
-| `3dfc9706` | Stats Admin & Session Management Engineer | `self` | Runtime Administration & Management | **Complete** | Full connection handling and admin controls (`kill_sessions`/`shutdown_sessions`, `enable_health`/`disable_health`, `clear_counters`, `set_maxconn`) in Web Admin UI, CLI applet, and `Engine` (`crates/ibex-rt/tests/it/stats_admin_sessions.rs`). |
+| `3dfc9706` | Stats Admin & Session Management Engineer | `self` | Runtime Administration & Management | **Complete** | Full connection handling and admin controls (`kill_sessions`/`shutdown_sessions`, `enable_health`/`disable_health`, `clear_counters`, `set_maxconn`) in Web Admin UI, CLI applet, and `Engine` (`crates/alcyon-rt/tests/it/stats_admin_sessions.rs`). |
 | `fa9404f9` | Server-Sent Events (SSE) Architect | `research` | Low-Latency Streaming Protocols | **Complete** | SSE protocol mechanics, HAProxy 3.5 streaming audit, unbuffered pipeline bypass, same-pass event flush, and disconnect cancellation recorded in `docs/research/server-sent-events.md`. |
-| `08c6d33d` | HTTP QUERY Method Architect | `research` | Modern Protocol Standards | **Complete** | RFC 10008 HTTP `QUERY` method analysis, HAProxy cache collision vulnerability discovery, composite cache key hashing, and Ibex integration blueprint recorded in `docs/research/http-query-method.md`. |
+| `08c6d33d` | HTTP QUERY Method Architect | `research` | Modern Protocol Standards | **Complete** | RFC 10008 HTTP `QUERY` method analysis, HAProxy cache collision vulnerability discovery, composite cache key hashing, and Alcyon integration blueprint recorded in `docs/research/http-query-method.md`. |
 | `189118e6` | WebSocket Protocol Architect | `research` | Real-Time & Multiplexing Protocols | **Complete** | RFC 6455 & RFC 8441 Extended CONNECT WebSocket architecture, `#![forbid(unsafe_code)]` SHA-1/base64 accept engine, tunnel transition, `timeout tunnel` scheduler integration, and cross-protocol bridging recorded in `docs/research/websocket-support.md`. |
 | `217f3889` | Static File & Async Filesystem I/O Architect | `research` | Storage & High-Performance I/O | **Complete** | Non-blocking Linux filesystem research (`RWF_NOWAIT`, `openat2(RESOLVE_BENEATH)`, `io_uring`, `eventfd` thread pools), ETag/RFC 9110 ranges/sidecar negotiation, and 3-Tier non-blocking engine blueprint recorded in `docs/research/static-file-serving-async-io.md`. |
 
@@ -42,12 +42,12 @@ This document records the work, findings, and deliverables produced by all backg
 - **Workspace Quality**: Zero compiler warnings, zero clippy warnings under `-D warnings`.
 
 ### 2. Milestone 3: TLS Architecture & Implementation (`5422d2cb` & `2b0fc166`)
-- **Memory Safety**: Pure `#![forbid(unsafe_code)]` with `rustls 0.23` across `crates/ibex-tls` and `crates/ebtree`.
-- **Multi-Certificate Resolution (`IbexCertResolver`)**: Implemented `rustls::server::ResolvesServerCert` backed by two `ebtree::EbMbTree` (Match-Bytes Tree) instances for exact domains and wildcard SNI domains (`*.domain.com`), with case-insensitivity and default fallback certificate support.
+- **Memory Safety**: Pure `#![forbid(unsafe_code)]` with `rustls 0.23` across `crates/alcyon-tls` and `crates/ebtree`.
+- **Multi-Certificate Resolution (`AlcyonCertResolver`)**: Implemented `rustls::server::ResolvesServerCert` backed by two `ebtree::EbMbTree` (Match-Bytes Tree) instances for exact domains and wildcard SNI domains (`*.domain.com`), with case-insensitivity and default fallback certificate support.
 - **Zero-Allocation Hot-Path (`TlsArena`, `TlsSlot`)**: Fixed-capacity pre-allocated connection arena (`MAX_TLS_SLOTS = 65536`) with recycled 16 KiB I/O staging buffers (`DEFAULT_TLS_BUF_CAPACITY`) to eliminate dynamic runtime allocations during active TLS proxying.
-- **L5/L6 Transport Abstraction (`RustlsTransport`)**: Implements `ibex_proto::transport::Transport` and `TlsInfo` without leaking provider types across layer boundaries. Full support for non-blocking handshakes, encrypted read/write pumping, ALPN negotiation (`h2`, `http/1.1`), cipher and protocol version extraction, and graceful write shutdown.
-- **Anti-DDoS Scheduler Defense**: Incoming TLS handshakes tagged with `state::HEAVY = 1 << 5` and limited to at most 1 handshake per scheduler pass via `Class::Heavy` in `ibex-sched`, protecting established HTTP connections from asymmetric CPU exhaustion attacks.
-- **Verification & Test Coverage**: 8 comprehensive integration and unit tests passing cleanly under `cargo test -p ibex-tls` and zero warnings under `cargo clippy -p ibex-tls --all-targets -- -D warnings`, plus real network loopback validation over `tokio` TCP sockets.
+- **L5/L6 Transport Abstraction (`RustlsTransport`)**: Implements `alcyon_proto::transport::Transport` and `TlsInfo` without leaking provider types across layer boundaries. Full support for non-blocking handshakes, encrypted read/write pumping, ALPN negotiation (`h2`, `http/1.1`), cipher and protocol version extraction, and graceful write shutdown.
+- **Anti-DDoS Scheduler Defense**: Incoming TLS handshakes tagged with `state::HEAVY = 1 << 5` and limited to at most 1 handshake per scheduler pass via `Class::Heavy` in `alcyon-sched`, protecting established HTTP connections from asymmetric CPU exhaustion attacks.
+- **Verification & Test Coverage**: 8 comprehensive integration and unit tests passing cleanly under `cargo test -p alcyon-tls` and zero warnings under `cargo clippy -p alcyon-tls --all-targets -- -D warnings`, plus real network loopback validation over `tokio` TCP sockets.
 
 ### 3. Milestone 4: Native HTX & HTTP/1.1 Mux (`b564eba3`)
 - **Bidirectional Memory Layout**: Contiguous ring buffer with payloads growing forward and 8-byte bit-packed descriptors growing backward.
@@ -55,7 +55,7 @@ This document records the work, findings, and deliverables produced by all backg
 - **Safe Rust Implementation**: `HtxBuffer` using index-partitioned slices under `#![forbid(unsafe_code)]` with zero `alloc` calls on hot forwarding loops.
 
 ### 4. Milestones 5 & 6: HTTP/2 & Distributed Peers Protocol (`5d24739a`)
-- **HTTP/2 Multiplexing**: `H2Stream` tasks mapped to `ibex-sched` (`Class::Urgent` for connection I/O demux, `Class::Normal` for stream transactions, `Class::Bulk` for large streaming).
+- **HTTP/2 Multiplexing**: `H2Stream` tasks mapped to `alcyon-sched` (`Class::Urgent` for connection I/O demux, `Class::Normal` for stream transactions, `Class::Bulk` for large streaming).
 - **Contiguous HPACK Dynamic Table**: Fixed 4096-byte memory slab with forward descriptor growth and backward string storage, bounded to exactly 4KB per connection.
 - **Distributed Peers Sync Protocol v2.1**: Masterless cluster replication for stick tables over binary frames (`HAProxyS 2.1`) using custom variable-length integer encoding (`intencode`/`intdecode`).
 
@@ -70,8 +70,8 @@ This document records the work, findings, and deliverables produced by all backg
 ### 6. Distributed State & Stick Table Aggregator Architecture (`7e873073`)
 - **Active-Active Rate Limiting Analysis**: Deconstructed the mathematical and architectural failure modes of standard HAProxy peer replication (LWW/overwrite data loss, gauge oscillation, rate dilution, $O(N^2)$ mesh complexity).
 - **Formal CRDT Convergence Proofs**: Join semi-lattice $(\mathcal{S}, \sqcup)$ formulations and mathematical proofs of Strong Eventual Consistency (SEC) for Delta-G-Counters (`conn_cnt`, `http_req_cnt`, `bytes_in_cnt`), PN-Counters (`conn_cur`), LWW-Registers (`server_id`), and distributed sliding window rate limiters ($\le 0.5\%$ error under network latency jitter).
-- **Multi-Protocol Wire Ingestion**: Wire framing specifications for HAProxy Peers Protocol v2.1 (`HAProxyS 2.1` varint encoding), Binary SPOP v2.0 offload engine, and custom batch delta streaming (`ibex-agg-v1`).
-- **High-Performance Safe Rust Architecture**: `#![forbid(unsafe_code)]` standalone aggregator engine (`ibex-aggregator`), 256-shard lock-partitioned `ebtree::EbMbTree` key indexing, contiguous generational pre-allocated memory arenas (`StickArena`), and zero runtime heap allocations on the hot aggregation path.
+- **Multi-Protocol Wire Ingestion**: Wire framing specifications for HAProxy Peers Protocol v2.1 (`HAProxyS 2.1` varint encoding), Binary SPOP v2.0 offload engine, and custom batch delta streaming (`alcyon-agg-v1`).
+- **High-Performance Safe Rust Architecture**: `#![forbid(unsafe_code)]` standalone aggregator engine (`alcyon-aggregator`), 256-shard lock-partitioned `ebtree::EbMbTree` key indexing, contiguous generational pre-allocated memory arenas (`StickArena`), and zero runtime heap allocations on the hot aggregation path.
 - **Throughput & Latency Scaling**: Validated design targets for $> 100,000$ delta updates/sec per core at $p99 < 500\,\mu\text{s}$ latency with linear multi-core scaling ($> 1.8\text{M}$ updates/sec across 16 cores) and bounded memory footprints ($1\text{M}$ keys in $< 96\,\text{MB}$). Deliverable in `docs/research/stick-table-aggregator.md`.
 
 ### 7. Multi-Threaded Distributed Peers Protocol Architecture (`d429bb91`)
@@ -83,7 +83,7 @@ This document records the work, findings, and deliverables produced by all backg
 - **Bounded Batching & Dynamic Backpressure**: Pre-allocated 64 KiB `PeerTxBatch` slabs, credit-based sliding ACK window (`MAX_IN_FLIGHT_UPDATES = 16384`), lossy delta coalescing for lagging peers, and three-phase fast resync state machine. Deliverable in `docs/research/multithreaded-peers.md`.
 
 ### 8. PROXY Protocol Versions 1 & 2 Engine (`77f483d9`)
-- **Memory Safety & Zero Allocations**: Pure `#![forbid(unsafe_code)]` implementation in `crates/ibex-proto/src/proxy_protocol.rs` with zero dynamic allocations on all parsing and encoding hot paths.
+- **Memory Safety & Zero Allocations**: Pure `#![forbid(unsafe_code)]` implementation in `crates/alcyon-proto/src/proxy_protocol.rs` with zero dynamic allocations on all parsing and encoding hot paths.
 - **Version 1 Human-Readable Engine**: Strict 107-character bounds checking, single-space delimiter parsing, decimal no-leading-zero IPv4/port enforcement, and `PROXY TCP4`/`TCP6`/`UNKNOWN` handling.
 - **Version 2 Binary Framing Engine**: 12-byte binary signature matching (`\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A`), `PROXY`/`LOCAL` command handling, `IPv4`/`IPv6`/`UNIX`/`UNSPEC` address decoding, and 16-bit payload framing.
 - **Comprehensive TLV Engine**: Zero-copy TLV vector parser and builder (`TlvBuilder`, `TlvIter`, `SslTlv`) for ALPN (`PP2_TYPE_ALPN`), Authority/SNI (`PP2_TYPE_AUTHORITY`), Unique ID (`PP2_TYPE_UNIQUE_ID`), Network Namespace (`PP2_TYPE_NETNS`), NOOP padding (`PP2_TYPE_NOOP`), and SSL containers with sub-TLVs (`PP2_SUBTYPE_SSL_VERSION`, `CN`, `CIPHER`, `SIG_ALG`, `KEY_ALG`, `GROUP`, `SIG_SCHEME`, `CLIENT_CERT`).
@@ -91,11 +91,11 @@ This document records the work, findings, and deliverables produced by all backg
 - **Property-Based Verification**: 32 unit and property-based tests passing cleanly (`proptest`), fuzzing parser against arbitrary byte sequences and streaming chunk boundaries. Zero clippy warnings under `-D warnings`. Deliverable in `docs/research/proxy-protocol.md`.
 
 ### 9. PROXY Protocol Runtime Integration & E2E Verification (`73ed5e8f`)
-- **Frontend Interception (`accept-proxy` & `accept-proxy-v2`)**: Integrated non-blocking PROXY v1/v2 header interception into `TcpSession::process_cli_io()` in `crates/ibex-rt/src/proxy.rs`. Intercepts incoming stream data before protocol dispatch, strictly parses headers, extracts the real client socket address (`client_addr`) and TLV vector (`proxy_info`), and strips the PROXY header so downstream HTTP or TCP stream handlers only process clean application data.
+- **Frontend Interception (`accept-proxy` & `accept-proxy-v2`)**: Integrated non-blocking PROXY v1/v2 header interception into `TcpSession::process_cli_io()` in `crates/alcyon-rt/src/proxy.rs`. Intercepts incoming stream data before protocol dispatch, strictly parses headers, extracts the real client socket address (`client_addr`) and TLV vector (`proxy_info`), and strips the PROXY header so downstream HTTP or TCP stream handlers only process clean application data.
 - **Deferred Backend Handshake in TCP Mode**: In `Engine::init_client_session` and `step_stream`, deferred upstream connection until the PROXY header is received and parsed, guaranteeing that source IP load balancing (`balance source`) and stick tables track the real client IP rather than the intermediary proxy IP.
-- **Backend Transmission (`send-proxy` & `send-proxy-v2`)**: Implemented `maybe_prepend_send_proxy` in `crates/ibex-rt/src/engine.rs` to generate PROXY v1 (ASCII) and PROXY v2 (binary with TLVs) headers, prefixing them directly to upstream connection request buffers for both TCP and HTTP modes without double-prepending on connection retries.
-- **Chained PROXY Architecture**: Validated multi-hop chained proxying (`Client -> Ibex 1 [accept-proxy, send-proxy-v2] -> Ibex 2 [accept-proxy] -> Backend Server`), verifying that original client metadata and custom TLVs are preserved and relayed end-to-end.
-- **Comprehensive E2E Test Suite**: 11 end-to-end integration tests in `crates/ibex-rt/tests/it/proxy_protocol.rs` covering PROXY v1 HTTP, PROXY v2 TCP, strict v2 rejection of v1, malformed header rejection, upstream v1/v2 generation, source hashing with PROXY client IP, fragmented chunk streaming, TLV forwarding, and CRC32c wire validation.
+- **Backend Transmission (`send-proxy` & `send-proxy-v2`)**: Implemented `maybe_prepend_send_proxy` in `crates/alcyon-rt/src/engine.rs` to generate PROXY v1 (ASCII) and PROXY v2 (binary with TLVs) headers, prefixing them directly to upstream connection request buffers for both TCP and HTTP modes without double-prepending on connection retries.
+- **Chained PROXY Architecture**: Validated multi-hop chained proxying (`Client -> Alcyon 1 [accept-proxy, send-proxy-v2] -> Alcyon 2 [accept-proxy] -> Backend Server`), verifying that original client metadata and custom TLVs are preserved and relayed end-to-end.
+- **Comprehensive E2E Test Suite**: 11 end-to-end integration tests in `crates/alcyon-rt/tests/it/proxy_protocol.rs` covering PROXY v1 HTTP, PROXY v2 TCP, strict v2 rejection of v1, malformed header rejection, upstream v1/v2 generation, source hashing with PROXY client IP, fragmented chunk streaming, TLV forwarding, and CRC32c wire validation.
 - **Quality & Parity**: 100% test pass rate across the workspace (`cargo test --workspace`), zero compiler warnings, and zero Clippy warnings under `cargo clippy --workspace --all-targets -- -D warnings`.
  
 ### 10. HAProxy 1.0 -> 3.5 Keyword Compatibility & Syntax Modernization (`4355d1b6`)
@@ -110,7 +110,7 @@ This document records the work, findings, and deliverables produced by all backg
   - `filter opentracing`: **Removed in 3.5**; replaced by `filter otel`.
   - Legacy `tune.quic.*`: **Removed in 3.5**; replaced by `tune.quic.fe.*` / `tune.quic.mem.*`.
 - **Modern HAProxy 3.5 Action Rules Matrix**: Complete mapping of L4-L7 pipeline rules (`quic-initial`, `tcp-request connection/session/content`, `tcp-response content`, `http-request`, `http-response`, `http-after-response`), sample fetches, converter chaining, and stick table counters.
-- **Concrete `ibex-config` Specification**: Clean AST structure in `crates/ibex-config/src/ast.rs` targeting HAProxy 3.5 directly without carrying legacy 1.x technical debt, with helpful diagnostic error messages on obsolete directives. Deliverable recorded in `docs/research/keyword-compatibility-matrix.md`.
+- **Concrete `alcyon-config` Specification**: Clean AST structure in `crates/alcyon-config/src/ast.rs` targeting HAProxy 3.5 directly without carrying legacy 1.x technical debt, with helpful diagnostic error messages on obsolete directives. Deliverable recorded in `docs/research/keyword-compatibility-matrix.md`.
 
 
 
@@ -126,7 +126,7 @@ This document records the work, findings, and deliverables produced by all backg
 
 ### 12. HAProxy 3.5 Command-Line Compatibility & Runtime Integration (`958c8b16`)
 - **Comprehensive CLI Audit**: Conducted an exhaustive audit of all command-line arguments in HAProxy 3.5 from `/home/bhenc/reference/haproxy` (`src/haproxy.c`, `src/mworker.c`, `doc/haproxy.1`, `doc/management.txt`).
-- **Memory-Safe CLI Architecture**: Implemented a pure-Rust, `#![forbid(unsafe_code)]` command-line argument parser in `crates/ibex-rt/src/bin/ibex.rs` supporting:
+- **Memory-Safe CLI Architecture**: Implemented a pure-Rust, `#![forbid(unsafe_code)]` command-line argument parser in `crates/alcyon-rt/src/bin/alcyon.rs` supporting:
   - Multi-path `-f <path>` and trailing `-- <paths...>` config declarations with recursive-safe directory expansion (`alphasort` lexical order, non-hidden `.cfg` filtering).
   - Check-only mode (`-c`) with exit codes (0 for valid, 1 for invalid) and quiet (`-q`) / verbose (`-V`) modifiers.
   - Working directory change (`-C <dir>`) executed before file expansion and PID file creation.
@@ -137,7 +137,7 @@ This document records the work, findings, and deliverables produced by all backg
   - Graceful soft reload (`-sf <pids...>`) via `SIGUSR1` and immediate termination (`-st <pids...>`) via `SIGTERM` using safe `rustix::process::kill_process`.
   - Resource and tuning overrides: global connection limit (`-n <maxconn>`), per-proxy default limit (`-N <maxsock>`), and virtual memory limits (`-m <megabytes>`) using `rustix::process::setrlimit`.
   - Master CLI socket binding (`-S <socket>`) and diagnostic reporting for specialized tuning flags (`-dr`, `-de`, `-dp`, `-dM`, `-dL`, `-u`, `-g`, `-U`, `-G`, `-ch`, `-e`).
-- **Verification & Test Coverage**: Written integration test suite in `crates/ibex-rt/tests/it/cli_options.rs` verifying `-c`, `-v`, `-vv`, `-h`, multiple `-f` files and directory expansion, `-p` PID creation, and `-n` parameter overrides.
+- **Verification & Test Coverage**: Written integration test suite in `crates/alcyon-rt/tests/it/cli_options.rs` verifying `-c`, `-v`, `-vv`, `-h`, multiple `-f` files and directory expansion, `-p` PID creation, and `-n` parameter overrides.
 - **Deliverable**: Recorded in `docs/research/cli-options-compatibility.md`.
 
 ### 13. Unix Build Automation & Makefile Parity (`fb2023df`)
@@ -146,11 +146,11 @@ This document records the work, findings, and deliverables produced by all backg
 - **Verification**: Verified all targets execute cleanly and integrate with differential and regression test runners.
 
 ### 14. Stats Admin, Connection Handling & Session Management (`3dfc9706`)
-- **Active Session Termination (`kill_sessions` / `shutdown_sessions`)**: Implemented `shutdown_session_entry` and `shutdown_matching_sessions` in `crates/ibex-rt/src/engine.rs`. Gracefully transitions streams to `ScState::Closed`, executes bidirectional socket shutdown via `raw::shutdown_both`, wakes up scheduler tasklets, and immediately reclaims `act_conn` and `server_actconn` counters with double-free protection.
-- **Health Check Control (`enable_health` / `disable_health`)**: Added `enabled: bool` to `ServerCheckState` in `crates/ibex-rt/src/check.rs`, enabling dynamic pausing/resuming of active health checks via Web UI and CLI socket while preserving administrative state.
+- **Active Session Termination (`kill_sessions` / `shutdown_sessions`)**: Implemented `shutdown_session_entry` and `shutdown_matching_sessions` in `crates/alcyon-rt/src/engine.rs`. Gracefully transitions streams to `ScState::Closed`, executes bidirectional socket shutdown via `raw::shutdown_both`, wakes up scheduler tasklets, and immediately reclaims `act_conn` and `server_actconn` counters with double-free protection.
+- **Health Check Control (`enable_health` / `disable_health`)**: Added `enabled: bool` to `ServerCheckState` in `crates/alcyon-rt/src/check.rs`, enabling dynamic pausing/resuming of active health checks via Web UI and CLI socket while preserving administrative state.
 - **Stats Counter Clearing (`clear_counters`)**: Added `ProxyStats::clear` zeroing traffic and error counters (`bytes_in`, `bytes_out`, `cum_conn`, `failed_conn`, `hrsp_5xx`) and resetting `max_conn` via Web Admin and CLI socket.
 - **Dynamic Maxconn Tuning (`set_maxconn`)**: Added live tuning of frontend, backend, and server connection limits from the Web Admin table and CLI applet.
-- **Verification**: Created comprehensive integration suite in `crates/ibex-rt/tests/it/stats_admin_sessions.rs` (6/6 tests passing).
+- **Verification**: Created comprehensive integration suite in `crates/alcyon-rt/tests/it/stats_admin_sessions.rs` (6/6 tests passing).
 
 ### 15. Server-Sent Events (SSE) Protocol & Unbuffered Pipeline Architecture (`fa9404f9`)
 - **HAProxy 3.5 Streaming Audit**: Audited `src/http_ana.c`, `src/mux_h1.c`, `src/mux_h2.c`, and `src/flt_http_comp.c`.
@@ -162,7 +162,7 @@ This document records the work, findings, and deliverables produced by all backg
 ### 16. HTTP QUERY Method (RFC 10008) Architecture & Caching (`08c6d33d`)
 - **RFC 10008 Analysis**: Deconstructed the IETF HTTP `QUERY` method specification (safe and idempotent method carrying a request body payload without URL length limits or URL data leakage).
 - **HAProxy 3.5 Cache Vulnerability Uncovered**: Discovered that HAProxy 3.5 (`src/cache.c`) restricts caching exclusively to `GET` and hashes only `Scheme + Host + URI`. Applying `QUERY` without payload hashing causes severe cross-tenant cache collisions and poisoning.
-- **Ibex Protocol & Caching Integration**: Added `HttpMethod::Query` across `ibex-proto`, `ibex-config`, and `ibex-sample`, and designed composite cache key hashing:
+- **Alcyon Protocol & Caching Integration**: Added `HttpMethod::Query` across `alcyon-proto`, `alcyon-config`, and `alcyon-sample`, and designed composite cache key hashing:
   $$\text{Key} = \text{XXH3\_128}(\text{Scheme} \parallel \text{Authority} \parallel \text{URI} \parallel \text{XXH3\_64}(\text{RequestBody}) \parallel \text{ContentType})$$
 - **Deliverable**: Recorded in `docs/research/http-query-method.md`.
 
@@ -170,7 +170,7 @@ This document records the work, findings, and deliverables produced by all backg
 - **RFC 6455 HTTP/1.1 Upgrade Codec**: Strict 5-point header validation, zero-unsafe constant-time stack-allocated SHA-1 and Base64 accept calculation (`compute_ws_accept`), and 101 Switching Protocols handling.
 - **RFC 8441 HTTP/2 Extended CONNECT Engine**: HTTP/2 SETTINGS parameter `SETTINGS_ENABLE_CONNECT_PROTOCOL` (`0x0008`), pseudo-header parsing (`:method = CONNECT`, `:protocol = websocket`, `:scheme`, `:authority`, `:path`), status code 200 stream establishment, and strict `PROTOCOL_ERROR` rejection for illegal `:protocol` pseudo-headers.
 - **Bidirectional Zero-Copy Streaming**: Seamless tunnel transition in `TcpSession`, disabling HTTP analyzers, enabling raw byte forwarding via `Buf` ring buffers, and preserving half-close TCP semantics.
-- **`timeout tunnel` Scheduler Integration**: Dynamic timer reassignment where `timeout tunnel` supersedes client/server timeouts once upgraded, integrated with `ibex-sched::Tick` modulo $2^{32}$ signed arithmetic.
+- **`timeout tunnel` Scheduler Integration**: Dynamic timer reassignment where `timeout tunnel` supersedes client/server timeouts once upgraded, integrated with `alcyon-sched::Tick` modulo $2^{32}$ signed arithmetic.
 - **Cross-Protocol Bridging Matrix**: Native transcoding enabling H2 clients (RFC 8441) to communicate with legacy H1 WebSocket backends (RFC 6455) and vice-versa.
 - **Deliverable**: Recorded in `docs/research/websocket-support.md`.
 
@@ -185,7 +185,7 @@ This document records the work, findings, and deliverables produced by all backg
   - `preadv2(2)` with `RWF_NOWAIT` (`0x08`) for microsecond page-cache lookups returning `EAGAIN` immediately on cache misses.
   - `openat2(2)` with `RESOLVE_BENEATH` and `RESOLVE_NO_MAGICLINKS` for TOCTOU-proof jail enforcement without root chroot.
   - `io_uring` dual-ring architecture (`IORING_OP_OPENAT2`, `STATX`, `READV`, `SPLICE`, `SEND_ZC`) for true zero-context-switch kernel async I/O.
-- **Ibex Static File Protocol Engine**:
+- **Alcyon Static File Protocol Engine**:
   - Zero-allocation MIME type matcher for all standard web assets (HTML, CSS, JS, WASM, Images, Fonts).
   - Deterministic ETag generation (`W/"mtime-size-inode"`) and conditional caching revalidation (`If-None-Match`, `If-Modified-Since` -> HTTP 304).
   - RFC 9110 Section 14 byte-range request engine (`Range: bytes=start-end` -> HTTP 206 Partial Content / HTTP 416 Range Not Satisfiable).

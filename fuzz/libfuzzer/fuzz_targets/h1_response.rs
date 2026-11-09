@@ -2,8 +2,8 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use ibex_proto::htx::HtxSlice;
-use ibex_proto::H1Parser;
+use alcyon_proto::htx::HtxSlice;
+use alcyon_proto::H1Parser;
 
 fuzz_target!(|data: &[u8]| {
     for split in [data.len(), data.len() / 2] {

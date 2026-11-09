@@ -1,0 +1,514 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+//
+// HAProxy 1.0 configuration parser, ported to Rust.
+// Derived from HAProxy 1.0.2 (haproxy.c) by Willy Tarreau <willy@meta-x.org>.
+
+/// A token extracted by the lexer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token {
+    /// The string content of the token.
+    pub text: String,
+    /// 1-based line number in the source file.
+    pub line: usize,
+    /// 1-based column number where the token begins.
+    pub col: usize,
+}
+
+/// A line containing zero or more tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Line {
+    /// 1-based line number.
+    pub line_number: usize,
+    /// Tokens found on this line.
+    pub tokens: Vec<Token>,
+    /// Set when `parse_line` would refuse the line: the 1-based column and the message.
+    pub error: Option<(usize, String)>,
+    /// The line as written, for [`lex_line_expanding`] to read again once the environment
+    /// it sees is known.
+    pub raw: String,
+}
+
+/// Where a line is, for the `${.LINE}`, `${.FILE}` and `${.SECTION}` pseudo-variables.
+#[derive(Debug, Clone, Copy)]
+pub struct LineEnv<'a> {
+    /// The keyword that opened the current section, if any.
+    pub section: Option<&'a str>,
+}
+
+/// Lexes `HAProxy` configuration text into a list of non-empty tokenized lines.
+///
+/// `$` is taken literally here; the lines are read again with [`lex_line_expanding`] when
+/// the preprocessor reaches them, as `HAProxy` expands the environment of a line only
+/// after the lines before it have been read (`setenv`).
+///
+/// Follows `HAProxy` 1.0.2 lexical conventions:
+/// - Comments start with `#` and continue to the end of the line.
+/// - Whitespace (spaces, tabs, form feeds) separates arguments.
+/// - Backslash escapes as `parse_line` reads them: `\ `, `\\`, `\#`, `\'`, `\"`, `\t`, `\n`,
+///   `\r`, `\xHH` outside single quotes; any other backslash is kept.
+/// - Blank lines and comment-only lines are omitted.
+#[must_use]
+pub fn lex(input: &str) -> Vec<Line> {
+    let mut lines = Vec::new();
+
+    for (line_idx, raw_line) in input.lines().enumerate() {
+        let line_number = line_idx + 1;
+        let (tokens, error) = lex_line(raw_line, line_number, None);
+        if !tokens.is_empty() || error.is_some() {
+            lines.push(Line {
+                line_number,
+                tokens,
+                error,
+                raw: raw_line.to_owned(),
+            });
+        }
+    }
+
+    lines
+}
+
+/// Reads one line again the way the configuration parser does, `$` included: inside double
+/// quotes `$VAR`, `${VAR}`, `${VAR-default}` and `${VAR[*]}` (the value split into words)
+/// are replaced by the environment (`parse_line` with `PARSE_OPT_ENV`, src/tools.c). An
+/// argument left empty is refused, as `HAProxy` does, for it would end the argument list.
+#[must_use]
+pub fn lex_line_expanding(raw_line: &str, line_number: usize, env: &LineEnv) -> (Vec<Token>, Option<(usize, String)>) {
+    lex_line(raw_line, line_number, Some(env))
+}
+
+/// The word being built, as `parse_line` keeps it (`in_arg`, `empty_quote`).
+#[derive(Default)]
+struct Word {
+    text: Vec<u8>,
+    in_arg: bool,
+    /// Nothing but quotes so far: closing them makes an empty argument.
+    empty_quote: bool,
+    /// 1-based column where the word began to exist, and where it was found empty.
+    begin: usize,
+    unknown_var: Option<usize>,
+}
+
+impl Word {
+    fn mark(&mut self, col: usize) {
+        if !self.in_arg {
+            self.in_arg = true;
+            self.begin = col;
+        }
+    }
+
+    fn emit(&mut self, bytes: &[u8], col: usize) {
+        self.mark(col);
+        self.text.extend_from_slice(bytes);
+        self.empty_quote = false;
+    }
+}
+
+/// Tokenizes a single line of input according to `HAProxy` rules.
+#[allow(clippy::too_many_lines)]
+fn lex_line(raw_line: &str, line_number: usize, env: Option<&LineEnv>) -> (Vec<Token>, Option<(usize, String)>) {
+    let mut tokens = Vec::new();
+    let mut empties: Vec<(usize, usize)> = Vec::new();
+    let chars: Vec<char> = raw_line.chars().collect();
+    let len = chars.len();
+    let mut idx = 0;
+
+    // Scan until comment or end of line (respecting quotes)
+    let mut end_idx = len;
+    let mut in_quote = None;
+    let mut esc = false;
+    for (i, &ch) in chars.iter().enumerate() {
+        if esc {
+            esc = false;
+            continue;
+        }
+        if ch == '\\' {
+            esc = true;
+            continue;
+        }
+        if let Some(q) = in_quote {
+            if ch == q {
+                in_quote = None;
+            }
+        } else if ch == '"' || ch == '\'' {
+            in_quote = Some(ch);
+        // Only '#' starts a comment. HAProxy does **not** treat ';' as one -- verified
+        // against 3.5-dev7, which rejects a ';' line with
+        //   "unknown keyword ';' out of section."
+        // Silently swallowing it would let a config that HAProxy refuses run on Alcyon,
+        // and a line the operator believed was a comment would simply vanish.
+        } else if ch == '#' || ch == '\r' || ch == '\n' {
+            end_idx = i;
+            break;
+        }
+    }
+
+    while idx < end_idx {
+        // Skip whitespace
+        while idx < end_idx && is_haproxy_space(chars[idx]) {
+            idx += 1;
+        }
+
+        if idx >= end_idx {
+            break;
+        }
+
+        // Start of a token (1-based column)
+        let token_col = idx + 1;
+        // Bytes, not chars: `\xHH` is a byte (see `hex_escapes_are_bytes`).
+        let mut word = Word::default();
+        let mut quote_mode = None;
+        let mut quote_at = 0;
+        let mut finish = |word: &mut Word, tokens: &mut Vec<Token>, empties: &mut Vec<(usize, usize)>| {
+            if word.in_arg {
+                if word.text.is_empty() {
+                    empties.push((tokens.len(), word.unknown_var.unwrap_or(word.begin)));
+                }
+                tokens.push(Token {
+                    text: alcyon_regex::bytetext::bytes_to_text(&word.text),
+                    line: line_number,
+                    col: token_col,
+                });
+            }
+            *word = Word::default();
+        };
+
+        while idx < end_idx {
+            let ch = chars[idx];
+            let col = idx + 1;
+            if quote_mode == Some('\'') {
+                // Single quotes take everything literally, backslashes included.
+                if ch == '\'' {
+                    if word.empty_quote {
+                        word.mark(col);
+                    }
+                    quote_mode = None;
+                } else {
+                    word.emit(ch.encode_utf8(&mut [0u8; 4]).as_bytes(), col);
+                }
+                idx += 1;
+            } else if ch == '\\' && idx + 1 < end_idx {
+                // `parse_line`'s escapes; any other backslash stays, for what follows
+                // to be read as usual (a regex's `\.`).
+                let next = chars[idx + 1];
+                let hex = |i: usize| chars.get(i).and_then(|c| c.to_digit(16)).filter(|_| i < end_idx);
+                match next {
+                    ' ' | '\\' | '#' | '\'' | '"' => {
+                        word.emit(next.encode_utf8(&mut [0u8; 4]).as_bytes(), col);
+                        idx += 2;
+                    }
+                    '$' if quote_mode == Some('"') => {
+                        word.emit(b"$", col);
+                        idx += 2;
+                    }
+                    't' | 'n' | 'r' => {
+                        word.emit(
+                            &[match next {
+                                't' => b'\t',
+                                'n' => b'\n',
+                                _ => b'\r',
+                            }],
+                            col,
+                        );
+                        idx += 2;
+                    }
+                    'x' => {
+                        // `parse_line` (src/tools.c) refuses a `\x` not followed by two
+                        // hex digits (PARSE_ERR_HEX); it does not keep the backslash.
+                        let (Some(h1), Some(h2)) = (hex(idx + 2), hex(idx + 3)) else {
+                            return (
+                                tokens,
+                                Some((
+                                    idx + 1,
+                                    format!("truncated or invalid hexadecimal sequence at position {}", idx + 1),
+                                )),
+                            );
+                        };
+                        word.emit(&[u8::try_from(h1 * 16 + h2).unwrap_or(0)], col);
+                        idx += 4;
+                    }
+                    _ => {
+                        word.emit(b"\\", col);
+                        idx += 1;
+                    }
+                }
+            } else if quote_mode == Some('"') {
+                if ch == '"' {
+                    if word.empty_quote {
+                        word.mark(col);
+                    }
+                    quote_mode = None;
+                    idx += 1;
+                } else if ch == '$' && env.is_some() {
+                    let exp = match expand(&chars, idx, end_idx, line_number, env) {
+                        Ok(e) => e,
+                        Err(e) => return (tokens, Some(e)),
+                    };
+                    idx = exp.next;
+                    if exp.words {
+                        word.empty_quote = false;
+                    }
+                    if let Some(value) = exp.value {
+                        word.unknown_var = None;
+                        for c in value.chars() {
+                            if exp.words && is_haproxy_space(c) {
+                                finish(&mut word, &mut tokens, &mut empties);
+                            } else {
+                                word.emit(c.encode_utf8(&mut [0u8; 4]).as_bytes(), col);
+                            }
+                        }
+                    } else if !exp.words {
+                        word.mark(col);
+                        word.unknown_var.get_or_insert(exp.name_col);
+                    }
+                } else {
+                    word.emit(ch.encode_utf8(&mut [0u8; 4]).as_bytes(), col);
+                    idx += 1;
+                }
+            } else if ch == '"' || ch == '\'' {
+                quote_mode = Some(ch);
+                quote_at = idx;
+                word.empty_quote = true;
+                idx += 1;
+            } else if is_haproxy_space(ch) {
+                break;
+            } else {
+                word.emit(ch.encode_utf8(&mut [0u8; 4]).as_bytes(), col);
+                idx += 1;
+            }
+        }
+
+        if quote_mode.is_some() {
+            return (tokens, Some((quote_at + 1, format!("unmatched quote at position {}", quote_at + 1))));
+        }
+        finish(&mut word, &mut tokens, &mut empties);
+    }
+
+    // `HAProxy` refuses an empty argument (a `""` or an unset variable) on any line but a
+    // `.` directive: what follows it would be dropped without a word.
+    if env.is_some() && !tokens.first().is_some_and(|t| t.text.starts_with('.')) {
+        if let Some(&(n, pos)) = empties.first() {
+            return (
+                tokens,
+                Some((pos, format!("argument number {n} at position {pos} is empty and marks the end of the argument list"))),
+            );
+        }
+    }
+
+    (tokens, None)
+}
+
+/// What a `$` in double quotes stands for.
+struct Expansion {
+    /// The value, or `None` for a variable that is not set.
+    value: Option<String>,
+    /// Index of the first char after the reference.
+    next: usize,
+    /// `${VAR[*]}`: the value is split into words.
+    words: bool,
+    /// 1-based column of the variable's name.
+    name_col: usize,
+}
+
+/// `parse_line`'s reading of `$VAR`, `${VAR}`, `${VAR-default}` and `${VAR[*]}` at `chars[at]`.
+fn expand(
+    chars: &[char],
+    at: usize,
+    end: usize,
+    line_number: usize,
+    env: Option<&LineEnv>,
+) -> Result<Expansion, (usize, String)> {
+    let get = |i: usize| if i < end { chars.get(i).copied() } else { None };
+    let mut i = at + 1;
+    let mut brace = None;
+    if get(i) == Some('{') {
+        brace = Some(i);
+        i += 1;
+    }
+    if !get(i).is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '.') {
+        return Err((i + 1, format!("forbidden first char in environment variable name at position {}", i + 1)));
+    }
+    let start = i;
+    if get(i) == Some('.') {
+        i += 1;
+    }
+    while get(i).is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+        i += 1;
+    }
+    let name: String = chars[start..i].iter().collect();
+    let mut value = if name.starts_with('.') {
+        match name.as_str() {
+            ".LINE" => Some(line_number.to_string()),
+            ".FILE" => Some(crate::env::file()),
+            ".SECTION" => env.and_then(|e| e.section).map(str::to_owned),
+            _ => return Err((start + 1, format!("forbidden first char in environment variable name at position {}", start + 1))),
+        }
+    } else {
+        crate::env::get(&name)
+    };
+    let mut words = false;
+    if get(i) == Some('[') && brace.is_some() {
+        let at_bracket = i;
+        i += 1;
+        if get(i) != Some('*') || get(i + 1) != Some(']') {
+            return Err((at_bracket + 1, format!("truncated or invalid word expansion sequence at position {}", at_bracket + 1)));
+        }
+        i += 2;
+        words = true;
+    }
+    if let Some(b) = brace {
+        let unmatched = (b + 1, format!("unmatched brace in environment variable name at position {}", b + 1));
+        if get(i) == Some('-') {
+            let from = i + 1;
+            while get(i).is_some_and(|c| c != '}') {
+                i += 1;
+            }
+            if get(i).is_none() {
+                return Err(unmatched);
+            }
+            if value.is_none() {
+                value = Some(chars[from..i].iter().collect());
+            }
+        } else if get(i) != Some('}') {
+            return Err(unmatched);
+        }
+        i += 1;
+    }
+    Ok(Expansion { value, next: i, words, name_col: start + 1 })
+}
+
+/// Checks whether a character is treated as whitespace by `HAProxy` 1.0.2 `isspace()`.
+#[inline]
+fn is_haproxy_space(ch: char) -> bool {
+    ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '\x0C' || ch == '\x0B'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `parse_line` (src/tools.c): outside single quotes `\ `, `\\`, `\#`, `\'` and `\"`
+    /// give the character, `\t` `\n` `\r` and `\xHH` their byte; any other backslash
+    /// stays (a regex's `\.`). Single quotes take everything literally.
+    #[test]
+    fn backslash_escapes_are_haproxy_s() {
+        let toks = |s: &str| lex(s).remove(0).tokens.into_iter().map(|t| t.text).collect::<Vec<_>>();
+        assert_eq!(toks(r#"k a\ b\"c\\d\#e\.f\x41\tg"#), ["k", "a b\"c\\d#e\\.fA\tg"]);
+        assert_eq!(toks(r#"k "q\"x\\y\.z" 's\"t'"#), ["k", "q\"x\\y\\.z", "s\\\"t"]);
+        assert_eq!(toks(r#"k {\"dip\":\"%fi\"}"#), ["k", "{\"dip\":\"%fi\"}"]);
+    }
+
+    /// `\xHH` is a byte, not a character: bytes that make UTF-8 together make the
+    /// character, and a byte that does not is U+FFFD (a token is a `String`). The json
+    /// converter's `utf8` modes (converter/json.vtc: `str(\xE0),json(utf8)` is empty)
+    /// tell a bad sequence by that.
+    /// `\$` escapes the `$` inside double quotes only (where `$` would expand a
+    /// variable); outside them the backslash stays (checks/redis-check.vtc matches
+    /// `"*1\r\n\$4\r\nPING\r\n"`).
+    #[test]
+    fn a_dollar_is_escaped_inside_double_quotes_only() {
+        let toks = |s: &str| lex(s).remove(0).tokens.into_iter().map(|t| t.text).collect::<Vec<_>>();
+        assert_eq!(toks(r#"k "\$4\r" a\$b"#), ["k", "$4\r", "a\\$b"]);
+    }
+
+    #[test]
+    fn hex_escapes_are_bytes() {
+        let toks = |s: &str| lex(s).remove(0).tokens.into_iter().map(|t| t.text).collect::<Vec<_>>();
+        assert_eq!(toks(r#"k a\xC3\xA9b"#), ["k", "a\u{e9}b"]);
+        assert_eq!(toks(r#"k "-\xE0-" \r"#), ["k", "-\u{F7E0}-", "\r"]);
+    }
+
+    #[test]
+    fn test_lex_basic() {
+        let input = "listen proxy1 0.0.0.0:3128\n\tmode http\n";
+        let lines = lex(input);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].tokens.len(), 3);
+        assert_eq!(lines[0].tokens[0].text, "listen");
+        assert_eq!(lines[0].tokens[0].col, 1);
+        assert_eq!(lines[0].tokens[1].text, "proxy1");
+        assert_eq!(lines[0].tokens[1].col, 8);
+        assert_eq!(lines[0].tokens[2].text, "0.0.0.0:3128");
+        assert_eq!(lines[0].tokens[2].col, 15);
+
+        assert_eq!(lines[1].tokens[0].text, "mode");
+        assert_eq!(lines[1].tokens[0].col, 2);
+        assert_eq!(lines[1].tokens[1].text, "http");
+        assert_eq!(lines[1].tokens[1].col, 7);
+    }
+
+    #[test]
+    fn test_lex_comments_and_blank_lines() {
+        let input = "\n# Full comment line\n  listen p1 # inline comment\n\n";
+        let lines = lex(input);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line_number, 3);
+        assert_eq!(lines[0].tokens.len(), 2);
+        assert_eq!(lines[0].tokens[0].text, "listen");
+        assert_eq!(lines[0].tokens[0].col, 3);
+    }
+
+    #[test]
+    fn semicolon_is_not_a_comment() {
+        // HAProxy 3.5 rejects a ';' line with "unknown keyword ';' out of section."
+        // Treating it as a comment would accept configs the reference refuses, and a
+        // line the operator believed was commented out would silently disappear.
+        let lines = lex("; not a comment\n");
+        assert_eq!(lines.len(), 1, "';' must produce a token line, not be skipped");
+        assert_eq!(lines[0].tokens[0].text, ";");
+    }
+
+    #[test]
+    fn test_lex_escaped_spaces() {
+        let input = "cliexp ^(Host:\\ [^:]*).* Host:\\ \\1:80";
+        let lines = lex(input);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].tokens.len(), 3);
+        assert_eq!(lines[0].tokens[0].text, "cliexp");
+        // `\ ` is a space (`parse_line`); `\1`, not an escape, keeps its backslash.
+        assert_eq!(lines[0].tokens[1].text, "^(Host: [^:]*).*");
+        assert_eq!(lines[0].tokens[2].text, "Host: \\1:80");
+    }
+
+    #[test]
+    fn test_lex_mixed_tabs_and_spaces() {
+        let input = " \t server \t\t srv1 \t 10.0.0.1:8080 ";
+        let lines = lex(input);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].tokens.len(), 3);
+        assert_eq!(lines[0].tokens[0].text, "server");
+        assert_eq!(lines[0].tokens[1].text, "srv1");
+        assert_eq!(lines[0].tokens[2].text, "10.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_lex_quoted_strings() {
+        let input = r#"http-response set-header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+http-request return status 200 content-type "text/plain" lf-string "OK\n" if { path /healthz }"#;
+        let lines = lex(input);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].tokens.len(), 4);
+        assert_eq!(lines[0].tokens[0].text, "http-response");
+        assert_eq!(lines[0].tokens[1].text, "set-header");
+        assert_eq!(lines[0].tokens[2].text, "Strict-Transport-Security");
+        assert_eq!(
+            lines[0].tokens[3].text,
+            "max-age=31536000; includeSubDomains"
+        );
+
+        assert_eq!(lines[1].tokens[0].text, "http-request");
+        assert_eq!(lines[1].tokens[1].text, "return");
+        assert_eq!(lines[1].tokens[2].text, "status");
+        assert_eq!(lines[1].tokens[3].text, "200");
+        assert_eq!(lines[1].tokens[4].text, "content-type");
+        assert_eq!(lines[1].tokens[5].text, "text/plain");
+        assert_eq!(lines[1].tokens[6].text, "lf-string");
+        // `\n` is a newline, inside double quotes too (`parse_line`).
+        assert_eq!(lines[1].tokens[7].text, "OK\n");
+        assert_eq!(lines[1].tokens[8].text, "if");
+        assert_eq!(lines[1].tokens[9].text, "{");
+        assert_eq!(lines[1].tokens[10].text, "path");
+        assert_eq!(lines[1].tokens[11].text, "/healthz");
+        assert_eq!(lines[1].tokens[12].text, "}");
+    }
+}

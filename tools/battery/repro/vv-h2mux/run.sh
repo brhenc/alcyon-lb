@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 # VV-10 / VV-11: h2 clients over TLS, large-body node backend (bigapp.js).
-#   run.sh BIN PORT [CORES]     e.g. run.sh ./ibex 19744 48-49
+#   run.sh BIN PORT [CORES]     e.g. run.sh ./alcyon 19744 48-49
 # VV-10: backend connections opened for sequential h2 client connections (reuse_h2.py).
 # VV-11: round time of 1, 2 and 4 concurrent 256 KB uploads on one h2 connection (uploads_h2.py).
 set -u

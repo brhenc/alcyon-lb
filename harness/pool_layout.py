@@ -4,7 +4,7 @@
 
 """A hand-written per-thread cache is a defect (AGENTS.md section 8, design/memory-2026-10-24.md 7c).
 
-Greps crates/*/src (not crates/ibex-alloc, not tests/) for `thread_local!` blocks whose body
+Greps crates/*/src (not crates/alcyon-alloc, not tests/) for `thread_local!` blocks whose body
 holds a cache-shaped type: RefCell<Vec<, RefCell<VecDeque<, Cell<Option<Vec<,
 Cell<Option<String> or Vec<Box<. A match not in ALLOWLIST fails, with file, line and the rule.
 
@@ -19,7 +19,7 @@ import os
 import re
 import sys
 
-RULE = ("AGENTS.md section 8: a cache, pool, spare list or arena is an ibex_alloc::Pool/Arena "
+RULE = ("AGENTS.md section 8: a cache, pool, spare list or arena is an alcyon_alloc::Pool/Arena "
         "(docs/design/memory-2026-10-24.md), or it does not exist")
 
 PATTERNS = ("RefCell<Vec<", "RefCell<VecDeque<", "Cell<Option<Vec<", "Cell<Option<String>",
@@ -32,12 +32,12 @@ ALLOWLIST: dict[tuple[str, str], str] = {}
 # list of what is waiting, a value a fetch reads. It holds no spare memory for a later owner,
 # so a pool (take, give, evict, drain) would be the wrong shape.
 NOT_CACHES: dict[tuple[str, str], str] = {
-    ("crates/ibex-rt/src/proxy.rs", "QUEUED"): "the requests waiting on this thread, oldest first (live queue state)",
-    ("crates/ibex-config/src/ast/userlist.rs", "USERLISTS"): "the userlist sections of the parse in progress, handed to the config by `take_userlists` (configuration, built once at start-up; no spare memory is kept for a later owner)",
-    ("crates/ibex-sample/src/registry.rs", "DEBUG_DESTS"): "the `debug()` destinations named while a config was checked, handed to the runtime once by `take_debug_destinations` (configuration)",
+    ("crates/alcyon-rt/src/proxy.rs", "QUEUED"): "the requests waiting on this thread, oldest first (live queue state)",
+    ("crates/alcyon-config/src/ast/userlist.rs", "USERLISTS"): "the userlist sections of the parse in progress, handed to the config by `take_userlists` (configuration, built once at start-up; no spare memory is kept for a later owner)",
+    ("crates/alcyon-sample/src/registry.rs", "DEBUG_DESTS"): "the `debug()` destinations named while a config was checked, handed to the runtime once by `take_debug_destinations` (configuration)",
 }
 
-SKIP_CRATES = {"ibex-alloc"}
+SKIP_CRATES = {"alcyon-alloc"}
 
 
 def thread_local_blocks(text: str):

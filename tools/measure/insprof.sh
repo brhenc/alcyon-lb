@@ -20,7 +20,7 @@ if [ $# -lt 5 ]; then sed -n '5,20p' "$0"; exit 2; fi
 LABEL=$1; BIN=$2; BODY=$3; N=$4; OUT=$5; CG=${6:-}
 mkdir -p "$OUT" || exit 1
 BENCH=${MEASURE_BENCH:-$HOME/ibex-targets/gate-slot1/release/measure-bench}
-IFS=, read -r CPU_P CPU_C CPU_B <<< "${IBEX_MEASURE_CPUS:-4,5,6}"
+IFS=, read -r CPU_P CPU_C CPU_B <<< "${ALCYON_MEASURE_CPUS:-4,5,6}"
 port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 FE=$(port); BE=$(port)
 CFG=$OUT/$LABEL.cfg

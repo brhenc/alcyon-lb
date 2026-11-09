@@ -1,7 +1,7 @@
-# Ibex Distributed State & Stick Table Aggregator Architecture
+# Alcyon Distributed State & Stick Table Aggregator Architecture
 
 **Status:** Research & Architecture Blueprint (Distributed State Subsystem)  
-**Author:** Ibex Distributed State & Stick Table Aggregator Researcher  
+**Author:** Alcyon Distributed State & Stick Table Aggregator Researcher  
 **Safety & Concurrency Invariant:** `#![forbid(unsafe_code)]`, zero runtime allocations on hot aggregation path (NASA JPL Rule 3), lock-sharded Elastic Binary Tree (`ebtree`) indexing, mathematically provable CRDT strong eventual consistency (SEC).
 
 ---
@@ -10,21 +10,21 @@
 
 In high-scale active-active reverse proxy clusters, rate limiting, DDoS mitigation, connection bounding, and session persistence require a coherent, real-time view of client behavior across all proxy nodes. HAProxy's native stick table subsystem (`src/stick_table.c`, `src/peers.c`) provides localized tracking and point-to-point replication. However, standard peer replication operates via **Last-Write-Wins (LWW) / direct overwrite semantics**, leading to severe counter undercounting, gauge oscillation, and rate dilution across active-active nodes.
 
-To solve this fundamental limitation, **Ibex Aggregator (`ibex-aggregator` / `ibex-stick-table`)** is designed as a standalone, ultra-high-performance distributed state aggregator written in memory-safe Rust. It ingests delta updates from edge proxy nodes, resolves concurrent state mutations using formal **Conflict-free Replicated Data Types (CRDTs)**, computes global sliding-window rates, and broadcasts authoritative cluster-wide state with sub-millisecond aggregation latency ($p99 < 500\,\mu\text{s}$) under sustained loads exceeding 100,000 updates/sec.
+To solve this fundamental limitation, **Alcyon Aggregator (`alcyon-aggregator` / `alcyon-stick-table`)** is designed as a standalone, ultra-high-performance distributed state aggregator written in memory-safe Rust. It ingests delta updates from edge proxy nodes, resolves concurrent state mutations using formal **Conflict-free Replicated Data Types (CRDTs)**, computes global sliding-window rates, and broadcasts authoritative cluster-wide state with sub-millisecond aggregation latency ($p99 < 500\,\mu\text{s}$) under sustained loads exceeding 100,000 updates/sec.
 
 ```
 +---------------------------------------------------------------------------------------------------+
-|                                 IBEX DISTRIBUTED STATE TOPOLOGY                                   |
+|                                 ALCYON DISTRIBUTED STATE TOPOLOGY                                   |
 +---------------------------------------------------------------------------------------------------+
 |                                                                                                   |
 |    [Edge Proxy Node 1]         [Edge Proxy Node 2]         [Edge Proxy Node N]                    |
-|    (HAProxy / Ibex)            (HAProxy / Ibex)            (HAProxy / Ibex)                       |
+|    (HAProxy / Alcyon)            (HAProxy / Alcyon)            (HAProxy / Alcyon)                       |
 |         │                           │                           │                                 |
 |         │  Delta Stream (Push)      │  Delta Stream (Push)      │  Delta Stream (Push)            |
 |         │  (conn_cnt, req_cnt, ...) │  (conn_cnt, req_cnt, ...) │  (conn_cnt, req_cnt, ...)       |
 |         ▼                           ▼                           ▼                                 |
 |   ┌───────────────────────────────────────────────────────────────────┐                           |
-|   │               IBEX STICK TABLE AGGREGATOR (HUB)                   │                           |
+|   │               ALCYON STICK TABLE AGGREGATOR (HUB)                   │                           |
 |   │                                                                   │                           |
 |   │  ┌─────────────────────────┐         ┌─────────────────────────┐  │                           |
 |   │  │  Zero-Copy Wire Ingest  │         │  CRDT Join Semilattice  │  │                           |
@@ -82,7 +82,7 @@ $$C_{\text{stored}} = C_{\text{remote}} \quad \text{or} \quad C_{\text{stored}} 
    - In a cluster of $N$ nodes, full-mesh peer replication requires $\frac{N(N-1)}{2}$ bidirectional TCP connections. For $N = 50$, this requires 1,225 active peer sessions, generating quadratic message duplication and CPU overhead.
 
 ```
-STANDARD PEERS (OVERWRITE/LWW)             IBEX AGGREGATOR (CRDT DELTAS)
+STANDARD PEERS (OVERWRITE/LWW)             ALCYON AGGREGATOR (CRDT DELTAS)
 Client -> Node A (50 reqs)                Client -> Node A (50 reqs)
 Client -> Node B (50 reqs)                Client -> Node B (50 reqs)
 
@@ -96,7 +96,7 @@ Threshold 80 -> ALLOWED (False Neg!)     Threshold 80 -> BLOCKED (Correct!)
 
 ### 1.2 Hub-and-Spoke Aggregation Architecture
 
-To eliminate quadratic mesh overhead and guarantee mathematically correct metric aggregation, Ibex uses a **Hub-and-Spoke Aggregation Topology**:
+To eliminate quadratic mesh overhead and guarantee mathematically correct metric aggregation, Alcyon uses a **Hub-and-Spoke Aggregation Topology**:
 
 - **Edge Proxies (Spokes):** Edge nodes track local metrics as monotonic counters and emit lightweight delta updates $\Delta_i(t)$ over a single persistent TCP connection to the aggregator hub.
 - **Aggregator (Hub):** Ingests delta streams from all spokes, applies CRDT join operations to maintain monotonically convergent cluster totals, continuously computes sliding window rates, and broadcasts authoritative aggregate states back to edge nodes.
@@ -106,7 +106,7 @@ To eliminate quadratic mesh overhead and guarantee mathematically correct metric
 
 ## 2. CRDT Mathematical Model & Formal Convergence Proofs
 
-Ibex models all stick table data types as **State-based / Delta-State Conflict-free Replicated Data Types (CvRDT / $\delta$-CRDT)** operating on a Join Semi-Lattice $(\mathcal{S}, \sqcup, \le)$.
+Alcyon models all stick table data types as **State-based / Delta-State Conflict-free Replicated Data Types (CvRDT / $\delta$-CRDT)** operating on a Join Semi-Lattice $(\mathcal{S}, \sqcup, \le)$.
 
 ### 2.1 Semi-Lattice Prerequisites
 
@@ -280,20 +280,20 @@ Under typical LAN clustering ($\tau_{\max} \le 1\,\text{ms}$), $\epsilon_R \le 0
 
 ## 3. Wire Protocol Compatibility & Ingestion Engine
 
-Ibex Aggregator provides native protocol adapters for three ingestion and synchronization interfaces:
+Alcyon Aggregator provides native protocol adapters for three ingestion and synchronization interfaces:
 1. **HAProxy Binary Peer Protocol v2.1 (`HAProxyS 2.1`)**
 2. **Binary Stream Processing Offload Protocol (SPOP v2.0)**
-3. **Ibex High-Performance Delta Stream Protocol (`ibex-agg-v1`)**
+3. **Alcyon High-Performance Delta Stream Protocol (`alcyon-agg-v1`)**
 
 ```
                      ┌──────────────────────────────────────────────┐
-                     │          IBEX WIRE ADAPTER LAYER             │
+                     │          ALCYON WIRE ADAPTER LAYER             │
                      └──────────────────────────────────────────────┘
                                      │
          ┌───────────────────────────┼───────────────────────────┐
          ▼                           ▼                           ▼
 ┌──────────────────┐       ┌──────────────────┐       ┌──────────────────┐
-│ HAProxy Peer 2.1 │       │ Binary SPOP 2.0  │       │ Ibex Delta v1    │
+│ HAProxy Peer 2.1 │       │ Binary SPOP 2.0  │       │ Alcyon Delta v1    │
 │ (src/peers.c)    │       │ (src/flt_spoe.c) │       │ (Zero-Copy MUX)  │
 └────────┬─────────┘       └────────┬─────────┘       └────────┬─────────┘
          │                          │                          │
@@ -386,7 +386,7 @@ impl VarintCodec {
 +---------------+---------------+--------------------+------------------------+
 ```
 
-When ingesting standard `TableUpdate` messages from stock HAProxy nodes, Ibex Aggregator performs **Delta Extraction**:
+When ingesting standard `TableUpdate` messages from stock HAProxy nodes, Alcyon Aggregator performs **Delta Extraction**:
 1. It maintains the previous baseline received from that specific node $i$: $V_{\text{last}}[i]$.
 2. When a new absolute count $V_{\text{curr}}[i]$ arrives, it computes: $\Delta = V_{\text{curr}}[i] - V_{\text{last}}[i]$.
 3. It applies $\Delta$ to the global Delta-G-Counter and updates $V_{\text{last}}[i] \leftarrow V_{\text{curr}}[i]$.
@@ -395,7 +395,7 @@ When ingesting standard `TableUpdate` messages from stock HAProxy nodes, Ibex Ag
 
 ### 3.2 Binary SPOP v2.0 Ingestion & Real-Time Query Engine
 
-For edge proxies running SPOE (`spoe-agent`), Ibex provides an ultra-low latency SPOP v2.0 query/update interface.
+For edge proxies running SPOE (`spoe-agent`), Alcyon provides an ultra-low latency SPOP v2.0 query/update interface.
 
 - **Request Frame:** Edge proxy evaluates client IP on TCP accept or HTTP header parse and sends a `spoe-message` containing `(ip, req_inc=1)`.
 - **Aggregator Processing:** Aggregator atomically ticks the sliding rate, records counter increments, and checks current rate against configured ACL thresholds in $< 50\,\mu\text{s}$.
@@ -403,9 +403,9 @@ For edge proxies running SPOE (`spoe-agent`), Ibex provides an ultra-low latency
 
 ---
 
-### 3.3 Ibex Native Delta Streaming Protocol (`ibex-agg-v1`)
+### 3.3 Alcyon Native Delta Streaming Protocol (`alcyon-agg-v1`)
 
-For Ibex-to-Ibex clustering, Ibex uses a specialized compact binary streaming protocol designed for vectorized batch updates.
+For Alcyon-to-Alcyon clustering, Alcyon uses a specialized compact binary streaming protocol designed for vectorized batch updates.
 
 #### Frame Header Layout (8 Bytes Fixed)
 
@@ -420,7 +420,7 @@ For Ibex-to-Ibex clustering, Ibex uses a specialized compact binary streaming pr
 ```
 
 - **Magic:** `0x4942` (`'I'`, `'B'`).
-- **Proto:** `0x01` (`ibex-agg-v1`).
+- **Proto:** `0x01` (`alcyon-agg-v1`).
 - **Opcodes:**
   - `0x01`: `DeltaBatch` (Vector of entry updates).
   - `0x02`: `AuthoritativeBroadcast` (Aggregated state push from hub).
@@ -440,11 +440,11 @@ For Ibex-to-Ibex clustering, Ibex uses a specialized compact binary streaming pr
 
 ## 4. High-Performance Standalone Aggregator Architecture
 
-The Ibex Aggregator is built from the ground up for massive concurrency, predictable soft real-time execution, and zero runtime heap allocations.
+The Alcyon Aggregator is built from the ground up for massive concurrency, predictable soft real-time execution, and zero runtime heap allocations.
 
 ```
 +---------------------------------------------------------------------------------------------------+
-|                                 IBEX AGGREGATOR RUNTIME ENGINE                                    |
+|                                 ALCYON AGGREGATOR RUNTIME ENGINE                                    |
 +---------------------------------------------------------------------------------------------------+
 |                                                                                                   |
 |    Network Reactor (tokio / epoll / io_uring)                                                     |
@@ -505,7 +505,7 @@ All data structures conform strictly to `#![forbid(unsafe_code)]`.
 ### 5.1 CRDT Primitives
 
 ```rust
-//! CRDT Core Mathematical Types for Ibex Stick Table Aggregator.
+//! CRDT Core Mathematical Types for Alcyon Stick Table Aggregator.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -910,7 +910,7 @@ impl StickTableAggregator {
 
 ## 6. Cluster Topologies, Fault Tolerance & High Availability
 
-To ensure zero single points of failure (SPOF), Ibex Aggregator supports three clustering modes:
+To ensure zero single points of failure (SPOF), Alcyon Aggregator supports three clustering modes:
 
 ```
 TOPOLOGY A: ACTIVE-PASSIVE (HOT STANDBY)      TOPOLOGY B: ACTIVE-ACTIVE SHARDED
@@ -951,7 +951,7 @@ When an edge spoke disconnects due to a transient network partition:
 
 ### 7.1 Algorithmic Complexity
 
-| Operation | Standard HAProxy Peers | Ibex Aggregator | Guarantee |
+| Operation | Standard HAProxy Peers | Alcyon Aggregator | Guarantee |
 | :--- | :--- | :--- | :--- |
 | **Key Lookup** | $O(k)$ `ebtree` | $O(k)$ `ebtree` per shard | Lock-free / 256-shard partitioned |
 | **Delta Ingest** | $O(1)$ Overwrite (Incorrect) | $O(1)$ Atomic Delta Join | Strong Eventual Consistency |
@@ -965,7 +965,7 @@ Under sustained load testing on AMD EPYC 9654 (Linux 6.6, 256 shards):
 
 ```
 +---------------------------------------------------------------------------------------+
-| Metric                             | HAProxy Peers v2.1 | Ibex Standalone Aggregator  |
+| Metric                             | HAProxy Peers v2.1 | Alcyon Standalone Aggregator  |
 +------------------------------------+--------------------+-----------------------------+
 | Sustained Ingest Rate              | 22,000 msgs/sec    | 145,000 deltas/sec / core   |
 | P50 Ingestion Latency              | 420 µs             | 45 µs                       |
@@ -983,16 +983,16 @@ Under sustained load testing on AMD EPYC 9654 (Linux 6.6, 256 shards):
 ### 8.1 HAProxy Spoke Configuration (`haproxy.cfg`)
 
 ```haproxy
-# HAProxy Spoke pointing to Ibex Aggregator Hub
-peers ibex_cluster
-    peer ibex_agg_hub 10.0.0.100:10254
+# HAProxy Spoke pointing to Alcyon Aggregator Hub
+peers alcyon_cluster
+    peer alcyon_agg_hub 10.0.0.100:10254
 
 frontend fe_http
     bind :80
     mode http
 
-    # Stick table configured with peer sync to Ibex Aggregator
-    stick-table type ip size 1m expire 5m store http_req_rate(10s),http_req_cnt,conn_cur peers ibex_cluster
+    # Stick table configured with peer sync to Alcyon Aggregator
+    stick-table type ip size 1m expire 5m store http_req_rate(10s),http_req_cnt,conn_cur peers alcyon_cluster
     
     # Track client IP
     http-request track-sc0 src table fe_http
@@ -1003,14 +1003,14 @@ frontend fe_http
     default_backend be_app
 ```
 
-### 8.2 Ibex Standalone Aggregator Configuration (`ibex-aggregator.yaml`)
+### 8.2 Alcyon Standalone Aggregator Configuration (`alcyon-aggregator.yaml`)
 
 ```yaml
 version: "1.0"
 
 aggregator:
   listen_addr: "0.0.0.0:10254"
-  protocol: "peers_v21" # Supports 'peers_v21', 'spop_v20', 'ibex_delta_v1'
+  protocol: "peers_v21" # Supports 'peers_v21', 'spop_v20', 'alcyon_delta_v1'
   worker_threads: 8
   shards: 256
 
@@ -1040,6 +1040,6 @@ telemetry:
 
 ## 9. Deliverables & Integration Roadmap
 
-1. **`crates/ibex-stick-table` Enhancement**: Integrates `DeltaGCounter`, `PNCounter`, `LwwRegister`, and `AggregatedSlidingRate` into core stick table storage.
-2. **`crates/ibex-aggregator` Crate**: Standalone binary daemon providing the 256-shard storage engine, binary peers v2.1 ingestion bridge, SPOP v2.0 adapter, and broadcast distributor.
+1. **`crates/alcyon-stick-table` Enhancement**: Integrates `DeltaGCounter`, `PNCounter`, `LwwRegister`, and `AggregatedSlidingRate` into core stick table storage.
+2. **`crates/alcyon-aggregator` Crate**: Standalone binary daemon providing the 256-shard storage engine, binary peers v2.1 ingestion bridge, SPOP v2.0 adapter, and broadcast distributor.
 3. **Integration Testing Suite**: Multi-node differential test harnesses simulating active-active split-traffic rate limiting with automated verification of CRDT convergence invariants.

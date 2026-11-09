@@ -1,7 +1,7 @@
-# Ibex Extensibility Architecture: Filters, Async SPOE & Script Sandboxing
+# Alcyon Extensibility Architecture: Filters, Async SPOE & Script Sandboxing
 
 **Status:** Research & Architecture Specification (Milestone 8 / Extensibility Subsystem)  
-**Author:** Ibex Extensibility & SPOE/Lua Researcher  
+**Author:** Alcyon Extensibility & SPOE/Lua Researcher  
 **Safety & Concurrency Invariant:** `#![forbid(unsafe_code)]`, zero-allocation hot-path (NASA JPL Rule 3), level-triggered asynchronous I/O, `!Send` thread-local affinity.
 
 ---
@@ -10,26 +10,26 @@
 
 Extensibility in a soft real-time reverse proxy allows operators to inject custom business logic, Web Application Firewall (WAF) rule sets, external authentication (SSO, OAuth2, LDAP), dynamic header rewriting, and traffic inspection. However, extensibility must not compromise proxy availability, memory safety, or latency predictability.
 
-This specification blueprints the three extensibility tiers for Project Ibex:
-1. **Ibex Stream Filter Pipeline (`ibex-filter`)**: A high-performance, zero-allocation native filter engine mirroring HAProxy's filter hooks (`src/filters.c`), orchestrating stream transformations over native HTX buffers.
-2. **Rust-Native Async SPOE Client (`ibex-spoe`)**: A zero-copy client implementing the binary Stream Processing Offload Protocol (SPOP v2.0), multiplexing asynchronous requests to out-of-process agent daemons (e.g. ModSecurity WAF, CrowdSec, OPA, OpenResty) without blocking the proxy.
-3. **Embedded Script Sandboxing (`ibex-script`)**: A memory-safe, fuel-budgeted script execution sandbox (WASM / Safe Bytecode) operating strictly under `#![forbid(unsafe_code)]` with cooperative preemption and bounded memory quotas.
+This specification blueprints the three extensibility tiers for Project Alcyon:
+1. **Alcyon Stream Filter Pipeline (`alcyon-filter`)**: A high-performance, zero-allocation native filter engine mirroring HAProxy's filter hooks (`src/filters.c`), orchestrating stream transformations over native HTX buffers.
+2. **Rust-Native Async SPOE Client (`alcyon-spoe`)**: A zero-copy client implementing the binary Stream Processing Offload Protocol (SPOP v2.0), multiplexing asynchronous requests to out-of-process agent daemons (e.g. ModSecurity WAF, CrowdSec, OPA, OpenResty) without blocking the proxy.
+3. **Embedded Script Sandboxing (`alcyon-script`)**: A memory-safe, fuel-budgeted script execution sandbox (WASM / Safe Bytecode) operating strictly under `#![forbid(unsafe_code)]` with cooperative preemption and bounded memory quotas.
 
 ```
 +---------------------------------------------------------------------------------------------------+
-|                                     IBEX EXTENSIBILITY STACK                                      |
+|                                     ALCYON EXTENSIBILITY STACK                                      |
 +---------------------------------------------------------------------------------------------------+
 |  L7 Stream Filter Pipeline   |  Filter Lifecycle Hooks  |  Channel Data Cursors | Header Holding  |
-|  (crates/ibex-filter)        |  on_headers / on_payload |  Resumable State Mach | HTX Transcoding |
+|  (crates/alcyon-filter)        |  on_headers / on_payload |  Resumable State Mach | HTX Transcoding |
 +------------------------------+--------------------------+-----------------------+-----------------+
 |  Async SPOE Offload Engine   |  Binary SPOP v2.0 Codec  |  Multiplexed MUX      | Eb64 Tree Trans |
-|  (crates/ibex-spoe)          |  Peers Varint / TypedData|  Pipelined Offload    | Action Applier  |
+|  (crates/alcyon-spoe)          |  Peers Varint / TypedData|  Pipelined Offload    | Action Applier  |
 +------------------------------+--------------------------+-----------------------+-----------------+
 |  Safe Script Sandboxing      |  WASM / Safe Bytecode    |  Deterministic Fuel   | Memory Slabs    |
-|  (crates/ibex-script)        |  Safe Host-Guest ABI     |  HTX Mutator Trait    | Sample Bridge   |
+|  (crates/alcyon-script)        |  Safe Host-Guest ABI     |  HTX Mutator Trait    | Sample Bridge   |
 +------------------------------+--------------------------+-----------------------+-----------------+
-|  Core Runtime & Sched        |  ibex-sched Class::Normal|  ibex-sample Lattice  | ibex-stick-table|
-|  (crates/ibex-rt / sched)    |  Tick Timer Deadlines    |  Zero Alloc Arenas    | #![forbid(..)]  |
+|  Core Runtime & Sched        |  alcyon-sched Class::Normal|  alcyon-sample Lattice  | alcyon-stick-table|
+|  (crates/alcyon-rt / sched)    |  Tick Timer Deadlines    |  Zero Alloc Arenas    | #![forbid(..)]  |
 +---------------------------------------------------------------------------------------------------+
 ```
 
@@ -306,11 +306,11 @@ When a Lua script performs network I/O (`core.tcp()`, `httpclient:send()`, `appl
 
 ---
 
-## 4. Project Ibex Filter Architecture Blueprint
+## 4. Project Alcyon Filter Architecture Blueprint
 
-The Project Ibex Filter Engine (`crates/ibex-filter`) provides a pure `#![forbid(unsafe_code)]` stream filter pipeline.
+The Project Alcyon Filter Engine (`crates/alcyon-filter`) provides a pure `#![forbid(unsafe_code)]` stream filter pipeline.
 
-### 4.1 Safe Trait Definition (`IbexFilter`)
+### 4.1 Safe Trait Definition (`AlcyonFilter`)
 
 ```rust
 pub enum FilterResult {
@@ -333,7 +333,7 @@ pub enum FilterDataResult {
     Abort(u16),
 }
 
-pub trait IbexFilter: 'static {
+pub trait AlcyonFilter: 'static {
     /// Filter name for logging and debugging.
     fn name(&self) -> &'static str;
 
@@ -387,7 +387,7 @@ In adherence to NASA JPL Rule 3 (no dynamic heap allocations on the request hot 
 pub const MAX_STREAM_FILTERS: usize = 8;
 
 pub struct FilterSlot {
-    pub filter: Box<dyn IbexFilter>,
+    pub filter: Box<dyn AlcyonFilter>,
     pub req_offset: u64,
     pub res_offset: u64,
     pub is_resumable: bool,
@@ -431,9 +431,9 @@ impl FilterChain {
 
 ---
 
-## 5. Project Ibex Rust-Native Async SPOE Client Blueprint
+## 5. Project Alcyon Rust-Native Async SPOE Client Blueprint
 
-The Project Ibex SPOE Client (`crates/ibex-spoe`) provides an asynchronous binary SPOP v2.0 offload client implemented purely in safe Rust.
+The Project Alcyon SPOE Client (`crates/alcyon-spoe`) provides an asynchronous binary SPOP v2.0 offload client implemented purely in safe Rust.
 
 ### 5.1 Safe SPOP Binary Wire Codec
 
@@ -567,14 +567,14 @@ pub struct SpopMux {
 }
 ```
 
-- When a stream triggers an SPOE offload event, it serializes a `NOTIFY` frame into the multiplexer's `out_buf`, registers its `(stream_id, frame_id)` in the `pending_txns` tree, sets a timeout in `ibex-sched`, and yields.
+- When a stream triggers an SPOE offload event, it serializes a `NOTIFY` frame into the multiplexer's `out_buf`, registers its `(stream_id, frame_id)` in the `pending_txns` tree, sets a timeout in `alcyon-sched`, and yields.
 - When the SPOP socket receives bytes, `SpopMux` decodes incoming `ACK` frames, looks up the corresponding `PendingSpoeTxn` in $O(k)$ time via `Eb64Tree`, executes the decoded actions (`SetVar`/`UnsetVar`) on the transaction sample variables, and calls `sched.wakeup(txn.task_ref)`.
 
 ---
 
-## 6. Project Ibex Embedded Script Sandboxing Blueprint
+## 6. Project Alcyon Embedded Script Sandboxing Blueprint
 
-To support custom on-the-fly request evaluation (equivalent to HAProxy Lua) under strict `#![forbid(unsafe_code)]`, Ibex utilizes a sandboxed, fuel-metered bytecode execution engine.
+To support custom on-the-fly request evaluation (equivalent to HAProxy Lua) under strict `#![forbid(unsafe_code)]`, Alcyon utilizes a sandboxed, fuel-metered bytecode execution engine.
 
 ### 6.1 Pure-Rust Script Engine Architecture Comparison
 
@@ -584,7 +584,7 @@ To support custom on-the-fly request evaluation (equivalent to HAProxy Lua) unde
 | **Pure-Rust Script (Rhai / Rune)** | `#![forbid(unsafe_code)]` native Rust | AST / Opcode step limits | Bounded Arena Allocator | ~1µs execution / lightweight |
 | **C Lua FFI (`mlua` / C-Lua)** | Requires `unsafe` C bindings | Debug hook instruction counters | Difficult to isolate C heaps | Requires unsafe isolation boundary |
 
-**Ibex Architecture Decision**: Project Ibex adopts a dual-tier sandbox:
+**Alcyon Architecture Decision**: Project Alcyon adopts a dual-tier sandbox:
 1. **Tier 1 (Safe Bytecode / Rhai / Safe-Lua Interpreter)**: Compiled under `#![forbid(unsafe_code)]` for microsecond-latency request header transforms, custom rate limiting, and dynamic routing rules.
 2. **Tier 2 (WASM Core Sandbox)**: Capability-isolated WebAssembly engine for complex third-party WAF filters and legacy plugins.
 
@@ -608,7 +608,7 @@ pub enum ScriptOutcome<T> {
 ```
 
 - **Fuel Metering**: Each script execution turn is granted a fixed quota (e.g. 50,000 fuel units). Each bytecode operation, string concatenation, and memory allocation deducts fuel.
-- **Cooperative Resumption**: If fuel runs out during a long-running computation, the script engine serializes its execution frame, yields control to `ibex-sched` with `Class::Normal`, and reschedules itself, preventing event loop starvation.
+- **Cooperative Resumption**: If fuel runs out during a long-running computation, the script engine serializes its execution frame, yields control to `alcyon-sched` with `Class::Normal`, and reschedules itself, preventing event loop starvation.
 - **Memory Sandboxing**: Script memory allocations draw strictly from a pre-allocated per-stream `StaticArena` (e.g. 64 KB). Exceeding this budget triggers immediate, graceful trap termination without panics.
 
 ### 6.3 Safe Host-Guest ABI
@@ -638,9 +638,9 @@ pub trait ScriptHostAbi {
 
 ## 7. Memory Bounds & NASA JPL Rule 3 Conformance
 
-1. **Zero Dynamic Allocation on Request Flow**: All `IbexFilter` slots, `SpopMux` frame buffers, and script state contexts are sized and pre-allocated at proxy initialization.
-2. **Deterministic Bounded Iteration**: All binary frame parsing loops in `ibex-spoe` and `ibex-filter` are wrapped with `bounded_loop!(1024)` macros to prevent algorithmic complexity attacks on malformed inputs.
-3. **No Unsafe Pointer Sharing**: Unlike HAProxy's `void *ctx` and raw C pointers, Ibex filters, SPOE multiplexers, and script sandboxes interact exclusively through borrow-checked typed references, guaranteeing spatial and temporal memory safety.
+1. **Zero Dynamic Allocation on Request Flow**: All `AlcyonFilter` slots, `SpopMux` frame buffers, and script state contexts are sized and pre-allocated at proxy initialization.
+2. **Deterministic Bounded Iteration**: All binary frame parsing loops in `alcyon-spoe` and `alcyon-filter` are wrapped with `bounded_loop!(1024)` macros to prevent algorithmic complexity attacks on malformed inputs.
+3. **No Unsafe Pointer Sharing**: Unlike HAProxy's `void *ctx` and raw C pointers, Alcyon filters, SPOE multiplexers, and script sandboxes interact exclusively through borrow-checked typed references, guaranteeing spatial and temporal memory safety.
 
 ---
 
@@ -648,7 +648,7 @@ pub trait ScriptHostAbi {
 
 | Milestone | Deliverable | Target Crate | Verification Standard |
 | :--- | :--- | :--- | :--- |
-| **8.1** | Core Filter Trait & HTX Pipeline Hooks | `crates/ibex-filter` | Unit tests with mock filter chains; differential test with HAProxy `flt_http_comp`. |
-| **8.2** | Safe SPOP v2.0 Binary Codec | `crates/ibex-spoe` | Differential codec fuzzing against HAProxy `flt_spoe.c` frames; varint property tests. |
-| **8.3** | Async SPOE Multiplexing Engine | `crates/ibex-spoe` | End-to-end integration test with real SPOA daemon (e.g. Python/C SPOA server). |
-| **8.4** | Pure-Safe Script Sandboxing & Host ABI | `crates/ibex-script` | Fuel exhaustion tests; memory ceiling assertion tests; WAF rule benchmarks. |
+| **8.1** | Core Filter Trait & HTX Pipeline Hooks | `crates/alcyon-filter` | Unit tests with mock filter chains; differential test with HAProxy `flt_http_comp`. |
+| **8.2** | Safe SPOP v2.0 Binary Codec | `crates/alcyon-spoe` | Differential codec fuzzing against HAProxy `flt_spoe.c` frames; varint property tests. |
+| **8.3** | Async SPOE Multiplexing Engine | `crates/alcyon-spoe` | End-to-end integration test with real SPOA daemon (e.g. Python/C SPOA server). |
+| **8.4** | Pure-Safe Script Sandboxing & Host ABI | `crates/alcyon-script` | Fuel exhaustion tests; memory ceiling assertion tests; WAF rule benchmarks. |

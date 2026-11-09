@@ -1,7 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-# T337 occurrence semantics: t337.sh BIN PORT (uses PORT and PORT+1); compare Ibex vs HAProxy output.
+# T337 occurrence semantics: t337.sh BIN PORT (uses PORT and PORT+1); compare Alcyon vs HAProxy output.
 # t337.sh BIN PORT: print fetch results for a set of requests
 B=$1; P=$2; S=$(cd "$(dirname "$0")" && pwd); D=$(mktemp -d /tmp/vv-t337-XXXX)
 sed "s/@P@/$P/; s/@BE@/$((P+1))/g" $S/t337.cfg > $D/t337-$P.cfg

@@ -5,13 +5,13 @@
 # Practical topology 03:  client -> proxy -> httpd (mod_proxy) -> node.js
 #                         and httpd serving static files and a CGI app
 #
-#   ./run.sh              run against Ibex
+#   ./run.sh              run against Alcyon
 #   ./run.sh --haproxy    run against HAProxy (the oracle)
 #
 # Everything is started by this script and killed by PID at the end.
 
 # ---- settings you may want to change ---------------------------------------
-IBEX_BIN=${IBEX_BIN:-/home/bhenc/ibex-targets/t201/release/ibex}
+ALCYON_BIN=${ALCYON_BIN:-/home/bhenc/ibex-targets/t201/release/alcyon}
 HAPROXY_BIN=${HAPROXY_BIN:-/home/bhenc/reference/haproxy/haproxy}
 HTTPD_BIN=${HTTPD_BIN:-/usr/sbin/httpd}
 HTTPD_MODS=${HTTPD_MODS:-/usr/lib64/httpd/modules}
@@ -25,9 +25,9 @@ LOAD_SECS=${LOAD_SECS:-10}
 # -----------------------------------------------------------------------------
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-PROXY=ibex
+PROXY=alcyon
 [ "$1" = "--haproxy" ] && PROXY=haproxy
-if [ "$PROXY" = ibex ]; then PROXY_BIN=$IBEX_BIN; else PROXY_BIN=$HAPROXY_BIN; fi
+if [ "$PROXY" = alcyon ]; then PROXY_BIN=$ALCYON_BIN; else PROXY_BIN=$HAPROXY_BIN; fi
 
 WORK=$(mktemp -d /tmp/practical03-XXXXXX)
 BASE=http://127.0.0.1:$PROXY_PORT
@@ -86,7 +86,7 @@ echo "== topology 03 via $PROXY ($PROXY_BIN), size ${SIZE_MB} MB, work dir $WORK
 #    connection seen behind each hop (CGI REMOTE_PORT = proxy->httpd; node's remotePort = httpd->node)
 # One curl for both, and the first of the run: a second client connection finds the first
 # one's server connection in the pool, and what it takes from there depends on the thread
-# it lands on (HAProxy spreads clients over all CPUs by default; Ibex runs one thread unless
+# it lands on (HAProxy spreads clients over all CPUs by default; Alcyon runs one thread unless
 # `nbthread` says otherwise, T202), so the ports are only comparable from an empty pool.
 ka=$(curl -s -w '\nnum_connects=%{num_connects}\n' "$BASE/cgi-bin/echo.cgi" "$BASE/cgi-bin/echo.cgi")
 c=$(echo "$ka" | sed -n 's/^num_connects=//p' | tr '\n' ' ')

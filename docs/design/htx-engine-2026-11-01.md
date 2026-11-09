@@ -24,7 +24,7 @@ Oracle: `~/reference/haproxy` (`include/haproxy/htx-t.h`, `src/htx.c`, `src/http
   serialisation, as today's keep-alive path); a modified one is written once at the send. This is
   what keeps `keepalive ab1` flat while `rules ab1` and the h2/h3 paths lose their copies.
   HAProxy copies instead (`h1_headers_to_hdr_list` -> `htx_add_all_headers`, h1_htx.c:244/376):
-  one head copy each way that Ibex does not need to pay.
+  one head copy each way that Alcyon does not need to pay.
 - **Expected gain (§3, reasoning per slice).** `rules ab1` 75.6k -> ~63-66k (-10 to -13k,
   from 1.80x to ~1.5-1.57x HAProxy's 42k); `h2s1` ~70k -> ~64-66k (-4 to -6k); `h3fit` the same
   -4 to -6k; `keepalive ab1` 45.9k flat (±0.5 %, the X2 budget) with -1k possible. After this the
@@ -39,7 +39,7 @@ Oracle: `~/reference/haproxy` (`include/haproxy/htx-t.h`, `src/htx.c`, `src/http
 
 ### 1.1 Records that exist
 
-| scenario | Ibex (release-perf) | HAProxy | ratio | record |
+| scenario | Alcyon (release-perf) | HAProxy | ratio | record |
 |---|---:|---:|---:|---|
 | rules ab1 | 75,630 | ~42,000 | 1.80x | `data/measurements.jsonl` last row (main 59c2f3bb, 2026-11-01 07:50); HAProxy from `memory-2026-10-24.md` §1.3 (42.0k) |
 | keepalive ab1 | 45,879 | 33,300 | 1.38x | same row; HAProxy §1.3 (33.3k) |
@@ -116,7 +116,7 @@ on HTTP/1.0 keep-alive requests** (8.1k vs ~0.5k on HAProxy, includes `write_req
 HAProxy's HTX (`htx-t.h:268-286`): one buffer, payload packed from the front, `struct htx_blk`
 (`flags:4, addr:28, info` = type in the top 4 bits, value length, name length; 8 bytes) packed
 from the back; `tail_addr`/`head_addr`/`end_addr` for the wrapping payload; holes left by
-removals count as free but are reused only by `htx_defrag` (htx.c:52). Ibex already has this
+removals count as free but are reused only by `htx_defrag` (htx.c:52). Alcyon already has this
 structure: `HtxSlice`/`HtxSliceRef` (htx.rs:1366/761) are views over any byte slice with the
 descriptor table at its end, `HtxBlockType` (htx.rs:79) mirrors `enum htx_blk_type`
 (`htx-t.h:204-214`, with `Eom` extra), and the session holds one in `sess.htx_buf` (proxy.rs:688,
@@ -171,22 +171,22 @@ copying (`htx_add_all_headers`), the transport buffer freed as soon as it is par
 (one layout, no reserve arithmetic, T15's `HtxBuffer` nearly is it), but it adds one head copy
 per direction (~1.0-1.5k each on a 300-500 B head) and makes the unmodified keep-alive head a
 serialisation instead of a passthrough: `keepalive ab1` would move +2-3k, outside any budget.
-HAProxy affords it because its h1 mux is the only reader; Ibex's measured keep-alive figure is
+HAProxy affords it because its h1 mux is the only reader; Alcyon's measured keep-alive figure is
 45.9k against 33.3k and cannot take more. **Recommendation: A.** B is the fallback if A's
 reserve model fails X2's tests on large heads (§4).
 
 ### 2.2 What reads the HTX
 
-- **Fetches and converters** (`crates/ibex-sample`): `SampleContext` keeps `htx_slice` (the
+- **Fetches and converters** (`crates/alcyon-sample`): `SampleContext` keeps `htx_slice` (the
   request) and gains `res_htx: Option<HtxSliceRef>`; `req_headers`, `req_uri`, `req_method`,
   `req_version`, `raw_req`, `raw_res`, `res_headers`, `res_status` (registry.rs:212-240) go.
   `hdr`/`req.hdr`/`res.hdr`/`req.fhdr`/`hdr_cnt`/`hdr_names`/`hdr_val` read blocks as
   HAProxy's `smp_fetch_hdr` does (http_fetch.c:980-1019): a view into the buffer, `SMP_F_CONST`,
   comma-split by `http_find_header(full=0)`'s rule (http_htx.c:130-245: next element in the same
-  block first, then the next block of the same name; `full=1` one whole line). Ibex's
+  block first, then the next block of the same name; `full=1` one whole line). Alcyon's
   `header_blocks_where`/`get_header` (htx.rs:874-1126) already walk this way for the request.
 - **Samples are bytes** (user decision 2026-11-01, superseding the 2026-10-10 half of tradeoff
-  6.12 that kept `str` samples UTF-8): Ibex keeps data as bytes like HAProxy and neither
+  6.12 that kept `str` samples UTF-8): Alcyon keeps data as bytes like HAProxy and neither
   validates nor re-encodes it. A `str`-typed sample is `Cow<'a, [u8]>` (engine doc §4.4 R2);
   matchers and converters work on bytes (HAProxy's `pat_match_*` on `smp->data.u.str`); the
   linear regex is `regex::bytes`, the backtracking one (fancy-regex, `str`) validates at the
@@ -220,8 +220,8 @@ One function per direction, the port of `h1_make_reqline`/`h1_make_stline`/`h1_m
 - walks blocks from the head in order (order preserved, `h1_make_headers` 2646), skips `Unused`
   and pseudo-headers;
 - **names in lower case** on the wire, as HAProxy (`htx_add_header` lowercases at the parse,
-  htx.h:557; `h1_format_htx_hdr` h1_htx.c:1122 then applies `h1-case-adjust`/`-file`, which Ibex
-  parses, global.rs:217, and `option h1-case-adjust-bogus-client/-server`, proxy.rs:90). Ibex's
+  htx.h:557; `h1_format_htx_hdr` h1_htx.c:1122 then applies `h1-case-adjust`/`-file`, which Alcyon
+  parses, global.rs:217, and `option h1-case-adjust-bogus-client/-server`, proxy.rs:90). Alcyon's
   `rewrite_header_names_before` (engine.rs:16803) is this rule done late on text; it goes. The
   unmodified passthrough keeps the client's case, which is **not** what HAProxy does (HAProxy
   always rewrites); D-E asks whether to lower-case unmodified heads too (costs the passthrough).
@@ -233,7 +233,7 @@ One function per direction, the port of `h1_make_reqline`/`h1_make_stline`/`h1_m
   2807-2935). Today these are text edits spread over the bridge (`chunked_head`
   h2_bridge.rs, the `add_len` rows), `check_response_head`'s `rewrite`, `websocket::Verdict::
   Rewrite`, and the connection-mode code; X5 moves them into the encoder as **flags on the start
-  line** (`HTX_SL_F_CLEN/CHNK/XFER_LEN/CONN_UPG/BODYLESS`, `htx-t.h:128-144`; Ibex's
+  line** (`HTX_SL_F_CLEN/CHNK/XFER_LEN/CONN_UPG/BODYLESS`, `htx-t.h:128-144`; Alcyon's
   `RequestLineView`/`res_line` grow the same flags).
 
 ### 2.4 h2/h3 muxes
@@ -252,11 +252,11 @@ One function per direction, the port of `h1_make_reqline`/`h1_make_stline`/`h1_m
 
 ### 2.5 Body, trailers, 1xx, tunnel, `http-buffer-request`
 
-- **Body**: stays in the transport buffer and is forwarded as today (Ibex has no DATA blocks on
+- **Body**: stays in the transport buffer and is forwarded as today (Alcyon has no DATA blocks on
   the h1 fast path). This is HAProxy with fast-forward always on: once the head is parsed,
   `SE_FL_MAY_FASTFWD_PROD` (mux_h1.c:2369-2375) lets `h1_fastfwd` (5273) move bytes to the
   consumer's `obuf` or a pipe and **the body never becomes HTX blocks**. `htx_xfer` (htx.c:837)
-  is a memcpy, not zero-copy, so HAProxy's non-fast-forward path is slower than Ibex's; nothing
+  is a memcpy, not zero-copy, so HAProxy's non-fast-forward path is slower than Alcyon's; nothing
   to port. Chunked input is passed through to an h1 peer, dechunked for h2/h3 (today's
   `forward_response_mux`, h2_bridge.rs:452); the remaining length is the mux's business
   (`h1m->curr_len`, not an HTX field, in HAProxy too).
@@ -267,7 +267,7 @@ One function per direction, the port of `h1_make_reqline`/`h1_make_stline`/`h1_m
   `smp_fetch_body` is a const view for one DATA block, http_fetch.c:685, a trash copy for more).
   Nothing is copied for a request that has no such rule.
 - **Trailers**: `Trailer` + `Eot` blocks both ways (`h1_parse_msg_tlrs` h1_htx.c:981;
-  `h1_make_trailers` mux_h1.c:3483). Today Ibex handles them on text in the bridge
+  `h1_make_trailers` mux_h1.c:3483). Today Alcyon handles them on text in the bridge
   (`late_trailers`, `drop_trailers`, h2_bridge.rs:510/817, T559); X6 parses the trailer section
   into blocks at the end of the transport buffer with the same reserve rule, so
   `option http-drop-response-trailers`, `%U` and the h2/h3 HEADERS frame read one thing.
@@ -278,13 +278,13 @@ One function per direction, the port of `h1_make_reqline`/`h1_make_stline`/`h1_m
   next head. The response rules run only on the final one (`http_process_res_common` stops early
   for 1xx, 1894).
 - **Tunnel / upgrade**: after 101 (or CONNECT 2xx) both sides are raw (`h1_set_tunnel_mode`
-  mux_h1.c:1890 clears XFER_LEN/CLEN/CHNK; `RAW_DATA` blocks): in Ibex the transport buffers are
+  mux_h1.c:1890 clears XFER_LEN/CLEN/CHNK; `RAW_DATA` blocks): in Alcyon the transport buffers are
   already raw; the descriptor region is released (reserve returns to the body) when the tunnel
   starts. No change to `websocket.rs`'s decision, only to where it reads the fields.
 
 ### 2.6 Oracle-compatibility risks, with the HAProxy rule each follows
 
-| item | HAProxy | Ibex today | design |
+| item | HAProxy | Alcyon today | design |
 |---|---|---|---|
 | header case on the h1 wire | names lowercased in HTX (htx.h:557), case-adjust map on output (h1_htx.c:1122) | passthrough keeps the client's case; `rewrite_header_names_before` lowercases some | lowercase at the parse (in place, 0 copies) so every output is HAProxy's; the passthrough is then byte-identical to HAProxy only when the client sent lowercase; **D-E** |
 | header order | preserved (blocks walked from head) | preserved | same; `add-header` appends before EOH, `set-header` removes all then appends (`http_replace_header`/`http_add_header` http_htx.c:678/286) |
@@ -310,13 +310,13 @@ not merged (AGENTS.md §8). Every slice keeps the parser refusing what it does n
 | slice | goal | files | test that fails first | expected ins/req, reasoning | size | depends | model |
 |---|---|---|---|---|---|---|---|
 | **X0** | post-E2 profile of rules ab1, h2s1, keepalive (§1.2) | `tools/measure/insprof.sh`, this doc §1.3 | - (measurement) | - | S (half a day) | - | Sonnet |
-| **X1** | the layout: `HtxSlice::over_received(head: &mut [u8], reserve: &mut [u8])` or an offsets form of `with_offsets` (htx.rs:1366) whose payload region is the received text plus the reserve's front and whose descriptors are the reserve's tail; in-place parse `HtxSlice::index_h1_head(&mut self) -> Result<ReqLineFlags>` writing `ReqLine`/`ResLine` + `Header` + `Eoh` descriptors over the bytes (names lowercased in place); `defrag` rewriting the head text from blocks when the reserve is full; `Buf` gains a reserve accessor (buf.rs:938 area). Data structure only, nothing on the path yet | `crates/ibex-proto/src/htx.rs`, `crates/ibex-rt/src/buf.rs` | `crates/ibex-proto/tests/it/htx_differential.rs` (exists; T15's module) gains the rows: for 200 generated heads (T15's generator + the R1 smuggling corpus), `index_h1_head` then every reader (`headers`, `get_header`, `req_line`, `body_len`) equals `H1Parser` + `put_request_head`'s HTX; edit sequences (set/add/del/replace x reserve sizes 64-1024) then `write_h1_wire` equals the copying HTX's output; reserve exhaustion triggers one `defrag` and the result is equal. Red: the constructor does not exist | 0 (not on the path); the file's existing `HtxSlice` tests stay green | M | - | Opus |
-| **X5** | the h1 encoder owns the framing (§2.3): `h1_encode_head(htx, mode: ConnMode, dir) -> usize` with the `h1_make_eoh` rules; start-line flags `CLEN/CHNK/XFER_LEN/CONN_UPG/BODYLESS`; the text rewrites it replaces (`chunked_head`, `check_response_head.rewrite`, `websocket::Verdict::Rewrite` text form, `rewrite_header_names_before`) call it | `crates/ibex-proto/src/htx.rs` (encoder), `h1.rs`, `response_head.rs`, `crates/ibex-rt/src/h2_bridge.rs`, `websocket.rs`, engine.rs (`rewrite_header_names_before` sites) | `crates/ibex-proto/tests/it/h1_encode.rs`: a table of (HTX, mode) -> bytes, each row's expected bytes **taken from HAProxy** (`h1_make_*` on the same input: run the oracle with `http-server-close`, `httpclose`, 1.0 client, CL+TE, websocket, 204/304, HEAD) and recorded in the test; red: no encoder. Integration: the response battery (T275, T281, T436) and the h2 battery stay green | neutral (±0.5 % budget): it replaces text edits with the same bytes; a differential row in `h2_per_request_work.rs` asserts the wire is byte-equal to today's for the scenarios' heads | M | X1 | Opus (the `h1_make_eoh` rules) |
-| **X2** | request head in place for h1, rules on HTX: the h1 parse writes descriptors into `sess.req`'s reserve (X1); `req_htx_init`/`sess.htx_buf` copy gone for h1; `req_headers`, `req_method`/`req_uri` text, `raw_req` retired from `TcpSession` and `SampleContext` (the fetches read blocks); the eleven `rebuild_req_buffer` sites and S7's hold/flush become one `encode_if_modified` at the server send; `req_set_uri`'s resize model becomes the reserve check | `engine.rs` (rules region 15400-16040, send site, `req_htx_init`), `proxy.rs` (`TcpSession` fields 687-701, `htx_slice` 1476), `crates/ibex-sample/src/registry.rs` (`SampleContext`), the header fetches in `ibex-sample`, `txn.rs` | `crates/ibex-rt/tests/it/htx_primary.rs` (new module): `a_request_head_is_written_at_most_once`: a `#[cfg(debug_assertions)]` counter on the encoder is 0 for keep-alive GET and 1 for the rules scenario's head (red today: `write_req_head` runs once per request on rules **and** the `req_headers` collect runs per edit, counted by `work::Op::ReqRebuild` engine.rs:16012: assert `ReqRebuild == 0` for an unmodified head); `an_unmodified_head_is_the_bytes_that_arrived` (mixed-case client header reaches the server unchanged or lowercased per D-E); `rules_with_a_full_reserve_still_forward` (16 KiB head + five 200 B `set-header`, 1 KiB reserve: 200 and the server sees all five; red: n/a today, pins the fallback); the rules battery, cookie, forwardfor, `set-path`/`set-query` rows green; differential corpus rows (R1 item 2) unchanged against HAProxy | **rules -6 to -8k** (the per-edit `req_headers` collect 3-4k, one `write_req_head` with its 8 KiB memset and body memmove 2.5k, UTF-8 ~0.5-1k, `SampleContext` fields ~0.3k); **keepalive flat** (the parse writes ~12 descriptors where it wrote nothing: +0.2k; `req_htx_init` and the `htx_buf` take/give go: -0.3k; net within ±0.5 %); h2 -1k (`copy_header` list) | L | X1, X5 | Opus |
+| **X1** | the layout: `HtxSlice::over_received(head: &mut [u8], reserve: &mut [u8])` or an offsets form of `with_offsets` (htx.rs:1366) whose payload region is the received text plus the reserve's front and whose descriptors are the reserve's tail; in-place parse `HtxSlice::index_h1_head(&mut self) -> Result<ReqLineFlags>` writing `ReqLine`/`ResLine` + `Header` + `Eoh` descriptors over the bytes (names lowercased in place); `defrag` rewriting the head text from blocks when the reserve is full; `Buf` gains a reserve accessor (buf.rs:938 area). Data structure only, nothing on the path yet | `crates/alcyon-proto/src/htx.rs`, `crates/alcyon-rt/src/buf.rs` | `crates/alcyon-proto/tests/it/htx_differential.rs` (exists; T15's module) gains the rows: for 200 generated heads (T15's generator + the R1 smuggling corpus), `index_h1_head` then every reader (`headers`, `get_header`, `req_line`, `body_len`) equals `H1Parser` + `put_request_head`'s HTX; edit sequences (set/add/del/replace x reserve sizes 64-1024) then `write_h1_wire` equals the copying HTX's output; reserve exhaustion triggers one `defrag` and the result is equal. Red: the constructor does not exist | 0 (not on the path); the file's existing `HtxSlice` tests stay green | M | - | Opus |
+| **X5** | the h1 encoder owns the framing (§2.3): `h1_encode_head(htx, mode: ConnMode, dir) -> usize` with the `h1_make_eoh` rules; start-line flags `CLEN/CHNK/XFER_LEN/CONN_UPG/BODYLESS`; the text rewrites it replaces (`chunked_head`, `check_response_head.rewrite`, `websocket::Verdict::Rewrite` text form, `rewrite_header_names_before`) call it | `crates/alcyon-proto/src/htx.rs` (encoder), `h1.rs`, `response_head.rs`, `crates/alcyon-rt/src/h2_bridge.rs`, `websocket.rs`, engine.rs (`rewrite_header_names_before` sites) | `crates/alcyon-proto/tests/it/h1_encode.rs`: a table of (HTX, mode) -> bytes, each row's expected bytes **taken from HAProxy** (`h1_make_*` on the same input: run the oracle with `http-server-close`, `httpclose`, 1.0 client, CL+TE, websocket, 204/304, HEAD) and recorded in the test; red: no encoder. Integration: the response battery (T275, T281, T436) and the h2 battery stay green | neutral (±0.5 % budget): it replaces text edits with the same bytes; a differential row in `h2_per_request_work.rs` asserts the wire is byte-equal to today's for the scenarios' heads | M | X1 | Opus (the `h1_make_eoh` rules) |
+| **X2** | request head in place for h1, rules on HTX: the h1 parse writes descriptors into `sess.req`'s reserve (X1); `req_htx_init`/`sess.htx_buf` copy gone for h1; `req_headers`, `req_method`/`req_uri` text, `raw_req` retired from `TcpSession` and `SampleContext` (the fetches read blocks); the eleven `rebuild_req_buffer` sites and S7's hold/flush become one `encode_if_modified` at the server send; `req_set_uri`'s resize model becomes the reserve check | `engine.rs` (rules region 15400-16040, send site, `req_htx_init`), `proxy.rs` (`TcpSession` fields 687-701, `htx_slice` 1476), `crates/alcyon-sample/src/registry.rs` (`SampleContext`), the header fetches in `alcyon-sample`, `txn.rs` | `crates/alcyon-rt/tests/it/htx_primary.rs` (new module): `a_request_head_is_written_at_most_once`: a `#[cfg(debug_assertions)]` counter on the encoder is 0 for keep-alive GET and 1 for the rules scenario's head (red today: `write_req_head` runs once per request on rules **and** the `req_headers` collect runs per edit, counted by `work::Op::ReqRebuild` engine.rs:16012: assert `ReqRebuild == 0` for an unmodified head); `an_unmodified_head_is_the_bytes_that_arrived` (mixed-case client header reaches the server unchanged or lowercased per D-E); `rules_with_a_full_reserve_still_forward` (16 KiB head + five 200 B `set-header`, 1 KiB reserve: 200 and the server sees all five; red: n/a today, pins the fallback); the rules battery, cookie, forwardfor, `set-path`/`set-query` rows green; differential corpus rows (R1 item 2) unchanged against HAProxy | **rules -6 to -8k** (the per-edit `req_headers` collect 3-4k, one `write_req_head` with its 8 KiB memset and body memmove 2.5k, UTF-8 ~0.5-1k, `SampleContext` fields ~0.3k); **keepalive flat** (the parse writes ~12 descriptors where it wrote nothing: +0.2k; `req_htx_init` and the `htx_buf` take/give go: -0.3k; net within ±0.5 %); h2 -1k (`copy_header` list) | L | X1, X5 | Opus |
 | **X3** | response head in place, response rules on HTX: `check_response_head` writes `ResLine`/`Header`/`Eoh` descriptors into `sess.rep`'s reserve, `RspHead` and `HeadFacts::scan`'s text path go, `run_res_rules` takes `&mut HtxSlice` (no `Vec<(String, String)>`, status/reason as start-line edits), the h1 client send is passthrough-or-encode, `send_head_fields` iterates blocks with the static-index `match` (Track 3 Q3); interim (1xx) messages as §2.5 | `response_head.rs`, `txn.rs` (`HeadFacts`), engine.rs (`apply_http_response_rules_in` 11500-11600, `run_res_rules` 16567-16700), `h2_bridge.rs` (`indexed_fields` 431, `forward_response_mux` 452), `mux_h2.rs`/`mux_h3.rs` (`send_head_fields`), `hpack.rs` (static `match`) | `htx_primary.rs`: `a_response_head_is_walked_once_and_written_at_most_once` (the E2 counter `scans == N` tightened to: no `Vec<(String, String)>` build, `ReqRebuild`-style `RspEncode == 0` with no response rules, 1 with the scenario's two); `an_interim_response_reaches_an_h2_client` (103 then 200 from an h1 server: HEADERS without END_STREAM then the final; red: dropped today, h3-engine §4; oracle: main HAProxy over h2 works, the h3 oracle's BUG_ON noted); the 23 response probe cases x h1/h2 of E2 stay identical to HAProxy | **rules -3 to -4k** (`Vec<(String, String)>` head + `SampleContext` per-rule copies ~2k, the text rewrite after the rules ~1k, `rewrite_header_names_before` 0.7k); **h2/h3 -2 to -3k** (`indexed_fields` and the HPACK linear scan 1.9k -> ~0.3k); keepalive -0.5 to -1k (`HeadFacts` from blocks, no second walk) | L | X1, X5 | Opus |
 | **X4** | h2/h3 request built in the child's transport layout: `put_request_head` writes blocks into `sess.req`'s layout (no `htx_buf`, no text until the server send); `start_request`'s cookie/ws/`content-length` work on blocks; the chunked-without-length head is an encoder flag | `h2_bridge.rs` (95-242), `htx.rs` (`put_request_head` target), `mux_h3.rs`/`mux_h2.rs` (`take_req_fields`), `proxy.rs` (`h2_child_of` buffers) | `h2_per_request_work.rs`: `an_h2_request_head_is_parsed_once` kept and `..._is_written_once` added (encoder counter 1 per request; red: `write_h1_wire` at h2_bridge.rs:242 **and** the send); `h3_request_framing_to_backend.rs`, cookie-blank and canonical `content-length` rows (E1, VV-32) green | **h2/h3 -2 to -3k** (the bridge's immediate `write_h1_wire` 1.5k, one `Buf` take/give 0.3k, `copy_header` remainder 0.5k) | M | X2 | Opus |
 | **X7** | retire the rest: `write_h1_wire_vec` sizing sites (proxy.rs:2387/2443/2939) take the encoder's length or the received length; `HtxBlock`/`Htx` (`Vec<HtxBlock>`, htx.rs:314/2470) deleted if no reader remains; `has_htx`/`htx_modified`/`htx_tail`/`htx_blocks` collapse into the layout; tradeoff 6.24's open item closed (`:path` bytes) | htx.rs, proxy.rs, txnlog.rs, engine.rs | `htx_primary.rs`: `a_log_line_does_not_serialise_the_head` (`%U` on a 1 KiB head: encoder counter 0; red: three `write_h1_wire_vec`); `h2_field_validity.rs` `:path` non-UTF-8 forwarded (red: RST_STREAM) | rules -1k, h2 -0.5k, keepalive -0.3k (`%U` sizing) | M | X2, X3, X4 | Sonnet |
-| **X6** | DATA on demand (`http-buffer-request`, `wait-for-body`, `req.body*`) as one in-place `Data` block; trailers as `Trailer`/`Eot` blocks both ways (replaces `late_trailers`/`drop_trailers` text handling) | engine.rs (body wait), `ibex-sample` body fetches, `h2_bridge.rs` (510, 817), htx.rs | `htx_primary.rs`: `req_body_is_a_view_into_the_request_buffer` (debug counter: 0 copies for a 4 KiB POST with `option http-buffer-request`; red: a copy today, verify in X0), T559's trailer rows green, `option http-drop-response-trailers` row | neutral on the four scenarios (none buffers a body); `h3_request_framing_to_backend` body rows measured once, -0.5k expected | M | X3 | Sonnet |
+| **X6** | DATA on demand (`http-buffer-request`, `wait-for-body`, `req.body*`) as one in-place `Data` block; trailers as `Trailer`/`Eot` blocks both ways (replaces `late_trailers`/`drop_trailers` text handling) | engine.rs (body wait), `alcyon-sample` body fetches, `h2_bridge.rs` (510, 817), htx.rs | `htx_primary.rs`: `req_body_is_a_view_into_the_request_buffer` (debug counter: 0 copies for a 4 KiB POST with `option http-buffer-request`; red: a copy today, verify in X0), T559's trailer rows green, `option http-drop-response-trailers` row | neutral on the four scenarios (none buffers a body); `h3_request_framing_to_backend` body rows measured once, -0.5k expected | M | X3 | Sonnet |
 | **X8** | backend h2/h3 from blocks: `srv_h2.rs` takes `HtxSliceRef` (no text parse), writes the response as blocks | `srv_h2.rs`, `h2_srv.rs:482` | `h2backend` scenario pin in `htx_primary.rs` (encoder counter 0 to an h2 server; red: text) | `h2backend` -3 to -4k (one serialisation and one parse gone); the four main scenarios untouched | M | X3, X4 | Sonnet |
 
 Order: X0 -> X1 -> X5 -> X2 -> X3 -> X4 -> X7 -> X6 -> X8. X1 and X5 are parallel (different
@@ -334,7 +334,7 @@ Expected total, ranges not added (read ±30 %): **rules 75.6k - 10 to 13k = 63-6
 
 **Risks.**
 1. The reserve model (§2.1) on edge heads: a head that nearly fills the buffer leaves a 1 KiB
-   reserve; HAProxy's own limit is the same `maxrewrite`, but Ibex's today is modelled, not
+   reserve; HAProxy's own limit is the same `maxrewrite`, but Alcyon's today is modelled, not
    enforced by layout, and the large-head reg-tests (`h1_large_headers`, the 400/502 rows) may
    change a verdict. X2's `rules_with_a_full_reserve_still_forward` and the reg-test board decide.
 2. In-place lowercasing of names changes what an unmodified head looks like (D-E); if the user
@@ -346,7 +346,7 @@ Expected total, ranges not added (read ±30 %): **rules 75.6k - 10 to 13k = 63-6
    descriptor writes are ~12 x 2 stores plus the lowercase pass over ~150 bytes of names
    (`rewrite_header_names_before` costs 0.7k today on the response: that is the number to beat).
 5. `SampleContext` is shared with `tcp-request content`, `use_backend`, logs, stick rules and the
-   Lua-less converters: retiring `req_headers` touches every fetch (`ibex-sample` ~1,200 lines of
+   Lua-less converters: retiring `req_headers` touches every fetch (`alcyon-sample` ~1,200 lines of
    sample code, T272's count) and the 290 test sites tradeoff 6.12 counted. X2 is L for this.
 
 **Stop rules.** Stop and reconsider B (§2.1) if X2 measures keepalive > +0.5 % with the parse in
@@ -359,7 +359,7 @@ without that row). Do not weaken a `tools/checkin.sha256` test to pass; report i
 
 | | question | recommendation |
 |---|---|---|
-| **D-A** | Layout: (A) descriptors in the transport buffer's reserve over the received bytes, passthrough for unmodified heads; or (B) HAProxy's separate HTX buffer, copy at the parse | **A.** B costs keepalive +2-3k for simplicity Ibex does not need; A keeps today's zero-work keep-alive path and is HAProxy's layout in every other respect |
+| **D-A** | Layout: (A) descriptors in the transport buffer's reserve over the received bytes, passthrough for unmodified heads; or (B) HAProxy's separate HTX buffer, copy at the parse | **A.** B costs keepalive +2-3k for simplicity Alcyon does not need; A keeps today's zero-work keep-alive path and is HAProxy's layout in every other respect |
 | **D-B** | Header values, `:path`, `:method` as bytes in the HTX; `str` samples validated at the fetch (tradeoff 6.12 kept, 6.24's open item closed) | **Yes.** It is what HAProxy does (opaque bytes) and removes the h2/h3 `:path` reset where HAProxy forwards. **Amended 2026-11-01 (user, §5)**: no validation at the fetch either; samples are bytes (R2) |
 | **D-C** | Keepalive budget for X2: strict ±0.5 %, or allow up to +1 % if rules gains ≥ 6k | **Strict.** Keep-alive is the production path for a blog; the design claims it is flat, so measure it flat |
 | **D-D** | Body in HTX as DATA blocks always (HAProxy's non-fast-forward path) or on demand only (X6) | **On demand.** HAProxy itself bypasses HTX for the body whenever it can; always-DATA is a copy per body for nothing |
@@ -373,10 +373,10 @@ without that row). Do not weaken a `tools/checkin.sha256` test to pass; report i
 - **D-A, D-B, D-C, D-D, D-F, D-H: as recommended** (layout A; values and `:path` as bytes; strict
   keepalive budget; body on demand; X slices before E3; `early-hint` refused until X3).
 - **D-E: a setting, not a fixed rule.** "HAProxy lowercasing everything has been a headache."
-  `tune.ibex.h1-lowercase-headers on|off` (name to be settled in X5): `off` = an unmodified head
+  `tune.alcyon.h1-lowercase-headers on|off` (name to be settled in X5): `off` = an unmodified head
   keeps the case it arrived with and the encoder writes names as stored; `on` = every h1 output
   lowercased, as HAProxy (with `h1-case-adjust` still applying on top, as HAProxy). Default
-  `off` (today's Ibex behaviour, and the cheaper path); differential rows against HAProxy run
+  `off` (today's Alcyon behaviour, and the cheaper path); differential rows against HAProxy run
   with `on`. Built in X5 (encoder) and X2 (passthrough).
 - **D-G: both.** The representation work (X0 -> X1, X5 -> X2, X3 ...) and the engine/scheduler
   work (T550 S2 = slice E3, a stream object per h2/h3 child; S3, the loop row: 17.4k on h2 against
@@ -385,7 +385,7 @@ without that row). Do not weaken a `tools/checkin.sha256` test to pass; report i
 
 **2026-11-01 (evening), after X0.**
 
-- **D-B amended: bytes like HAProxy.** Ibex keeps request and response data as bytes and does
+- **D-B amended: bytes like HAProxy.** Alcyon keeps request and response data as bytes and does
   not validate or re-encode it; the "`str` samples stay UTF-8, validated once at the fetch" half
   of tradeoff 6.12 is retired (`tradeoff.md` 6.12 and 6.24 updated at R2's merge). `Sample` Str
   becomes borrowed bytes, matchers and converters on bytes, the linear regex `regex::bytes`,

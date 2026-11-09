@@ -27,6 +27,6 @@ end 04:42:44 load=1.52 2.73 7.09
 ```
 
 The same method was used earlier that night, with the results in the merge messages:
-- **S1:** 05ddac2e, against d48d6037, with `tune.ibex.zero-buffers off` on both sides.
+- **S1:** 05ddac2e, against d48d6037, with `tune.alcyon.zero-buffers off` on both sides.
 - **S2+S3:** fcab8c91, against 05ddac2e.
 - **S4:** 0b57eabf, against S3 4ed7312a.

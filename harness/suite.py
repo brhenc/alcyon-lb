@@ -17,7 +17,7 @@ Two things make this usable as a gate rather than noise:
     *flaky*: it is named, and it fails the gate like any other failure unless the
     baseline lists it with a reason. This script used to re-run once and call a
     single pass "flaky, not counted", and `keepalive_binary` was then excused while it
-    failed alone 4 runs in 12. A flake is a race in the test or in ibex, and the gate
+    failed alone 4 runs in 12. A flake is a race in the test or in alcyon, and the gate
     is where it gets noticed.
 
   * Known failures live in `data/suite_baseline.json` with a reason each
@@ -37,9 +37,9 @@ while the tests run, and parallel invocations queue behind it.) Each test is kil
 re-run alone the same way. `SUITE_SERIAL=1` runs the single `cargo test --workspace` of
 before.
 
-Keys are `crate/target::test`, as the baseline names them: `ibex-rt/it::h3_end_to_end::x`
-for a test of tests/it/h3_end_to_end.rs, `ibex-rt/request_allocations::x` for a file with
-a binary of its own, `ibex-rt/lib::proxy::tests::x` for a unit test.
+Keys are `crate/target::test`, as the baseline names them: `alcyon-rt/it::h3_end_to_end::x`
+for a test of tests/it/h3_end_to_end.rs, `alcyon-rt/request_allocations::x` for a file with
+a binary of its own, `alcyon-rt/lib::proxy::tests::x` for a unit test.
 
 The tests run once per gate, instrumented (T257): in the build `cargo llvm-cov` makes
 (`<target>/llvm-cov-target`, covercheck.instrumented_env), and the profiles they write are
@@ -117,7 +117,7 @@ def failed_by_target(out: str) -> dict[str, set[str]]:
 
 
 RESULT_RE = re.compile(r"^test result: \w+\. (\d+) passed; (\d+) failed", re.M)
-# One process per test (T260) waits more than it computes: most tests wait on ibex, a
+# One process per test (T260) waits more than it computes: most tests wait on alcyon, a
 # backend or a timer. Measured 2026-10-10, instrumented, wall with reruns (load 20-50 from
 # other builds): 64 cores 8 jobs 165 s, 16 89 s, 32 56 s, 64 41 s; 8 cores (taskset) 8 jobs
 # 151 s, 16 88 s, 32 58 s. Load flakes were seen at every setting, as before. 32 is the
@@ -129,7 +129,7 @@ JOBS = int(os.environ.get("SUITE_JOBS", "32"))
 TARGET_TIMEOUT = int(os.environ.get("SUITE_TIMEOUT", "300"))
 HEARTBEAT = 15
 # Set by covercheck.instrumented_env to the instrumented target directory.
-INSTRUMENTED_KEY = "IBEX_INSTRUMENTED"
+INSTRUMENTED_KEY = "ALCYON_INSTRUMENTED"
 
 
 def say(msg: str) -> None:
@@ -141,8 +141,8 @@ def run_bounded(cmd: list[str], cwd: str, env: dict | None) -> tuple[int, str]:
     group, since under `cargo test` the hung process is cargo's child and killing cargo
     alone leaves it running. A timeout returns -9."""
     # stdin is /dev/null: inherited, it is whatever ran the gate (a socket under an agent's
-    # shell), and the ibex processes the tests start inherit it in turn --
-    # fd_hygiene counted it as a socket ibex had left open, and failed every run.
+    # shell), and the alcyon processes the tests start inherit it in turn --
+    # fd_hygiene counted it as a socket alcyon had left open, and failed every run.
     p = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, start_new_session=True)
     try:
@@ -160,11 +160,11 @@ def run_bounded(cmd: list[str], cwd: str, env: dict | None) -> tuple[int, str]:
 # canonical_haproxy_35_e2e left the list (T259): its stick counters are read once the
 # answer has arrived and the engine is idle, no longer after a fixed number of passes.
 SERIAL_TARGETS = {
-    "ibex-rt/request_allocations",     # counts allocations and bytes per request
-    "ibex-rt/memory_baseline",         # reads the child's VmRSS and `show pools` after fixed idle periods
-    "ibex-rt/cli_applet",              # `show pools` waits a fixed 20 engine steps (T116)
+    "alcyon-rt/request_allocations",     # counts allocations and bytes per request
+    "alcyon-rt/memory_baseline",         # reads the child's VmRSS and `show pools` after fixed idle periods
+    "alcyon-rt/cli_applet",              # `show pools` waits a fixed 20 engine steps (T116)
     # Failed only in gates that shared the machine with another gate, passed alone (2026-10-05):
-    "ibex-rt/it::fd_hygiene",          # counts /proc/<pid>/fd after the server closes (T217)
+    "alcyon-rt/it::fd_hygiene",          # counts /proc/<pid>/fd after the server closes (T217)
 }
 
 

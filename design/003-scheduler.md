@@ -1,8 +1,8 @@
-# 003 — The Scheduler, and Why Ibex Writes Its Own
+# 003 — The Scheduler, and Why Alcyon Writes Its Own
 
 Reference: `/home/bhenc/reference/haproxy` @ `e6f616af` (3.5-dev7).
 
-**Decision D1: Ibex implements HAProxy's scheduler in Rust rather than adopting a
+**Decision D1: Alcyon implements HAProxy's scheduler in Rust rather than adopting a
 general-purpose async runtime.**
 
 The thesis under test: HAProxy's scheduler contains several mechanisms that exist
@@ -237,7 +237,7 @@ everything a connection touches, which reintroduces `Arc`/atomics exactly where 
 has a plain struct field. Adopting it would not produce a memory-safe HAProxy. It would
 produce a differently-shaped proxy that happens to be written in Rust.
 
-### What Ibex still takes from the ecosystem
+### What Alcyon still takes from the ecosystem
 
 Writing the scheduler does not mean writing an epoll wrapper. `mio` (or direct `epoll`
 via `rustix`) supplies readiness notification; the scheduler above it is ours. Later,
@@ -247,7 +247,7 @@ whatever is convenient.
 
 ---
 
-## 7. What Ibex builds
+## 7. What Alcyon builds
 
 ```rust
 // Sketch only -- see 004 for the tree these keys live in.

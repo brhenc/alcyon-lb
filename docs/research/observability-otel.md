@@ -1,7 +1,7 @@
-# Ibex Observability & OpenTelemetry Architecture Blueprint
+# Alcyon Observability & OpenTelemetry Architecture Blueprint
 
 **Status:** Research & Architecture Specification (Milestone Observability & Tracing Architecture)  
-**Author:** Ibex Observability & OpenTelemetry Researcher  
+**Author:** Alcyon Observability & OpenTelemetry Researcher  
 **Safety & Concurrency Invariant:** `#![forbid(unsafe_code)]`, zero-allocation hot-path (NASA JPL Rule 3), level-triggered streaming I/O, `!Send` thread-local affinity with atomic cross-thread metric aggregation.
 
 ---
@@ -12,7 +12,7 @@ Observability in high-performance reverse proxies and load balancers must satisf
 1. **Zero Runtime Allocation & Bounded Memory Overhead (NASA JPL Rule 3):** Exporting metrics for 100,000+ endpoints or tracing millions of requests per second must never trigger dynamic heap allocations (`alloc`, `realloc`, `free`), lock contention, or memory fragmentation on the request forwarding hot path.
 2. **Deterministic Latency & Isolation:** Scraper slow-read attacks (e.g., slow clients scraping `/metrics`) or lagging downstream OpenTelemetry collectors must never block, delay, or exhaust resources of the primary packet and stream forwarding engine.
 
-This document establishes the architecture for native Prometheus scraping (`/metrics`) and OpenTelemetry distributed tracing in Project Ibex, based on exhaustive research into:
+This document establishes the architecture for native Prometheus scraping (`/metrics`) and OpenTelemetry distributed tracing in Project Alcyon, based on exhaustive research into:
 1. **HAProxy Native Prometheus Exporter Applet** (`addons/promex/service-prometheus.c`, `src/stats.c`, `src/stats-proxy.c`, and `include/haproxy/stats-proxy.h`).
 2. **HAProxy OpenTelemetry Integration & Trace Engine** (`haproxy-opentelemetry` / `flt_ot.c`, `src/trace.c`, `src/flt_spoe.c`, and `set-var-ctx`).
 3. **W3C Distributed Tracing Standards**: W3C Trace Context (`traceparent`, `tracestate`), W3C Baggage, and OpenTelemetry Protocol (OTLP v1).
@@ -20,7 +20,7 @@ This document establishes the architecture for native Prometheus scraping (`/met
 
 ```
 +---------------------------------------------------------------------------------------------------+
-|                                     IBEX OBSERVABILITY ENGINE                                     |
+|                                     ALCYON OBSERVABILITY ENGINE                                     |
 +---------------------------------------------------------------------------------------------------+
 |  L7 Tracing & Context  | W3C traceparent (55B) | W3C tracestate (512B) | W3C baggage Context      |
 |  (SpanContext)         | Zero-Copy Hex Codec   | Sampling Decisions    | Ingress/Egress Injection |
@@ -120,7 +120,7 @@ Historical analysis of HAProxy's `service-prometheus.c` (e.g., CVEs, GitHub Issu
 2. **Buffer Overflows on High-Cardarity Label Strings**: Unchecked `snprintf` format truncation or chunk overruns when server names or dynamic paths contained long strings or special characters.
 3. **Dangling Pointers on Dynamic Reconfiguration**: If a backend or server was removed via CLI/runtime API while a long-running `/metrics` dump was yielding over slow TCP sockets, the preserved `px`/`sv` raw pointers became dangling, causing use-after-free crashes.
 
-**Ibex Invariant:** In Ibex, all indices are validated generational arena references (`ProxyId`, `ServerIndex`, `TableId`), protected by Rust's type system and safe bounds checking under `#![forbid(unsafe_code)]`.
+**Alcyon Invariant:** In Alcyon, all indices are validated generational arena references (`ProxyId`, `ServerIndex`, `TableId`), protected by Rust's type system and safe bounds checking under `#![forbid(unsafe_code)]`.
 
 ---
 
@@ -155,7 +155,7 @@ Format: `version-trace_id-parent_id-trace_flags`
 - Must be propagated unmodified except when the proxy updates its own tenant key.
 
 #### 3. `baggage` (Optional, OpenTelemetry Context)
-- User-defined key-value properties: `userId=alice,serverNode=ibex-node-01`.
+- User-defined key-value properties: `userId=alice,serverNode=alcyon-node-01`.
 
 ### 2.2 Trace Lifecycle & Filter Execution Points
 
@@ -197,13 +197,13 @@ Modern reverse proxies face severe challenges when exporting traces:
 
 ---
 
-## 3. Ibex Zero-Allocation Observability Architecture Design
+## 3. Alcyon Zero-Allocation Observability Architecture Design
 
-Ibex implements observability strictly under `#![forbid(unsafe_code)]`, eliminating heap allocations on all scraping and tracing paths.
+Alcyon implements observability strictly under `#![forbid(unsafe_code)]`, eliminating heap allocations on all scraping and tracing paths.
 
 ### 3.1 Prometheus Metric Exposition Architecture (`PrometheusApplet`)
 
-The native Prometheus exporter in Ibex is implemented as a streaming Applet in `ibex-rt`:
+The native Prometheus exporter in Alcyon is implemented as a streaming Applet in `alcyon-rt`:
 
 ```rust
 /// Cursor state for incremental zero-allocation metric exposition.
@@ -229,7 +229,7 @@ pub enum PromexState {
 #### Zero-Allocation Numeric String Formatter (`PromexWriter`)
 Formatting integers and floating-point values via `write!(out, "{val}")` or `format!()` in Rust can trigger hidden allocations or excessive formatting machinery.
 
-Ibex uses a stack-allocated, lookup-table-based fast formatter operating directly on byte slices (`&mut [u8]`):
+Alcyon uses a stack-allocated, lookup-table-based fast formatter operating directly on byte slices (`&mut [u8]`):
 - **`write_u64(buf: &mut [u8], val: u64) -> usize`**: 2-digit lookup table (`00`–`99`) converting 64-bit integers in < 5 nanoseconds without memory allocation.
 - **`write_f64(buf: &mut [u8], val: f64, precision: usize) -> usize`**: Fixed-precision decimal converter without heap allocation.
 - **Line Scratch Buffer**: A fixed `[u8; 512]` buffer on the stack. The metric name, labels, and value are composed into the scratch buffer and copied into the `HtxBuffer` in a single `copy_from_slice` operation.
@@ -291,9 +291,9 @@ impl<'a> PromexWriter<'a> {
 
 ---
 
-### 3.2 Ibex Prometheus Metric Catalog
+### 3.2 Alcyon Prometheus Metric Catalog
 
-Ibex exposes the full standard HAProxy-compatible Prometheus metric catalog:
+Alcyon exposes the full standard HAProxy-compatible Prometheus metric catalog:
 
 | Metric Name | Type | Scope | Description |
 | :--- | :--- | :--- | :--- |
@@ -301,7 +301,7 @@ Ibex exposes the full standard HAProxy-compatible Prometheus metric catalog:
 | `haproxy_process_connections_total` | Counter | Global | Cumulative accepted connections across all listeners |
 | `haproxy_process_current_connections` | Gauge | Global | Current live connections across all threads |
 | `haproxy_process_max_connections` | Gauge | Global | Configured global `maxconn` limit |
-| `haproxy_process_tasks_total` | Gauge | Global | Total registered tasks in `ibex-sched` |
+| `haproxy_process_tasks_total` | Gauge | Global | Total registered tasks in `alcyon-sched` |
 | `haproxy_process_run_queue_length` | Gauge | Global | Active runnable tasks in scheduler run queue |
 | `haproxy_frontend_connections_total` | Counter | Frontend | Cumulative connections accepted by frontend (`proxy="fe"`) |
 | `haproxy_frontend_current_connections` | Gauge | Frontend | Active connections on frontend |
@@ -339,7 +339,7 @@ Ibex exposes the full standard HAProxy-compatible Prometheus metric catalog:
 
 ### 3.3 Zero-Copy W3C Trace Context Implementation
 
-Ibex implements the W3C Trace Context standard with zero dynamic allocations using fixed-size byte structures.
+Alcyon implements the W3C Trace Context standard with zero dynamic allocations using fixed-size byte structures.
 
 ```rust
 /// Fully parsed and validated W3C `traceparent` representation.
@@ -483,7 +483,7 @@ pub struct SpanRingBuffer<const CAPACITY: usize> {
 
 ### 3.5 Multi-Core Concurrency & Atomic Metric Aggregation
 
-Project Ibex runs an event-driven thread-per-core architecture (`!Send` sessions). To prevent cross-thread cacheline bouncing and lock contention during metric recording:
+Project Alcyon runs an event-driven thread-per-core architecture (`!Send` sessions). To prevent cross-thread cacheline bouncing and lock contention during metric recording:
 
 ```
 +------------------ Core 0 ------------------+    +------------------ Core 1 ------------------+
@@ -532,10 +532,10 @@ Project Ibex runs an event-driven thread-per-core architecture (`!Send` sessions
 ## 5. Implementation Roadmap & Integration Milestones
 
 1. **Phase 1: Zero-Alloc W3C Codec & Metric Registry**:
-   - Implement `TraceParent` parser/serializer with 100% property-tested boundary validation (`ibex-core` / `ibex-proto`).
-   - Implement `PromexWriter` zero-allocation fast numeric formatters (`ibex-rt::stats`).
+   - Implement `TraceParent` parser/serializer with 100% property-tested boundary validation (`alcyon-core` / `alcyon-proto`).
+   - Implement `PromexWriter` zero-allocation fast numeric formatters (`alcyon-rt::stats`).
 2. **Phase 2: Native Prometheus Applet Engine**:
-   - Extend `ibex-rt::applet` with `PrometheusApplet` cursor state machine.
+   - Extend `alcyon-rt::applet` with `PrometheusApplet` cursor state machine.
    - Implement `/metrics` route dispatching in `ProxyEngine`.
    - Implement differential tests comparing `/metrics` exposition format against HAProxy 3.x `service-prometheus`.
 3. **Phase 3: OpenTelemetry Distributed Tracing**:

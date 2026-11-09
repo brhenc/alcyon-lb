@@ -1,11 +1,11 @@
 <!-- SPDX-License-Identifier: GPL-2.0-or-later -->
 <!-- Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE. -->
 
-# Operating Ibex
+# Operating Alcyon
 
 For someone who runs HAProxy under systemd today. Every statement here was run against the
-release binary (`ibex -v`: 0.1.0) unless it is under "Does not work yet". Where Ibex differs from
-HAProxy it says so. What Ibex refuses to load is in [differences.md](differences.md).
+release binary (`alcyon -v`: 0.1.0) unless it is under "Does not work yet". Where Alcyon differs from
+HAProxy it says so. What Alcyon refuses to load is in [differences.md](differences.md).
 
 ## How the process is laid out
 
@@ -17,7 +17,7 @@ Two layouts, depending on whether the master CLI is asked for:
   the master) starts a new worker, which takes the listening sockets over from the serving one
   and soft-stops it. The master's PID never changes: it is in the pidfile and it is systemd's
   `MAINPID`. `show proc` lists master and workers. See "Master CLI" below.
-- `-W` / `-Ws` without `-S`: one process with worker threads. A reload starts a **new Ibex
+- `-W` / `-Ws` without `-S`: one process with worker threads. A reload starts a **new Alcyon
   process**, which takes the listening sockets over from the old one and then tells the old one
   to soft-stop; the pidfile and systemd's `MAINPID` move to the new process.
 - `-S` without `-W` is refused, as by HAProxy (`a master CLI socket was defined, but
@@ -28,28 +28,28 @@ The worker itself is one process with threads (`nbthread`), not several processe
 ## Install
 
 ```
-install -m 0755 target/release/ibex /usr/local/sbin/ibex
-install -d /etc/ibex
-install -m 0644 contrib/systemd/ibex.service /etc/systemd/system/ibex.service
-$EDITOR /etc/ibex/ibex.cfg
+install -m 0755 target/release/alcyon /usr/local/sbin/alcyon
+install -d /etc/alcyon
+install -m 0644 contrib/systemd/alcyon.service /etc/systemd/system/alcyon.service
+$EDITOR /etc/alcyon/alcyon.cfg
 systemctl daemon-reload
-systemctl enable --now ibex
+systemctl enable --now alcyon
 ```
 
-`contrib/systemd/ibex.service` is HAProxy's unit with the names changed: `Type=notify`,
-`ExecStart=ibex -Ws -f $CONFIG -p $PIDFILE $EXTRAOPTS`, `KillMode=mixed`,
+`contrib/systemd/alcyon.service` is HAProxy's unit with the names changed: `Type=notify`,
+`ExecStart=alcyon -Ws -f $CONFIG -p $PIDFILE $EXTRAOPTS`, `KillMode=mixed`,
 the same commented sandboxing options. Differences from HAProxy's:
 
-- `EXTRAOPTS=-S /run/ibex-master.sock` (HAProxy's: `/run/haproxy-master.sock`), so the service
+- `EXTRAOPTS=-S /run/alcyon-master.sock` (HAProxy's: `/run/haproxy-master.sock`), so the service
   runs as master + worker. No `conf.d` directory by default. `-f` accepts a directory, as in HAProxy
-  (`*.cfg` files, lexical order, dot-files skipped); add `-f /etc/ibex/conf.d` to `ExecStart` if
+  (`*.cfg` files, lexical order, dot-files skipped); add `-f /etc/alcyon/conf.d` to `ExecStart` if
   you use one.
-- Put overrides in `/etc/default/ibex` or `/etc/sysconfig/ibex`: `CONFIG=`, `PIDFILE=`,
+- Put overrides in `/etc/default/alcyon` or `/etc/sysconfig/alcyon`: `CONFIG=`, `PIDFILE=`,
   `EXTRAOPTS=`.
 - Check it with `contrib/systemd/test-unit.sh` (runs `systemd-analyze verify` on a copy; skips
   if `systemd-analyze` is missing).
 
-### What `-Ws` sends to systemd (read from `crates/ibex-rt/src/systemd.rs`, observed on a `NOTIFY_SOCKET`)
+### What `-Ws` sends to systemd (read from `crates/alcyon-rt/src/systemd.rs`, observed on a `NOTIFY_SOCKET`)
 
 With `-S` (the shipped unit) the master sends everything, and `MAINPID` is always the master:
 `READY=1` once the first worker listens, `RELOADING=1` at each reload, `READY=1` when the new
@@ -71,18 +71,18 @@ ignored with `[NOTICE] SIGUSR2 ignored: reloading on SIGUSR2 needs -W or -Ws`.
 ## Check a configuration
 
 ```
-ibex -f /etc/ibex/ibex.cfg -c
+alcyon -f /etc/alcyon/alcyon.cfg -c
 ```
 
 Prints `Configuration file is valid.` and exits 0; on a parse error prints one line and exits 1.
 Measured against HAProxy 3.5-dev8 on the same bad file: both exit 1. The messages differ:
 
 ```
-Ibex:    Configuration parsing error: line 3, col 3: unknown keyword 'foo' in 'frontend' section
+Alcyon:    Configuration parsing error: line 3, col 3: unknown keyword 'foo' in 'frontend' section
 HAProxy: [ALERT] (n) : config : parsing [/tmp/t168/bad.cfg:3] : unknown keyword 'foo' in 'frontend' section
 ```
 
-**Ibex's message names the line but not the file.** With several `-f` files, find the file
+**Alcyon's message names the line but not the file.** With several `-f` files, find the file
 yourself. A missing file: `Cannot open configuration file/directory '<path>': No such file or
 directory`, exit 1. `ExecReload` runs `-c` first, so a bad configuration fails `systemctl reload`
 before any signal is sent.
@@ -90,14 +90,14 @@ before any signal is sent.
 ## Reload
 
 ```
-systemctl reload ibex          # ExecReload: ibex -c, then kill -USR2 $MAINPID
-echo reload | socat - /run/ibex-master.sock     # the same, with the result (master CLI)
+systemctl reload alcyon          # ExecReload: alcyon -c, then kill -USR2 $MAINPID
+echo reload | socat - /run/alcyon-master.sock     # the same, with the result (master CLI)
 ```
 
 With the master (`-S`, the shipped unit), `$MAINPID` is the master and SIGUSR2 makes it start a
 new worker; the paragraphs below describe the single-process layout (`-W` without `-S`), which is
 what T166 measured under load. The master layout was tested with requests sent in a loop
-through a valid and a failed reload (none failed; `crates/ibex-rt/tests/it/master_cli.rs`), not
+through a valid and a failed reload (none failed; `crates/alcyon-rt/tests/it/master_cli.rs`), not
 with the 100-reload measurement.
 
 Needs `-W` or `-Ws`. Verified on one reload with the `-Ws` command line: the new process took the
@@ -111,7 +111,7 @@ Under load (T166): `tools/measure/reload_under_load.py`, 8 keep-alive clients, 2
 downloads, one WebSocket, `hard-stop-after 4s`, SIGUSR2 every second, 100 reloads, nbthread 1,
 release build, same machine:
 
-| | HAProxy 3.5-dev8 | Ibex |
+| | HAProxy 3.5-dev8 | Alcyon |
 |---|---|---|
 | failed requests / resets | 0 / 0 | 0 / 0 |
 | requests that met a closed keep-alive connection (client retried) | 23 | 0 |
@@ -120,7 +120,7 @@ release build, same machine:
 | WebSocket on the old process closed after its reload | 3.2-4.3 s (FIN) | 4.0-4.1 s (FIN or RST) |
 | old process gone after its reload, max / median | 4.35 s / 1.85 s | 4.15 s / 1.70 s |
 | reload time (SIGUSR2 to new process) max | 0.04 s | 0.05 s |
-| RSS master (HAProxy) / serving process (Ibex), reload 10 -> 100 | 20984 -> 20844 kB | 8184 -> 8148 kB |
+| RSS master (HAProxy) / serving process (Alcyon), reload 10 -> 100 | 20984 -> 20844 kB | 8184 -> 8148 kB |
 | all processes' RSS, peak during reloads | 377 MB | 33 MB |
 | fds, net of TCP connections, reload 10 -> 100 | 10 -> 12 (one per live worker) | 6 -> 6 |
 | SIGUSR1 with a download in flight | completes, exit | completes, exit |
@@ -129,7 +129,7 @@ As in HAProxy, a stopping process answers every request it reads with `Connectio
 closes idle connections only when it has nothing else to run, so a client under constant load is
 told to reconnect rather than having its connection closed between two requests. A client that is
 idle when the stop comes is closed; a request it sends at that instant can meet the close (the
-retried case above), as with HAProxy. `crates/ibex-rt/tests/it/reload_under_load.rs` runs 10 reloads
+retried case above), as with HAProxy. `crates/alcyon-rt/tests/it/reload_under_load.rs` runs 10 reloads
 in the gate and 100 with `--ignored`.
 
 The handover socket lives in a private (0700) directory under `$TMPDIR` (default `/tmp`), so
@@ -144,12 +144,12 @@ binary replaced on disk is picked up).
 | `SIGTERM` | fast stop. Under `-W`/`-Ws` the process exits 0 at once, as HAProxy's master does (connections are dropped, not drained); the unit needs no `SuccessExitStatus`. Without `-W` the signal is left at its default and the process dies of it (143), as HAProxy standalone does. |
 | `SIGINT` | left at the default: terminates. |
 
-`systemctl stop ibex` sends SIGTERM (fast). For a graceful stop use
-`systemctl kill -s USR1 ibex` and wait for the service to leave `active`.
+`systemctl stop alcyon` sends SIGTERM (fast). For a graceful stop use
+`systemctl kill -s USR1 alcyon` and wait for the service to leave `active`.
 
 ## Logs
 
-- Ibex uses HAProxy's `log` directive and writes in the HAProxy syslog format
+- Alcyon uses HAProxy's `log` directive and writes in the HAProxy syslog format
   (`<134>Oct  5 00:36:14 haproxy[PID]: 127.0.0.1:53002 [...] f b/s1 0/0/-1/-1/3001 503 ...`).
   Note the tag is `haproxy`, as in the oracle.
 - Verified here: `log stdout format raw local0` (goes to the journal under systemd) and
@@ -164,14 +164,14 @@ binary replaced on disk is picked up).
 
 `stats enable` + `stats uri /stats` in a frontend gives the HTML page; append `;csv` for CSV
 (`curl 'http://127.0.0.1:18080/stats;csv'`). Verified: CSV header and a FRONTEND and a server
-row come back, `show info` is `Name: Ibex`. The CSV fields monitoring reads are made equal to
+row come back, `show info` is `Name: Alcyon`. The CSV fields monitoring reads are made equal to
 HAProxy's after the same traffic in T165.
 
 ## Runtime API
 
-Declare `stats socket /run/ibex/admin.sock mode 600 level admin` in `global` (needs
-`/run/ibex` to exist and be writable: add `RuntimeDirectory=ibex` to the unit; the shipped unit
-does not). Talk to it as with HAProxy, e.g. `echo "show stat" | socat - /run/ibex/admin.sock`.
+Declare `stats socket /run/alcyon/admin.sock mode 600 level admin` in `global` (needs
+`/run/alcyon` to exist and be writable: add `RuntimeDirectory=alcyon` to the unit; the shipped unit
+does not). Talk to it as with HAProxy, e.g. `echo "show stat" | socat - /run/alcyon/admin.sock`.
 
 Commands that exist (from `help` and run): `help`, `prompt`, `quit`, `set timeout cli`,
 `show info`, `show pools`, `show stat`, `show table`, `show servers state`, `show errors`,
@@ -182,19 +182,19 @@ Run: `set server b/s1 weight 5` then `disable server b/s1` and `show servers sta
 weight 5 and admin state 1.
 
 Runtime changes are not persisted by themselves. As with HAProxy, save them before a reload
-(`echo "show servers state" | socat - /run/ibex.sock > /var/lib/ibex/state`) and point
+(`echo "show servers state" | socat - /run/alcyon.sock > /var/lib/alcyon/state`) and point
 `server-state-file` (or `server-state-base` + `load-server-state-from-file local`) at it with
 `load-server-state-from-file global` in `defaults`: the new process starts each server with the
 saved admin state (maint, drain), operational state, weight (unless the configured weight
 changed), `disable health`, last check status, port and check port, and a server written as a
 name starts on the saved address (`init-addr last`, the default `last,libc`), so a reload keeps
 the addresses DNS gave; a `srv_fqdn` changed from HAProxy's CLI is kept with `resolvers` (T490,
-tests in `crates/ibex-rt/tests/it/server_state_file.rs` and `resolvers.rs`). `srv_use_ssl`, check
+tests in `crates/alcyon-rt/tests/it/server_state_file.rs` and `resolvers.rs`). `srv_use_ssl`, check
 address and agent columns are not applied and the start says so.
 
 ## Master CLI
 
-`ibex -W -S /run/ibex-master.sock[,mode,600] -f ...`, then `socat - /run/ibex-master.sock`. The
+`alcyon -W -S /run/alcyon-master.sock[,mode,600] -f ...`, then `socat - /run/alcyon-master.sock`. The
 commands and their output are HAProxy 3.5's master CLI (measured side by side; see
 `tasks/T200-master-cli.md`): `help`, `show proc`, `reload`, `hard-reload`,
 `show startup-logs`, `show version`, `echo`, `show cli level`, `operator`, `user`,
@@ -202,7 +202,7 @@ commands and their output are HAProxy 3.5's master CLI (measured side by side; s
 run a command on the serving worker's own CLI (`@1 show info`, `@1 show stat`, ...).
 
 ```
-$ echo "show proc" | socat - /run/ibex-master.sock
+$ echo "show proc" | socat - /run/alcyon-master.sock
 #<PID>          <type>          <reloads>       <uptime>        <version>
 4120            master          1 [failed: 0]   0d00h05m12s     0.1.0
 # workers

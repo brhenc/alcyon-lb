@@ -12,6 +12,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "alcyon-alloc"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "zeroize",
+]
+
+[[package]]
+name = "alcyon-fuzz"
+version = "0.1.0"
+dependencies = [
+ "alcyon-proto",
+]
+
+[[package]]
+name = "alcyon-proto"
+version = "0.1.0"
+dependencies = [
+ "alcyon-alloc",
+ "alcyon-regex",
+ "alcyon-sched",
+ "memchr",
+]
+
+[[package]]
+name = "alcyon-regex"
+version = "0.1.0"
+dependencies = [
+ "fancy-regex",
+ "regex",
+]
+
+[[package]]
+name = "alcyon-sched"
+version = "0.1.0"
+dependencies = [
+ "alcyon-alloc",
+ "ebtree",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -55,47 +96,6 @@ dependencies = [
  "bit-set",
  "regex-automata",
  "regex-syntax",
-]
-
-[[package]]
-name = "ibex-alloc"
-version = "0.1.0"
-dependencies = [
- "rustix",
- "zeroize",
-]
-
-[[package]]
-name = "ibex-fuzz"
-version = "0.1.0"
-dependencies = [
- "ibex-proto",
-]
-
-[[package]]
-name = "ibex-proto"
-version = "0.1.0"
-dependencies = [
- "ibex-alloc",
- "ibex-regex",
- "ibex-sched",
- "memchr",
-]
-
-[[package]]
-name = "ibex-regex"
-version = "0.1.0"
-dependencies = [
- "fancy-regex",
- "regex",
-]
-
-[[package]]
-name = "ibex-sched"
-version = "0.1.0"
-dependencies = [
- "ebtree",
- "ibex-alloc",
 ]
 
 [[package]]

@@ -4,7 +4,7 @@
 
 """QUIC & HTTP/3 Differential Conformance Test Harness.
 
-Executes conformance checks against HAProxy and Ibex:
+Executes conformance checks against HAProxy and Alcyon:
 1. Protocol Advertisement Inspection:
    - Negotiated ALPN (must be 'h3')
    - QUIC Transport Parameters (max_idle_timeout, max_data, max_streams, etc.)

@@ -137,11 +137,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "ibex-alloc"
+name = "alcyon-alloc"
 version = "0.1.0"
 
 [[package]]
-name = "ibex-config"
+name = "alcyon-config"
 version = "0.1.0"
 dependencies = [
  "regex",
@@ -149,26 +149,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "ibex-mmsg"
+name = "alcyon-mmsg"
 version = "0.1.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
-name = "ibex-proto"
+name = "alcyon-proto"
 version = "0.1.0"
 dependencies = [
- "ibex-sched",
+ "alcyon-sched",
  "regex",
 ]
 
 [[package]]
-name = "ibex-quic"
+name = "alcyon-quic"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "ibex-tls",
+ "alcyon-tls",
  "quinn-proto",
  "rustls",
  "rustls-pemfile",
@@ -176,41 +176,41 @@ dependencies = [
 ]
 
 [[package]]
-name = "ibex-rt"
+name = "alcyon-rt"
 version = "0.1.0"
 dependencies = [
- "ibex-alloc",
- "ibex-config",
- "ibex-mmsg",
- "ibex-proto",
- "ibex-quic",
- "ibex-sample",
- "ibex-sched",
- "ibex-stick-table",
- "ibex-tls",
+ "alcyon-alloc",
+ "alcyon-config",
+ "alcyon-mmsg",
+ "alcyon-proto",
+ "alcyon-quic",
+ "alcyon-sample",
+ "alcyon-sched",
+ "alcyon-stick-table",
+ "alcyon-tls",
  "rustix",
  "rustls",
 ]
 
 [[package]]
-name = "ibex-sample"
+name = "alcyon-sample"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
- "ibex-proto",
+ "alcyon-proto",
  "regex",
  "serde_json",
 ]
 
 [[package]]
-name = "ibex-sched"
+name = "alcyon-sched"
 version = "0.1.0"
 dependencies = [
  "ebtree",
 ]
 
 [[package]]
-name = "ibex-stick-table"
+name = "alcyon-stick-table"
 version = "0.1.0"
 dependencies = [
  "ebtree",
@@ -219,13 +219,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "ibex-tls"
+name = "alcyon-tls"
 version = "0.1.0"
 dependencies = [
  "ebtree",
- "ibex-config",
- "ibex-proto",
- "ibex-sched",
+ "alcyon-config",
+ "alcyon-proto",
+ "alcyon-sched",
  "rustix",
  "rustls",
  "rustls-pemfile",
@@ -265,8 +265,8 @@ checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
 name = "livepatch-bench"
 version = "0.1.0"
 dependencies = [
- "ibex-config",
- "ibex-rt",
+ "alcyon-config",
+ "alcyon-rt",
 ]
 
 [[package]]

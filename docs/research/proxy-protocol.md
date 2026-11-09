@@ -1,10 +1,10 @@
-# Ibex PROXY Protocol v1 & v2 Architecture & Research Blueprint
+# Alcyon PROXY Protocol v1 & v2 Architecture & Research Blueprint
 
 ## Executive Summary
 
 The **PROXY Protocol** (Versions 1 & 2), designed by Willy Tarreau and HAProxy Technologies, is the industry standard mechanism for safely relaying connection metadata—including original client IP addresses, destination addresses, layer-4 ports, ALPN protocol identifiers, TLS SNI authorities, SSL client certificate properties, and network namespaces—across intermediate proxies, load balancers, and Layer-4 / NAT layers.
 
-This document records the architectural research and Safe Rust implementation of PROXY protocol version 1 (human-readable text) and version 2 (binary framing) in **Ibex** under `crates/ibex-proto/src/proxy_protocol.rs`.
+This document records the architectural research and Safe Rust implementation of PROXY protocol version 1 (human-readable text) and version 2 (binary framing) in **Alcyon** under `crates/alcyon-proto/src/proxy_protocol.rs`.
 
 ---
 
@@ -125,9 +125,9 @@ Compliant with RFC 4960 Appendix B, polynomial `0x1EDC6F41` (reflected `0x82F63B
 
 ---
 
-## 2. Ibex Safe Rust Architecture
+## 2. Alcyon Safe Rust Architecture
 
-Implemented in `crates/ibex-proto/src/proxy_protocol.rs` under strict `#![forbid(unsafe_code)]`.
+Implemented in `crates/alcyon-proto/src/proxy_protocol.rs` under strict `#![forbid(unsafe_code)]`.
 
 ```text
                                  +-----------------------+
@@ -206,4 +206,4 @@ The test suite covers:
    - `prop_v2_crc32c_fuzz`: Checksum integrity across random unique IDs.
    - `prop_fuzz_parser_never_panics`: Fuzz parser over arbitrary random byte sequences (panics forbidden).
    - `prop_streaming_chunk_resilience`: Arbitrary split-point fragmentation streaming tests.
-5. **Clippy Cleanliness**: 100% clean under `cargo clippy -p ibex-proto --all-targets -- -D warnings`.
+5. **Clippy Cleanliness**: 100% clean under `cargo clippy -p alcyon-proto --all-targets -- -D warnings`.

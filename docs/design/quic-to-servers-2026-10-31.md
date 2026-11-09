@@ -7,20 +7,20 @@ Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 Status: design, no production code. Written on main `348dfcf7` (branch `fix/t533`). Inputs:
 `m2-scope-2026-10-25.md` (§2 refuses QUIC to servers), `h3-engine-2026-10-26.md` (owner/child
 model, `HtxMux`), `memory-2026-10-24.md`, `rustls-side-by-side-2026-10-24.md`,
-`tasks/T341`/`T353` (open item "`server ... ssl alpn h2` loads but Ibex speaks HTTP/1.1"),
+`tasks/T341`/`T353` (open item "`server ... ssl alpn h2` loads but Alcyon speaks HTTP/1.1"),
 T528's 33-test table (commit `7f3873b0`, `tasks/T528-progress.md`).
 
 Scope changed during the task (supervisor, user decision 10-31): **HTTP/2 to servers is scoped
 first and in full (section A)**: it is what deployments use (gRPC, h2c to app servers,
 `proto h2`, `ssl alpn h2,http/1.1`). **QUIC/h3 to servers (section B) builds on A's backend mux.**
 
-Oracles, both on this host, same minute as the Ibex runs (host load 15-22, other agents
+Oracles, both on this host, same minute as the Alcyon runs (host load 15-22, other agents
 building: **no timing claim**; the few times shown are context, they come from timeouts and
 retries, not from speed):
 - HTTP/2: `~/reference/haproxy/haproxy` — `HAProxy version 3.5-dev8-885761-29 2026/10/02`.
 - QUIC: `~/reference/haproxy-quic-dev10/haproxy` — `HAProxy version 3.5-dev10-38e65c-10 2026/10/30`,
   `+QUIC -QUIC_OPENSSL_COMPAT`, OpenSSL 3.5.9, `QUIC: connection sock-per-conn mode support : yes`.
-- Ibex: `/home/bhenc/ibex-targets/t528/release/ibex` (`0.1.0-rc3-484-gc9ce54c3`, main + T528's
+- Alcyon: `/home/bhenc/ibex-targets/t528/release/alcyon` (`0.1.0-rc3-484-gc9ce54c3`, main + T528's
   `cond.rs` line; nothing on the server side differs from `348dfcf7`).
 - Clients and servers: curl 8.18.0, nghttp/nghttpd (nghttp2 1.68.0), a 20-line Python HTTP/1
   backend that answers after 2 s (`slow.py`) and an echo backend (`echo.py`).
@@ -32,12 +32,12 @@ from `/tmp/t533`). All on ports 63000-63999, every process stopped by PID at the
 
 | Question | Answer |
 |---|---|
-| How close is HTTP/2 to servers? | **The protocol pieces exist, the engine piece does not.** `ibex-proto` has frames, HPACK (encoder and decoder, `hpack.rs`), flow control, GOAWAY/RST, and `H2MuxContext` already has an `is_server: false` role: it sends the client preface and SETTINGS (`mux_h2.rs:1208`), applies the server's `MAX_CONCURRENT_STREAMS` (`:1837`) and checks a response's fields (`check_response_fields`, `:1621`, with the comment "no runtime path speaks h2 to a server yet"). Missing: a request HEADERS encoder and client stream ids, the response → HTTP/1 text conversion, and above all **a server leg that is not a file descriptor**: a session's server side is `srv: Option<OwnedFd>` + `srv_xprt` (`proxy.rs:644`), used at ~100 sites (`engine.rs`, `proxy.rs`), and the idle pool holds `IdleConn { fd, xprt }` with cross-worker takeover (`engine.rs:345-560`). **9 slices: 3 S, 5 M, 1 L ≈ 9-11 agent sessions, about two working weeks** (§A.6). |
-| How close is QUIC/h3 to servers? | **After A: 7 slices, 1 S, 5 M, 1 L-conditional ≈ 7-8 sessions**, of which B0 is T534 (started). What is there: quinn-proto 0.11 can connect as a client; Ibex's QUIC server, h3 mux (T509-T520) and static QPACK; rustls 0.24.0-dev.2's QUIC client connection (see the TLS row). What is not: the client half of Ibex's quinn↔rustls adapter (`crypto.rs` is server-only), a client endpoint and UDP socket per connection, the h3 mux's client role, and A's backend mux to hang it on. |
+| How close is HTTP/2 to servers? | **The protocol pieces exist, the engine piece does not.** `alcyon-proto` has frames, HPACK (encoder and decoder, `hpack.rs`), flow control, GOAWAY/RST, and `H2MuxContext` already has an `is_server: false` role: it sends the client preface and SETTINGS (`mux_h2.rs:1208`), applies the server's `MAX_CONCURRENT_STREAMS` (`:1837`) and checks a response's fields (`check_response_fields`, `:1621`, with the comment "no runtime path speaks h2 to a server yet"). Missing: a request HEADERS encoder and client stream ids, the response → HTTP/1 text conversion, and above all **a server leg that is not a file descriptor**: a session's server side is `srv: Option<OwnedFd>` + `srv_xprt` (`proxy.rs:644`), used at ~100 sites (`engine.rs`, `proxy.rs`), and the idle pool holds `IdleConn { fd, xprt }` with cross-worker takeover (`engine.rs:345-560`). **9 slices: 3 S, 5 M, 1 L ≈ 9-11 agent sessions, about two working weeks** (§A.6). |
+| How close is QUIC/h3 to servers? | **After A: 7 slices, 1 S, 5 M, 1 L-conditional ≈ 7-8 sessions**, of which B0 is T534 (started). What is there: quinn-proto 0.11 can connect as a client; Alcyon's QUIC server, h3 mux (T509-T520) and static QPACK; rustls 0.24.0-dev.2's QUIC client connection (see the TLS row). What is not: the client half of Alcyon's quinn↔rustls adapter (`crypto.rs` is server-only), a client endpoint and UDP socket per connection, the h3 mux's client role, and A's backend mux to hang it on. |
 | Blockers | (1) **The engine's single-fd server leg** (A2, L): every multiplexed backend needs it; nothing in B can be wired before it. (2) **TLS for B**: rustls 0.24.0-dev.2 *has* a QUIC client connection (`ClientConnectionBuilder::build_quic`, `client/connection.rs:89`, driven by `Connection<ClientSide, Quic>::read_hs`, `quic.rs:275-296`, which verifies the server inline in `MessageIterMode::All`); only the typed step-by-step API is unfinished in dev.2 (`FromConn<ClientSide> for ()` is `todo!("nyi")`, `quic.rs:146-152`, reached from `VerifyPeerIdentity::continue_with`) and was finished upstream in `f238d682f` "Support `quic::ClientHandshake`" on 2026-10-14, the day after the dev.2 tag (2026-10-13), unreleased (main is 64 commits past dev.2 today; no milestone or date). T534 writes the client half on the `read_hs` path and proves it with a test; if that path fails, the pin moves to a git rev ≥ `f238d682f` (API churn: `NeedsInput` became generic, so the server half is re-ported too). No rustls 0.23 comes back. (3) **The +0.5 % instructions-per-request budget** on the HTTP/1 path, which A2 touches (§A.5). (4) HAProxy's own QUIC backend is **experimental** (`expose-experimental-directives`; "QUIC is currently incompatible with dynamic backends deletion", `server.c:3842`), so B's oracle moves (the last 8 commits to `mux_quic.c` in the dev10 tree are all bug fixes, two MEDIUM and one MAJOR). |
 | Should h2 come first? | **Yes** (and the user decided it). Everything that makes B hard is in A: a backend connection serving several sessions, its owner, the per-worker avail/idle lists, `http-reuse` for a multiplexed connection, `max-reuse`, server GOAWAY/RST handling, per-stream timeouts, checks through a mux. B then adds a transport (UDP, quinn) and a second mux kind behind the same interface. Built QUIC-first, the same engine work would be done against a less stable oracle and harder tooling (no vtest h3). |
-| A defect to fix now, independent of A | **`server ... ssl alpn h2` and `alpn h2,http/1.1` are accepted today and every request fails 502** against a server that picks h2 (measured, §A.3 row 1: HAProxy 200 `ver=2.0`, Ibex `502 Bad Gateway`); `check-alpn h2` with `option httpchk` leaves the server DOWN (`L7TOUT`; HAProxy UP `L7OK`, checks arrive as `HTTP/2.0`). Known since T341/T353 (open boxes), never fixed. AGENTS.md §5: slice A0 (S) makes the parser refuse an `h2` in `alpn`/`check-alpn` until A lands — user decision D1. **Superseded 10-31 (T535, §A.6b): not refused; one stream per server connection, 2 M + 3 S.** |
-| What it unlocks | A: 15 dev8 reg-tests whose server line needs h2 (`proto h2` ×13, `alpn h2` ×3, `check-proto h2` ×1; board `93a00df9`: 10 OUT_OF_SCOPE, 3 FAIL, 2 SKIP; list in §A.4), gRPC through Ibex, h2c to app servers. B: T528's 17 OUT_OF_SCOPE QUIC tests (a QUIC bind and a `server quic4@` in one block) and the 12 skipped for `ssllib_name_startswith(OpenSSL)` once forced; Ibex-to-Ibex h3 chains (the server half already works with HAProxy as the h3 client, measured §B.2). |
+| A defect to fix now, independent of A | **`server ... ssl alpn h2` and `alpn h2,http/1.1` are accepted today and every request fails 502** against a server that picks h2 (measured, §A.3 row 1: HAProxy 200 `ver=2.0`, Alcyon `502 Bad Gateway`); `check-alpn h2` with `option httpchk` leaves the server DOWN (`L7TOUT`; HAProxy UP `L7OK`, checks arrive as `HTTP/2.0`). Known since T341/T353 (open boxes), never fixed. AGENTS.md §5: slice A0 (S) makes the parser refuse an `h2` in `alpn`/`check-alpn` until A lands — user decision D1. **Superseded 10-31 (T535, §A.6b): not refused; one stream per server connection, 2 M + 3 S.** |
+| What it unlocks | A: 15 dev8 reg-tests whose server line needs h2 (`proto h2` ×13, `alpn h2` ×3, `check-proto h2` ×1; board `93a00df9`: 10 OUT_OF_SCOPE, 3 FAIL, 2 SKIP; list in §A.4), gRPC through Alcyon, h2c to app servers. B: T528's 17 OUT_OF_SCOPE QUIC tests (a QUIC bind and a `server quic4@` in one block) and the 12 skipped for `ssllib_name_startswith(OpenSSL)` once forced; Alcyon-to-Alcyon h3 chains (the server half already works with HAProxy as the h3 client, measured §B.2). |
 
 ---
 
@@ -69,7 +69,7 @@ from `/tmp/t533`). All on ports 63000-63999, every process stopped by PID at the
 ## A.2 Refused (the parser says so, by keyword)
 
 - `ws h2` (WebSocket over h2 to a server, RFC 8441): stays ignored-with-warning as today
-  (`server_keywords.rs:82`: Ibex upgrades over HTTP/1.1); a WebSocket upgrade always takes an
+  (`server_keywords.rs:82`: Alcyon upgrades over HTTP/1.1); a WebSocket upgrade always takes an
   HTTP/1.1 connection, as HAProxy's default `ws auto` does.
 - `proto fcgi|spop|none` on servers: unchanged (refused, `server.rs:703`).
 - **Takeover of a multiplexed connection by another worker**: not built (D3). HAProxy takes over
@@ -78,14 +78,14 @@ from `/tmp/t533`). All on ports 63000-63999, every process stopped by PID at the
   purged. Not a keyword: a documented difference (`docs/differences.md`).
 - `tune.h2.be.*` keywords not in A.1 (if HAProxy adds more): refused by name.
 
-## A.3 Measured: HAProxy 3.5-dev8 as the h2 client (Ibex where it differs today)
+## A.3 Measured: HAProxy 3.5-dev8 as the h2 client (Alcyon where it differs today)
 
 Rig (`h2/`): client curl → **A** (frontend `:63101` h1, `:63105` `proto h2`; `nbthread 1`
 unless said) → **C** (HAProxy dev8 serving `:63102 proto h2`, `:63103 ssl alpn h2,http/1.1`,
 `:63106 ssl alpn http/1.1`, answering `ver=%[req.ver] src_port=%[src_port]`, `/slow*` to a 2 s
 backend). "per-conn" = requests per distinct source port in C's log.
 
-| # | case | HAProxy 3.5-dev8 | Ibex today |
+| # | case | HAProxy 3.5-dev8 | Alcyon today |
 |---|---|---|---|
 | 1 | `server ... ssl verify none alpn h2` / `alpn h2,http/1.1` to C:63103 | `ver=2.0` `200` / `ver=2.0` `200` | `-c` valid; **`502 Bad Gateway` both** (offers h2, writes HTTP/1.1) |
 | 2 | same `alpn h2,http/1.1` to a server offering only `http/1.1` (`:63106`) | `ver=1.1` `200` | (not run: falls in A0) |
@@ -113,13 +113,13 @@ backend). "per-conn" = requests per distinct source port in C's log.
 | 24 | `option httpchk` + `ssl check check-ssl check-alpn h2` | UP `L7OK`, `HTTP/2.0` | **accepted, DOWN `L7TOUT`, 0 checks reach C** |
 | 25 | `option httpchk` + `ssl alpn h2 check check-alpn http/1.1` | UP, C sees `HTTP/1.0` | — |
 | 26 | gRPC shape: `nghttp` h2c → A `:63105` → `server proto h2` → `nghttpd --trailer 'grpc-status: 0' --trailer 'grpc-message: ok'`, POST `content-type: application/grpc`, `te: trailers`, request trailer `x-req-trailer: one` | client receives `grpc-status: 0`, `grpc-message: ok` in a trailing HEADERS (`flags=0x05`); nghttpd receives `x-req-trailer: one` in a trailing HEADERS | refused (`proto h2`) |
-| 27 | Ibex parser, other keywords | — | `tune.h2.be.initial-window-size`, `.glitches-threshold` unknown → refused; `proto qmux` refused; `ws h2` ignored with warning; `http-reuse always` accepted |
+| 27 | Alcyon parser, other keywords | — | `tune.h2.be.initial-window-size`, `.glitches-threshold` unknown → refused; `proto qmux` refused; `ws h2` ignored with warning; `http-reuse always` accepted |
 
-## A.4 Gap table (Ibex `348dfcf7`)
+## A.4 Gap table (Alcyon `348dfcf7`)
 
 Size: S ≤ half a session, M = one session with its gate, L = several.
 
-| item | HAProxy | Ibex | status | slice |
+| item | HAProxy | Alcyon | status | slice |
 |---|---|---|---|---|
 | `alpn h2[,…]` / `check-alpn h2` on a server | h2 when selected | accepted, 502 / DOWN | **defect (§5)** | A0 (S) |
 | `alpn h3` on a TCP server | QMux, experimental | accepted, HTTP/1.1 | defect (§5) | A0 |
@@ -149,11 +149,11 @@ Towards servers the same trick runs the other way: **the session keeps writing a
 request into its `req` and reading an HTTP/1.1 response from its `rep`**; what changes is who
 moves those bytes. On the h1 path it is the fd; on a mux path it is the backend connection's
 owner, which converts them to and from frames. HAProxy converts HTX ↔ h2 (`mux_h2.c`
-`h2s_bck_make_req_headers`, `h2c_dec_hdrs`); Ibex's HTX-equivalent at this boundary is the
+`h2s_bck_make_req_headers`, `h2c_dec_hdrs`); Alcyon's HTX-equivalent at this boundary is the
 HTTP/1 text it already produces, as on the frontend.
 
 ```rust
-// ibex-rt/src/proxy.rs — the server leg of a session (replaces `srv` + `srv_xprt` as a pair)
+// alcyon-rt/src/proxy.rs — the server leg of a session (replaces `srv` + `srv_xprt` as a pair)
 pub enum ServerLeg {
     None,
     Fd { fd: OwnedFd, xprt: ServerXprt },           // today's HTTP/1 path, unchanged
@@ -161,7 +161,7 @@ pub enum ServerLeg {
 }
 pub struct BeConnRef { idx: u32, gen: u32 }        // slot in the worker's `be_conns` arena
 
-// ibex-rt/src/be_mux.rs (new) — HAProxy's backend h2c / qcc; one per server connection
+// alcyon-rt/src/be_mux.rs (new) — HAProxy's backend h2c / qcc; one per server connection
 pub struct BeConn {
     mux: BeMux,                                     // H2(H2MuxContext /* is_server=false */) | H3(B)
     leg: BeLeg,                                     // Tcp { fd, xprt } | Quic (B)
@@ -186,10 +186,10 @@ pub struct BeStream { sess: (u32, TaskRef), req_sent: usize, head_sent: bool, rs
   headers, then the body with the response's `content-length` or chunked; trailers as chunked
   trailers, which the engine already forwards to h2/h3 frontends since T520) and wake the
   session; for each attached session with new `req` bytes (it wakes the owner, as children do
-  on the frontend), parse its HTTP/1 request head once with `ibex-proto`'s h1 parser into
+  on the frontend), parse its HTTP/1 request head once with `alcyon-proto`'s h1 parser into
   HEADERS (HPACK) and its body into DATA under the stream and connection windows; then send.
   A session whose `req` is blocked by flow control stops being read: the client's window, not
-  Ibex memory, holds the body back (the frontend's rule, `h3-engine` §2.3).
+  Alcyon memory, holds the body back (the frontend's rule, `h3-engine` §2.3).
 - **Attach** (in today's `connect_server` path, `engine.rs:13818-13900`): if the server's mux
   is h2 (`proto h2`, or TLS ALPN selected `h2` — known only after the handshake, so the first
   request on a TLS connection waits for ALPN before choosing h1 or the mux, as HAProxy's
@@ -226,12 +226,12 @@ pub struct BeStream { sess: (u32, TaskRef), req_sent: usize, head_sent: bool, rs
 
 | # | slice | scope | size | depends | model |
 |---|---|---|---|---|---|
-| A0 | **Refuse what does not work** | Test first (row 1: `alpn h2` → 502 today; row 24: `check-alpn h2` DOWN): the parser refuses `h2` in a server's `alpn` and `check-alpn` and `h3` in a TCP server's `alpn`, message names the keyword ("Ibex speaks HTTP/1.1 to servers until …"), or the D1 alternative. Closes T341/T353's open box. `differences.md` row. | S | — | Sonnet / Muse Glimmer (single file, rows given) |
-| A1 | **Client role of `H2MuxContext`** (ibex-proto only) | Request head (HTTP/1 text) → HEADERS (`h2s_bck_make_req_headers`: pseudo-headers from the request line and `host`, connection-specific headers dropped, `te` kept only as `trailers`, cookies split); client stream ids and the concurrency limit (min of the peer's SETTINGS and `tune.h2.be.max-concurrent-streams`); response HEADERS (incl. 1xx, trailers) → HTTP/1.1 text; GOAWAY received (last id, retryable set); RST_STREAM codes; WINDOW_UPDATE on read; `h2s`/`buffer` pools. Unit tests from frames captured off HAProxy dev8 and nghttpd (`nghttp -v`). | M | — | Sonnet |
+| A0 | **Refuse what does not work** | Test first (row 1: `alpn h2` → 502 today; row 24: `check-alpn h2` DOWN): the parser refuses `h2` in a server's `alpn` and `check-alpn` and `h3` in a TCP server's `alpn`, message names the keyword ("Alcyon speaks HTTP/1.1 to servers until …"), or the D1 alternative. Closes T341/T353's open box. `differences.md` row. | S | — | Sonnet / Muse Glimmer (single file, rows given) |
+| A1 | **Client role of `H2MuxContext`** (alcyon-proto only) | Request head (HTTP/1 text) → HEADERS (`h2s_bck_make_req_headers`: pseudo-headers from the request line and `host`, connection-specific headers dropped, `te` kept only as `trailers`, cookies split); client stream ids and the concurrency limit (min of the peer's SETTINGS and `tune.h2.be.max-concurrent-streams`); response HEADERS (incl. 1xx, trailers) → HTTP/1.1 text; GOAWAY received (last id, retryable set); RST_STREAM codes; WINDOW_UPDATE on read; `h2s`/`buffer` pools. Unit tests from frames captured off HAProxy dev8 and nghttpd (`nghttp -v`). | M | — | Sonnet |
 | A2 | **The multiplexed server leg** | `ServerLeg` enum in place of `srv`/`srv_xprt` (every site), `BeConn` arena and pool, `be_conn_pass`, attach/detach, `FdState::BeConn`, wakes both ways, `proto h2` (h2c) end to end, then TLS with ALPN `h2` chosen after the handshake. Tests: rows 1, 3, 5, 7 on one worker; the h1 tests unchanged; **`insreq.sh` before/after on the h1 path within +0.5 %**; allocation pin. Two sessions: (a) the enum with the h1 path only (pure refactor, budget measured), (b) the mux leg. | L | A1 | Opus (a: Sonnet) |
 | A3 | **Reuse, pools, `max-reuse`** | Per-worker avail/idle lists for `BeConn`; `http-reuse` rows 5-8 (safe/never: private to the session; aggressive/always: shared); `max-reuse` enforced on h2 (row 11), still warned-and-ignored on h1 (row 12, as HAProxy); `pool-max-conn`/`pool-low-conn`/`pool-purge-delay` count a `BeConn` as one; `show servers conn` columns; no cross-worker takeover (D3, documented). | M | A2 | Sonnet |
 | A4 | **`tune.h2.be.*`** | `max-concurrent-streams`, `initial-window-size`, `glitches-threshold`, `rxbuf`, `max-frames-at-once` to the data path, each with a test that observes it (row 9 for the first). | S | A2 | Sonnet / Muse Glimmer |
-| A5 | **Server-side errors and stop** | Rows 13-19 as tests: GOAWAY (graceful and `max-total-streams`), streams above last-id replayed, REFUSED_STREAM replayed, RST_STREAM → 502 `SH--`, connection loss, server reload with idle and in-flight streams; `timeout server` per stream; soft stop of Ibex with backend streams in flight. | M | A3 | Sonnet |
+| A5 | **Server-side errors and stop** | Rows 13-19 as tests: GOAWAY (graceful and `max-total-streams`), streams above last-id replayed, REFUSED_STREAM replayed, RST_STREAM → 502 `SH--`, connection loss, server reload with idle and in-flight streams; `timeout server` per stream; soft stop of Alcyon with backend streams in flight. | M | A3 | Sonnet |
 | A6 | **Checks over h2** | `option httpchk` over `proto h2` (inherited), `check-proto h2`, `check-alpn h2` (rows 20-25), `http-check expect` on the h2 response, `check_status`/`show stat` as HAProxy. | M | A1 | Sonnet |
 | A7 | **gRPC and trailers** | Row 26 as a test (nghttpd fixture or an in-test h2 server), both trailer directions, `te: trailers`, long streaming RPC under `timeout server`/`timeout tunnel`, h2 frontend → h2 backend, h3 frontend → h2 backend. | S | A2 | Sonnet |
 | A8 | **Reg-tests, parity, numbers** | The 15 reg-tests of A.4 run (OUT_OF_SCOPE → PASS or a filed reason); a `tools/practical/` topology "node behind h2c" (keep-alive, 100 MB up/down, SSE, gRPC unary + streaming); night measurements: ins/req and allocations per request to an h2 server vs HAProxy, connections per 1k requests under each `http-reuse` mode. | M (+ night) | A3-A7 | Sonnet; V&V night |
@@ -270,9 +270,9 @@ total (9-11 sessions) is unchanged, less A0 and most of A1 (≈ 2 sessions) once
 | Question | Answer |
 |---|---|
 | What B adds to A | A transport (`BeLeg::Quic`: a quinn-proto client connection and a connected UDP socket) and a second mux kind (`BeMux::H3`: the h3 mux's client role) behind A's `BeConn`, attach/detach, avail/idle lists, error mapping, checks and pools. |
-| TLS | rustls 0.24.0-dev.2's `build_quic` + `read_hs` client connection (§0 row 3); Ibex's adapter gains `qc::ClientConfig` and the client `TlsSession` (T534, started). No rustls 0.23 in the binary (T461's rule; 0.23 + 0.24 together cost +12.6 % binary size, `rustls-side-by-side-2026-10-24.md` §2). Server verification: `verify required`/`ca-file`/`verifyhost`/`sni` as the TCP `srv_tls.rs` path. |
+| TLS | rustls 0.24.0-dev.2's `build_quic` + `read_hs` client connection (§0 row 3); Alcyon's adapter gains `qc::ClientConfig` and the client `TlsSession` (T534, started). No rustls 0.23 in the binary (T461's rule; 0.23 + 0.24 together cost +12.6 % binary size, `rustls-side-by-side-2026-10-24.md` §2). Server verification: `verify required`/`ca-file`/`verifyhost`/`sni` as the TCP `srv_tls.rs` path. |
 | Endpoint and sockets | **One connected UDP socket per server connection** (HAProxy's `sock-per-conn`: measured, every QUIC server connection has its own source port) and **one client `quinn_proto::Endpoint` per worker** (no server config) that routes datagrams to connections by CID. 1 fd per server connection, so `maxsock` is unchanged. No migration (client never migrates; `disable_active_migration` is the server's to send), no 0-RTT (refused: `allow-0rtt` on a QUIC server, D-row in B.3), no Retry handling beyond what quinn does as a client. |
-| What HAProxy does with reuse | **Same rules as h2 but no takeover** (B.2 rows 3-6): with 64 threads, 26 requests open 26 QUIC connections in every mode; at `nbthread 1`, `aggressive`/`always` carry all 30 requests on one connection, `safe` and `never` open one per client session. Ibex with per-worker lists and no takeover matches this by construction. |
+| What HAProxy does with reuse | **Same rules as h2 but no takeover** (B.2 rows 3-6): with 64 threads, 26 requests open 26 QUIC connections in every mode; at `nbthread 1`, `aggressive`/`always` carry all 30 requests on one connection, `safe` and `never` open one per client session. Alcyon with per-worker lists and no takeover matches this by construction. |
 | How close | After A: B0 (T534) M, B1 M, B2 M, B3 M, B4 S/M, B5 S, B6 M; B7 (qmux) refused. ≈ 7-8 sessions, **about 1.5 working weeks after A**; B0 runs now in parallel. |
 
 ## B.1 Scope
@@ -282,7 +282,7 @@ total (9-11 sessions) is unchanged, less A0 and most of A1 (≈ 2 sessions) once
 `tune.quic.be.stream.max-concurrent` (measured to reach HAProxy's data path, B.2 row 7; `be.max-idle-timeout` from the doc, not measured);
 plain `check` = a QUIC handshake (`L6OK`, row 10); errors as B.2 rows 11-16; `show quic` listing
 backend connections **only if** HAProxy does (measured: dev10's `show quic` on the client side
-lists none, row 2 — so Ibex lists none either); counters in `show stat`/`show servers conn`.
+lists none, row 2 — so Alcyon lists none either); counters in `show stat`/`show servers conn`.
 
 **Refused, by keyword:**
 - `proto qmux` and `ssl alpn h3` on a TCP server (QMux, `draft-ietf-quic-qmux-01`, experimental
@@ -290,12 +290,12 @@ lists none, row 2 — so Ibex lists none either); counters in `show stat`/`show 
 - `option httpchk`/`http-check` on a QUIC server: HAProxy accepts it and sends the check **over
   TCP** to the same port ("For explicit tcp-check/http-check rules, always assume TCP, QUIC is
   not supported yet", `tcpcheck.c:1447`), so the server is DOWN with `Layer6 invalid response,
-  "Connection refused"` and `-c` says nothing (row 10). Ibex refuses the combination with a
+  "Connection refused"` and `-c` says nothing (row 10). Alcyon refuses the combination with a
   message (D5) — an action that parses must work.
 - `allow-0rtt` on a QUIC server, `quic-cc-algo` on a server (other than the default cubic), the
   other `tune.quic.be.*` (`cc.*`, `sec.glitches-threshold`, `stream.data-ratio`, `stream.rxbuf`,
   `tx.pacing`, `tx.udp-gso`: dev10 doc lines 1992-2003) until a test needs them.
-- `expose-experimental-directives` is **not** required by Ibex (Ibex has no experimental tier);
+- `expose-experimental-directives` is **not** required by Alcyon (Alcyon has no experimental tier);
   the HAProxy alert text is recorded in B.2 row 1 for the differences file.
 
 ## B.2 Measured: HAProxy 3.5-dev10 as the h3 client
@@ -323,25 +323,25 @@ qmux`, `:63004 ssl alpn h3`, answering `ver=%[req.ver] src_port=%[src_port]`).
 | 15 | B `tune.quic.fe.max-idle-timeout 1s`, request, 2.5 s pause, request | `200`, `200` on a new connection (the closed one is not reused, no error) |
 | 16 | B soft stop (SIGUSR1) with A's idle connection | B exits at once; A's next request `503 SC--` after 3 s; a request **in flight** during B's soft stop completes `200` in 2.0 s |
 
-### B.2b Ibex as the h3 server, HAProxy dev10 as the client (the other half of an Ibex↔Ibex chain)
+### B.2b Alcyon as the h3 server, HAProxy dev10 as the client (the other half of an Alcyon↔Alcyon chain)
 
 `ib/`: A (dev10) → `server q1 quic4@127.0.0.1:63022 ssl verify none alpn h3 http-reuse always`
-→ Ibex (`bind quic4@… alpn h3`, backend echo server), with `tune.ibex.h3-path relay` and `mux`:
-5 sequential `200`, 20 concurrent **20/20 `200`**, POST 1 MiB `200`, Ibex `show quic` lists 2
+→ Alcyon (`bind quic4@… alpn h3`, backend echo server), with `tune.alcyon.h3-path relay` and `mux`:
+5 sequential `200`, 20 concurrent **20/20 `200`**, POST 1 MiB `200`, Alcyon `show quic` lists 2
 connections — **both h3 paths serve HAProxy's QUIC client today**. What is missing for
-Ibex↔Ibex is only the client side (B).
+Alcyon↔Alcyon is only the client side (B).
 
 ## B.3 Design (on A)
 
 ```rust
-// ibex-quic: client half (B0 = T534) and endpoint (B1)
+// alcyon-quic: client half (B0 = T534) and endpoint (B1)
 pub struct QuicClientConfig { /* qc::ClientConfig over rustls24 ClientConfig: alpn h3, verifier, SNI */ }
 pub struct QuicClientEndpoint {                // one per worker; quinn Endpoint without server config
     endpoint: quinn_proto::Endpoint,
     conns: Slab<quinn_proto::Connection>,      // by ConnectionHandle; timers: T493's BTreeSet, not a walk
     rx: CopyBlock, tx: CopyBlock,              // as the server endpoint (`endpoint.rs:82-110`)
 }
-// ibex-rt be_mux.rs
+// alcyon-rt be_mux.rs
 enum BeLeg { Tcp { fd: OwnedFd, xprt: ServerXprt }, Quic { sock: OwnedFd /* connected UDP */, handle: ConnectionHandle } }
 enum BeMux { H2(H2MuxContext), H3(H3ClientCtx) }   // H3ClientCtx: mux_h3.rs client role (B2)
 ```
@@ -362,20 +362,20 @@ enum BeMux { H2(H2MuxContext), H3(H3ClientCtx) }   // H3ClientCtx: mux_h3.rs cli
   (row 15).
 - **Memory**: `Pool<BeConn>` as A; quinn's per-connection state stays quinn's (tradeoff.md 6.30,
   ~3.9 allocations per request on the server side, the same expected here); datagram buffers per
-  worker endpoint, not per connection; target: Ibex's own allocations 0 per request on a warm
+  worker endpoint, not per connection; target: Alcyon's own allocations 0 per request on a warm
   connection.
 
 ## B.4 Slices
 
 | # | slice | scope | size | depends | model |
 |---|---|---|---|---|---|
-| B0 | **Client half of the quinn↔rustls adapter** = T534 (running) | `qc::ClientConfig` + client `TlsSession` over `build_quic`/`read_hs`; test: Ibex client ↔ Ibex server handshake and ↔ quinn's own (dev-dependency) server; ALPN, SNI, verification failure as a TLS alert. Decides D7. | M | — | (T534) |
+| B0 | **Client half of the quinn↔rustls adapter** = T534 (running) | `qc::ClientConfig` + client `TlsSession` over `build_quic`/`read_hs`; test: Alcyon client ↔ Alcyon server handshake and ↔ quinn's own (dev-dependency) server; ALPN, SNI, verification failure as a TLS alert. Decides D7. | M | — | (T534) |
 | B1 | **Client endpoint and socket** | `QuicClientEndpoint` per worker, connected UDP socket per connection, `BeLeg::Quic`, timers, close/drain; test: connect, one stream echo, idle close, server gone (rows 11-12). | M | B0, A2 | Sonnet |
 | B2 | **h3 client mux** | `mux_h3.rs` client role (B.3), unit tests against frames from HAProxy dev10's server (aioquic capture) | M | A1 | Sonnet |
 | B3 | **Wire into `BeConn`** | parser accepts `server quic4@… ssl alpn h3` (refusal at `server.rs:34` lifted), attach/detach/reuse rows 2-8 on `nbthread 1` and N; errors rows 13-16 | M | A3, A5, B1, B2 | Sonnet |
 | B4 | **`tune.quic.be.*` and `max-reuse`** | the two keywords of B.1 with tests (rows 7, 8, 15) | S | B3 | Sonnet / Muse Glimmer |
 | B5 | **Checks over QUIC** | plain `check` = handshake `L6OK` (row 10); `httpchk` on a QUIC server refused (D5) | S | B3 | Sonnet |
-| B6 | **Reg-tests and chains** | the vtc runner stops sending `server quic+…` blocks to the oracle: T528's 17 OOS run on Ibex alone; Ibex→Ibex h3 practical topology; night numbers (ins/req, allocations, RSS per backend QUIC connection vs HAProxy) | M | B3-B5 | Sonnet; V&V night |
+| B6 | **Reg-tests and chains** | the vtc runner stops sending `server quic+…` blocks to the oracle: T528's 17 OOS run on Alcyon alone; Alcyon→Alcyon h3 practical topology; night numbers (ins/req, allocations, RSS per backend QUIC connection vs HAProxy) | M | B3-B5 | Sonnet; V&V night |
 | B7 | **QMux** (`proto qmux`, `alpn h3` over TCP) | **refused** (D6); revisit when HAProxy drops "experimental" | — | — | — |
 
 ---
@@ -406,22 +406,22 @@ C http-request reject / silent-drop; C reload (new C + SIGUSR1 old); kill -9 C m
 option httpchk GET /chk + proto h2 check | check | check-proto h2 | alpn h2 check | check-ssl check-alpn h2 | check-alpn http/1.1    # rows 20-25
 nghttpd --no-tls -d htdocs -v --trailer 'grpc-status: 0' --trailer 'grpc-message: ok' 63104
 nghttp -v -H 'content-type: application/grpc' -H 'te: trailers' -d req.bin --trailer 'x-req-trailer: one' http://127.0.0.1:63105/svc  # row 26
-# Ibex parser and runtime (dir ib/): ibex -c -f k<n>.cfg; ibex -f k2|k3|k4|k7.cfg against C        # A.3 rows 1, 4, 24, 27
+# Alcyon parser and runtime (dir ib/): alcyon -c -f k<n>.cfg; alcyon -f k2|k3|k4|k7.cfg against C        # A.3 rows 1, 4, 24, 27
 # QUIC (dir m/): B = h3 server, A = h3 client (dev10)
 ./reuse.sh <mode>       (64 threads, then a.cfg with nbthread 1)                                   # B.2 rows 3-5
 tune.quic.be.stream.max-concurrent 100|5 (cold and warm); max-reuse 2                               # rows 6-8
 server … proto qmux | ssl alpn h3 over TCP; check variants with/without option httpchk              # rows 9-10
 B down; kill -9 B mid-request (timeout server 4s); reject; deny; B tune.quic.fe.max-idle-timeout 1s; SIGUSR1 B   # rows 11-16
-A (dev10) → Ibex quic4@:63022, tune.ibex.h3-path relay|mux                                          # B.2b
+A (dev10) → Alcyon quic4@:63022, tune.alcyon.h3-path relay|mux                                          # B.2b
 # rustls upstream (read-only GitHub API): commits on rustls/src/quic.rs, compare v/0.24.0-dev.2...main, tags
 ```
-Processes: every haproxy, ibex, nghttpd, `slow.py`, `echo.py` started here was stopped by PID;
+Processes: every haproxy, alcyon, nghttpd, `slow.py`, `echo.py` started here was stopped by PID;
 `ss -ltnup` showed no listener on 63000-63999 afterwards. No file in `crates/` was changed;
 `tools/checkin.sh` was not run (documentation-only branch).
 
 ## Note added 2026-10-31 (supervisor, after T534)
 
-T534's QUIC client (`crates/ibex-quic/src/crypto/client.rs`) uses `build_quic` + `read_hs` +
+T534's QUIC client (`crates/alcyon-quic/src/crypto/client.rs`) uses `build_quic` + `read_hs` +
 `events()` only; the server certificate is verified inside rustls's internal `ClientState`
 (`client/hs.rs:73-79`), so the `todo!("nyi")` of rustls 0.24.0-dev.2 (`quic.rs:146-152`, `impl
 FromConn<ClientSide> for ()`) is unreachable: it needs a `VerifyPeerIdentity<ClientSide, Quic>`,

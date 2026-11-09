@@ -1,6 +1,6 @@
 # T342: eprintln!/eprint! panic on EAGAIN when stderr is a full non-blocking pipe (`log stderr`
 # makes fd 2 O_NONBLOCK, and a reloaded process inherits it); the crash hook then aborts.
-# Use ibex_rt::stderr_line! (ibex-rt) or ibex_config::stderr_line! (ibex-config, ibex-tls).
+# Use alcyon_rt::stderr_line! (alcyon-rt) or alcyon_config::stderr_line! (alcyon-config, alcyon-tls).
 # Test crates allow it at their root.
 disallowed-macros = [
     { path = "std::eprintln", reason = "panics on a full non-blocking stderr; use stderr_line!" },

@@ -62,7 +62,7 @@ class Repo:
         self.tmp.cleanup()
 
 
-ENV = {"IBEX_COVERCHECK_BASE": "HEAD"}
+ENV = {"ALCYON_COVERCHECK_BASE": "HEAD"}
 
 
 class TestTreeKey(unittest.TestCase):
@@ -102,19 +102,19 @@ class TestTreeKey(unittest.TestCase):
 
     def test_verdict_changing_env_changes_the_key(self):
         k1 = self.key()
-        self.assertNotEqual(self.key(IBEX_GATE_SKIP_MEASURE="1"), k1)
+        self.assertNotEqual(self.key(ALCYON_GATE_SKIP_MEASURE="1"), k1)
         self.assertNotEqual(self.key(COVERCHECK="0"), k1)
         self.assertEqual(self.key(COVERCHECK="1"), k1)  # the default, spelled out
         before = git(self.r.path, "rev-parse", "HEAD")
         self.r.write("crates/x/src/lib.rs", "fn a() {}\nfn c() {}\n")
         self.r.commit("third")
         k3 = self.key()
-        self.assertNotEqual(self.key(IBEX_COVERCHECK_BASE=before), k3)
+        self.assertNotEqual(self.key(ALCYON_COVERCHECK_BASE=before), k3)
 
     def test_covercheck_default_base_is_part_of_the_key(self):
         # Without an override, the base covercheck judges against follows the branch: the
         # same commit judged against another base is another verdict.
-        env = {"IBEX_COVERCHECK_BASE": ""}
+        env = {"ALCYON_COVERCHECK_BASE": ""}
         root = git(self.r.path, "rev-parse", "HEAD")
         git(self.r.path, "checkout", "-q", "-b", "topic")
         self.r.write("crates/x/src/lib.rs", "fn a() {}\nfn t() {}\n")
@@ -224,7 +224,7 @@ class TestAttemptHistory(StateCase):
     def test_a_flake_is_shown_not_hidden(self):
         with open(self.log, "w") as f:
             f.write("suite: NEW FAILURES\n"
-                    "   ibex-rt/idle_pool_shared::burst (flaky: parallel run only)\n"
+                    "   alcyon-rt/idle_pool_shared::burst (flaky: parallel run only)\n"
                     "!! FAILED: workspace suite\n")
         for s in STAGES:
             self.rec(s, "fail" if s == "suite" else "pass", ["workspace suite"] if s == "suite" else ())
@@ -233,14 +233,14 @@ class TestAttemptHistory(StateCase):
         line = next(x for x in lines if x.lstrip().startswith("suite"))
         self.assertIn("PASS on attempt 2", line)
         self.assertIn("attempt 1 FAIL", line)
-        self.assertIn("ibex-rt/idle_pool_shared::burst (flaky: parallel run only)", line)
+        self.assertIn("alcyon-rt/idle_pool_shared::burst (flaky: parallel run only)", line)
 
     def test_the_new_failures_are_the_detail_not_the_baselined_ones(self):
         # Gate 1 of the demonstration: the detail named three baselined failures and not
         # the one test that failed the stage.
         with open(self.log, "w") as f:
             f.write("   slz/t267_demo: fails alone in 3/3 runs\n"
-                    "   ibex-dns/resolver_behavior: fails alone in 1/1 runs\n"
+                    "   alcyon-dns/resolver_behavior: fails alone in 1/1 runs\n"
                     "suite: 3 confirmed failing, 0 flaky, 2 + 2 baselined\n"
                     "suite: NEW FAILURES\n"
                     "   slz/t267_demo::t267_demo\n"
@@ -310,8 +310,8 @@ class TestCovercheckNeedsSuite(StateCase):
 
 class DriverCase(unittest.TestCase):
     """tools/checkin.sh itself, in a throwaway repository, with every stage replaced by a
-    script in $IBEX_CHECKIN_FAKE (`<stage>`; missing means pass). Each run appends the stages
-    it ran to $IBEX_CHECKIN_FAKE/ran."""
+    script in $ALCYON_CHECKIN_FAKE (`<stage>`; missing means pass). Each run appends the stages
+    it ran to $ALCYON_CHECKIN_FAKE/ran."""
 
     def setUp(self) -> None:
         self.r = Repo()
@@ -323,12 +323,12 @@ class DriverCase(unittest.TestCase):
         self.aux = tempfile.TemporaryDirectory()
         self.fake = os.path.join(self.aux.name, "fake")
         os.makedirs(self.fake)
-        self.env = dict(os.environ, IBEX_CHECKIN_FAKE=self.fake,
-                        IBEX_GATE_STATE=os.path.join(self.aux.name, "state"),
-                        IBEX_GATE_HISTORY=os.path.join(self.aux.name, "history.tsv"),
+        self.env = dict(os.environ, ALCYON_CHECKIN_FAKE=self.fake,
+                        ALCYON_GATE_STATE=os.path.join(self.aux.name, "state"),
+                        ALCYON_GATE_HISTORY=os.path.join(self.aux.name, "history.tsv"),
                         CARGO_TARGET_DIR=os.path.join(self.aux.name, "target"),
-                        IBEX_COVERCHECK_BASE="HEAD", PYTHONDONTWRITEBYTECODE="1")
-        self.env.pop("IBEX_GATE_SKIP_MEASURE", None)
+                        ALCYON_COVERCHECK_BASE="HEAD", PYTHONDONTWRITEBYTECODE="1")
+        self.env.pop("ALCYON_GATE_SKIP_MEASURE", None)
         self.env.pop("COVERCHECK", None)
 
     def tearDown(self) -> None:
@@ -402,7 +402,7 @@ class TestCheckinDriver(DriverCase):
 
     def test_only_covercheck_reuses_the_suite_run_of_this_tree(self):
         # The fake suite leaves a suite-run.json, as harness/suite.py does.
-        self.stage("suite", 'mkdir -p "$IBEX_INSTRUMENTED"; echo "{}" > "$IBEX_INSTRUMENTED/suite-run.json"\n')
+        self.stage("suite", 'mkdir -p "$ALCYON_INSTRUMENTED"; echo "{}" > "$ALCYON_INSTRUMENTED/suite-run.json"\n')
         self.stage("covercheck", "exit 1\n")
         rc, out, _ = self.run_gate()
         self.assertEqual(rc, 1, out)
@@ -424,7 +424,7 @@ class TestCheckinDriver(DriverCase):
 
     def test_measure_gets_the_plain_env(self):
         self.stage("measure", 'echo "R=${RUSTFLAGS:-unset} L=${LLVM_PROFILE_FILE:-unset} '
-                              'I=${IBEX_INSTRUMENTED:-unset} T=$CARGO_TARGET_DIR"\n')
+                              'I=${ALCYON_INSTRUMENTED:-unset} T=$CARGO_TARGET_DIR"\n')
         self.env.update(RUSTFLAGS="-Cinstrument-coverage", LLVM_PROFILE_FILE="/x/%m.profraw")
         rc, out, ran = self.run_gate("--only", "measure")
         self.assertEqual(ran, ["measure"])
@@ -440,7 +440,7 @@ class TestCarryFromParent(DriverCase):
     def setUp(self) -> None:
         super().setUp()
         # A base that does not move with HEAD, as on a branch (the key holds it).
-        self.env["IBEX_COVERCHECK_BASE"] = git(self.r.path, "rev-parse", "HEAD")
+        self.env["ALCYON_COVERCHECK_BASE"] = git(self.r.path, "rev-parse", "HEAD")
         rc, out, _ran = self.run_gate()
         self.assertEqual(rc, 0, out)
 
@@ -514,7 +514,7 @@ class TestCarryFromParent(DriverCase):
     def test_rerun_failed_keeps_the_carry(self):
         self.r.write("crates/x/tests/it/a.rs", "// t\n")
         self.r.commit("test-only fix")
-        self.stage("suite", 'mkdir -p "$IBEX_INSTRUMENTED"; echo "{}" > "$IBEX_INSTRUMENTED/suite-run.json"\n')
+        self.stage("suite", 'mkdir -p "$ALCYON_INSTRUMENTED"; echo "{}" > "$ALCYON_INSTRUMENTED/suite-run.json"\n')
         self.stage("covercheck", "exit 1\n")
         self.run_gate()
         os.unlink(os.path.join(self.fake, "covercheck"))
@@ -532,7 +532,7 @@ class TestCarryFromParent(DriverCase):
 
     def test_the_parent_key_follows_the_default_base(self):
         # No base override: on main the base is HEAD^, which differs between parent and child.
-        self.env["IBEX_COVERCHECK_BASE"] = ""
+        self.env["ALCYON_COVERCHECK_BASE"] = ""
         self.r.write("crates/x/src/lib.rs", "fn a() {}\nfn b() {}\n")
         self.r.commit("src")
         rc, out, _ran = self.run_gate()

@@ -18,7 +18,7 @@ if __name__ == "__main__":
     try:
         for conns in (1, 50):
             for path in ("/small", "/64k"):
-                for kind in ("ibex", "haproxy"):
+                for kind in ("alcyon", "haproxy"):
                     port = m.free_port()
                     p = m.start(kind, m.write_file(f"tp-{kind}.cfg", m.proxy_cfg(port, op, 1)), port)
                     try:

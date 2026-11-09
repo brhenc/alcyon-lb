@@ -6,8 +6,8 @@
 //! options; the rest is split at 0xFF into: name, three server cookie values, the Cookie
 //! values and the Set-Cookie values (each a list split at LF).
 #![no_main]
-use ibex_config::CookieConfig;
-use ibex_rt::cookie::{self, ReqKind, SrvCookie, Target};
+use alcyon_config::CookieConfig;
+use alcyon_rt::cookie::{self, ReqKind, SrvCookie, Target};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

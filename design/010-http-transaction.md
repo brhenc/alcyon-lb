@@ -1,4 +1,4 @@
-# Ibex Design: the HTTP transaction
+# Alcyon Design: the HTTP transaction
 
 Status: steps 1-4 implemented on branch `txn/010`, 2026-10-02 (see "As built" at the end).
 Step 5 (one transaction per H2 stream) is not done.
@@ -28,9 +28,9 @@ this transaction", and the reviewer must too. Sonnet's T57 and T64 each spent mo
 ~300K tokens there, and T64's `wait-for-body` stopped exactly at "a suspension point that
 doesn't exist".
 
-## What Ibex does today
+## What Alcyon does today
 
-`crates/ibex-rt/src/engine.rs` `step_stream` (:3463) runs numbered steps over a
+`crates/alcyon-rt/src/engine.rs` `step_stream` (:3463) runs numbered steps over a
 `TcpSession` (`proxy.rs`) whose byte-level `process()` (:1462) moves data between `req`,
 `rep` and the two sockets. HTTP is layered on top by inspecting buffers between steps:
 
@@ -142,7 +142,7 @@ HTX as HAProxy has it, filters, the analyser bit-mask, HTTP/3.
 
 Where the implementation differs from the proposal above, and what it found.
 
-- **Where the transaction lives.** `TcpSession::txn: Option<HttpTxn>` (`crates/ibex-rt/src/
+- **Where the transaction lives.** `TcpSession::txn: Option<HttpTxn>` (`crates/alcyon-rt/src/
   txn.rs`), not the session entry: the byte movers in `proxy.rs` need the message states to
   bound what they forward. `req_method`/`req_uri`/`req_headers` stay on the session; they are
   cleared in one place, `TcpSession::reset_for_next_request`.
@@ -168,7 +168,7 @@ Where the implementation differs from the proposal above, and what it found.
   arriving is drained as it comes (`drain_request`), as `HAProxy` 3.5 does, bounded by
   `timeout client`. The connection closes after an empty page or one that says
   `Connection: close`. (It also closed after an unread body behind `Expect: 100-continue`;
-  `HAProxy` 3.5 keeps that connection, and so does Ibex now --
+  `HAProxy` 3.5 keeps that connection, and so does Alcyon now --
   `a_reply_to_an_expect_100_continue_request_keeps_the_connection`.)
 - **What `HttpTxn` replaced.** `resp_released`, `resp_length_known`, `resp_status`,
   `resp_headers_processed`, `srv_connection_close`, `connection_close`, the session copies of

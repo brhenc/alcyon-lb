@@ -1,15 +1,15 @@
-# QUIC/h3 profile: Ibex (quinn-proto) against HAProxy 3.5-dev10 (T544, 2026-10-31 night)
+# QUIC/h3 profile: Alcyon (quinn-proto) against HAProxy 3.5-dev10 (T544, 2026-10-31 night)
 
 Measurement and evidence only. The redesign is T545, which starts from here. All the numbers
 are user-space instructions (`instructions:u`). There are no wall-time claims: everything ran in
-measuring slot B (`flock -x /tmp/ibex-load-n1.lock`, `IBEX_MEASURE_CPUS=12,13,14`, perf and the
+measuring slot B (`flock -x /tmp/ibex-load-n1.lock`, `ALCYON_MEASURE_CPUS=12,13,14`, perf and the
 client on 13), governor `performance`, no `wwm.exe`, 21:55-22:16 CET.
 
 **Build measured**: branch `fix/t544` = main d581eae9 (T539: HandleMap hasher, qpack
 `static_ref`) + fix/t542 f9ac59ef (vendored quinn-proto 0.11.18 + PADDING-run patch).
-`cargo build --profile release-perf --bin ibex` (`~/ibex-targets/t544/release-perf/ibex`). The
+`cargo build --profile release-perf --bin alcyon` (`~/ibex-targets/t544/release-perf/alcyon`). The
 profiles come from the same tree built with `RUSTFLAGS="-C force-frame-pointers=yes"`
-(`~/ibex-targets/t544/fp/release-perf/ibex`, +5.2 % on h3, +1.5 % on h2), and their shares are
+(`~/ibex-targets/t544/fp/release-perf/alcyon`, +5.2 % on h3, +1.5 % on h2), and their shares are
 scaled to the plain build's counts. T543's commits (allocations at 0) are **not** in this build.
 Oracle: `~/reference/haproxy-quic/haproxy` 3.5-dev10-38e65c-10 (OpenSSL 3.5.9, `-O2 -g`, no
 frame pointers, so DWARF unwinding). Scenario: `tools/measure/scenarios/h3.body`, `nbthread 1`,
@@ -35,20 +35,20 @@ AMD IBS gives precise IPs: `perf record -e 'ibs_op/cnt_ctl=1,swfilt=1/u' -c 1000
 97.66 % of the samples on `main` in the same test. It counts dispatched ops, not instructions.
 This report takes every phase **share** from IBS and scales it to the instructions:u total that
 perf stat measured. Samples on the `syscall` instruction itself are dropped (many ops, one
-instruction): 22.8 % of Ibex h3's samples, 21.6 % of HAProxy h3's. Ops and instructions differ
+instruction): 22.8 % of Alcyon h3's samples, 21.6 % of HAProxy h3's. Ops and instructions differ
 by a few percent per phase (AES-NI/AVX, `rep movsb`), so read the table as ±10 % per row.
 
 **(b) h3c1 instructions per request depend on how many ACK-only datagrams h2load sends, and
 that changes from one run to the next.** The request packets are always 1.0 per request, and
 the proxy always sends 1.078 datagrams per request. But the client sends 1.12 to 1.91 datagrams
-per request to Ibex (the extra ones are ACK-only). Over 10 rounds of 10,000 requests
+per request to Alcyon (the extra ones are ACK-only). Over 10 rounds of 10,000 requests
 (`rounds/`), a linear fit gives:
 
 `ins/req = 113,222 + 6,041 x (client datagrams/req)`, r = 0.982. **One inbound ACK-only datagram
-costs Ibex ~6.0k instructions.**
+costs Alcyon ~6.0k instructions.**
 
 HAProxy always gets 1.97 datagrams per request from the same client (73.66-73.72k/req). With
-the same inbound load, Ibex is at **125.1k = 1.70x HAProxy**. insreq's "min of rounds" picks
+the same inbound load, Alcyon is at **125.1k = 1.70x HAProxy**. insreq's "min of rounds" picks
 the round with the fewest ACKs: 120.2k = 1.63x. h2load prints the datagram counts in each
 `<label>.rN.client` (`UDP datagram: N sent, M received`). Read them next to every h3 figure.
 
@@ -59,7 +59,7 @@ ACK-only datagram (1.000 client datagrams/req), `h3worst` answers every server d
 1.96/req to HAProxy, counted in a pcap). Each round runs both, and **the h3 figure is the line
 through the two points read at 1.97 client datagrams/req** (user decision D6: HAProxy's packet
 rate), the median over rounds; min-of-rounds is retired for h3. The client's count is pinned by
-`crates/ibex-rt/tests/it/h3_bench_client.rs`. Two differences from h2load make h3fit figures
+`crates/alcyon-rt/tests/it/h3_bench_client.rs`. Two differences from h2load make h3fit figures
 lower than the h3c1 ones in this report, for both proxies: h3bench's request packets are
 ~70 bytes (as curl's), h2load pads each to 1200 (decryption and PADDING parsing per request), and
 its request carries four fields (no `user-agent`). Compare h3fit with h3fit only. Stability and
@@ -72,7 +72,7 @@ undercount. The syscall counts below still hold.
 
 ## 1. Totals (perf stat, `tools/measure/insreq.sh`, slot B, 3-10 rounds of 10,000)
 
-| | Ibex | HAProxy dev10 | Ibex/HAProxy |
+| | Alcyon | HAProxy dev10 | Alcyon/HAProxy |
 |---|---:|---:|---:|
 | h3 mux (h3c1), min of rounds | 120,241 (1.17 client dgrams/req) | 73,684 (1.97) | 1.63x |
 | h3 mux at HAProxy's inbound datagram count (fit) | 125,110 | 73,684 | 1.70x |
@@ -81,14 +81,14 @@ undercount. The syscall counts below still hold.
 
 ## 2. Per-phase table (IBS shares x instructions:u, per request; per packet = / (rx + tx datagrams))
 
-The Ibex h3 profile ran at 1.292 client datagrams per request, scaled to 121.0k (the fit at
-1.292). Packets per request: Ibex 1.292 rx + 1.078 tx = 2.37; HAProxy 1.980 + 1.020 = 3.00 (one
+The Alcyon h3 profile ran at 1.292 client datagrams per request, scaled to 121.0k (the fit at
+1.292). Packets per request: Alcyon 1.292 rx + 1.078 tx = 2.37; HAProxy 1.980 + 1.020 = 3.00 (one
 QUIC packet per datagram here). HAProxy's IBS DWARF chains unwind for 78 % of the samples. For
 HAProxy, each IBS leaf's cost is split over the phases in the proportions that leaf's callers
-have in the instructions:u DWARF profile (`scripts/hybrid.py`). Ibex's frame-pointer chains
+have in the instructions:u DWARF profile (`scripts/hybrid.py`). Alcyon's frame-pointer chains
 unwind, with inlined frames expanded by `llvm-symbolizer` (`scripts/fold2.py`).
 
-| phase | Ibex h3 /req | HAProxy h3 /req | Ibex - HAP | Ibex /pkt | HAP /pkt | Ibex h2 /req |
+| phase | Alcyon h3 /req | HAProxy h3 /req | Alcyon - HAP | Alcyon /pkt | HAP /pkt | Alcyon h2 /req |
 |---|---:|---:|---:|---:|---:|---:|
 | UDP recv (recvmmsg glue, rx batch) | 745 | 420 | +325 | 314 | 140 | - |
 | packet decode / CID route | 1,795 | 1,203 | +592 | 757 | 401 | - |
@@ -110,7 +110,7 @@ unwind, with inlined frames expanded by `llvm-symbolizer` (`scripts/fold2.py`).
 | of which non-crypto | 30,136 | 20,913 | +9,223 | 12,716 | 6,971 | |
 | h3 framing + QPACK (`mux_h3`, `qpack`) | 10,066 | 4,610 | +5,456 | | | h2+HPACK 7,469 |
 | header codec shared with h2 (Huffman, `check_request_fields`, `DecodedFields`) | 4,827 | 1,540 | +3,287 | | | 2,231 |
-| Ibex QUIC glue (listener, owner, endpoint maps, CID SipHash, copies) | 10,996 | 0 | +10,996 | 4,640 | | 714 |
+| Alcyon QUIC glue (listener, owner, endpoint maps, CID SipHash, copies) | 10,996 | 0 | +10,996 | 4,640 | | 714 |
 | mux<->stream bridge (`h2_bridge`, child sessions; HAProxy: inside its h3/stream rows) | 11,096 | - | | | | 10,546 |
 | HTTP engine + backend h1 | 25,251 | 24,619 | | | | 35,403 |
 | scheduler / event loop / poller / `engine::*` | 22,917 | 2,329 | | | | 17,633 |
@@ -123,19 +123,19 @@ The split between the three "common" rows depends on which inlined frame matches
 sum is the stable figure: 59.3k (h3) against 63.6k (h2) for the same engine.
 
 Where the gaps are:
-- **Ibex h3 - HAProxy h3 = +47.3k**: common engine +32.3k (not QUIC: Ibex h2 has the same
-  engine, 63.6k); Ibex QUIC glue +11.0k; h3 + QPACK + shared codec +8.7k; quinn non-crypto
+- **Alcyon h3 - HAProxy h3 = +47.3k**: common engine +32.3k (not QUIC: Alcyon h2 has the same
+  engine, 63.6k); Alcyon QUIC glue +11.0k; h3 + QPACK + shared codec +8.7k; quinn non-crypto
   transport +9.2k; crypto **-11.2k** (ring opens 1200 B for 2.0k; OpenSSL opens 1444 B for 12.0k,
   with `evp_cipher_init_internal`/`EVP_CIPHER_CTX_ctrl` on every packet); malloc -3.5k.
-- **Ibex h3 - Ibex h2 = +41.4k** (what H4's "h2 + 15 %" measures): transport +29.2k (34.1k
+- **Alcyon h3 - Alcyon h2 = +41.4k** (what H4's "h2 + 15 %" measures): transport +29.2k (34.1k
   against h2's TLS record 4.8k), glue +10.3k, h3 framing + codec +5.6k, engine -4.3k.
 
 ## 3. Calls, datagrams and syscalls per request
 
-uprobes on the release-perf binary (`scripts/calls.sh`, perf stat `probe_ibex:*`, 5000
+uprobes on the release-perf binary (`scripts/calls.sh`, perf stat `probe_alcyon:*`, 5000
 requests, 1.91 client datagrams/req in that run):
 
-| per request | Ibex h3 | Ibex h2 |
+| per request | Alcyon h3 | Alcyon h2 |
 |---|---:|---:|
 | `QuicEndpoint::handle_datagram` = `Connection::handle_event` = `process_payload` = `drive_connection` | 1.911 | - |
 | `QuicEndpoint::refresh_timer` (`conn.poll_timeout()` + BTreeSet re-key) | 2.990 | - |
@@ -148,7 +148,7 @@ requests, 1.91 client datagrams/req in that run):
 
 Syscalls (strace, 2000 requests; the datagram counts are undercounted, see 0c):
 
-| per request | Ibex h3 | HAProxy h3 | Ibex h2 | HAProxy h2 |
+| per request | Alcyon h3 | HAProxy h3 | Alcyon h2 | HAProxy h2 |
 |---|---|---|---|---|
 | epoll_wait | 3.01 | 3.01 | 3.07 | 3.00 |
 | UDP rx | recvmmsg 1.00 | recvmsg 3.04 (2.02 EAGAIN) | | |
@@ -157,8 +157,8 @@ Syscalls (strace, 2000 requests; the datagram counts are undercounted, see 0c):
 | other | **getsockname 1.00** | clock_gettime 6.02 (real syscalls) | | clock_gettime 6.0 |
 | datagram sizes | rx 1200 B, tx 49 B | rx 1444 B, tx 62-64 B | | |
 
-Ibex makes fewer syscalls than HAProxy. Its `getsockname` per request is
-`TcpSession::attach_server_with_xprt` (`crates/ibex-rt/src/proxy.rs:1733`, `bc_src` for
+Alcyon makes fewer syscalls than HAProxy. Its `getsockname` per request is
+`TcpSession::attach_server_with_xprt` (`crates/alcyon-rt/src/proxy.rs:1733`, `bc_src` for
 `%bi/%bp`): every h3 stream is a new child session that takes the server connection again from
 the idle pool. h2 does not make this call.
 
@@ -167,7 +167,7 @@ the idle pool. h2 does not make this call.
 | # | hypothesis | verdict | the number |
 |---|---|---|---|
 | 1 | Per datagram: `Endpoint::handle` -> `handle_event` -> drive -> `poll_transmit` round trips | **confirmed** | handle/drive 1.91/req (one full pass per datagram, not batched); `send_batch` 8.25/req for 1.08 packets: ~7 `Connection::poll_transmit` sweeps per request that build nothing; `Connection::poll_transmit` + `QuicEndpoint::poll_transmit` self 2.1k + `send_batch` self 2.0k |
-| 2 | An ACK-only datagram is cheap | **refuted** | +6.0k instructions per inbound ACK-only datagram (fit, r = 0.98); HAProxy's whole transport is 7.0k (non-crypto) per packet, Ibex's 12.7k |
+| 2 | An ACK-only datagram is cheap | **refuted** | +6.0k instructions per inbound ACK-only datagram (fit, r = 0.98); HAProxy's whole transport is 7.0k (non-crypto) per packet, Alcyon's 12.7k |
 | 3 | Does quinn ACK more often than HAProxy? | **refuted** | tx 1.078 against 1.022 datagrams/req; both send one ACK in each response packet. The extra 0.056 is `MAX_STREAMS` (T539) |
 | 4 | BTreeMap/BTreeSet/RangeSet costs | **confirmed, moderate** | BTree leaves 2.8k/req; ACK generation 1.85k against 0.40k (`ArrayRangeSet::insert` 565, `RangeSet::pop_min` 226, `PendingAcks` 250) |
 | 5 | Timers / loss detection on every packet | **confirmed** | 4.0k against 0.77k: `refresh_timer` 1.7k (2.99 calls/req, each a `poll_timeout` scan of quinn's `TimerTable` and a BTreeSet remove+insert), `TimerTable::next_timeout` 0.6k, `detect_lost_packets` + `pto_time_and_space` + `set_loss_detection_timer` 0.64k, `reset_idle_timeout`/`reset_keep_alive` 0.34k |
@@ -179,13 +179,13 @@ the idle pool. h2 does not make this call.
 | 11 | `Transmit` / datagram copies | **refuted as h3-specific** | memcpy leaves 3.7k (h3) against 3.5k (h2); rx copies 1200 B into `CopyBlock`/`BytesMut` per datagram, tx copies 49 B twice (`tx_buf` -> `send_raw_bufs`) |
 | 12 | Pacing / congestion control | **refuted** | 226 against 176 |
 | 13 | More wakeups / loop passes per request than h2 or HAProxy | **refuted** | `Engine::step` 6.98 (h3) against 7.15 (h2); epoll_wait 3.0 for all four |
-| 14 | More syscalls than HAProxy | **refuted** | Ibex h3 ~8.2/req against HAProxy ~15/req (HAProxy: 6 clock_gettime, 2 EAGAIN recvmsg); one avoidable `getsockname` per h3 request |
-| 15 | HAProxy wins with pools, no per-frame heap | **refuted for this build** | HAProxy `pool_*`/malloc 4.2k/req against Ibex malloc 0.67k (and T543 takes Ibex to 0 allocations) |
-| 16 | GSO/GRO, recvmmsg/sendmmsg batching | **refuted at -c1 -m1** | HAProxy does one recvmsg/sendmsg per datagram; Ibex batches but gets 1 datagram per call |
+| 14 | More syscalls than HAProxy | **refuted** | Alcyon h3 ~8.2/req against HAProxy ~15/req (HAProxy: 6 clock_gettime, 2 EAGAIN recvmsg); one avoidable `getsockname` per h3 request |
+| 15 | HAProxy wins with pools, no per-frame heap | **refuted for this build** | HAProxy `pool_*`/malloc 4.2k/req against Alcyon malloc 0.67k (and T543 takes Alcyon to 0 allocations) |
+| 16 | GSO/GRO, recvmmsg/sendmmsg batching | **refuted at -c1 -m1** | HAProxy does one recvmsg/sendmsg per datagram; Alcyon batches but gets 1 datagram per call |
 | 17 | PADDING still costs after T542 | **confirmed, fixable** | `frame::Iter::try_next` 1.75k/req: the patch's `position(|&b| b != 0)` scans 1150 B one byte at a time. HAProxy's `quic_parse_padding_frame` does the same, 1.8k/req for 1444 B |
-| 18 | Crypto is Ibex's problem | **refuted** | ring HP + AEAD 3.9k/req against OpenSSL 15.1k |
+| 18 | Crypto is Alcyon's problem | **refuted** | ring HP + AEAD 3.9k/req against OpenSSL 15.1k |
 | 19 | h3 framing + QPACK cost more than h2 + HPACK | **confirmed** | 10.1k + 4.8k shared = 14.9k against h2's 7.5k + 2.2k = 9.7k (+5.2k). Largest: `H3MuxContext::put_head` 2.55k (response QPACK encode), `on_headers` 1.06k, `parse_head` 0.85k, `static_ref` binary search 0.74k, Huffman decode 1.72k, `check_request_fields` 1.16k (against h2's 2.2k for the whole shared codec: unknown why h3 pays twice the shared codec) |
-| 20 | The gap to HAProxy is mostly QUIC | **refuted** | 32.3k of the 47.3k is the common stream engine (Ibex h2 pays it too: 63.6k against HAProxy's 26.9k). QUIC + glue + h3 is +15.0k net over HAProxy, but +41.4k over Ibex h2 |
+| 20 | The gap to HAProxy is mostly QUIC | **refuted** | 32.3k of the 47.3k is the common stream engine (Alcyon h2 pays it too: 63.6k against HAProxy's 26.9k). QUIC + glue + h3 is +15.0k net over HAProxy, but +41.4k over Alcyon h2 |
 
 ## 5. If T543's plans land (from `tasks/T543-progress.md` on fix/t543, 1d2f9114)
 
@@ -205,17 +205,17 @@ round it compares (0b). Both were sent to the supervisor at 22:1x.
 ## 6. Facts for the designer (T545)
 
 Ranked cost centres of the h3 mux, per request at 1.29 client datagrams per request (121.0k in
-all), with what each is over HAProxy and over Ibex h2:
+all), with what each is over HAProxy and over Alcyon h2:
 
-1. **Common stream engine** 59.3k (49 %): HAProxy 26.9k, Ibex h2 63.6k. Shared with h2 and not
+1. **Common stream engine** 59.3k (49 %): HAProxy 26.9k, Alcyon h2 63.6k. Shared with h2 and not
    QUIC. It accounts for 32k of the HAProxy gap and none of the h2 + 15 % gap.
 2. **quinn transport, non-crypto** 30.1k (25 %): HAProxy 20.9k. Structural to quinn: one
    `handle_event` + drive + endpoint-event loop per datagram, a `poll_transmit` that re-checks
    every space, path, CID queue and retransmit queue each time it is asked (~8 times per request
    in our loop, 1 packet built), the `TimerTable` scan on each `poll_timeout`, and its RangeSet
    ACK bookkeeping. Fixable locally: the PADDING scan (1.75k, word-at-a-time),
-   `Retransmits::is_empty` and `FrameStats` (~1k), how often Ibex asks for a transmit.
-3. **Ibex QUIC glue** 11.0k (9 %): HAProxy 0, h2 0.7k. All Ibex's own: `send_batch` 2.0k (8.25
+   `Retransmits::is_empty` and `FrameStats` (~1k), how often Alcyon asks for a transmit.
+3. **Alcyon QUIC glue** 11.0k (9 %): HAProxy 0, h2 0.7k. All Alcyon's own: `send_batch` 2.0k (8.25
    calls/req, `take_dirty` set by every `owner_send`), `drive_connection` 1.6k, SipHash
    `ConnectionId` lookups 1.4k + 0.8k (by `get_handle` on each stream call), `owner_recv` 0.84k,
    `pump` 0.5k, wake/news bookkeeping 0.46k, `Bytes` refcounts. Plus 1 `getsockname` per request
@@ -223,7 +223,7 @@ all), with what each is over HAProxy and over Ibex h2:
 4. **mux<->stream bridge** 11.1k: the h2 bridge, reused by h3. Same as h2 (10.5k). Counted in
    item 1.
 5. **h3 framing + QPACK + shared header codec** 14.9k (12 %): h2 9.7k, HAProxy 6.15k. Local to
-   `ibex_proto::mux_h3`/`qpack`.
+   `alcyon_proto::mux_h3`/`qpack`.
 6. **Crypto** 3.9k: HAProxy 15.1k. Not a target.
 7. **Per inbound ACK-only datagram: 6.0k**. Any design that does a full connection pass per
    datagram pays this. The client decides how many there are (0.1 to 0.9 per request with
@@ -233,17 +233,17 @@ Structural to quinn-proto (needs a deeper rework or a different layer): items 2'
 pass and the `poll_transmit` design, the `TimerTable`/`poll_timeout` contract that makes the
 caller re-key a global timer after every call, and the RangeSet-based ACK and send-buffer
 bookkeeping. Fixable without restructuring quinn: the PADDING scan, the number of
-`poll_transmit`/`refresh_timer` calls Ibex makes (item 3), the CID-keyed lookups, the
+`poll_transmit`/`refresh_timer` calls Alcyon makes (item 3), the CID-keyed lookups, the
 `getsockname`, and the h3/QPACK encoder.
 
 ### Measurement recipe (reuse it)
 
-1. Counts: `IBEX_MEASURE_CPUS=12,13,14 flock -x /tmp/ibex-load-n1.lock tools/measure/insreq.sh
+1. Counts: `ALCYON_MEASURE_CPUS=12,13,14 flock -x /tmp/ibex-load-n1.lock tools/measure/insreq.sh
    <label> <bin> tools/measure/scenarios/h3.body h3c1 10000 10 <out>`. Read `grep 'UDP datagram'
    <out>/<label>.r*.client` next to each round, and compare at equal client datagrams per request
    (or fit, as in 0b). HAProxy: the same command with `~/reference/haproxy-quic/haproxy`.
 2. Profile: build with `RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile
-   release-perf --bin ibex` (separate `CARGO_TARGET_DIR`), then `EV='ibs_op/cnt_ctl=1,swfilt=1/u'
+   release-perf --bin alcyon` (separate `CARGO_TARGET_DIR`), then `EV='ibs_op/cnt_ctl=1,swfilt=1/u'
    scripts/prof.sh <label> <fp-bin> <body> h3c1 20000 fp <out> 100000` (setup as insreq; `sudo -n
    perf record -e $EV --call-graph fp -c 100000 -p <proxy>`). HAProxy: the same with `dwarf` and
    30000 requests, plus an instructions:u DWARF profile for its callers.

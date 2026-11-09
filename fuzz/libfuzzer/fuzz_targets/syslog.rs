@@ -5,8 +5,8 @@
 //! 3164 and its header rebuilt in every output format, as forwarding does. The first byte
 //! picks `assume-rfc6587-ntf`; the rest is the stream.
 #![no_main]
-use ibex_config::RingFormat;
-use ibex_rt::{logfwd, loghdr};
+use alcyon_config::RingFormat;
+use alcyon_rt::{logfwd, loghdr};
 use libfuzzer_sys::fuzz_target;
 
 const FORMATS: [RingFormat; 8] = [

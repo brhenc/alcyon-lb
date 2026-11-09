@@ -22,7 +22,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 PARITY_DIR = REPO_ROOT / "tools" / "parity-bench"
 BENCH_BIN = Path("/tmp/t39-target/release/parity-bench")
-IBEX_BIN = Path("/tmp/t39-target/release/ibex")
+ALCYON_BIN = Path("/tmp/t39-target/release/alcyon")
 HAPROXY_BIN = Path("/home/bhenc/reference/haproxy-quic/haproxy")
 PERF_SCRIPT_DIR = Path("/home/bhenc/.cargo/bin")
 
@@ -64,7 +64,7 @@ def start_udp_log_sink(port: int) -> tuple[socket.socket, subprocess.Popen]:
 
 
 def make_configs(fe_port: int, be_port: int, log_port: int) -> dict[str, tuple[str, str]]:
-    """Returns {config_name: (haproxy_cfg_text, ibex_cfg_text)}"""
+    """Returns {config_name: (haproxy_cfg_text, alcyon_cfg_text)}"""
     configs = {}
 
     # 1. Baseline
@@ -353,7 +353,7 @@ def run_noncanonical_diff(fe_port: int, be_port: int) -> dict[str, str]:
     )
 
     results = {}
-    for name, pbin in [("haproxy", HAPROXY_BIN), ("ibex", IBEX_BIN)]:
+    for name, pbin in [("haproxy", HAPROXY_BIN), ("alcyon", ALCYON_BIN)]:
         be_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         be_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         be_sock.bind(("127.0.0.1", be_port))
@@ -416,7 +416,7 @@ def main():
     print("\n--- 1. Running 4-Configuration Benchmarks (3 runs each, 1-conn & 50-conn) ---")
     for cfg_name, (h_cfg, i_cfg) in configs.items():
         bench_results[cfg_name] = {}
-        for proxy_name, proxy_bin, cfg_text in [("haproxy", HAPROXY_BIN, h_cfg), ("ibex", IBEX_BIN, i_cfg)]:
+        for proxy_name, proxy_bin, cfg_text in [("haproxy", HAPROXY_BIN, h_cfg), ("alcyon", ALCYON_BIN, i_cfg)]:
             print(f"\nEvaluating {proxy_name.upper()} on config '{cfg_name}'...")
             with tempfile.NamedTemporaryFile("w", suffix=".cfg", delete=False) as f:
                 f.write(cfg_text)
@@ -455,27 +455,27 @@ def main():
     print("\n--- 2. Syscall Counting via strace (10,000 requests) ---")
     h_baseline_cfg, i_baseline_cfg = configs["baseline"]
     h_syscalls = run_strace(HAPROXY_BIN, h_baseline_cfg, fe_port, be_port, log_port)
-    i_syscalls = run_strace(IBEX_BIN, i_baseline_cfg, fe_port, be_port, log_port)
+    i_syscalls = run_strace(ALCYON_BIN, i_baseline_cfg, fe_port, be_port, log_port)
 
     print("HAProxy Syscalls (10k reqs):", h_syscalls)
-    print("Ibex Syscalls (10k reqs):", i_syscalls)
+    print("Alcyon Syscalls (10k reqs):", i_syscalls)
 
     print("\n--- 3. Perf Profiling & Flamegraph Generation ---")
     PARITY_DIR.mkdir(parents=True, exist_ok=True)
     haproxy_svg = PARITY_DIR / "haproxy.svg"
-    ibex_svg = PARITY_DIR / "ibex.svg"
+    alcyon_svg = PARITY_DIR / "alcyon.svg"
     print("Capturing HAProxy perf flamegraph...")
     run_perf_profile(HAPROXY_BIN, h_baseline_cfg, fe_port, be_port, haproxy_svg)
     print(f"Saved {haproxy_svg} ({haproxy_svg.stat().st_size:,} bytes)")
 
-    print("Capturing Ibex perf flamegraph...")
-    run_perf_profile(IBEX_BIN, i_baseline_cfg, fe_port, be_port, ibex_svg)
-    print(f"Saved {ibex_svg} ({ibex_svg.stat().st_size:,} bytes)")
+    print("Capturing Alcyon perf flamegraph...")
+    run_perf_profile(ALCYON_BIN, i_baseline_cfg, fe_port, be_port, alcyon_svg)
+    print(f"Saved {alcyon_svg} ({alcyon_svg.stat().st_size:,} bytes)")
 
     print("\n--- 4. Byte-for-Byte Differential Inspection ---")
     diff_results = run_noncanonical_diff(fe_port, be_port)
     print("HAProxy Backend Raw View:\n" + repr(diff_results["haproxy"]))
-    print("Ibex Backend Raw View:\n" + repr(diff_results["ibex"]))
+    print("Alcyon Backend Raw View:\n" + repr(diff_results["alcyon"]))
 
     be_proc.terminate()
     be_proc.wait()
@@ -487,7 +487,7 @@ def main():
         "benchmarks": bench_results,
         "syscalls": {
             "haproxy": h_syscalls,
-            "ibex": i_syscalls,
+            "alcyon": i_syscalls,
         },
         "non_canonical": diff_results,
     }

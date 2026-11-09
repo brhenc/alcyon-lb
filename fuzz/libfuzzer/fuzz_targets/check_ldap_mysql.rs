@@ -3,7 +3,7 @@
 //! LDAP and MySQL check replies (T242), apart from `check_reply`: they panic on short
 //! replies (production review #7, fixed by T238). First byte: parser, EOF, MySQL user.
 #![no_main]
-use ibex_rt::check_reply as cr;
+use alcyon_rt::check_reply as cr;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

@@ -1,7 +1,7 @@
-# Ibex QUIC & HTTP/3 Architecture Blueprint
+# Alcyon QUIC & HTTP/3 Architecture Blueprint
 
 **Status:** Research & Architecture Specification (Milestone 7 / Future Transport Architecture)  
-**Author:** Ibex QUIC & HTTP/3 Architecture Researcher  
+**Author:** Alcyon QUIC & HTTP/3 Architecture Researcher  
 **Safety & Concurrency Invariant:** `#![forbid(unsafe_code)]`, zero-allocation hot-path (NASA JPL Rule 3), level-triggered batch I/O, `!Send` thread-local affinity.
 
 ---
@@ -10,15 +10,15 @@
 
 QUIC (RFC 9000), QUIC TLS 1.3 (RFC 9001), and HTTP/3 (RFC 9114) represent a paradigm shift in Internet transport and proxy architecture. Unlike TCP where the kernel handles stream reassembly, congestion control, ACK generation, and connection state machines, QUIC places the entire transport and encryption stack inside the userspace application layer over UDP datagrams.
 
-This document establishes the architecture for native QUIC and HTTP/3 in Project Ibex, based on exhaustive research into:
+This document establishes the architecture for native QUIC and HTTP/3 in Project Alcyon, based on exhaustive research into:
 1. **HAProxy 3.5-dev native QUIC/H3 implementation** (`src/quic_sock.c`, `src/quic_cid.c`, `src/quic_conn.c`, `src/quic_rx.c`, `src/quic_tx.c`, `src/quic_tls.c`, `src/quic_ssl.c`, `src/xprt_quic.c`, `src/mux_quic.c`, `src/h3.c`, and `include/haproxy/quic_*.h`).
 2. **IETF Standards**: RFC 9000 (QUIC Transport), RFC 9001 (QUIC TLS 1.3), RFC 9002 (Loss Detection & Congestion Control), RFC 9114 (HTTP/3), and RFC 9204 (QPACK).
 3. **Rustls 0.23 QUIC Engine**: Operating strictly under `#![forbid(unsafe_code)]`, providing record-less TLS 1.3 handshake state machines, header protection key derivation, and packet encryption.
-4. **Ibex Engine Integration**: Level-triggered `Poller` with `recvmmsg`/`sendmmsg` batching, `FdTab` virtualized FD-less sessions, 256-shard `ebtree` CID routing, stateless ODCID hashing, zero-allocation packet and frame index arenas, unified TCP/QUIC TLS 1.3 certificate dispatch, and `Class::Heavy` scheduler throttling against asymmetric handshake attacks.
+4. **Alcyon Engine Integration**: Level-triggered `Poller` with `recvmmsg`/`sendmmsg` batching, `FdTab` virtualized FD-less sessions, 256-shard `ebtree` CID routing, stateless ODCID hashing, zero-allocation packet and frame index arenas, unified TCP/QUIC TLS 1.3 certificate dispatch, and `Class::Heavy` scheduler throttling against asymmetric handshake attacks.
 
 ```
 +---------------------------------------------------------------------------------------------------+
-|                                          IBEX ARCHITECTURE                                        |
+|                                          ALCYON ARCHITECTURE                                        |
 +---------------------------------------------------------------------------------------------------+
 |  L7 HTTP/3 (RFC 9114)  |  H3 Control Stream (0x00)  |  QPACK Streams (0x02/03)  | Request Streams |
 |                        +----------------------------+---------------------------+-----------------+
@@ -297,7 +297,7 @@ while let Some(event) = quic_tls.next_event() {
 
 ---
 
-## 3. Architectural Impact on Ibex
+## 3. Architectural Impact on Alcyon
 
 ### 3.1 UDP Datagram Polling in `Poller` and `FdTab`
 
@@ -377,7 +377,7 @@ In TCP, `Poller` and `FdTab` manage 1:1 file descriptors (`FdState::Conn` / `FdS
      ```
 3. **Seamless Connection Migration**:
    - When a mobile client switches networks (e.g., Wi-Fi to 5G), the source IP and port change.
-   - Because Ibex routes datagrams strictly via DCID in the `EbMbTree` rather than `(IP, Port)`, the datagram is instantly dispatched to the existing session without connection teardown.
+   - Because Alcyon routes datagrams strictly via DCID in the `EbMbTree` rather than `(IP, Port)`, the datagram is instantly dispatched to the existing session without connection teardown.
    - The session updates its peer address upon validating the migration via `PATH_CHALLENGE` / `PATH_RESPONSE`.
 
 ### 3.3 Zero-Allocation Memory Layout for Datagrams & Streams
@@ -476,15 +476,15 @@ In alignment with **NASA JPL Rule 3** and `design/006-data-layout.md`, the QUIC 
 
 1. **CPU Exhaustion Defense**:
    - Initial QUIC packet decryption, ECDH key exchange, and certificate signature verification are computationally asymmetric.
-   - Incoming Initial packets that require cryptographic handshakes are tagged with `state::HEAVY = 1 << 5` and scheduled under `Class::Heavy` in `ibex-sched`.
+   - Incoming Initial packets that require cryptographic handshakes are tagged with `state::HEAVY = 1 << 5` and scheduled under `Class::Heavy` in `alcyon-sched`.
    - The scheduler restricts execution to **at most 1 heavy task per scheduler pass**, guaranteeing established HTTP/1.1, HTTP/2, and HTTP/3 transactions never experience latency spikes during SYN/Initial flooding.
 2. **Stateless Retry Defense (`Retry` Packets)**:
-   - Under server overload, Ibex emits stateless `Retry` packets containing an encrypted `Token` with an AEAD Retry Integrity Tag.
+   - Under server overload, Alcyon emits stateless `Retry` packets containing an encrypted `Token` with an AEAD Retry Integrity Tag.
    - The server drops the connection state entirely; legitimate clients replay their `Initial` packet with the validated token, confirming client IP ownership before allocating server memory.
 
 ---
 
-## 4. Ibex QUIC & HTTP/3 Implementation Roadmap (Milestone 7)
+## 4. Alcyon QUIC & HTTP/3 Implementation Roadmap (Milestone 7)
 
 ```
 +-----------------------------------------------------------------------------------------------+

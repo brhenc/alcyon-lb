@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 #
-# T603: build HAProxy the ways Ibex is built (o2, lto, pgo, pgo-lto) from COPIES of the oracle
+# T603: build HAProxy the ways Alcyon is built (o2, lto, pgo, pgo-lto) from COPIES of the oracle
 # sources, train the pgo builds with the same request mix as tools/pgo-build.sh, and measure.
 # The oracle trees and binaries under ~/reference are never touched (git archive reads them).
 #
@@ -16,12 +16,12 @@
 # Training: the mix of tools/pgo-build.sh train(), the same requests in the same order; q10 gets
 # the HTTP/3 part and the fe_h3 frontend of tools/pgo/train.cfg, d8 (no QUIC) does not.
 # Needs the same tools as pgo-build.sh (h2load, socat, openssl, curl, nc) and its measure-bench/h3bench
-# (HAPV_BENCH_DIR, default ~/ibex-targets/t603-ibex/pgo-bench/release). Training runs under
+# (HAPV_BENCH_DIR, default ~/ibex-targets/t603-alcyon/pgo-bench/release). Training runs under
 # flock -x /tmp/ibex-load.lock (a synthetic load), builds run niced on CPUs 16-47.
 set -u
 ROOT=${HAPV_ROOT:-$HOME/ibex-targets/t603}
 HERE=$(cd "$(dirname "$0")/../.." && pwd) || exit 1
-BENCHD=${HAPV_BENCH_DIR:-$HOME/ibex-targets/t603-ibex/pgo-bench/release}
+BENCHD=${HAPV_BENCH_DIR:-$HOME/ibex-targets/t603-alcyon/pgo-bench/release}
 BUILDCPUS=${HAPV_BUILD_CPUS:-16-47}
 log() { echo "haproxy-variants [$(date +%H:%M:%S)]: $*" >&2; }
 die() { echo "haproxy-variants: $*" >&2; exit 1; }

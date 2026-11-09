@@ -4,8 +4,8 @@
 
 """Run the HTTP transaction tests against the reference HAProxy, to see when HAProxy changes.
 
-`crates/ibex-rt/tests/http_txn.rs` drives a proxy binary over real sockets, and every case
-in it was measured against HAProxy before Ibex was made to match (`IBEX_TXN_BIN` selects the
+`crates/alcyon-rt/tests/http_txn.rs` drives a proxy binary over real sockets, and every case
+in it was measured against HAProxy before Alcyon was made to match (`ALCYON_TXN_BIN` selects the
 binary). Run against HAProxy here, the file states what HAProxy does today. A case that
 starts failing means HAProxy's behaviour moved -- the T89 case (Content-Length beside
 chunked) exists for exactly this -- and the user wants to know when that happens, not to
@@ -43,10 +43,10 @@ def main() -> int:
     print(f"txn oracle: {version}")
     print(f"txn oracle: baseline measured on {base['measured_on']}")
 
-    env = dict(os.environ, IBEX_TXN_BIN=haproxy)
-    # http_txn.rs is the module `http_txn` of ibex-rt's test binary `it` (T260); its cases
+    env = dict(os.environ, ALCYON_TXN_BIN=haproxy)
+    # http_txn.rs is the module `http_txn` of alcyon-rt's test binary `it` (T260); its cases
     # keep their bare names in the baseline.
-    p = subprocess.run(["cargo", "test", "-p", "ibex-rt", "--test", "it", "--no-fail-fast", "--", "http_txn::"],
+    p = subprocess.run(["cargo", "test", "-p", "alcyon-rt", "--test", "it", "--no-fail-fast", "--", "http_txn::"],
                        cwd=REPO, env=env, capture_output=True, text=True, timeout=1800)
     results = {t.removeprefix("http_txn::"): r for t, r in RESULT_RE.findall(p.stdout + p.stderr)
                if t.startswith("http_txn::")}

@@ -1,8 +1,8 @@
-# HAProxy 3.5 Complete Keyword Catalog & Implementation Roadmap for Project Ibex
+# HAProxy 3.5 Complete Keyword Catalog & Implementation Roadmap for Project Alcyon
 
 **Target Baseline:** HAProxy 3.5-dev7 (commit `e6f616af`, 2026-09-21)  
 **Document Type:** Exhaustive Architectural Syntax Catalog & Engineering Roadmap  
-**Target Crates:** `ibex-config`, `ibex-proto`, `ibex-rt`, `ibex-stick-table`, `ibex-tls`, `ibex-sample`  
+**Target Crates:** `alcyon-config`, `alcyon-proto`, `alcyon-rt`, `alcyon-stick-table`, `alcyon-tls`, `alcyon-sample`  
 **Safety & Memory Invariant:** Pure Rust `#![forbid(unsafe_code)]`, zero heap allocation on event loops (NASA JPL Rule 3), bounded $O(1)$/$O(\log N)$ algorithmic complexity.
 
 ---
@@ -36,13 +36,13 @@
 6. [Bind and Server Parameters Catalog](#6-bind-and-server-parameters-catalog)
    - 6.1 [Bind Parameters (`bind`)](#61-bind-parameters-bind)
    - 6.2 [Server & Default-Server Parameters (`server`, `default-server`)](#62-server--default-server-parameters-server-default-server)
-7. [Project Ibex Implementation Priority Roadmap](#7-project-ibex-implementation-priority-roadmap)
+7. [Project Alcyon Implementation Priority Roadmap](#7-project-ibex-implementation-priority-roadmap)
    - 7.1 [Roadmap Summary Matrix](#71-roadmap-summary-matrix)
    - 7.2 [Tier P0: Core Production Essentials (Milestones 1–4)](#72-tier-p0-core-production-essentials-milestones-14)
    - 7.3 [Tier P1: Standard Web Traffic & Observability (Milestones 5–8)](#73-tier-p1-standard-web-traffic--observability-milestones-58)
    - 7.4 [Tier P2: Advanced Traffic Management & Caching (Milestones 9–11)](#74-tier-p2-advanced-traffic-management--caching-milestones-911)
    - 7.5 [Tier P3: Specialized Niche Features (Post-1.0 / Enterprise / Edge)](#75-tier-p3-specialized-niche-features-post-10--enterprise--edge)
-   - 7.6 [Parser Architectural Blueprint for `ibex-config`](#76-parser-architectural-blueprint-for-ibex-config)
+   - 7.6 [Parser Architectural Blueprint for `alcyon-config`](#76-parser-architectural-blueprint-for-alcyon-config)
 
 ---
 
@@ -50,7 +50,7 @@
 
 This document represents the definitive, exhaustive audit of the configuration syntax, action rules, sample extraction engines, converter pipelines, and server/listener parameter models implemented in **HAProxy 3.5-dev7** (specifically reference commit `e6f616af` dated September 2026).
 
-Project Ibex is an ultra-high-performance, memory-safe, asynchronous HTTP/1.1, HTTP/2, HTTP/3, and TCP reverse proxy written entirely in pure Rust under `#![forbid(unsafe_code)]`. Rather than emulating obsolete HAProxy 1.x configurations that relied on unmaintainable regex replacements (`reqrep`/`rsprep`) and monolithic architectures, Ibex targets native **HAProxy 3.5 HTX (HTTP Tree eXpression)** grammar directly.
+Project Alcyon is an ultra-high-performance, memory-safe, asynchronous HTTP/1.1, HTTP/2, HTTP/3, and TCP reverse proxy written entirely in pure Rust under `#![forbid(unsafe_code)]`. Rather than emulating obsolete HAProxy 1.x configurations that relied on unmaintainable regex replacements (`reqrep`/`rsprep`) and monolithic architectures, Alcyon targets native **HAProxy 3.5 HTX (HTTP Tree eXpression)** grammar directly.
 
 ### 1.1 Codebase Audit Methodology
 The audit was conducted by extracting and analyzing keyword definitions across both HAProxy 3.5's canonical documentation (`doc/configuration.txt`, 33,415 lines) and C source registration tables:
@@ -75,18 +75,18 @@ The `global` section configures process-wide parameters, system security limits,
 
 #### 2.1.1 Process Management & Security Directives
 
-| Keyword | Syntax | Status (3.5) | Description & Ibex Architecture |
+| Keyword | Syntax | Status (3.5) | Description & Alcyon Architecture |
 |---|---|---|---|
-| `chroot` | `chroot <jail dir>` | Standard | Changes the root directory of the process after binding sockets. In Ibex, containerized deployments (cgroups/namespaces) or `systemd DynamicUser` provide superior isolation; supported for compatibility. |
-| `daemon` | `daemon` | Standard | Forks the process into the background. Ibex runs in foreground by default (`Type=notify` in systemd); ignored with informational log if present. |
-| `user` | `user <username>` | Standard | Drops privileges to the specified user after socket binding. Ibex drops Linux capabilities (`CAP_NET_BIND_SERVICE`). |
+| `chroot` | `chroot <jail dir>` | Standard | Changes the root directory of the process after binding sockets. In Alcyon, containerized deployments (cgroups/namespaces) or `systemd DynamicUser` provide superior isolation; supported for compatibility. |
+| `daemon` | `daemon` | Standard | Forks the process into the background. Alcyon runs in foreground by default (`Type=notify` in systemd); ignored with informational log if present. |
+| `user` | `user <username>` | Standard | Drops privileges to the specified user after socket binding. Alcyon drops Linux capabilities (`CAP_NET_BIND_SERVICE`). |
 | `group` | `group <groupname>` | Standard | Drops privileges to the specified group. |
 | `uid` | `uid <number>` | Standard | Numerical user ID to set. |
 | `gid` | `gid <number>` | Standard | Numerical group ID to set. |
 | `pidfile` | `pidfile <path>` | Standard | Writes the process PID to a file. |
 | `node` | `node <name>` | Standard | Sets the node name for inventory and cluster identification. |
 | `description` | `description <text>` | Standard | Sets an administrative description of the instance. |
-| `hard-stop-after` | `hard-stop-after <time>` | Standard | Maximum time allowed to perform a soft reload before forcing shutdown. Crucial in Ibex graceful draining. |
+| `hard-stop-after` | `hard-stop-after <time>` | Standard | Maximum time allowed to perform a soft reload before forcing shutdown. Crucial in Alcyon graceful draining. |
 | `grace` | `grace <time>` | Standard | Duration of the graceful drain period upon receiving `SIGUSR1`. |
 | `default-path` | `default-path { current | config | parent | origin }` | Standard | Sets default base directory resolution for relative configuration paths. |
 | `ca-base` | `ca-base <dir>` | Standard | Default directory for CA certificates. |
@@ -125,9 +125,9 @@ The `global` section configures process-wide parameters, system security limits,
 
 #### 2.1.2 Multi-Threading & CPU Topology Directives
 
-| Keyword | Syntax | Status (3.5) | Description & Ibex Architecture |
+| Keyword | Syntax | Status (3.5) | Description & Alcyon Architecture |
 |---|---|---|---|
-| `nbthread` | `nbthread <number>` | Standard | Number of worker threads to spawn. Ibex defaults to `std::thread::available_parallelism()` with hard thread affinity. |
+| `nbthread` | `nbthread <number>` | Standard | Number of worker threads to spawn. Alcyon defaults to `std::thread::available_parallelism()` with hard thread affinity. |
 | `thread-group` | `thread-group <num> <threads>` | Standard | Defines thread groupings for NUMA locality and partitioned worker pools. |
 | `thread-groups` | `thread-groups <count>` | Standard | Sets the total count of thread groups. |
 | `thread-hard-limit` | `thread-hard-limit <num>` | Standard | Enforces a hard ceiling on total worker threads. |
@@ -141,9 +141,9 @@ The `global` section configures process-wide parameters, system security limits,
 
 HAProxy 3.5 provides deep, low-level tuning knobs for memory buffers, socket queues, TLS pipelines, HTTP/2 flow control, and HTTP/3 QUIC state machines.
 
-| Keyword | Syntax | Status (3.5) | Description & Ibex Mapping |
+| Keyword | Syntax | Status (3.5) | Description & Alcyon Mapping |
 |---|---|---|---|
-| `tune.bufsize` | `tune.bufsize <bytes>` | Standard | Default buffer slab size for all session I/O (default 16,384 bytes). In Ibex, maps to `PooledBuf` chunk size. |
+| `tune.bufsize` | `tune.bufsize <bytes>` | Standard | Default buffer slab size for all session I/O (default 16,384 bytes). In Alcyon, maps to `PooledBuf` chunk size. |
 | `tune.bufsize.small` | `tune.bufsize.small <bytes>` | New in 3.x | Smaller buffer slab size for idle or low-bandwidth streams. |
 | `tune.bufsize.large` | `tune.bufsize.large <bytes>` | New in 3.x | Jumbo buffer slab size for heavy streaming responses. |
 | `tune.maxrewrite` | `tune.maxrewrite <bytes>` | Standard | Reserved header rewrite buffer margin (default 1,024 bytes). Prevents body data from starving header injection. |
@@ -184,7 +184,7 @@ HAProxy 3.5 provides deep, low-level tuning knobs for memory buffers, socket que
 | `tune.quic.fe.tx.udp-gso` | `tune.quic.fe.tx.udp-gso { on \| off }` | New in 3.x | Enables Linux UDP Generic Segmentation Offload (GSO) for high-speed QUIC packet output. |
 | `tune.quic.fe.tx.pacing` | `tune.quic.fe.tx.pacing { on \| off }` | New in 3.x | Enables packet pacing for QUIC congestion avoidance. |
 | `tune.quic.mem.tx-max` | `tune.quic.mem.tx-max <bytes>` | New in 3.x | Global memory allocation ceiling for QUIC retransmission buffers. |
-| `tune.sched.low-latency` | `tune.sched.low-latency { on \| off }` | Standard | Instructs event scheduler to prioritize I/O completion over batching. Maps to `ibex-sched`. |
+| `tune.sched.low-latency` | `tune.sched.low-latency { on \| off }` | Standard | Instructs event scheduler to prioritize I/O completion over batching. Maps to `alcyon-sched`. |
 | `tune.sched.remote-work-budget` | `tune.sched.remote-work-budget <num>` | New in 3.x | Number of task migrations processed per scheduler tick. |
 | `tune.peers.max-updates-at-once` | `tune.peers.max-updates-at-once <num>` | Standard | Batch limit on stick-table synchronization updates sent across peers. |
 | `tune.ring.queues` | `tune.ring.queues <num>` | New in 3.x | Number of multi-producer lock-free queues in ring sinks. |
@@ -219,7 +219,7 @@ Proxy sections define the core forwarding topology of HAProxy:
 
 #### 2.2.1 Proxy Keywords Applicability Matrix & Reference
 
-| Keyword | Syntax | Defaults | Frontend | Backend | Listen | Status (3.5) | Description & Ibex Architecture |
+| Keyword | Syntax | Defaults | Frontend | Backend | Listen | Status (3.5) | Description & Alcyon Architecture |
 |---|---|:---:|:---:|:---:|:---:|:---:|---|
 | `mode` | `mode { http \| tcp }` | Yes | Yes | Yes | Yes | Standard | Sets the operational layer. `http` activates the HTX state machine; `tcp` operates raw stream forwarding. |
 | `bind` | `bind <addr>:<port> [param*]` | No | Yes | No | Yes | Standard | Binds listeners to network endpoints. Supports TLS, PROXY protocol, and socket options. |
@@ -306,7 +306,7 @@ Proxy sections define the core forwarding topology of HAProxy:
 
 #### 2.2.2 Obsolete Directives Purged in HAProxy 3.5
 
-| Excised Keyword | Excised In | Historical Purpose | Modern HAProxy 3.5 & Ibex Replacement |
+| Excised Keyword | Excised In | Historical Purpose | Modern HAProxy 3.5 & Alcyon Replacement |
 |---|---|---|---|
 | `dispatch <addr:port>` | HAProxy 3.5 (`be8159248`) | Fixed unconditional IP:port forwarding fallback. | **Fatal parse error**. Replace with `server default <addr:port>`. |
 | `transparent` | HAProxy 3.5 (`be8159248`) | Intercepted destination address preservation. | **Fatal parse error**. Replace with `server transparent 0.0.0.0` or `usesrc clientip`. |
@@ -322,7 +322,7 @@ Proxy sections define the core forwarding topology of HAProxy:
 
 The `peers` section defines cluster membership for synchronizing stick-table contents across multiple HAProxy instances or across multi-core worker threads.
 
-| Keyword | Syntax | Status (3.5) | Description & Ibex Architecture |
+| Keyword | Syntax | Status (3.5) | Description & Alcyon Architecture |
 |---|---|---|---|
 | `peers` | `peers <name>` | Standard | Begins a peers cluster definition block. |
 | `peer` | `peer <name> <addr>:<port>` | Standard | Defines a remote peer host address and synchronization TCP listener port. |
@@ -342,7 +342,7 @@ The `peers` section defines cluster membership for synchronizing stick-table con
 
 The `mailers` section configures SMTP servers used by proxies to dispatch email notifications upon critical server health state transitions.
 
-| Keyword | Syntax | Status (3.5) | Description & Ibex Architecture |
+| Keyword | Syntax | Status (3.5) | Description & Alcyon Architecture |
 |---|---|---|---|
 | `mailers` | `mailers <name>` | Standard | Begins an SMTP mailer cluster definition block. |
 | `mailer` | `mailer <name> <addr>:<port>` | Standard | Declares an outbound SMTP relay server endpoint. |
@@ -354,7 +354,7 @@ The `mailers` section configures SMTP servers used by proxies to dispatch email 
 
 The `cache` section declares an in-memory HTTP cache instance adhering to RFC 9111 HTTP Caching semantics, referenced by `http-request cache-use` and `http-response cache-store`.
 
-| Keyword | Syntax | Status (3.5) | Description & Ibex Architecture |
+| Keyword | Syntax | Status (3.5) | Description & Alcyon Architecture |
 |---|---|---|---|
 | `cache` | `cache <name>` | Standard | Begins an in-memory RFC 9111 cache definition block. |
 | `total-max-size` | `total-max-size <megabytes>` | Standard | Global RAM ceiling allocated to this cache instance in megabytes. |
@@ -370,7 +370,7 @@ The `cache` section declares an in-memory HTTP cache instance adhering to RFC 91
 
 The `resolvers` section configures asynchronous DNS nameservers for runtime backend server IP address resolution, SRV service discovery, and dynamic hostname tracking.
 
-| Keyword | Syntax | Status (3.5) | Description & Ibex Architecture |
+| Keyword | Syntax | Status (3.5) | Description & Alcyon Architecture |
 |---|---|---|---|
 | `resolvers` | `resolvers <id>` | Standard | Begins a DNS resolution group definition block. |
 | `nameserver` | `nameserver <id> <addr>:<port>` | Standard | Declares an upstream DNS nameserver (UDP/TCP fallback). |
@@ -404,8 +404,8 @@ However, managing child process lifecycles, signal propagation (`SIGUSR1`, `SIGT
 In HAProxy commit `7cb6167d046f1b37c19784fe99b9b6d37ea83c54` ("MAJOR: mworker: remove program section support"), William Lallemand completely excised the `program` section:
 > *"This patch removes completely the support for the program section, the parsing of the section as well as the internals in the mworker does not support it anymore. The program section was considered dysfunctional and not fully compatible with the 'mworker V3' model. Users that want to run an external program must use their init system."*
 
-#### 2.7.2 Ibex Architectural Recommendation
-- **Ibex Parser Behavior**: The `ibex-config` parser strictly rejects `program` blocks with a structured diagnostic error:
+#### 2.7.2 Alcyon Architectural Recommendation
+- **Alcyon Parser Behavior**: The `alcyon-config` parser strictly rejects `program` blocks with a structured diagnostic error:
   ```
   error[E0350]: 'program' section is obsolete and was removed in HAProxy 3.2+
     --> haproxy.cfg:42:1
@@ -415,7 +415,7 @@ In HAProxy commit `7cb6167d046f1b37c19784fe99b9b6d37ea83c54` ("MAJOR: mworker: r
      |
      = help: manage sidecar binaries using your system init daemon (systemd, runit) or container orchestrator (Kubernetes, Nomad).
   ```
-- **Architectural Tenet**: Adhering to Unix philosophy, Ibex focuses exclusively on high-performance packet and byte processing, delegating process lifecycle supervision to systemd / cgroups.
+- **Architectural Tenet**: Adhering to Unix philosophy, Alcyon focuses exclusively on high-performance packet and byte processing, delegating process lifecycle supervision to systemd / cgroups.
 
 ---
 
@@ -423,7 +423,7 @@ In HAProxy commit `7cb6167d046f1b37c19784fe99b9b6d37ea83c54` ("MAJOR: mworker: r
 
 The `fcgi-app` section configures an upstream FastCGI application gateway (e.g. PHP-FPM, Python FastCGI) for direct proxying without intermediary web servers.
 
-| Keyword | Syntax | Status (3.5) | Description & Ibex Architecture |
+| Keyword | Syntax | Status (3.5) | Description & Alcyon Architecture |
 |---|---|---|---|
 | `fcgi-app` | `fcgi-app <name>` | Standard | Begins a FastCGI application definition block. |
 | `docroot` | `docroot <path>` | Standard | Base document root directory sent in `DOCUMENT_ROOT` FastCGI parameter. |
@@ -446,7 +446,7 @@ The `fcgi-app` section configures an upstream FastCGI application gateway (e.g. 
 
 The `ring` section configures a fixed-capacity, lock-free, zero-allocation circular memory buffer used for internal log aggregation, tracing, and CLI inspection.
 
-| Keyword | Syntax | Status (3.5) | Description & Ibex Architecture |
+| Keyword | Syntax | Status (3.5) | Description & Alcyon Architecture |
 |---|---|---|---|
 | `ring` | `ring <name>` | Standard | Begins a circular ring buffer definition block. |
 | `size` | `size <bytes>` | Standard | Allocates fixed byte capacity for the circular buffer (power of 2 recommended). |
@@ -462,7 +462,7 @@ The `ring` section configures a fixed-capacity, lock-free, zero-allocation circu
 
 ### 2.10 Ancillary Sections (`userlist`, `http-errors`, `log-forward`, `crt-store`, `acme`)
 
-| Section | Key Directives | Status (3.5) | Description & Ibex Architecture |
+| Section | Key Directives | Status (3.5) | Description & Alcyon Architecture |
 |---|---|---|---|
 | `userlist <name>` | `user <name> [password\|insecure-password <pwd>] [groups <g>]`, `group <name> [users <u>]` | Standard | In-memory authentication database for HTTP Basic Auth (`http-request auth`). |
 | `http-errors <name>` | `errorfile <code> <path>`, `http-error status <code> [headers/body]` | Standard | Reusable dictionary of custom error pages shared across multiple proxies. |
@@ -541,7 +541,7 @@ HAProxy 3.5 executes HTTP actions across three discrete pipeline stages:
 | `set-mark` | `set-mark <mark>` | Deprecated | Legacy socket mark setter; deprecated in 3.5 in favor of `set-fc-mark`. |
 | `set-tos` | `set-tos <tos>` | Deprecated | Legacy socket ToS setter; deprecated in 3.5 in favor of `set-fc-tos`. |
 | `set-log-level`| `set-log-level <level>` | Standard | Dynamically adjusts syslog severity level for this specific transaction. |
-| `set-nice` | `set-nice <nice>` | Standard | Adjusts thread task priority nice value (-1024 to 1024) in `ibex-sched`. |
+| `set-nice` | `set-nice <nice>` | Standard | Adjusts thread task priority nice value (-1024 to 1024) in `alcyon-sched`. |
 | `set-priority-class`| `set-priority-class <expr>` | Standard | Assigns stream to a connection queue priority class. |
 | `set-priority-offset`| `set-priority-offset <expr>`| Standard | Adjusts stream queue priority offset for aging acceleration. |
 | `set-retries` | `set-retries <expr>` | Standard | Dynamically overrides backend retry limit. |
@@ -736,7 +736,7 @@ Fetches return values typed according to HAProxy's internal type lattice:
 
 #### 5.1.2 Essential Sample Fetches Matrix
 
-| Category | Sample Fetch | Output Type | Description & Ibex Processing Engine |
+| Category | Sample Fetch | Output Type | Description & Alcyon Processing Engine |
 |---|---|---|---|
 | **Layer 4 Socket** | `src` | `SMP_T_ADDR` | Client socket source IP address (IPv4 or IPv6). |
 | | `src_port` | `SMP_T_SINT` | Client socket source TCP/UDP port number. |
@@ -917,9 +917,9 @@ Listeners declared via `bind` and backend server destinations declared via `serv
 
 ### 6.1 Bind Parameters (`bind`)
 
-| Bind Parameter | Syntax | Status (3.5) | Description & Ibex Architecture |
+| Bind Parameter | Syntax | Status (3.5) | Description & Alcyon Architecture |
 |---|---|---|---|
-| `accept-proxy` | `accept-proxy` | Standard | Enforces PROXY protocol v1 or v2 on all incoming client connections. Parsed via `ibex-proto::proxy_protocol`. |
+| `accept-proxy` | `accept-proxy` | Standard | Enforces PROXY protocol v1 or v2 on all incoming client connections. Parsed via `alcyon-proto::proxy_protocol`. |
 | `accept-netscaler-cip`| `accept-netscaler-cip <magic>`| Standard | Accepts Citrix NetScaler Client IP insertion header. |
 | `allow-0rtt` | `allow-0rtt` | Standard | Enables TLS 1.3 Early Data (0-RTT). Gated against replay attacks in HTTP. |
 | `alpn` | `alpn <proto1>,<proto2>...`| Standard | Sets ALPN protocols advertised in TLS handshake (e.g. `h2,http/1.1`). |
@@ -957,7 +957,7 @@ Listeners declared via `bind` and backend server destinations declared via `serv
 
 ### 6.2 Server & Default-Server Parameters (`server`, `default-server`)
 
-| Server Parameter | Syntax | Status (3.5) | Description & Ibex Architecture |
+| Server Parameter | Syntax | Status (3.5) | Description & Alcyon Architecture |
 |---|---|---|---|
 | `check` | `check` | Standard | Enables active health check probing on the server endpoint. |
 | `inter` | `inter <time>` | Standard | Regular health check probing interval (default 2,000 ms). |
@@ -1018,9 +1018,9 @@ Listeners declared via `bind` and backend server destinations declared via `serv
 | `verifyhost` | `verifyhost <hostname>` | Standard | Expected Subject Alternative Name in upstream certificate validation. |
 
 ---
-## 7. Project Ibex Implementation Priority Roadmap
+## 7. Project Alcyon Implementation Priority Roadmap
 
-Project Ibex prioritizes feature implementation using a rigorous four-tier taxonomy:
+Project Alcyon prioritizes feature implementation using a rigorous four-tier taxonomy:
 - **Tier P0: Core Production Essentials (Milestones 1–4, Immediate Production Baseline)**
 - **Tier P1: Standard Web Traffic & Observability (Milestones 5–8, Modern TLS & HTTP/2)**
 - **Tier P2: Advanced Traffic Management & Caching (Milestones 9–11, Enterprise Clustering)**
@@ -1032,10 +1032,10 @@ Project Ibex prioritizes feature implementation using a rigorous four-tier taxon
 
 | Tier | Subsystem / Focus | Core Directives & Keywords | Key Action Rules | Target Crates | Safety & Allocation Tenet |
 |---|---|---|---|---|---|
-| **P0** | Core TCP/HTTP Proxy, Basic Balancing, Probes, Logging | `global`, `defaults`, `frontend`, `backend`, `listen`, `bind`, `server`, `default-server`, `mode {tcp\|http}`, `balance {roundrobin\|leastconn\|source}`, `hash-type consistent`, `check`, `inter`, `fall`, `rise`, `weight`, `backup`, `maxconn`, `send-proxy`, `send-proxy-v2`, `accept-proxy`, `timeout connect\|client\|server\|http-request`, `option httplog\|tcplog\|dontlognull` | `http-request {set-header, add-header, del-header, redirect, deny, allow, return}`, `http-response {set-header, add-header, del-header, set-status, deny, allow}`, `tcp-request connection {accept, reject}` | `ibex-config`, `ibex-proto`, `ibex-rt` | Zero runtime heap allocation on event loops (`NASA JPL Rule 3`). |
-| **P1** | HTTP/2, TLS 1.3/SNI/ALPN, Stick Tables, DNS, CLI | `ssl`, `crt`, `ca-file`, `sni`, `alpn`, `strict-sni`, `verify required`, `stick-table`, `resolvers`, `nameserver`, `resolve-prefer`, `http-reuse safe`, `stats socket`, `stats admin`, `log-format`, `server-template` | `http-request {set-path, set-query, replace-header, replace-uri, track-sc0..2, sc-inc-gpc}`, `tcp-request content {accept, reject, track-sc0..2}` | `ibex-tls`, `ibex-stick-table`, `ibex-proto`, `ibex-sample` | Bounded $O(\log N)$ ebtree index lookups, hard thread affinity. |
-| **P2** | RFC 9111 Caching, Multi-Threaded Peers, SPOE, Maps | `cache`, `total-max-size`, `max-age`, `process-vary`, `early-hints`, `peers`, `peer`, `shards`, `table`, `tune.peers.max-updates-at-once`, `filter spoe`, `http-check`, `tcp-check` | `http-request {cache-use, send-spoe-group, set-var, unset-var}`, `http-response {cache-store, send-spoe-group}`, `http-after-response {set-header, set-status}` | `ibex-cache`, `ibex-peers`, `ibex-spoe`, `ibex-rt` | Lock-free SPSC replication rings, pre-allocated memory slabs. |
-| **P3** | FastCGI Gateway, Rings, ACME, Devices, Bandwidth | `fcgi-app`, `ring`, `acme`, `userlist`, `filter bwlim`, `filter otel`, `external-check`, `51degrees`, `deviceatlas`, `wurfl` | `tcp-request content switch-mode`, `http-request {set-bandwidth-limit, normalize-uri}`, `tcp-request connection silent-drop` | `ibex-fcgi`, `ibex-ring`, `ibex-acme`, `ibex-flt` | Bounded queue capacities, sandbox isolation for external processes. |
+| **P0** | Core TCP/HTTP Proxy, Basic Balancing, Probes, Logging | `global`, `defaults`, `frontend`, `backend`, `listen`, `bind`, `server`, `default-server`, `mode {tcp\|http}`, `balance {roundrobin\|leastconn\|source}`, `hash-type consistent`, `check`, `inter`, `fall`, `rise`, `weight`, `backup`, `maxconn`, `send-proxy`, `send-proxy-v2`, `accept-proxy`, `timeout connect\|client\|server\|http-request`, `option httplog\|tcplog\|dontlognull` | `http-request {set-header, add-header, del-header, redirect, deny, allow, return}`, `http-response {set-header, add-header, del-header, set-status, deny, allow}`, `tcp-request connection {accept, reject}` | `alcyon-config`, `alcyon-proto`, `alcyon-rt` | Zero runtime heap allocation on event loops (`NASA JPL Rule 3`). |
+| **P1** | HTTP/2, TLS 1.3/SNI/ALPN, Stick Tables, DNS, CLI | `ssl`, `crt`, `ca-file`, `sni`, `alpn`, `strict-sni`, `verify required`, `stick-table`, `resolvers`, `nameserver`, `resolve-prefer`, `http-reuse safe`, `stats socket`, `stats admin`, `log-format`, `server-template` | `http-request {set-path, set-query, replace-header, replace-uri, track-sc0..2, sc-inc-gpc}`, `tcp-request content {accept, reject, track-sc0..2}` | `alcyon-tls`, `alcyon-stick-table`, `alcyon-proto`, `alcyon-sample` | Bounded $O(\log N)$ ebtree index lookups, hard thread affinity. |
+| **P2** | RFC 9111 Caching, Multi-Threaded Peers, SPOE, Maps | `cache`, `total-max-size`, `max-age`, `process-vary`, `early-hints`, `peers`, `peer`, `shards`, `table`, `tune.peers.max-updates-at-once`, `filter spoe`, `http-check`, `tcp-check` | `http-request {cache-use, send-spoe-group, set-var, unset-var}`, `http-response {cache-store, send-spoe-group}`, `http-after-response {set-header, set-status}` | `alcyon-cache`, `alcyon-peers`, `alcyon-spoe`, `alcyon-rt` | Lock-free SPSC replication rings, pre-allocated memory slabs. |
+| **P3** | FastCGI Gateway, Rings, ACME, Devices, Bandwidth | `fcgi-app`, `ring`, `acme`, `userlist`, `filter bwlim`, `filter otel`, `external-check`, `51degrees`, `deviceatlas`, `wurfl` | `tcp-request content switch-mode`, `http-request {set-bandwidth-limit, normalize-uri}`, `tcp-request connection silent-drop` | `alcyon-fcgi`, `alcyon-ring`, `alcyon-acme`, `alcyon-flt` | Bounded queue capacities, sandbox isolation for external processes. |
 
 ---
 
@@ -1099,18 +1099,18 @@ Provide the minimum viable, high-performance production proxy engine capable of 
 ### 7.3 Tier P1: Standard Web Traffic & Observability (Milestones 5–8)
 
 #### 7.3.1 Scope & Mission
-Bring Ibex to full modern HTTPS web scale: HTTP/2 multiplexing, TLS 1.3 termination with SNI routing and client mTLS, stateful stick-table rate limiting, dynamic DNS service discovery, and CLI control.
+Bring Alcyon to full modern HTTPS web scale: HTTP/2 multiplexing, TLS 1.3 termination with SNI routing and client mTLS, stateful stick-table rate limiting, dynamic DNS service discovery, and CLI control.
 
 #### 7.3.2 P1 Directives & Keyword Inventory
-1. **HTTP/2 Multiplexing & HPACK (`ibex-proto` M5)**:
+1. **HTTP/2 Multiplexing & HPACK (`alcyon-proto` M5)**:
    - Full HTTP/2 connection and stream state machines (`mux_h2`).
    - Static and dynamic HPACK table encoder/decoder (`hpack-dec`, `hpack-enc`).
    - Anti-DDoS mitigation: Rapid Reset RST flood throttling (`tune.h2.fe.max-rst-at-once`).
-2. **TLS / SSL Modern Architecture (`ibex-tls`)**:
+2. **TLS / SSL Modern Architecture (`alcyon-tls`)**:
    - `bind ... ssl crt <path> [alpn <protos>] [strict-sni] [ca-file <ca>] [verify required]`: TLS termination, ALPN negotiation (`h2`, `http/1.1`), and strict SNI certificate dispatch.
    - `server ... ssl [verify none|required] [sni <str>] [alpn <protos>]`: Upstream TLS re-encryption.
    - Sample fetches: `ssl_fc`, `ssl_fc_sni`, `ssl_fc_alpn`, `ssl_fc_cipher`, `ssl_fc_protocol`, `ssl_c_verify`, `ssl_c_s_dn`.
-3. **Stick Tables & Sliding Rate Limiters (`ibex-stick-table`)**:
+3. **Stick Tables & Sliding Rate Limiters (`alcyon-stick-table`)**:
    - `stick-table type {ip|string} size <size> expire <time> store {conn_rate,conn_cnt,http_req_rate,http_err_rate,gpc0,gpt0}`.
    - `http-request track-sc0 <sample> [table <tab>]`.
    - `http-request track-sc1 <sample>`, `track-sc2 <sample>`.
@@ -1197,9 +1197,9 @@ Specialized protocol gateways, legacy hardware offloads, third-party proprietary
 
 ---
 
-### 7.6 Parser Architectural Blueprint for `ibex-config`
+### 7.6 Parser Architectural Blueprint for `alcyon-config`
 
-To achieve exact compatibility with HAProxy 3.5 without inheriting legacy technical debt, the `ibex-config` crate adheres to the following parser architecture:
+To achieve exact compatibility with HAProxy 3.5 without inheriting legacy technical debt, the `alcyon-config` crate adheres to the following parser architecture:
 
 ```
                             [HAProxy 3.5 Configuration File]
@@ -1275,7 +1275,7 @@ match directive {
 ```
 
 #### 7.6.2 Zero-Allocation Hot-Path Invariant
-All parsed rules (`http-request`, `tcp-request`, sample fetches, converters) compile directly into pre-allocated, flat enum representations in `ibex-proto::actions`. During runtime request processing:
+All parsed rules (`http-request`, `tcp-request`, sample fetches, converters) compile directly into pre-allocated, flat enum representations in `alcyon-proto::actions`. During runtime request processing:
 1. No dynamic heap allocations occur (`String`, `Vec`, `Box` are strictly forbidden on the event loop).
 2. Header searches use zero-copy byte slice references against the HTX index arena.
 3. String formatting (`set-var-fmt`, `set-header`) writes directly into pre-allocated thread-local scratch buffers (`PooledBuf`).

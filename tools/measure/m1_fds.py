@@ -42,7 +42,7 @@ if __name__ == "__main__":
     print(m.header("m1_fds"), f"N={N}")
     o, op = m.start_origin()
     try:
-        for kind in ("ibex", "haproxy"):
+        for kind in ("alcyon", "haproxy"):
             med, rs = m.median_of(lambda: once(kind, op))
             m.emit(param="fds", kind=kind, n=N, **med)
     finally:

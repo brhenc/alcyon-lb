@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-"""Generates crates/ibex-sample/src/argspec_table.rs from the HAProxy source (T343).
+"""Generates crates/alcyon-sample/src/argspec_table.rs from the HAProxy source (T343).
 
 Every sample fetch and converter keyword list in HAProxy's src/*.c declares, per keyword, an
 argument mask (ARGn(min, T1, ...), include/haproxy/arg.h), a val_args function, and its types
 (a fetch: output type; a converter: input and output types). Every ACL keyword list names
-the fetch an ACL keyword stands for. This reads them all, so that Ibex checks each argument
+the fetch an ACL keyword stands for. This reads them all, so that Alcyon checks each argument
 against the type HAProxy declares for it, rather than against a hand-copied table.
 
-    python3 tools/gen_sample_argspecs.py /home/bhenc/reference/haproxy > crates/ibex-sample/src/argspec_table.rs
+    python3 tools/gen_sample_argspecs.py /home/bhenc/reference/haproxy > crates/alcyon-sample/src/argspec_table.rs
 """
 import glob
 import re

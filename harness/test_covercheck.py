@@ -61,7 +61,7 @@ class TestBase(unittest.TestCase):
     def setUp(self) -> None:
         self.r = Repo()
         self.env = {k: v for k, v in os.environ.items()
-                    if k not in ("IBEX_COVERCHECK_BASE", "COVERCHECK_BASE")}
+                    if k not in ("ALCYON_COVERCHECK_BASE", "COVERCHECK_BASE")}
 
     def tearDown(self) -> None:
         self.r.close()
@@ -127,7 +127,7 @@ class TestBase(unittest.TestCase):
         self.r.commit("second")
         self.r.write("crates/x/src/lib.rs", "fn a() {}\nfn b() {}\nfn c() {}\n")
         self.r.commit("third")
-        self.assertEqual(self.base(IBEX_COVERCHECK_BASE="HEAD~2"), root)
+        self.assertEqual(self.base(ALCYON_COVERCHECK_BASE="HEAD~2"), root)
         # the older name still works
         self.assertEqual(self.base(COVERCHECK_BASE="HEAD~2"), root)
 
@@ -152,7 +152,7 @@ class TestBase(unittest.TestCase):
 class EnoughProfiles(unittest.TestCase):
     def test_a_mostly_uninstrumented_build_is_refused(self):
         # Seen on 2026-10-03: 22 profiles from 148 binaries; the report held none of
-        # ibex-sample, and covercheck exited 0 on a planted untested function.
+        # alcyon-sample, and covercheck exited 0 on a planted untested function.
         self.assertFalse(covercheck.enough_profiles(22, 148))
 
     def test_a_fully_instrumented_build_is_accepted(self):
@@ -177,19 +177,19 @@ class StaleBinaries(unittest.TestCase):
                 open(path, "w").close()
                 os.chmod(path, 0o755)
                 return path
-            tests = {exe("reload-1111111111111111"), exe("ibex-2222222222222222")}
+            tests = {exe("reload-1111111111111111"), exe("alcyon-2222222222222222")}
             exe("reload-3333333333333333")
-            exe("ibex-4444444444444444")
-            open(os.path.join(deps, "libibex_rt-5555555555555555.rlib"), "w").close()
+            exe("alcyon-4444444444444444")
+            open(os.path.join(deps, "libalcyon_rt-5555555555555555.rlib"), "w").close()
             # The binary the integration tests spawn: cargo names it by its uplifted path,
             # a hard link of the one in deps/.
-            in_deps = exe("ibex-6666666666666666")
-            uplifted = os.path.join(root, "ibex")
+            in_deps = exe("alcyon-6666666666666666")
+            uplifted = os.path.join(root, "alcyon")
             os.link(in_deps, uplifted)
             self.assertEqual(covercheck.prune_stale_binaries(deps, tests | {uplifted}), 2)
             self.assertEqual(sorted(os.listdir(deps)),
                              sorted([os.path.basename(p) for p in tests | {in_deps}]
-                                    + ["libibex_rt-5555555555555555.rlib"]))
+                                    + ["libalcyon_rt-5555555555555555.rlib"]))
 
 
 class CorruptProfiles(unittest.TestCase):
@@ -508,7 +508,7 @@ class OneRunOfTheTests(unittest.TestCase):
 
 
 class ReportObjects(unittest.TestCase):
-    """2026-10-17: the report read debug/ibex-fuzz, the differential harness's binary that
+    """2026-10-17: the report read debug/alcyon-fuzz, the differential harness's binary that
     the diff-fuzz stage builds *after* covercheck, so it was always the previous gate's,
     built from older sources. Its zero counts sat on the line numbers of the old
     `mux_h2.rs` and covercheck called two doc-comment lines of the new one unexecuted.
@@ -532,15 +532,15 @@ class ReportObjects(unittest.TestCase):
 
     def test_an_executable_the_suite_did_not_build_is_not_read(self):
         test_bin = self.exe("deps/it-0123")
-        self.exe("ibex-fuzz")
+        self.exe("alcyon-fuzz")
         self.exe("examples/old")
         self.exe("deps/it-stale")
         self.assertEqual(covercheck.report_objects(self.debug, {test_bin}), [test_bin])
 
     def test_a_hard_link_of_a_built_executable_is_read_once(self):
-        built = self.exe("deps/ibex-0123")
-        os.link(built, os.path.join(self.debug, "ibex"))
-        self.assertEqual(covercheck.report_objects(self.debug, {os.path.join(self.debug, "ibex")}),
+        built = self.exe("deps/alcyon-0123")
+        os.link(built, os.path.join(self.debug, "alcyon"))
+        self.assertEqual(covercheck.report_objects(self.debug, {os.path.join(self.debug, "alcyon")}),
                          [built])
 
 
@@ -549,14 +549,14 @@ class ScopedMode(unittest.TestCase):
     the selected tests only, prints the candidates and always exits 0 (advisory)."""
 
     def test_a_spec_is_crate_target_and_filter(self):
-        self.assertEqual(covercheck.parse_specs(["ibex-rt:it:htx_primary::", "ibex-proto:it"]),
-                         [("ibex-rt", "it", "htx_primary::"), ("ibex-proto", "it", "")])
+        self.assertEqual(covercheck.parse_specs(["alcyon-rt:it:htx_primary::", "alcyon-proto:it"]),
+                         [("alcyon-rt", "it", "htx_primary::"), ("alcyon-proto", "it", "")])
 
     def test_a_filter_may_hold_colons(self):
         self.assertEqual(covercheck.parse_specs(["a:it:m::t"]), [("a", "it", "m::t")])
 
     def test_a_malformed_spec_is_refused(self):
-        for bad in ("ibex-rt", ":it", "ibex-rt:", ""):
+        for bad in ("alcyon-rt", ":it", "alcyon-rt:", ""):
             with self.assertRaises(SystemExit, msg=bad):
                 covercheck.parse_specs([bad])
 
@@ -575,11 +575,11 @@ class ScopedMode(unittest.TestCase):
     def test_the_packages_built_are_the_selected_and_the_changed_ones(self):
         r = Repo()
         try:
-            r.write("crates/x/Cargo.toml", '[package]\nname = "ibex-x"\nversion = "0.1.0"\n')
+            r.write("crates/x/Cargo.toml", '[package]\nname = "alcyon-x"\nversion = "0.1.0"\n')
             self.assertEqual(
                 covercheck.scoped_packages(covercheck.parse_specs(["c:it:"]),
                                            {"crates/x/src/lib.rs": {1}}, r.path),
-                (["c", "ibex-x"], {"ibex-x"}))
+                (["c", "alcyon-x"], {"alcyon-x"}))
         finally:
             r.close()
 
@@ -638,8 +638,8 @@ class ScopedMode(unittest.TestCase):
 
     def test_scoped_mode_takes_no_gate_lock(self):
         src = open(covercheck.__file__).read()
-        self.assertNotIn("ibex-gate", src)
-        self.assertNotIn("ibex-load.lock", src)
+        self.assertNotIn("alcyon-gate", src)
+        self.assertNotIn("alcyon-load.lock", src)
 
 
 if __name__ == "__main__":

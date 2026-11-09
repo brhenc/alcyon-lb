@@ -21,23 +21,23 @@ pub(super) struct Send {
     pub(super) stop_reason: Option<VarInt>,
 }
 
-/// What a `Send` is held in: a pool object with `ibex-pools`, else a `Box` (and the connection
+/// What a `Send` is held in: a pool object with `alcyon-pools`, else a `Box` (and the connection
 /// keeps `SendSpares` of them)
-#[cfg(feature = "ibex-pools")]
-pub(super) type SendBox = ibex_alloc::PoolBox<Box<Send>>;
-#[cfg(not(feature = "ibex-pools"))]
+#[cfg(feature = "alcyon-pools")]
+pub(super) type SendBox = alcyon_alloc::PoolBox<Box<Send>>;
+#[cfg(not(feature = "alcyon-pools"))]
 pub(super) type SendBox = Box<Send>;
-/// The connection's own list of freed `Send`s; with `ibex-pools` the pool is the list
-#[cfg(feature = "ibex-pools")]
+/// The connection's own list of freed `Send`s; with `alcyon-pools` the pool is the list
+#[cfg(feature = "alcyon-pools")]
 pub(super) type SendSpares = ();
-#[cfg(not(feature = "ibex-pools"))]
+#[cfg(not(feature = "alcyon-pools"))]
 pub(super) type SendSpares = Vec<SendBox>;
 
-#[cfg(feature = "ibex-pools")]
-ibex_alloc::declare_pool!(static SEND_POOL: Pool<Box<Send>> = ibex_alloc::PoolSpec::new("quic_send").size(std::mem::size_of::<Send>()););
+#[cfg(feature = "alcyon-pools")]
+alcyon_alloc::declare_pool!(static SEND_POOL: Pool<Box<Send>> = alcyon_alloc::PoolSpec::new("quic_send").size(std::mem::size_of::<Send>()););
 
-#[cfg(feature = "ibex-pools")]
-impl ibex_alloc::Poolable for Box<Send> {
+#[cfg(feature = "alcyon-pools")]
+impl alcyon_alloc::Poolable for Box<Send> {
     fn footprint(&self) -> usize {
         std::mem::size_of::<Send>() + self.pending.footprint()
     }
@@ -52,19 +52,19 @@ impl ibex_alloc::Poolable for Box<Send> {
 
 impl Send {
     /// An unused one; `reinit` gives it its stream's limits
-    #[cfg(feature = "ibex-pools")]
+    #[cfg(feature = "alcyon-pools")]
     fn blank() -> Box<Self> {
         Self::boxed(VarInt::from_u32(0))
     }
 
-    #[cfg(feature = "ibex-pools")]
+    #[cfg(feature = "alcyon-pools")]
     pub(super) fn new(max_data: VarInt) -> SendBox {
-        let mut s = crate::ibex_pools::take(&SEND_POOL);
+        let mut s = crate::alcyon_pools::take(&SEND_POOL);
         s.reinit(max_data);
         s
     }
 
-    #[cfg(not(feature = "ibex-pools"))]
+    #[cfg(not(feature = "alcyon-pools"))]
     pub(super) fn new(max_data: VarInt) -> SendBox {
         Self::boxed(max_data)
     }
@@ -82,12 +82,12 @@ impl Send {
         })
     }
 
-    /// Release the stream's data when it is freed, keeping its allocations (Ibex T543)
+    /// Release the stream's data when it is freed, keeping its allocations (Alcyon T543)
     pub(super) fn free(&mut self) {
         self.pending.reinit();
     }
 
-    /// Reset a freed `Send` to the state `new` gives it, for another stream (Ibex T543)
+    /// Reset a freed `Send` to the state `new` gives it, for another stream (Alcyon T543)
     pub(super) fn reinit(&mut self, max_data: VarInt) {
         // NB: when adding or removing fields, update `new` and this
         let Self {

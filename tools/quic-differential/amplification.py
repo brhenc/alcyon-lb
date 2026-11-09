@@ -19,7 +19,7 @@ This script measures the exact byte response ratio across multiple scenarios:
 3. Spoofed / unverified token Initial packet
 4. Anti-amplification ceiling under repeated Initial packets (unvalidated address)
 
-Outputs statistical measurements and compliance verdicts for HAProxy and Ibex.
+Outputs statistical measurements and compliance verdicts for HAProxy and Alcyon.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ def probe_amplification_single(
     kInitialRtt at 333 ms, placing the first PTO near 1000 ms. HAProxy 3.5-dev7 retransmits at
     1002 ms, so a 0.5 s window counted only its first flight and reported 1.242x for what is
     really 2.281x over 4 s. That number was quoted for a week as the parity target and made
-    Ibex look twice as bad as it was.
+    Alcyon look twice as bad as it was.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", 0))

@@ -3,13 +3,13 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 """M1: reload time and memory (T214). SIGUSR2 under constant `wrk2 -t2 -c50 -R2000` load.
 
-Layouts: haproxy `-W`; ibex `-W`; ibex `-W -S <sock>` (master CLI, T200).
+Layouts: haproxy `-W`; alcyon `-W`; alcyon `-W -S <sock>` (master CLI, T200).
     tools/measure/m1_reload.py single [--runs 3] [--sizes 1000,10000]
     tools/measure/m1_reload.py soak [--reloads 100] [--sizes 1000]
 
 single: per (size, layout), interleaved over the runs: seconds from SIGUSR2 to the first
 answer on a connection a new worker holds (a probe opens one every ~5 ms, then finds the
-process owning the accepted socket in /proc; Ibex has no `pid` fetch to put in a header),
+process owning the accepted socket in /proc; Alcyon has no `pid` fetch to put in a header),
 seconds until the old workers are gone, peak combined VmRSS of every process of the layout
 (master + old + new; sampled every 10 ms), failed requests (wrk2 socket errors + non-2xx).
 soak: N reloads one after the other under load; RSS and fds of the master and of the
@@ -28,7 +28,7 @@ import time
 import m1lib as m
 
 WRK2 = os.path.expanduser(os.environ.get("WRK2", "~/.local/bin/wrk2"))
-LAYOUTS = (("haproxy", "-W"), ("ibex", "-W"), ("ibex", "-W -S"))
+LAYOUTS = (("haproxy", "-W"), ("alcyon", "-W"), ("alcyon", "-W -S"))
 _ports = iter(range(27001, 27100))
 
 
@@ -48,7 +48,7 @@ def next_port():
 m.free_port = next_port  # m1lib.start_origin uses it too
 
 
-def cfg_text(port, origin, n, kind="ibex", sock=""):
+def cfg_text(port, origin, n, kind="alcyon", sock=""):
     out = ["global", "    maxconn 20000", "    nbthread 1"] + ([f"    stats socket {sock} mode 600 level admin expose-fd listeners"] if kind == "haproxy" and not os.environ.get("NO_EXPOSE_FD") else []) + ["defaults", "    mode http",
            "    timeout connect 5s", "    timeout client 30s", "    timeout server 30s",
            "frontend fe", "    maxconn 20000", f"    bind 127.0.0.1:{port}",
@@ -132,7 +132,7 @@ class Proxy:
         self.pidfile = os.path.join(self.dir, "p.pid")
         with open(self.cfg, "w") as f:
             f.write(cfg_text(self.port, origin, nback, kind, f"/tmp/m1r-{os.getpid()}-{self.port}.stats"))
-        binary = m.IBEX if kind == "ibex" else m.HAPROXY
+        binary = m.ALCYON if kind == "alcyon" else m.HAPROXY
         argv = [binary] + flags.split() + ["-f", self.cfg, "-p", self.pidfile]
         if "-S" in argv:  # master CLI socket: short path (sun_path limit)
             argv.insert(argv.index("-S") + 1, f"/tmp/m1r-{os.getpid()}-{self.port}.sock")

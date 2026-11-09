@@ -29,10 +29,10 @@
 
 | Count | Total Bytes | Call Site |
 |---:|---:|---|
-| 2 | 12 B | `<ibex_rt::proxy::TcpSession>::process_cli_io` |
-| 1 | 32 B | `<alloc::vec::Vec<usize> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<usize, core::iter::adapters::filter::Filter<core::ops::range::Range<usize>, <ibex_rt::engine::Proxy>::eligible_server_indices::{closure#1}>>>::from_iter` |
-| 1 | 48 B | `<alloc::boxed::Box<ibex_proto::h1::H1Parser>>::new` |
-| 1 | 40 B | `<no ibex frame>` |
+| 2 | 12 B | `<alcyon_rt::proxy::TcpSession>::process_cli_io` |
+| 1 | 32 B | `<alloc::vec::Vec<usize> as alloc::vec::spec_from_iter_nested::SpecFromIterNested<usize, core::iter::adapters::filter::Filter<core::ops::range::Range<usize>, <alcyon_rt::engine::Proxy>::eligible_server_indices::{closure#1}>>>::from_iter` |
+| 1 | 48 B | `<alloc::boxed::Box<alcyon_proto::h1::H1Parser>>::new` |
+| 1 | 40 B | `<no alcyon frame>` |
 
 ## 2. VTC Regression Board
 
@@ -96,7 +96,7 @@ Tested against HAProxy 3.5-dev regression test suite.
 
 ## 4. Prometheus Telemetry Verification
 
-- **Ibex Emits:** `42` metrics
+- **Alcyon Emits:** `42` metrics
 - **HAProxy Oracle:** `227` metrics
 - **Metric Parity Coverage:** `18.5%`
 - **Rendering Allocations:** `0` allocs, `0` bytes (Zero-Allocation verified: `True`)

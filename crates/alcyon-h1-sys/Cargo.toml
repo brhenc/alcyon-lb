@@ -1,0 +1,15 @@
+[package]
+name = "alcyon-h1-sys"
+version = "0.1.0"
+edition = "2021"
+autotests = false
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1.0"
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"

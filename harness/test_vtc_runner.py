@@ -167,7 +167,7 @@ class MasterCliVersusStatsSocket(unittest.TestCase):
     answers `Unknown command: 'show'` to worker commands, so ~18 reg-tests failed on HAProxy
     itself (T138)."""
 
-    def test_ibex_gets_the_same_prelude_and_no_master_socket(self):
+    def test_alcyon_gets_the_same_prelude_and_no_master_socket(self):
         # T146: several `global` sections merge, so the prelude is the same for both.
         fp = FakeProxy()
         self.addCleanup(fp.tmp.cleanup)
@@ -354,9 +354,9 @@ if __name__ == "__main__":
 
 
 class NothingSurvivesTheRunner(unittest.TestCase):
-    """The runner must not leave the proxy (or its children) or a /tmp/vtc_ibex_* dir behind.
+    """The runner must not leave the proxy (or its children) or a /tmp/vtc_alcyon_* dir behind.
 
-    A board run left an `ibex -f /tmp/vtc_ibex_*/h1/cfg -d` alive for 9 h: a test that
+    A board run left an `alcyon -f /tmp/vtc_alcyon_*/h1/cfg -d` alive for 9 h: a test that
     raised, a timeout, or a SIGTERM of the runner skipped the cleanup. The "proxy" here is
     a script that forks a child (as `-W` does), so only a process-group kill gets both.
     """
@@ -374,7 +374,7 @@ class NothingSurvivesTheRunner(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="leaktest_")
         self.addCleanup(self._reap)
-        self.fake = os.path.join(self.root, "fakeibex")
+        self.fake = os.path.join(self.root, "fakealcyon")
         with open(self.fake, "w") as f:
             f.write(self.FAKE)
         os.chmod(self.fake, 0o755)

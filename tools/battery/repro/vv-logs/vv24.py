@@ -3,7 +3,7 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 """VV-24: server state changes are neither logged nor printed.
 
-vv24.py IBEX [HAPROXY]
+vv24.py ALCYON [HAPROXY]
 s1 has a check on a closed port (127.0.0.1:19991); after 2 s the CLI puts it into maintenance.
 Then a second process loads a server-state file that has s1 in maintenance. Prints every
 non-NOTICE line of stdout+stderr (`log stdout`). HAProxy: 'Server b/s1 is DOWN, reason: ...',
@@ -46,7 +46,7 @@ def run(b, conf, wait, cmds=(), save=None):
         if l.strip() and "NOTICE" not in l and "FD limit" not in l:
             print("    " + l[:170])
 
-for tag, b in (("ibex", IB), ("haproxy", HA)):
+for tag, b in (("alcyon", IB), ("haproxy", HA)):
     st = D + "/state." + tag
     print("%s: check fails, then disable server" % tag)
     run(b, cfg(), 2.0, ["disable server b/s1"], save=st)

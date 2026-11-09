@@ -75,7 +75,7 @@ Breaking the 103 down:
 | `unknown balance algorithm` | 3 | `server/cli_add_server.vtc` |
 | ~14 further keywords and actions | 1–2 each | `hash-preserve-affinity`, `unique-id-format`, `wait-for-body`, `set-retries`, `set-dst-port`, `do-resolve`, `reject`, … |
 
-So the split is close to even: **roughly half the board never reaches Ibex's behaviour**,
+So the split is close to even: **roughly half the board never reaches Alcyon's behaviour**,
 and the other half is genuine behavioural debt. That is a better position than the raw
 10/312 suggests, and a worse one than "it is all parser stubs" would.
 
@@ -109,21 +109,21 @@ with what already exists, it is 20%. Quoting 10/312 understates the position; qu
 `del server` and the dynamic-server family. Either those CLI commands regressed or they
 were never implemented and something else used to carry the test.
 
-**`startup/default_rules.vtc`: "Config check unexpectedly succeeded (-conf-BAD)."** Ibex
+**`startup/default_rules.vtc`: "Config check unexpectedly succeeded (-conf-BAD)."** Alcyon
 accepted a configuration HAProxy rejects. That is the direction that matters — a parser
 that is too permissive is how a typo becomes a silent production difference.
 
 **`startup/check_condition.vtc`: `/bin/sh: line 3: -cc: command not found`.** A harness
-bug, not an Ibex one: the shell block is executed without the binary path prepended.
+bug, not an Alcyon one: the shell block is executed without the binary path prepended.
 
-**`stats/clear_counters_server.vtc`** expects `No such backend` and Ibex says
+**`stats/clear_counters_server.vtc`** expects `No such backend` and Alcyon says
 `No such proxy.` — a one-word message difference, and the cheapest pass on the board.
 
 ## Caveat on an earlier reading
 
 An intermediate analysis of this data concluded that 36 of the 51 `REACHABLE_NOW` tests
-failed because Ibex does not expand `${VAR-default}` in configuration files. **That was
-wrong.** It came from extracting the raw `-conf` block and running `ibex -c` on it
+failed because Alcyon does not expand `${VAR-default}` in configuration files. **That was
+wrong.** It came from extracting the raw `-conf` block and running `alcyon -c` on it
 directly, which skips the substitution the harness does at `vtc_runner.py:619`. The real
 run shows no such failures. Recorded because the wrong number was nearly the headline.
 
@@ -137,6 +137,6 @@ run shows no such failures. Recorded because the wrong number was nearly the hea
 No tests that passed before are failing now.
 
 - `missing port in address` failures (31 tests) on prefixes like `unix@`, `fd@`, `abns@` were correctly changed to fail with `address prefix <prefix> is not implemented`.
-- `startup/default_rules.vtc` still reports "Config check unexpectedly succeeded". The underlying parser flaws (closing unknown keywords in `global` and `defaults` sections, refusing `http-request`/`http-response`/`http-after-request`/`tcp-response` in `defaults`, refusing `defaults <name>`, and refusing inline `from`) were fixed. The remaining failure is blocked by a harness bug where `vtc_runner.py`'s manual block parser incorrectly extracts an empty configuration for `haproxy h1 -conf-BAD {} {`, which `ibex` correctly parses as a valid empty configuration (returning 0).
-- Keywords `log-format`, `capture`, `http-check`, `tcp-check` etc. were left unimplemented and continue to fail with `unknown keyword`. Implementing them would require changes to `ibex-rt` to evaluate them on the data path, which is out of bounds for this session. Accepting them without implementing them would violate Rule 5.
-- `stats/clear_counters_server.vtc` is blocked because the required string `No such proxy.` resides in `crates/ibex-rt/src/applet.rs` which is strictly out of bounds.
+- `startup/default_rules.vtc` still reports "Config check unexpectedly succeeded". The underlying parser flaws (closing unknown keywords in `global` and `defaults` sections, refusing `http-request`/`http-response`/`http-after-request`/`tcp-response` in `defaults`, refusing `defaults <name>`, and refusing inline `from`) were fixed. The remaining failure is blocked by a harness bug where `vtc_runner.py`'s manual block parser incorrectly extracts an empty configuration for `haproxy h1 -conf-BAD {} {`, which `alcyon` correctly parses as a valid empty configuration (returning 0).
+- Keywords `log-format`, `capture`, `http-check`, `tcp-check` etc. were left unimplemented and continue to fail with `unknown keyword`. Implementing them would require changes to `alcyon-rt` to evaluate them on the data path, which is out of bounds for this session. Accepting them without implementing them would violate Rule 5.
+- `stats/clear_counters_server.vtc` is blocked because the required string `No such proxy.` resides in `crates/alcyon-rt/src/applet.rs` which is strictly out of bounds.

@@ -50,8 +50,8 @@ class PoolLayout(unittest.TestCase):
         d = tree({"crates/foo/src/lib.rs": STRAY.replace("}\n", "    static Y: RefCell<Vec<u8>> = x();\n}\n")})
         self.assertEqual([h[2] for h in pool_layout.violations(d, {("crates/foo/src/lib.rs", "X"): "S1"})], ["Y"])
 
-    def test_ibex_alloc_tests_and_non_cache_statics_are_skipped(self):
-        d = tree({"crates/ibex-alloc/src/lib.rs": STRAY, "crates/foo/src/tests/t.rs": STRAY,
+    def test_alcyon_alloc_tests_and_non_cache_statics_are_skipped(self):
+        d = tree({"crates/alcyon-alloc/src/lib.rs": STRAY, "crates/foo/src/tests/t.rs": STRAY,
                   "crates/foo/src/ok.rs": "thread_local! { static N: Cell<u32> = x(); }\n"
                                           "fn f() { let v: RefCell<Vec<u8>>; }\n"})
         self.assertEqual(pool_layout.violations(d, {}), [])

@@ -1,6 +1,6 @@
-# Ibex Design: Hitless Reload
+# Alcyon Design: Hitless Reload
 
-This document details the mechanics of HAProxy's hitless reload based on the 3.5 tree and evaluates how Ibex should achieve the same properties without adopting HAProxy's legacy architecture.
+This document details the mechanics of HAProxy's hitless reload based on the 3.5 tree and evaluates how Alcyon should achieve the same properties without adopting HAProxy's legacy architecture.
 
 ## Part 1 — What HAProxy actually does
 
@@ -39,23 +39,23 @@ Introduced in HAProxy 3.1 (`doc/internals/mworker.md`), V3 ensures a failed conf
 - **Keyword removed, mode active:** Commit `5a6ce0481` (2026-06-30) explicitly states: *MAJOR: mworker: remove deprecated "master-worker" global keyword... Now using it results in an error message inviting to start haproxy with -W or -Ws instead.* `src/cfgparse-global.c:973` enforces this by rejecting the bare keyword but pointing users to the command-line flags.
 - **No replacement planned:** A search of the git log for `socket activation`, `FDSTORE`, and `mworker V4` reveals no active replacements for the fork-and-exec reload mechanism. The `sd_notify` integration (`src/systemd.c`, introduced in 3.0) signals state to systemd but does not replace the worker management. V3 is the settled design.
 
-## Part 3 — What Ibex would have to build
+## Part 3 — What Alcyon would have to build
 
-Ibex is a single-process Rust binary with an async scheduler. It does not carry HAProxy's `nbproc` history.
+Alcyon is a single-process Rust binary with an async scheduler. It does not carry HAProxy's `nbproc` history.
 
 **1. Soft stop alone**
-- **Action:** Install a `SIGUSR1` handler in `crates/ibex-rt/src/bin/ibex.rs`, unbind listeners, and wait for active async tasks to drain before exiting.
+- **Action:** Install a `SIGUSR1` handler in `crates/alcyon-rt/src/bin/alcyon.rs`, unbind listeners, and wait for active async tasks to drain before exiting.
 - **What breaks:** The reload becomes graceful but not hitless. As soon as the listener drops, clients in the accept queue receive `RST`s.
 
 **2. FD handover**
-- **Action:** Implement an IPC socket in the runtime/CLI where the old process can send its FDs via `SCM_RIGHTS`. The startup sequence in `ibex.rs` must attempt to connect to this socket and adopt the FDs before binding anew.
+- **Action:** Implement an IPC socket in the runtime/CLI where the old process can send its FDs via `SCM_RIGHTS`. The startup sequence in `alcyon.rs` must attempt to connect to this socket and adopt the FDs before binding anew.
 - **Value:** This is what actually guarantees zero connection drops. Without it, high-traffic hitless reload is impossible.
 
 **3. Adopt master-worker at all?**
-- **Action:** Ibex **should not** copy the master-worker structure.
-- **Why:** HAProxy's master process exists to supervise multiple workers and to offload heavy config parsing from a single-threaded event loop. Ibex doesn't have these constraints.
-- **Alternative:** Ibex can achieve the exact same V3 property (failed reload leaves the old process serving) through a standalone `ExecReload` workflow paired with FD handover:
-  1. Systemd spawns a *new* Ibex process.
+- **Action:** Alcyon **should not** copy the master-worker structure.
+- **Why:** HAProxy's master process exists to supervise multiple workers and to offload heavy config parsing from a single-threaded event loop. Alcyon doesn't have these constraints.
+- **Alternative:** Alcyon can achieve the exact same V3 property (failed reload leaves the old process serving) through a standalone `ExecReload` workflow paired with FD handover:
+  1. Systemd spawns a *new* Alcyon process.
   2. The new process parses the config. If it fails, it exits (the old process is entirely unaware and unaffected).
   3. If parsing succeeds, the new process connects to the old process's IPC socket and requests the FDs.
   4. Only after safely binding the FDs does the new process send `SIGUSR1` to the old process to trigger a soft stop.
@@ -67,13 +67,13 @@ This reaches HAProxy's exact behavioral guarantees without imitating its structu
 Parts 1 and 2 above were implemented as written. Part 3's workflow was not, because it
 cannot work under systemd:
 
-> 1. Systemd spawns a *new* Ibex process.
+> 1. Systemd spawns a *new* Alcyon process.
 
 `ExecReload` commands must exit, so a process started by one cannot become the server; and
 under `Type=notify`, when the main PID exits with no successor named, systemd treats the
 service as failed. That is the exact failure the "haproxy-systemd-wrapper" history in
 `doc/internals/mworker.md` describes. HAProxy solves it with a master whose PID never
-changes. Ibex has no master and cannot re-exec in place without discarding every
+changes. Alcyon has no master and cannot re-exec in place without discarding every
 in-flight session, so the serving PID *must* change on reload. What makes that safe:
 
 - **The running process starts its successor**, on `SIGUSR2` (`-W` / `-Ws`), with the same
@@ -94,7 +94,7 @@ in-flight session, so the serving PID *must* change on reload. What makes that s
   and take the listeners.
 
 `-x` against an operator-managed stats socket with `expose-fd listeners` also works, for
-reloads done by hand as `ibex -f cfg -x <sock> -sf <pid>`.
+reloads done by hand as `alcyon -f cfg -x <sock> -sf <pid>`.
 
 ### Not done
 
@@ -106,8 +106,8 @@ reloads done by hand as `ibex -f cfg -x <sock> -sf <pid>`.
 
 ### Evidence
 
-`crates/ibex-rt/tests/it/soft_stop.rs` and `tests/reload.rs` drive the real binary.
-`harness/systemd_reload.sh` drives `admin/systemd/ibex.service` through `systemctl --user`
+`crates/alcyon-rt/tests/it/soft_stop.rs` and `tests/reload.rs` drive the real binary.
+`harness/systemd_reload.sh` drives `admin/systemd/alcyon.service` through `systemctl --user`
 under continuous load: three reloads, a reload onto a broken config (refused, `MainPID`
 unchanged, `Reload failed!`), a recovering reload, and a stop. Four runs, 27,002 requests,
 one failure; 40 SIGUSR2 reloads without systemd, 21,743 requests, none. The one failure was

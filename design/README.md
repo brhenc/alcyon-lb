@@ -1,6 +1,6 @@
-# Ibex Design Notes
+# Alcyon Design Notes
 
-Working design documents for Ibex, a memory-safe reverse proxy that keeps HAProxy's
+Working design documents for Alcyon, a memory-safe reverse proxy that keeps HAProxy's
 architecture and configuration language.
 
 **Reference source:** `/home/bhenc/reference/haproxy` @ `e6f616af` (3.5-dev7, mainline,
@@ -22,7 +22,7 @@ read from that tree. When a claim here is about HAProxy, it has a file:line behi
 
 ## Decisions taken
 
-- **D1 — Own scheduler, not tokio.** Ibex implements HAProxy's task/tasklet scheduler in
+- **D1 — Own scheduler, not tokio.** Alcyon implements HAProxy's task/tasklet scheduler in
   Rust rather than adopting a general-purpose async runtime. Rationale and evidence in
   [003](003-scheduler.md). The short version: HAProxy's scheduler has four properties that
   exist specifically to survive adversarial load — class budgets, bounded work per pass,

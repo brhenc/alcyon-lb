@@ -1,8 +1,8 @@
 # libFuzzer (cargo-fuzz) targets. A separate crate, outside the workspace: libFuzzer links
-# only into the binaries here, never into Ibex. Run from this directory:
+# only into the binaries here, never into Alcyon. Run from this directory:
 #   cargo +nightly fuzz run <target>      (see ../README.md)
 [package]
-name = "ibex-libfuzz"
+name = "alcyon-libfuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -14,12 +14,12 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-ibex-proto = { path = "../../crates/ibex-proto" }
-ibex-config = { path = "../../crates/ibex-config" }
-ibex-sample = { path = "../../crates/ibex-sample" }
-ibex-regex = { path = "../../crates/ibex-regex" }
-ibex-rt = { path = "../../crates/ibex-rt" }
-ibex-sched = { path = "../../crates/ibex-sched" }
+alcyon-proto = { path = "../../crates/alcyon-proto" }
+alcyon-config = { path = "../../crates/alcyon-config" }
+alcyon-sample = { path = "../../crates/alcyon-sample" }
+alcyon-regex = { path = "../../crates/alcyon-regex" }
+alcyon-rt = { path = "../../crates/alcyon-rt" }
+alcyon-sched = { path = "../../crates/alcyon-sched" }
 
 [[bin]]
 name = "h1_request"
@@ -134,6 +134,6 @@ test = false
 doc = false
 bench = false
 
-# Vendored quinn (T542), as in the root workspace: the fuzzers build the quinn Ibex ships.
+# Vendored quinn (T542), as in the root workspace: the fuzzers build the quinn Alcyon ships.
 [patch.crates-io]
 quinn-proto = { path = "../../vendor/quinn-proto" }

@@ -5,12 +5,12 @@
 """The h3 board (quic-transport design section 4, M1): the h3fit rows of data/measurements.jsonl,
 one line per (commit, method), with the columns
 
-    release-perf   Ibex built plain: the A/B and the +0.5 % budget are judged here
-    pgo            Ibex built by tools/pgo-build.sh: the "shipped" figure
+    release-perf   Alcyon built plain: the A/B and the +0.5 % budget are judged here
+    pgo            Alcyon built by tools/pgo-build.sh: the "shipped" figure
     haproxy        the oracle (not PGO-built: the like-for-like comparison is the release-perf one)
 
 and the ratios to HAProxy. insreq.sh records the column in the row's "build" field
-(IBEX_MEASURE_BUILD=pgo for a PGO binary; absent means release-perf, or haproxy when the binary's
+(ALCYON_MEASURE_BUILD=pgo for a PGO binary; absent means release-perf, or haproxy when the binary's
 path says so). The last row of a column wins.
 
     tools/measure/h3board.py [data/measurements.jsonl]

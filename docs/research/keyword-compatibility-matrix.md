@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-Project Ibex is built from the ground up to achieve feature and syntactic parity with **modern HAProxy 3.5**. Rather than accumulating historical technical debt from obsolete 1.x regex engines and deprecated configuration directives, Project Ibex targets HAProxy 3.5's structured configuration grammar directly.
+Project Alcyon is built from the ground up to achieve feature and syntactic parity with **modern HAProxy 3.5**. Rather than accumulating historical technical debt from obsolete 1.x regex engines and deprecated configuration directives, Project Alcyon targets HAProxy 3.5's structured configuration grammar directly.
 
 This specification details:
 1. The chronological evolution and modernization of HAProxy syntax across major releases (1.0 $\to$ 1.5 $\to$ 2.0 $\to$ 2.4 $\to$ 2.8 $\to$ 3.0 $\to$ 3.5).
@@ -16,7 +16,7 @@ This specification details:
 3. The modern **L4–L7 Action Rules Grammar** (`http-request`, `http-response`, `http-after-response`, `tcp-request connection/session/content`, `tcp-response content`).
 4. Modern **Sample Fetches & Converters** syntax.
 5. Modern **Stick Table & Tracking** syntax (`track-sc0..track-sc2`, `sc_conn_rate`, `sc-inc-gpc`).
-6. Specification for the `ibex-config` parser AST update.
+6. Specification for the `alcyon-config` parser AST update.
 
 ---
 
@@ -66,9 +66,9 @@ HAProxy 1.0 (2001) ───► HAProxy 1.5 (2014) ───► HAProxy 2.0/2.1 
 
 ## 2. Exhaustive Keyword Deprecation & Removal Matrix
 
-The table below catalogs obsolete keywords up to HAProxy 3.5, their status, modern HAProxy 3.5 equivalents, and Ibex parser validation rules.
+The table below catalogs obsolete keywords up to HAProxy 3.5, their status, modern HAProxy 3.5 equivalents, and Alcyon parser validation rules.
 
-| Obsolete / Legacy Directive | Version Deprecated | Version Removed | Modern HAProxy 3.5 Equivalent | Ibex Parser Rule |
+| Obsolete / Legacy Directive | Version Deprecated | Version Removed | Modern HAProxy 3.5 Equivalent | Alcyon Parser Rule |
 | :--- | :--- | :--- | :--- | :--- |
 | `dispatch <ip:port>` | 1.5 | **3.5** | `server srv 0.0.0.0` or dynamic backend routing | **Reject with fatal error**; guide user to `server` / `default_backend`. |
 | `option transparent` | 2.0 | **3.5** | `source 0.0.0.0 usesrc clientip` | **Reject with fatal error**; guide user to `usesrc clientip`. |
@@ -106,7 +106,7 @@ Modern HAProxy rules are structured into explicit rule stages, evaluated sequent
 3. **`tcp-request content <action> [if|unless <cond>]`**: Evaluated after buffering payload inspection data (L4/L5 payload, SSL client hello, TLS cert inspection, PROXY headers).
 4. **`http-request <action> [if|unless <cond>]`**: Evaluated during HTTP request header and body processing (L7 routing, authentication, header manipulation, rate limiting).
 5. **`http-response <action> [if|unless <cond>]`**: Evaluated during HTTP response processing from upstream backend servers (header rewriting, cookie injection, status masking).
-6. **`http-after-response <action> [if|unless <cond>]`**: Evaluated at the final response delivery stage, including on responses generated internally by HAProxy/Ibex (e.g. 503 error pages, `http-request return`).
+6. **`http-after-response <action> [if|unless <cond>]`**: Evaluated at the final response delivery stage, including on responses generated internally by HAProxy/Alcyon (e.g. 503 error pages, `http-request return`).
 7. **`tcp-response content <action> [if|unless <cond>]`**: Evaluated on upstream TCP response payload.
 
 ### 3.2 Supported Actions Reference
@@ -157,8 +157,8 @@ flowchart TD
 ### 4.1 Frontend & Bind Syntax
 ```haproxy
 frontend fe_https
-    bind 0.0.0.0:443 ssl crt /etc/ibex/certs/ alpn h2,http/1.1 accept-proxy
-    bind [::]:443 ssl crt /etc/ibex/certs/ alpn h2,http/1.1 accept-proxy
+    bind 0.0.0.0:443 ssl crt /etc/alcyon/certs/ alpn h2,http/1.1 accept-proxy
+    bind [::]:443 ssl crt /etc/alcyon/certs/ alpn h2,http/1.1 accept-proxy
     mode http
     
     # Modern timeouts
@@ -228,19 +228,19 @@ stick-table type {ip|ipv6|integer|string [len <n>]|binary [len <n>]} \
 
 ---
 
-## 6. Implementation Roadmap for `ibex-config`
+## 6. Implementation Roadmap for `alcyon-config`
 
-To bring `crates/ibex-config` into full alignment with HAProxy 3.5 without breaking existing test harnesses:
+To bring `crates/alcyon-config` into full alignment with HAProxy 3.5 without breaking existing test harnesses:
 
-1. **AST Modernization (`crates/ibex-config/src/ast.rs`)**:
+1. **AST Modernization (`crates/alcyon-config/src/ast.rs`)**:
    - Replace legacy fields (`contimeout`, `clitimeout`, `srvtimeout`) with unified `timeouts: TimeoutConfig` (`connect`, `client`, `server`, `http_req`, `http_keepalive`, `check`, `queue`).
    - Remove obsolete fields: `cliexp`, `srvexp`, `cookie` from L4 listen sections.
    - Introduce structured `ActionRule` AST supporting `HttpRequestAction`, `HttpResponseAction`, `HttpAfterResponseAction`, `TcpRequestAction`, `TcpResponseAction`.
-2. **Parser Validation & Error Messages (`crates/ibex-config/src/parser.rs`)**:
+2. **Parser Validation & Error Messages (`crates/alcyon-config/src/parser.rs`)**:
    - Add explicit diagnostic matchers for purged keywords (`dispatch`, `transparent`, `reqadd`, `reqrep`, `clitimeout`, `mode health`). When encountered, output helpful modern migration diagnostics (e.g. `"The 'mode health' directive was removed in HAProxy 2.3. Please use 'http-request return status 200' instead."`).
    - Enforce conditional requirement on `use_backend` (`use_backend <name> requires 'if' or 'unless'; use 'default_backend <name>' for unconditional routing`).
 3. **Test Parity**:
-   - Maintain the differential test suite (`harness/difftest.py`) and unit test coverage (`cargo test -p ibex-config`).
+   - Maintain the differential test suite (`harness/difftest.py`) and unit test coverage (`cargo test -p alcyon-config`).
 
 ---
 

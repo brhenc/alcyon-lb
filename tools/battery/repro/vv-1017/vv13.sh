@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 # VV-13: a client that aborts while the proxy is still connecting (server port closed, retries)
-# is logged as b/<NOSRV> by Ibex, b/s by HAProxy.     vv13.sh BIN [PORT=19899]
+# is logged as b/<NOSRV> by Alcyon, b/s by HAProxy.     vv13.sh BIN [PORT=19899]
 # Also: e2e/ holds the 2026-10-17 re-verification inputs for FZ-5/6/7 and RV-33
 # (python3 fuzz/e2e.py tools/battery/repro/vv-1017/e2e BIN; every case SAME on 945ae6be).
 set -u

@@ -22,10 +22,10 @@
 //!
 //! [`Client::set_gap`] spaces the client's datagrams (the tool: 200 us), so that the server
 //! takes each in a wakeup of its own; back to back, whether it reads an ACK and the next
-//! request in one pass or two is timing, and moved Ibex's figure by ~2 % between rounds.
+//! request in one pass or two is timing, and moved Alcyon's figure by ~2 % between rounds.
 //!
 //! This file is compiled by `tools/measure/h3bench` (the binary) and by
-//! `crates/ibex-rt/tests/it/h3_bench_client.rs` (the test pinning both policies).
+//! `crates/alcyon-rt/tests/it/h3_bench_client.rs` (the test pinning both policies).
 
 use quinn_proto::crypto::rustls::QuicClientConfig;
 use quinn_proto::{ClientConfig, Connection, ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig, Event, StreamEvent, StreamId, VarInt};

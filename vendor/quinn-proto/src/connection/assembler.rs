@@ -228,8 +228,8 @@ impl Assembler {
         self.bytes_read
     }
 
-    /// Bytes the heap of chunks keeps for reuse (Ibex P1, pool footprint)
-    #[cfg(feature = "ibex-pools")]
+    /// Bytes the heap of chunks keeps for reuse (Alcyon P1, pool footprint)
+    #[cfg(feature = "alcyon-pools")]
     pub(super) fn footprint(&self) -> usize {
         self.data.capacity() * mem::size_of::<Buffer>()
     }

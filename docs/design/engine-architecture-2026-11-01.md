@@ -21,16 +21,16 @@ slices and gets the ordering answer in §3.6.
   `rules ab1`, `h2s1`; non-PGO `release-perf` against non-PGO HAProxy dev8; kernel instructions
   no worse than today. Today (11:50, slot A, min of 3, user / kernel): keepalive 45,843 / 68,152
   against 36,236 / 69,421 (**1.27x**); rules 75,712 / 65,959 against 43,833 / 69,926
-  (**1.73x**); h2s1 ~70k against ~54k (**1.30x**). Kernel is at parity already (Ibex makes fewer
+  (**1.73x**); h2s1 ~70k against ~54k (**1.30x**). Kernel is at parity already (Alcyon makes fewer
   syscalls: §2 row 9); the whole gap is user space.
-- **Why the gap is design, not language.** Ibex already holds structural advantages HAProxy does
+- **Why the gap is design, not language.** Alcyon already holds structural advantages HAProxy does
   not: no stream allocation and free per keep-alive request (HAProxy's `stream_new`/`stream_free`
   are ~4.4k of its 53.4k on h2, §2 row 4); the server connection parked on the session between
   requests (HAProxy returns it to the idle list and takes it back, ~1k); an unmodified head sent
   as the bytes that arrived (HAProxy re-serialises every head, `h1_make_*` ~2.4k per request);
   rustls/ring against OpenSSL (~3k on h2, 11k on h3); no `CLOCK_THREAD_CPUTIME_ID` syscalls
   (HAProxy makes 6 a request); 4 data syscalls a request against 6; no pool/malloc traffic
-  (HAProxy 1.4-4.2k). That is ~12-15k of advantage on h1, and Ibex is still 9.6k behind on
+  (HAProxy 1.4-4.2k). That is ~12-15k of advantage on h1, and Alcyon is still 9.6k behind on
   keep-alive: **the engine's own overhead is ~20k above HAProxy's on the simplest request**. It
   is in four places, each a track: the loop and the stream run (L), the stream object and its
   backend side (O), the rules' dispatch and samples (R), the message representation (X, D5).
@@ -50,7 +50,7 @@ slices and gets the ordering answer in §3.6.
   parsed arguments and evaluate borrowed samples; actions edit blocks; the h1 encoder writes a
   modified head once at the send; h2/h3 muxes write and read blocks. Owner and streams of one
   connection run in the same pass (instant wakeup, HAProxy's `task_instant_wakeup`, task.h:553),
-  which is where Ibex goes below HAProxy's pass count.
+  which is where Alcyon goes below HAProxy's pass count.
 - **Landing (§5, ranges overlap, read at +-30 %).** keepalive 35-41k (0.96-1.14x, central
   ~1.05x); rules 45-57k (1.03-1.30x, central ~1.15x); h2s1 41-54k (0.75-1.0x, central ~0.9x).
   h2 reaches the target with margin (TLS and the pass count); keepalive reaches it only at the
@@ -69,7 +69,7 @@ slices and gets the ordering answer in §3.6.
 
 | record | what it gives | trust |
 |---|---|---|
-| `~/ibex-worktrees/review/t544-2026-11-01/ibs/ibex-h2.folded` (IBS, frame pointers, inlines expanded) | Ibex h2s1 per-function inclusive and self, 79.6k build (pre-E1/E2/Q2/Q3/Q8) | +-10-20 % a row |
+| `~/ibex-worktrees/review/t544-2026-11-01/ibs/alcyon-h2.folded` (IBS, frame pointers, inlines expanded) | Alcyon h2s1 per-function inclusive and self, 79.6k build (pre-E1/E2/Q2/Q3/Q8) | +-10-20 % a row |
 | `.../hap-h2-dwarf.folded` (`instructions:u` + DWARF) | HAProxy h2s1 per-function **inclusive**; 24.5 % of samples are on syscall entry (skid) so each inclusive share carries the syscalls under it | +-20 %, and read "minus the syscall skid" where a row contains recv/send |
 | `.../ibs/hap-h2.folded` | HAProxy h2 IBS: 79 % of leaves unresolved (`[unknown]`): **no per-function HAProxy IBS exists**; T544's HAProxy phase rows came from the DWARF callers (`scripts/hybrid.py`) | per-phase only |
 | `.../census/*.strace`, `calls/*.stat` | syscalls and probe counts per request (2000 / 5000 requests) | exact for that run |
@@ -83,9 +83,9 @@ scenario exists.** The parity table marks every h1 row "estimate" and says what 
 ### 1.2 X0, extended
 
 X0 (`tasks/X0-profile-post-e2.md`, Sonnet, S, slot B then A, quiet host) now produces, on main,
-for `keepalive ab1`, `rules ab1`, `h2s1` (and `h3fit` for the h3 track), Ibex **and** HAProxy:
+for `keepalive ab1`, `rules ab1`, `h2s1` (and `h3fit` for the h3 track), Alcyon **and** HAProxy:
 
-1. Per-function inclusive and self tables: Ibex by IBS with inline expansion (T544's `fold2.py`);
+1. Per-function inclusive and self tables: Alcyon by IBS with inline expansion (T544's `fold2.py`);
    HAProxy by `perf record -e instructions:u -c 100003 --call-graph dwarf` (as
    `hap-h2-dwarf.folded`), because its IBS leaves do not resolve. Scaled to the `insreq.sh`
    totals of the same run.
@@ -124,28 +124,28 @@ written against these numbers; their designs do not wait for them.
 
 ## 2. Parity table
 
-Columns: HAProxy cost; Ibex cost; why they differ (design); the design that reaches parity or
-better; slice. Sources: **[I]** Ibex h2 IBS (79.6k build; E1/E2/Q2/Q3/Q8 have since taken ~9k),
+Columns: HAProxy cost; Alcyon cost; why they differ (design); the design that reaches parity or
+better; slice. Sources: **[I]** Alcyon h2 IBS (79.6k build; E1/E2/Q2/Q3/Q8 have since taken ~9k),
 **[H]** HAProxy h2 DWARF inclusive x 53.4k, **[M]** memory doc §1.3 rules, **[C]** T544 census,
 **[E]** reasoned estimate (X0 measures). Per-request figures; h2s1 unless the row says otherwise.
 
-| # | component | HAProxy | Ibex | why they differ | design to parity or better | slice |
+| # | component | HAProxy | Alcyon | why they differ | design to parity or better | slice |
 |---|---|---:|---:|---|---|---|
-| 1 | **Loop pass**: clock, poll, event dispatch, pass housekeeping | `run_poll_loop` self 0.23k, `_do_poll` self 0.28k, `clock_update_date` ~0.05k, `fd_update_events` ~0.1k [H]; ~3 passes/req [C]: **~1.5-2k/req**. Housekeeping is tasks on timers (`srv_cleanup_idle_conns`, `process_table_expire`, `pool_gc`): 0 per pass | `step_at` self ~0.6k + `run_loop` self ~0.9k + `Poller::poll` self 0.2k [I] = **~1.7k/req** at 7.15 passes, i.e. ~250 a pass of pure loop; plus ~40 checks a pass (`step_at` 5917-6230: watchdog x3, `wake_queued` x2, `buf_wait`, `QueueWait::any`, QUIC fold/any x2, `purge`, `trim_idle`, `purge_stick_tables`, `pool_gc::poll`, `pool::pass`, `publish` x3, `next_purge`, `accept_limited`, `resume_paused_listeners`, `cli_accept_retry`, `note_sched`, `srvlog::pending`, the `EngineDispatcher` of 25 fields, 4 QUIC adopt/admit calls, `resume_cli_after_close`) [E ~200-400 a pass] | Ibex does per pass what HAProxy does per timer; and runs more passes (row 2) | **L1**: housekeeping as `Kind::Housekeeping` tasks on the wait queue (idle purge, buffer trim, stick expiry, pool pass, publishes, accept-limit/CLI retry); QUIC work behind one `has_quic` bool; the dispatcher built once per `Engine` (borrow split by a struct of `&mut`), not per pass. Pass fixed cost target <= 120 instr | L1 |
-| 2 | **Passes and task runs per request** | ~3 passes (3.00 `epoll_wait`, one of them zero-timeout after a task wake) [C]; runs: `h2_io_cb` x2, `sc_conn_io_cb` x1, `process_stream` x2 [E from the DWARF shares]: ~5 runs, each a direct `t->process` call, `run_tasks_from_lists` self 0.85k + `process_runnable_tasks` self 0.38k [H] | **7.15 `Engine::step`** and 3.07 `epoll_wait` [C, to reconcile]; `run_tasks_from_lists` self ~0.3k [I]; the owner<->child **wake ping-pong** (`wake_queue.push(owner_task)` after every child run, engine.rs:11212; the owner's `h2_owner_pass` wakes children) crosses passes because `wake_queue` drains after `process_runnable_tasks` (engine.rs:6196-6224) | HAProxy's mux calls the stream's receive synchronously (`sc_sync_recv`, stream.c:1926; `sc_chk_snd`, stconn.c:978); Ibex hands off through the run queue | **L2**: instant wakeup: a wake raised during the pass joins the current pass's tasklet list (HAProxy's `task_instant_wakeup`, task.h:553, which its stream path does not use: this is where Ibex goes **below** HAProxy's pass count); the `last_run == loops` guard (sched.rs:703) becomes "at most twice a pass", budget-bounded. Target: h2 <= 3 passes, h1 <= 2 | L2 |
-| 3 | **Stream run prologue/epilogue** (what runs on every task run besides I/O and HTTP) | `process_stream` self 1.8k [H] for 2 runs: ~0.9k a run, gated: `stream_check_timeouts` only on `TASK_WOKEN_TIMER` (stream.c:1751), analysers only while `req->analysers` bits are set, `stream_process_counters` once | `step_stream` + `step_stream_run` self 1.26k [I] + `stream_vars_enter/leave` (`Arc<[(String,usize)]>` clone+drop 0.7k [I]), `stream_timeouts_enter` (thread-local), `check_srv_connect`, `fdtab.ready` x2, `check_timeouts` every run, `retry_after`, glitches, `stick_stores`, `run_deferred_session_rules`, tcp inspect x2, `scrape`, `log_line.take`, `checkcache`, `srv_park_exp`, `update_interests`, `req/rep.release()`, `wants_rerun`, owner wake, `timer_updates.push`, heavy check (engine.rs:10889-11270): [E] ~500-800 a run x 7 = **3.5-5.5k** on h2, ~1.5-2.5k on h1 | HAProxy's run is state-gated; Ibex's re-derives every rare condition on every run | **L3**: `step_stream_run` gated by the wake reason (`WOKEN_TIMER` -> `check_timeouts`; `WOKEN_IO` -> the side whose fd fired) and a `pending: u16` bitmask on the session set where each rare condition arises (deferred rules, inspect, scrape, stick stores, glitches, park, retry, connect log, rate max, handshake failure); `&Proxy` passed down instead of thread-locals (Q6); `update_interests` only when `(Want, Want)` changed; buffers released at txn end. Target <= 150 a run | L3 |
-| 4 | **Stream/txn object set-up and tear-down** | `stream_new` 1.4k + `stream_free` 3.0k [H] **per request** (h1 keep-alive too: `h1c_frt_stream_new`, mux_h1.c:4255, per request); `session` persists | h2: `h2_child_of` 1.9k + `new_with_mode` 0.8k + `StreamLog` 0.7k + `end_stream` 1.7k + `end_txn` 2.7k [I] = **~7.8k** (a full `TcpSession`, proxy.rs:653-894, per stream); h1 keep-alive: `end_txn` 2.7k + `account_stream` 1.1k [I, same code] = ~3.8k, no set-up | Ibex's h1 model is cheaper than HAProxy's (no object per request) but its tear-down rebuilds state HAProxy frees in one `pool_free`; its h2 child is a connection-sized object | **O1**: a pooled `Stream` (txn, log, vars, backend side, captures; <= 1 KiB; `ibex_alloc::Pool`): h1 keeps one and **resets** it (a few stores, O1a); h2/h3 owners hold `Vec<Stream>` by stream id, one scheduler task each (timers per stream, as HAProxy), not a `TcpSession` (O1b, O1c). Set-up target <= 0.8k, tear-down <= 1.2k | O1a/b/c |
-| 5 | **Backend selection and connection reuse** | `stream_set_backend` 0.38k self, `assign_server` 0.6k, `connect_server` 1.3k incl. `conn_backend_get` 0.23k, `srv_add_to_idle_list` 0.27k [H] = **~2.5k**; per-thread idle `mt_list` per server, own thread first | `connect_http_backend` **7.2k** inclusive [I] (self 1.0k; `route_to_server` 1.3k, `select_server` 0.6k, `IdlePools::with_count` 0.7k: `RwLock` read + SipHash on `(usize,usize)`, `IdleKey` hashing, `attach_server_with_xprt` incl. the `getsockname` Q8 removed); keep-alive: server parked 100 ms on the session (`SRV_PARK_MS`, engine.rs:8761), no pool round trip (**Ibex advantage ~1k**) | hashed maps and a lock on the fast path (AGENTS §8: the lock word is a write another thread reads) against dense per-thread lists | **O2**: servers by dense index (Q5), idle connections as per-thread per-server lists (`Vec<IdleConn>` by server index; cross-thread take only on miss, as `conn_backend_get`), `with_count` gone, `route_to_server` reading the compiled backend. Target <= 2.5k on h2; keep-alive unchanged (parked) | O2 |
-| 6 | **h1 parse** (request at the frontend, response from the server) | `h1_parse_msg_hdrs` 2.3k + `h1_headers_to_hdr_list` 1.4k + `htx_add_*` 1.1k [H] = **~4.8k per head** (parse into a list, then copy into HTX) | `H1Parser` ~3.5k [I] + `req_htx_init` 1.0k (the HTX copy) on the request; response: `H1Parser` + E2's `RspHead` | parity-ish; Ibex copies into `htx_buf` where D-A writes descriptors in place | **X2/X3** (D5): descriptors over the received bytes, no copy; names lowercased per the D-E setting. Target <= 3.5k per head, i.e. **below HAProxy by ~1.3k per head** | X2, X3 |
+| 1 | **Loop pass**: clock, poll, event dispatch, pass housekeeping | `run_poll_loop` self 0.23k, `_do_poll` self 0.28k, `clock_update_date` ~0.05k, `fd_update_events` ~0.1k [H]; ~3 passes/req [C]: **~1.5-2k/req**. Housekeeping is tasks on timers (`srv_cleanup_idle_conns`, `process_table_expire`, `pool_gc`): 0 per pass | `step_at` self ~0.6k + `run_loop` self ~0.9k + `Poller::poll` self 0.2k [I] = **~1.7k/req** at 7.15 passes, i.e. ~250 a pass of pure loop; plus ~40 checks a pass (`step_at` 5917-6230: watchdog x3, `wake_queued` x2, `buf_wait`, `QueueWait::any`, QUIC fold/any x2, `purge`, `trim_idle`, `purge_stick_tables`, `pool_gc::poll`, `pool::pass`, `publish` x3, `next_purge`, `accept_limited`, `resume_paused_listeners`, `cli_accept_retry`, `note_sched`, `srvlog::pending`, the `EngineDispatcher` of 25 fields, 4 QUIC adopt/admit calls, `resume_cli_after_close`) [E ~200-400 a pass] | Alcyon does per pass what HAProxy does per timer; and runs more passes (row 2) | **L1**: housekeeping as `Kind::Housekeeping` tasks on the wait queue (idle purge, buffer trim, stick expiry, pool pass, publishes, accept-limit/CLI retry); QUIC work behind one `has_quic` bool; the dispatcher built once per `Engine` (borrow split by a struct of `&mut`), not per pass. Pass fixed cost target <= 120 instr | L1 |
+| 2 | **Passes and task runs per request** | ~3 passes (3.00 `epoll_wait`, one of them zero-timeout after a task wake) [C]; runs: `h2_io_cb` x2, `sc_conn_io_cb` x1, `process_stream` x2 [E from the DWARF shares]: ~5 runs, each a direct `t->process` call, `run_tasks_from_lists` self 0.85k + `process_runnable_tasks` self 0.38k [H] | **7.15 `Engine::step`** and 3.07 `epoll_wait` [C, to reconcile]; `run_tasks_from_lists` self ~0.3k [I]; the owner<->child **wake ping-pong** (`wake_queue.push(owner_task)` after every child run, engine.rs:11212; the owner's `h2_owner_pass` wakes children) crosses passes because `wake_queue` drains after `process_runnable_tasks` (engine.rs:6196-6224) | HAProxy's mux calls the stream's receive synchronously (`sc_sync_recv`, stream.c:1926; `sc_chk_snd`, stconn.c:978); Alcyon hands off through the run queue | **L2**: instant wakeup: a wake raised during the pass joins the current pass's tasklet list (HAProxy's `task_instant_wakeup`, task.h:553, which its stream path does not use: this is where Alcyon goes **below** HAProxy's pass count); the `last_run == loops` guard (sched.rs:703) becomes "at most twice a pass", budget-bounded. Target: h2 <= 3 passes, h1 <= 2 | L2 |
+| 3 | **Stream run prologue/epilogue** (what runs on every task run besides I/O and HTTP) | `process_stream` self 1.8k [H] for 2 runs: ~0.9k a run, gated: `stream_check_timeouts` only on `TASK_WOKEN_TIMER` (stream.c:1751), analysers only while `req->analysers` bits are set, `stream_process_counters` once | `step_stream` + `step_stream_run` self 1.26k [I] + `stream_vars_enter/leave` (`Arc<[(String,usize)]>` clone+drop 0.7k [I]), `stream_timeouts_enter` (thread-local), `check_srv_connect`, `fdtab.ready` x2, `check_timeouts` every run, `retry_after`, glitches, `stick_stores`, `run_deferred_session_rules`, tcp inspect x2, `scrape`, `log_line.take`, `checkcache`, `srv_park_exp`, `update_interests`, `req/rep.release()`, `wants_rerun`, owner wake, `timer_updates.push`, heavy check (engine.rs:10889-11270): [E] ~500-800 a run x 7 = **3.5-5.5k** on h2, ~1.5-2.5k on h1 | HAProxy's run is state-gated; Alcyon's re-derives every rare condition on every run | **L3**: `step_stream_run` gated by the wake reason (`WOKEN_TIMER` -> `check_timeouts`; `WOKEN_IO` -> the side whose fd fired) and a `pending: u16` bitmask on the session set where each rare condition arises (deferred rules, inspect, scrape, stick stores, glitches, park, retry, connect log, rate max, handshake failure); `&Proxy` passed down instead of thread-locals (Q6); `update_interests` only when `(Want, Want)` changed; buffers released at txn end. Target <= 150 a run | L3 |
+| 4 | **Stream/txn object set-up and tear-down** | `stream_new` 1.4k + `stream_free` 3.0k [H] **per request** (h1 keep-alive too: `h1c_frt_stream_new`, mux_h1.c:4255, per request); `session` persists | h2: `h2_child_of` 1.9k + `new_with_mode` 0.8k + `StreamLog` 0.7k + `end_stream` 1.7k + `end_txn` 2.7k [I] = **~7.8k** (a full `TcpSession`, proxy.rs:653-894, per stream); h1 keep-alive: `end_txn` 2.7k + `account_stream` 1.1k [I, same code] = ~3.8k, no set-up | Alcyon's h1 model is cheaper than HAProxy's (no object per request) but its tear-down rebuilds state HAProxy frees in one `pool_free`; its h2 child is a connection-sized object | **O1**: a pooled `Stream` (txn, log, vars, backend side, captures; <= 1 KiB; `alcyon_alloc::Pool`): h1 keeps one and **resets** it (a few stores, O1a); h2/h3 owners hold `Vec<Stream>` by stream id, one scheduler task each (timers per stream, as HAProxy), not a `TcpSession` (O1b, O1c). Set-up target <= 0.8k, tear-down <= 1.2k | O1a/b/c |
+| 5 | **Backend selection and connection reuse** | `stream_set_backend` 0.38k self, `assign_server` 0.6k, `connect_server` 1.3k incl. `conn_backend_get` 0.23k, `srv_add_to_idle_list` 0.27k [H] = **~2.5k**; per-thread idle `mt_list` per server, own thread first | `connect_http_backend` **7.2k** inclusive [I] (self 1.0k; `route_to_server` 1.3k, `select_server` 0.6k, `IdlePools::with_count` 0.7k: `RwLock` read + SipHash on `(usize,usize)`, `IdleKey` hashing, `attach_server_with_xprt` incl. the `getsockname` Q8 removed); keep-alive: server parked 100 ms on the session (`SRV_PARK_MS`, engine.rs:8761), no pool round trip (**Alcyon advantage ~1k**) | hashed maps and a lock on the fast path (AGENTS §8: the lock word is a write another thread reads) against dense per-thread lists | **O2**: servers by dense index (Q5), idle connections as per-thread per-server lists (`Vec<IdleConn>` by server index; cross-thread take only on miss, as `conn_backend_get`), `with_count` gone, `route_to_server` reading the compiled backend. Target <= 2.5k on h2; keep-alive unchanged (parked) | O2 |
+| 6 | **h1 parse** (request at the frontend, response from the server) | `h1_parse_msg_hdrs` 2.3k + `h1_headers_to_hdr_list` 1.4k + `htx_add_*` 1.1k [H] = **~4.8k per head** (parse into a list, then copy into HTX) | `H1Parser` ~3.5k [I] + `req_htx_init` 1.0k (the HTX copy) on the request; response: `H1Parser` + E2's `RspHead` | parity-ish; Alcyon copies into `htx_buf` where D-A writes descriptors in place | **X2/X3** (D5): descriptors over the received bytes, no copy; names lowercased per the D-E setting. Target <= 3.5k per head, i.e. **below HAProxy by ~1.3k per head** | X2, X3 |
 | 7 | **HTX / representation through rules, facts, logs** | one HTX per direction; `http_find_header` views (0.15k) | three copies of the request head and a `Vec<(String,String)>` response head (D5 §1); rules: per-edit rebuild 6.5k, spares 4.1k, context clones 1.5k, UTF-8 1.6k [M, pre-S7]; `apply_http_response_rules` with no rules 4.2k [I] -> E2 cut ~2k | D5 §1 | **X1/X5/X2/X3/X4/X7** as D5, with X2 also building the rules' `SampleContext` once per phase (S7's "borrow") and X3 retiring the per-rule clone. Target rules' representation share <= 3k | X |
 | 8 | **Rule compilation and execution** (rules ab1: 2 ACLs, 7 rules) | HAProxy's rules cost: 43.8k - 36.2k = **7.6k for the scenario** (~1k a rule); `acl_exec_cond` -> `sample_process` -> `expr->fetch->process` (function pointer, args parsed at load, acl.c:1044, sample.c:1395) -> `pattern_exec_match` (compiled); actions `http_replace_header` on blocks; samples are views (`SMP_F_CONST`) | 75.7k - 45.8k = **29.9k for the scenario** (today, [insreq]); `Expr::eval` -> `registry.eval_g(&self.fetch_name, &self.fetch_args, ...)` -> `self.fetches.get(name)` (registry.rs:1310: a SipHash lookup per fetch per request) with `&[String]` args interpreted per call; `Sample::Str(String)` from the spare pool per fetch (`spare::string_from` 1.4k [M]); `set-var` through a 4 KiB `VarStore` spare; `%[rand]` rendered into a `String` | dispatch by name at run time, samples materialised | **R1**: `Expr` compiled to `FetchFn` + parsed `Arg`s + converter pointers at `Expr::parse`; no map on the path. **R2**: `Sample<'a>` borrowing the HTX block (`Cow<'a,[u8]>`), owned only after a converter makes bytes; `str` validated once at the fetch (D-B). **R4**: vars and format scratch inside the `Stream` (O1a). Target scenario rules cost <= 9k (HAProxy 7.6k) | R1, R2, R4, X2 |
-| 9 | **Send/recv path, syscalls** | h2s1: `recvmsg` 4.01 (1 EAGAIN), `sendmsg` 2.00, `epoll_wait` 3.00, `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` **6.00 real syscalls** (`clock_entering/leaving_poll`, clock.c:404/474) [C]; `MSG_MORE` via `CO_SFL_MSG_MORE` when a head precedes a body; `sc_conn_recv` self 0.8k, `sc_conn_send` self 0.2k, `h1_recv`/`h1_send` ~1k [H] | h2s1: `read` 2.00, `write` 2.00, `epoll_wait` 3.07, no clock syscalls [C]: **fewer syscalls, kernel at parity** (68.2k vs 69.4k on keepalive today); user side: `process_cli` 0.36k, `process_cli_io` 0.26k, `advance` 0.18k, `MsgState::advance_counted` 0.53k + `eq` 0.18k, `interests` 0.18k, `Buf::nominal/readable/drop` 0.9k [I self] = **~2.6k** against HAProxy's ~2k; `req/rep.release()` per run gives the buffer back and re-takes it on the next read (HAProxy frees only when empty, keeps `ibuf` while a request is in flight) | Ibex's state machine re-derives `MsgState` and interests per run; buffer take/give per run | **IO1**: `advance` driven by readiness bits set by the poller, `MsgState` advanced by the parser's return (no re-walk), buffer kept while the txn is open, `Buf` accessors without the `nominal` indirection. Target <= 1.5k. No splice/zero-copy work: at these sizes HAProxy does not use them either (`htx_xfer` is a memcpy) | IO1 |
-| 10 | **h2 framing and HPACK** | `h2c_dec_hdrs` 2.6k + `h2_make_htx_request` 2.1k + `h2c_frt_handle_headers` self 0.3k [H] on the request; `h2s_snd_fhdrs` 0.7k + `h2_snd_buf` self 0.3k + `h2_send` 0.4k on the response: **~6.4k** | `MuxH2` 4.9k + `hpack` 3.8k (of which `find_table_entry` 1.4k, Q3 done) + bridge `start_request` 5.3k (E1 took the 4.7k re-parse) + `forward_response` 3.6k (E2 took `send_h1_head`'s re-split) [I]: ~**8-10k after E1/E2/Q3** [E] | Ibex still crosses HTTP/1.1 text at the server send and a `copy_header` list; the owner moves bytes through `h2_bridge_moves` 4.2k | **X4** (blocks into the child's layout, one encode at the server send), **O1b** (the child is a `Stream`, the owner iterates its streams: no `get2_mut` dance per child per pass), **L2** (same-pass). Target <= 6k | X4, O1b, L2 |
-| 11 | **TLS record layer** (h2s1) | `SSL_read` 7.4k + `SSL_write` 6.6k inclusive [H], of which ~7k is syscall skid: **~7-8k** user | rustls record 3.4k + ring seal/open 1.4k [T544] = **4.8k**: **Ibex advantage ~3k** | ring's assembly, rustls's smaller state | keep | - |
+| 9 | **Send/recv path, syscalls** | h2s1: `recvmsg` 4.01 (1 EAGAIN), `sendmsg` 2.00, `epoll_wait` 3.00, `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` **6.00 real syscalls** (`clock_entering/leaving_poll`, clock.c:404/474) [C]; `MSG_MORE` via `CO_SFL_MSG_MORE` when a head precedes a body; `sc_conn_recv` self 0.8k, `sc_conn_send` self 0.2k, `h1_recv`/`h1_send` ~1k [H] | h2s1: `read` 2.00, `write` 2.00, `epoll_wait` 3.07, no clock syscalls [C]: **fewer syscalls, kernel at parity** (68.2k vs 69.4k on keepalive today); user side: `process_cli` 0.36k, `process_cli_io` 0.26k, `advance` 0.18k, `MsgState::advance_counted` 0.53k + `eq` 0.18k, `interests` 0.18k, `Buf::nominal/readable/drop` 0.9k [I self] = **~2.6k** against HAProxy's ~2k; `req/rep.release()` per run gives the buffer back and re-takes it on the next read (HAProxy frees only when empty, keeps `ibuf` while a request is in flight) | Alcyon's state machine re-derives `MsgState` and interests per run; buffer take/give per run | **IO1**: `advance` driven by readiness bits set by the poller, `MsgState` advanced by the parser's return (no re-walk), buffer kept while the txn is open, `Buf` accessors without the `nominal` indirection. Target <= 1.5k. No splice/zero-copy work: at these sizes HAProxy does not use them either (`htx_xfer` is a memcpy) | IO1 |
+| 10 | **h2 framing and HPACK** | `h2c_dec_hdrs` 2.6k + `h2_make_htx_request` 2.1k + `h2c_frt_handle_headers` self 0.3k [H] on the request; `h2s_snd_fhdrs` 0.7k + `h2_snd_buf` self 0.3k + `h2_send` 0.4k on the response: **~6.4k** | `MuxH2` 4.9k + `hpack` 3.8k (of which `find_table_entry` 1.4k, Q3 done) + bridge `start_request` 5.3k (E1 took the 4.7k re-parse) + `forward_response` 3.6k (E2 took `send_h1_head`'s re-split) [I]: ~**8-10k after E1/E2/Q3** [E] | Alcyon still crosses HTTP/1.1 text at the server send and a `copy_header` list; the owner moves bytes through `h2_bridge_moves` 4.2k | **X4** (blocks into the child's layout, one encode at the server send), **O1b** (the child is a `Stream`, the owner iterates its streams: no `get2_mut` dance per child per pass), **L2** (same-pass). Target <= 6k | X4, O1b, L2 |
+| 11 | **TLS record layer** (h2s1) | `SSL_read` 7.4k + `SSL_write` 6.6k inclusive [H], of which ~7k is syscall skid: **~7-8k** user | rustls record 3.4k + ring seal/open 1.4k [T544] = **4.8k**: **Alcyon advantage ~3k** | ring's assembly, rustls's smaller state | keep | - |
 | 12 | **Clock and timers** | one `clock_update_date` a pass (vDSO) + 2 CPU-time syscalls a pass; timers in the `eb32` wait queue, `wake_expired_tasks` 0.11k [H] | 37.6 `Instant::now` a request at T544 (3-3.4k) [I]; Q2 since: per-pass cell; `wake_expired_tasks` 0.3k, `Tick::is_before` 0.1k, `Duration::as_millis` 0.2k [I] | done by Q2; residue in conversions and `StreamLog::start`'s `SystemTime::now` | **C2**: `%t`/`%Tl` from the pass clock (HAProxy's global `date`), ticks stored as the pass's `u32` ms, no `Duration` arithmetic on the path. X0 counts reads after Q2 | C2 |
-| 13 | **Counters, stats accounting, logs** | `stream_process_counters` 0.21k + `stream_update_time_stats` 0.15k + atomics on per-tgroup shared counters [H]: **~0.5k**; no `log` target: `strm_log` 0 | `account_stream` 1.1k + `statcnt` 1.0k + `atomic` 1.3k (incl. `TimeStat::add`'s `fetch_max` cmpxchg loop 0.35k) + `txnlog` 0.8k [I]: **~3k**; `set_stream_log` with no target: X0 item 10 | both sides use shared atomics (HAProxy per thread group); Ibex adds a `now_ms` read, `RateCtr::at`, `count_status` on three rows, the `fetch_max` loop | **C1**: Q6 (`fetch_max` -> load, store if greater); `account_stream` from the pass clock; one `count_status` call; `StreamLog` fields only when a log target exists. Per-thread counter rows **not** adopted (10k servers x 64 threads x 200 B = 128 MB, T175's lesson). Target <= 1.2k | C1 |
-| 14 | **Pools and malloc** | `pool_*` + malloc/free 1.4k (h2) to 4.2k (rules) [H, M] | 0 malloc; `Buf` pool 0.3k; spares 4.1k on rules [M] (row 8) | Ibex's pools are cheaper per op; the rules' spare traffic is a representation cost | nothing beyond R2/X2 | - |
-| 15 | **Safety extras on by default** (zero-on-free, wipe, `crash::contain`, `watchdog` x3/pass, `fault_point`) | none | [E] 0.3-1k; X0 item 9 lists them | Ibex-only | user decision per item (fair benchmark defaults, §6 D-11) | X0 |
+| 13 | **Counters, stats accounting, logs** | `stream_process_counters` 0.21k + `stream_update_time_stats` 0.15k + atomics on per-tgroup shared counters [H]: **~0.5k**; no `log` target: `strm_log` 0 | `account_stream` 1.1k + `statcnt` 1.0k + `atomic` 1.3k (incl. `TimeStat::add`'s `fetch_max` cmpxchg loop 0.35k) + `txnlog` 0.8k [I]: **~3k**; `set_stream_log` with no target: X0 item 10 | both sides use shared atomics (HAProxy per thread group); Alcyon adds a `now_ms` read, `RateCtr::at`, `count_status` on three rows, the `fetch_max` loop | **C1**: Q6 (`fetch_max` -> load, store if greater); `account_stream` from the pass clock; one `count_status` call; `StreamLog` fields only when a log target exists. Per-thread counter rows **not** adopted (10k servers x 64 threads x 200 B = 128 MB, T175's lesson). Target <= 1.2k | C1 |
+| 14 | **Pools and malloc** | `pool_*` + malloc/free 1.4k (h2) to 4.2k (rules) [H, M] | 0 malloc; `Buf` pool 0.3k; spares 4.1k on rules [M] (row 8) | Alcyon's pools are cheaper per op; the rules' spare traffic is a representation cost | nothing beyond R2/X2 | - |
+| 15 | **Safety extras on by default** (zero-on-free, wipe, `crash::contain`, `watchdog` x3/pass, `fault_point`) | none | [E] 0.3-1k; X0 item 9 lists them | Alcyon-only | user decision per item (fair benchmark defaults, §6 D-11) | X0 |
 
 ### 2.1 Measured (X0, 2026-11-01)
 
@@ -157,7 +157,7 @@ folded stacks, scripts: `~/ibex-worktrees/review/x0-2026-11-01/` (`insreq/`, `ca
 ab1` (the bodies in `tools/measure/scenarios/`) and `h2s1` on a copy of `h3.body` without the
 `quic4@` bind (`scripts/h2.body`).
 
-**How to read the profile columns.** Ibex: IBS (`ibs_op/cnt_ctl=1,swfilt=1/u`), frame pointers,
+**How to read the profile columns.** Alcyon: IBS (`ibs_op/cnt_ctl=1,swfilt=1/u`), frame pointers,
 inlines expanded (`fold2.py`); samples on the `syscall` instruction (24-28 % of the samples) are
 dropped and the rest scaled to the `insreq.sh` user total of the same run (T544's convention).
 HAProxy: `instructions:u -c 100003 --call-graph dwarf`, with the same two drops (`__syscall_cancel_arch_end`
@@ -167,7 +167,7 @@ Read each row as +-15 %; two tools, two skids. A "k" below is 1,000 instructions
 **Totals** (`insreq.sh`, 5 rounds x 20,000 requests, min-total round; h3fit 5 rounds x 5,000, user
 only):
 
-| scenario | Ibex user | Ibex kernel | HAProxy user | HAProxy kernel | ratio user | Ibex passes/req | HAProxy passes/req |
+| scenario | Alcyon user | Alcyon kernel | HAProxy user | HAProxy kernel | ratio user | Alcyon passes/req | HAProxy passes/req |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | keepalive ab1 | 45,900 | 65,892 | 36,230 | 69,698 | 1.27x | 2.00 | 2.00 |
 | rules ab1 | 75,719 | 66,143 | 43,830 | 69,570 | 1.73x | 2.00 | 2.00 |
@@ -176,7 +176,7 @@ only):
 
 HAProxy dev10's h3fit is 64.0k here against 73.7k in D6 and the table of §5: dev10 was rebuilt on
 10-31 (memory: "dev10 since 18:17"); the ratio for the h3 row of §5 must be re-read from this
-table. Kernel: Ibex is **3.8k (keepalive), 3.4k (rules), 7.0k (h2s1) below HAProxy**, i.e. the
+table. Kernel: Alcyon is **3.8k (keepalive), 3.4k (rules), 7.0k (h2s1) below HAProxy**, i.e. the
 kernel side is already past parity; every slice's "kernel <= parent" rule is the right one.
 HAProxy's keepalive user total is 36.2k here (33.3k in the htx doc's record from
 `memory-2026-10-24.md`: older build/oracle), so the keepalive gap is **9.7k**, not 12.6k.
@@ -190,16 +190,16 @@ land in the same `epoll_wait`, so the pass count falls to HAProxy's). T544's 3.0
 census, its 7.15 the uprobe run. The undisturbed figure is about **8**, and it varies with the
 timing of the client (6.0-8.0 over my runs); HAProxy is 3.00 under every observer. keepalive is 2.00
 under every observer, both proxies. Task runs a request (`Dispatch::run`, uprobes, 6-pass runs):
-Ibex 2.0 / 2.0 / 9.0 (`step_stream_run` the same; `h2_owner_mut` 10.0, `advance` 12.0, `wake_queued`
+Alcyon 2.0 / 2.0 / 9.0 (`step_stream_run` the same; `h2_owner_mut` 10.0, `advance` 12.0, `wake_queued`
 12.0, `update_interests` 9.0 on h2s1), HAProxy `process_stream` 2 / 2 / 2, `h1_io_cb` 2 / 2 / 1,
 `h2_io_cb` 0 / 0 / 3, `sc_conn_io_cb` 3 / 3 / 3, `run_tasks_from_lists` 5.0 / - / 7.0 calls of
-`t->process` (HAProxy h2: 7 task runs, 3 passes; Ibex: 9 runs in 6-8 passes). Ibex's h2s1 pass
+`t->process` (HAProxy h2: 7 task runs, 3 passes; Alcyon: 9 runs in 6-8 passes). Alcyon's h2s1 pass
 costs 1.05k outside the tasks (below), so **each pass L2 removes is worth ~1k**.
 
 **Syscalls a request** (tracepoints, 5,000 requests; `strace -c` over 2,000 in `strace/` agrees
 except for `epoll_wait` on h2s1):
 
-| syscall | keepalive Ibex / HAProxy | rules Ibex / HAProxy | h2s1 Ibex / HAProxy |
+| syscall | keepalive Alcyon / HAProxy | rules Alcyon / HAProxy | h2s1 Alcyon / HAProxy |
 |---|---:|---:|---:|
 | `epoll_wait` | 2.00 / 2.00 | 2.00 / 2.00 | **7.99 / 3.00** |
 | `read` / `recvmsg` | 2.00 / 2.00 | 2.00 / 2.00 | 2.00 / **4.00** (1 EAGAIN each) |
@@ -207,10 +207,10 @@ except for `epoll_wait` on h2s1):
 | `clock_gettime` (real syscall, `CLOCK_THREAD_CPUTIME_ID`) | 0 / **4.00** | 0 / **4.00** | 0 / **6.00** |
 | all syscalls | 6.01 / 10.01 | 6.01 / 10.01 | 12.01 / 15.01 |
 
-Ibex has fewer syscalls on all three and fewer kernel instructions; the 5 extra `epoll_wait` of
+Alcyon has fewer syscalls on all three and fewer kernel instructions; the 5 extra `epoll_wait` of
 h2s1 cost less in the kernel than HAProxy's 2 `recvmsg` EAGAIN, 6 CPU-time syscalls and the rest.
 
-**Clock reads** (uprobe on libc `clock_gettime` with a call chain, `clk/`): Ibex keepalive **5.0**
+**Clock reads** (uprobe on libc `clock_gettime` with a call chain, `clk/`): Alcyon keepalive **5.0**
 (4 `Instant::now`: two a pass, `run_loop` and `step_at`; 1 `SystemTime::now`, `StreamLog::start`
 from `reset_for_next_request`), rules **6.0** (+1 `SystemTime::now` inside a fetch, closure #214,
 `eval_g`), h2s1 **14-16.6** (2 a pass x 6-8 passes, +2 `StreamLog::start`). Q2 holds: two a pass.
@@ -218,26 +218,26 @@ Cost, inclusive: `Instant::now` 0.55k / 0.53k / 2.58k, `SystemTime::now` 0.30k /
 the vDSO leaf alone 0.51k / 0.37k / 1.83k (**1.8 % / 1.1 % / 4.1 %** of the user total). HAProxy:
 8 / 8 / 12 `clock_gettime` calls a request, half of them real syscalls.
 
-**Rows of the §2 table, measured** (user instructions a request, keepalive / rules / h2s1; Ibex
+**Rows of the §2 table, measured** (user instructions a request, keepalive / rules / h2s1; Alcyon
 inclusive unless "self"; HAProxy inclusive, skid-dropped; the full tables are `prof/*.tab`,
-`ibex-rows.txt`, `hap-rows.txt`):
+`alcyon-rows.txt`, `hap-rows.txt`):
 
-| # | component | HAProxy | Ibex | against §2's estimate |
+| # | component | HAProxy | Alcyon | against §2's estimate |
 |---|---|---|---|---|
 | 1 | loop pass, outside the tasks | `run_poll_loop` less `process_runnable_tasks`: 1.34k / 1.30k / 1.17k = **0.67k / 0.65k / 0.39k a pass** | `run_loop` less `run_tasks_from_lists`: 2.93k / 2.09k / ~8.4k (h2s1: `step_at` less its tasks and `spawn_h2_children`, plus `run_loop`'s own) = **1.47k / 1.05k / 1.05k a pass**; `step_at` self 0.39k / 0.31k / 1.17k; `wake_expired_tasks` 0.23 / 0.13 / 0.92, `Instant::now` 0.55 / 0.53 / 2.58 (two a pass), `trim_idle` 0.14 / 0.14 / 0.43, `publish` x3 0.04 / 0.01 / 0.32, `pool::pass` 0.01 / 0.01 / 0.09, `purge` 0.07 / 0.01 / 0.10, `watchdog` 0.04 / 0.10 / 0.11 | §2 said ~250 a pass of pure loop: measured **1.05-1.5k** including the clock, the timer queue, `epoll_wait`'s user side and event decode. Housekeeping calls alone are 0.35k / 0.2k / 1.0k a request (the 100-250 a pass of L1). |
 | 2 | passes, task runs | 2 / 2 / 3 passes; 5 / - / 7 runs | 2 / 2 / **6-8** passes; 2 / 2 / 9 runs | h2s1 is 8 passes (not 3.07, not 7.15); keepalive has no excess pass. |
 | 3 | stream run, fixed | `process_stream` self 1.98k / 2.1k / 2.7k for 2 runs = **~1.0-1.3k a run**; `process_runnable_tasks` + `run_tasks_from_lists` self 1.5k / 1.6k / 2.0k | `Dispatch::run` .. `step_stream` shell 0.48k a run + `step_stream_run` self 0.27k a run + its other children (`update_interests` 0.35k, `next_expiry`, `is_done`, `wants_rerun`, ...) = **~1.5k a run** keepalive; h2s1 (`step_stream_run` self 1.57k, `update_interests` 1.50k, `Buf::release` 0.80k, `next_expiry` 0.22k, shell 2.3k over 9 runs) = **~0.95k a run** | §2 said 500-800 a run: keepalive is above it; L3's target of 150 is right. |
-| 4 | stream set-up and tear-down | `stream_new` 3.2k / 2.6k / 1.6k + `stream_free` 4.2k / 4.4k / 4.0k = **7.4k / 7.0k / 5.6k** | keepalive: `end_txn` 1.70k (`reset_for_next_request` 0.97k, `IdlePool::note_used` 0.33k); rules 2.04k; h2s1: `h2_child_of` 2.03k (`new_with_mode` 0.80k) + `end_txn` 2.47k + `end_stream` 2.60k (`h2_child_released` 1.42k) = **7.1k** | the Ibex h1 model is **5.7k cheaper than HAProxy** per request; on h2s1 Ibex is 1.5k *dearer* (7.1k against 5.6k). `end_txn` is 1.7k on h1, not 2.7k. |
+| 4 | stream set-up and tear-down | `stream_new` 3.2k / 2.6k / 1.6k + `stream_free` 4.2k / 4.4k / 4.0k = **7.4k / 7.0k / 5.6k** | keepalive: `end_txn` 1.70k (`reset_for_next_request` 0.97k, `IdlePool::note_used` 0.33k); rules 2.04k; h2s1: `h2_child_of` 2.03k (`new_with_mode` 0.80k) + `end_txn` 2.47k + `end_stream` 2.60k (`h2_child_released` 1.42k) = **7.1k** | the Alcyon h1 model is **5.7k cheaper than HAProxy** per request; on h2s1 Alcyon is 1.5k *dearer* (7.1k against 5.6k). `end_txn` is 1.7k on h1, not 2.7k. |
 | 5 | backend selection and reuse | `connect_server` 1.9k / 1.9k / 1.8k incl `assign_server` 1.1k, `conn_backend_get` 0.2k, `srv_add_to_idle_list` 0.5k, `stream_set_backend` 0.3k, `back_try_conn_req` 2.1k incl | `connect_http_backend` 12.9k / 33.4k / 6.4k incl; **without the request rules and the `Connection` rewrite** (below): 7.4k keepalive; `route_to_server` 1.86k / 3.89k / 2.55k (`select_server` 0.94k / 2.83k / 1.38k, `IdlePools` 0.33k / 0.59k / 0.78k) | h2s1's 6.4k (7.2k at T544) is the O2 base; the lock/hash rows (`IdlePools`) are 0.8k on h2s1 and 0.3k on keepalive: a small share. |
 | 6 | h1 parse | `h1_parse_msg_hdrs` 2.4k + `h1_headers_to_hdr_list` 0.6k + `htx_*`/`__htx_*` 1.9k = **~4.9k per head** | request: `validate_request_head` **10.06k / 9.34k** (`H1Parser::parse` 7.51k / 6.78k, of which `parse_headers` 5.86k, `parse_start_line` 1.14k; `from_utf8` 0.67k) + `req_htx_init` 0.59k / 1.45k; response: `check_response_head` 1.1k, `HeadFacts::of_response` 1.2k, `RspHead` 0.2k | **parse is 2x HAProxy** (7.5k vs 3.0k for the header parse alone): hot leaves are `memchr` 3.5k self, `eq_ignore_ascii_case` 1.1k, `to_ascii_lowercase`/`is_ascii_uppercase` 1.25k, `ascii_word_spans` 1.1k, `from_utf8` 0.55k. X2/X3's 3.5k target is right. |
 | 7 | representation through rules | see `htx-engine-2026-11-01.md` §1.3 | | |
 | 8 | rules (rules ab1) | 7.6k for the scenario: `http_req_get_intercept_rule` 7.3k incl (`acl_exec_cond` 2.1k incl, `pattern_exec_match` 1.55k, `sample_process` 0.72k, `http_add_header` 0.9k), `http_res_get_intercept_rule` 1.3k | **29.8k**: request rules (`connect_http_backend::{closure#16}`) **16.9k**, response rules `apply_http_response_rules_in` +9.7k over keepalive's; per request: **3 fetch-function bodies** (closure #19 x2, #214 x1), `apply_converters_g` 3, `render_rule_format` 2, `req_rule_header` 2, `write_req_head` **2**, `vars::with_stream` 1, `from_utf8` **39** (22 on keepalive: +17 for the rules), `spare::*` pool misses 0 (the take/give itself is 2.26k incl), `VarStore`/`vars::` 1.31k, `SampleContext` constructions 2.11k incl, `Expr::eval` 3.75k, `any_acl` 2.26k, `eval_g` 1.33k, `Matcher` (regex) 1.1k, converters 1.88k | the hash lookup is not the cost: `eval_g` is 1.33k for 3 fetches (~0.44k a fetch), `fetches.get` itself is not separable (inlined; 3 calls a request). The rules cost sits in the per-rule representation (rebuild 3.0k, spares 2.3k, contexts 2.1k, `from_utf8` 1.7k, header edits 1.75k). |
 | 9 | send/recv, I/O state machine, self | `sc_conn_recv` self 0.8k, `sc_conn_send` self 0.22k, `h1_send` self 0.23k, `h1_snd_buf` self 1.5k, `h1_rcv_buf` 0.18k, `h1_process_demux` self 1.16k = ~4.1k | `process_cli_io` self 0.88k, `process_srv*` 0.03k, `advance` self 0.05k, `MsgState::advance_counted` 0.49k, `interests` 0.05k, `update_interests` 0.07k, `Buf::nominal` 0.18k, `Buf::readable` 0.28k, `release_idle_buffers` 0.01k (0.34k incl) = **~2.1k** (h2s1: 3.0k with `advance_counted` 0.85k, `update_interests` 0.21k, `Buf::release` 0.8k incl) | the I/O state machine's *self* is not the gap (HAProxy's equivalents are larger); IO1's gain is the walk it avoids. |
 | 10 | h2 framing + HPACK | `h2_*` 24.4k incl; `h2c_dec_hdrs` 3.2k, `h2_make_htx_request` 2.6k, `h2s_snd_fhdrs` 0.6k | `MuxH2` 6.2k incl, `hpack` 3.1k incl, `start_request` 8.7k incl (incl. `put_request_head` 3.9k, `process_decoded_block` 5.3k), `forward_response` 1.3k | the bridge, not the mux, is the cost: `start_request` 8.7k. |
-| 11 | TLS (h2s1) | `SSL_read` 5.6k + `SSL_write` 7.5k = 13.1k incl (skid-shares) | `rustls` 3.6k + `ring` 3.5k + `ibex_tls` glue 3.9k incl (partly overlapping) | Ibex advantage stands. |
+| 11 | TLS (h2s1) | `SSL_read` 5.6k + `SSL_write` 7.5k = 13.1k incl (skid-shares) | `rustls` 3.6k + `ring` 3.5k + `alcyon_tls` glue 3.9k incl (partly overlapping) | Alcyon advantage stands. |
 | 12 | clock and timers | see "Clock reads" above | | C2 stands. |
 | 13 | counters, accounting, logs | `stream_process_counters` 0.25k + `stream_update_time_stats` 0.15-0.26k = **0.45-0.64k** | keepalive: `statcnt` 0.20k, `atomic_umax` 0.08k, `StreamLog`/`txnlog` 0.47k / 0.54k (incl. a `SystemTime::now` 0.30k), `end_txn` self 0.17k = **~0.9k**; rules ~1.0k; h2s1: `statcnt` 0.46k, `account_stream` 0.48k, `set_stream_log` 0.86k (`StreamLog` 0.78k), `end_stream` self 0.15k = **~2.0k** | §2 said ~3k: **0.9k keepalive, 2.0k h2s1**. |
-| 14 | pools and malloc | `__pool_alloc` 1.1k / 1.6k / 1.3k + `__pool_free` 0.5k / 0.75k / 0.63k + `pool_put_to_cache` 0.5k = **~2.1k / 2.9k / 2.2k** | pool take/give 0.13k / 1.84k (rules) / 0.67k; 0 malloc | Ibex advantage 2k on keepalive. |
+| 14 | pools and malloc | `__pool_alloc` 1.1k / 1.6k / 1.3k + `__pool_free` 0.5k / 0.75k / 0.63k + `pool_put_to_cache` 0.5k = **~2.1k / 2.9k / 2.2k** | pool take/give 0.13k / 1.84k (rules) / 0.67k; 0 malloc | Alcyon advantage 2k on keepalive. |
 | 15 | safety extras on by default | none | below | below |
 
 **Safety extras (item 9), one row each, user instructions a request, keepalive / rules / h2s1:**
@@ -246,8 +246,8 @@ inclusive unless "self"; HAProxy inclusive, skid-dropped; the full tables are `p
 |---|---|---:|
 | `crash::contain` (thread-local set/clear + `catch_unwind` landing pad), once per task run | on | **0.03k / 0.13k / 0.08k** (self; `catch_unwind` is zero-cost when nothing panics). Below the 0.3k at which §5 (c) would move it to a setting. |
 | `watchdog::progress` / `sleeping` / `set_streams`, 3 a pass | on | 0.04k / 0.10k / 0.11k |
-| buffer wipe (`tune.ibex.zero-buffers`) | **default off**: `ibex_alloc::wipe` is an atomic load | 0.03k / 0.05k / 0.05k |
-| TLS record wipe (`tune.ibex.ssl-zero-buffers`) | on | h2s1: a memset under `Encrypting::encrypt_records` 0.12k (probably the wipe; the call chain does not say) |
+| buffer wipe (`tune.alcyon.zero-buffers`) | **default off**: `alcyon_alloc::wipe` is an atomic load | 0.03k / 0.05k / 0.05k |
+| TLS record wipe (`tune.alcyon.ssl-zero-buffers`) | on | h2s1: a memset under `Encrypting::encrypt_records` 0.12k (probably the wipe; the call chain does not say) |
 | `fault_point` | **compiled out** (`#[cfg(debug_assertions)]`, crash.rs:101) | 0 |
 | `StreamLog`/`set_stream_log` with no `log` target (item 10) | on | **0.47k / 0.45k / 0.78k**, 1.0-1.1 % of the total; see below |
 | `Pool`/guard bookkeeping | on | not a safety extra; `Guard` 0.14k / 0.25k / 0.21k |
@@ -262,8 +262,8 @@ target exists".
 
 **Where the keepalive remainder goes (the ~2k of the 9.6k that §5 says no slice names).** The
 measured gap is 9.7k. Its largest single item is not in any slice list: **the `Connection`-header
-path, 8.1k on Ibex against ~0.5k on HAProxy**. `ab -k` sends HTTP/1.0 with `Connection:
-Keep-Alive`, and Ibex does this per request: `strip_request_connection` 2.29k (`with_htx_mut` 0.6k,
+path, 8.1k on Alcyon against ~0.5k on HAProxy**. `ab -k` sends HTTP/1.0 with `Connection:
+Keep-Alive`, and Alcyon does this per request: `strip_request_connection` 2.29k (`with_htx_mut` 0.6k,
 `and_then` 0.55k, `is_some_and` 0.66k), `rewrite_request_connection` **5.50k** (of which
 `write_req_head` 3.08k, plus a **`memset` 1.14k** attributed to
 `rewrite_request_connection` itself: the 8 KiB stack zeroing of the head rebuild, inlined
@@ -280,7 +280,7 @@ no memset; expected **-4 to -6k on keepalive ab1 and rules ab1**, 0 on h2s1/h3. 
 etc. **+5k** (X2/X3: named); response head after the server `apply_http_response_rules_in` 5.0k with
 no rules (`HeadFacts::of_response` 1.2k, `check_response_head` 1.1k, `inject` 0.4k, memset 0.3k)
 against HAProxy's ~2.4k: **+2.6k** (E2 left it; X3 names part); loop + run fixed **+2.2k** (L1/L3:
-named); the rest nets against Ibex's **-5.7k** (no per-request stream object). So after K1 and X
+named); the rest nets against Alcyon's **-5.7k** (no per-request stream object). So after K1 and X
 the named + K1 total covers the gap with ~1k to spare; without K1, §5's keepalive landing
 (38.7-41.9k) is optimistic by ~5k.
 
@@ -329,7 +329,7 @@ Objects:
   across keep-alive. Owner (h2/h3): the connection, the mux, `Vec<Stream>` by stream id.
 - **`Stream`** (O1): txn state (`MsgState` x2, flags, status, termination), `StreamLog`,
   txn/reqres vars, captures, backend side (server index, the server connection handle, retries,
-  queue position), the scheduler task ref, timers (`expire`). Pooled (`ibex_alloc::Pool`, 1 KiB
+  queue position), the scheduler task ref, timers (`expire`). Pooled (`alcyon_alloc::Pool`, 1 KiB
   class), never zero-constructed on the path: a reset writes the dozen fields that change.
   HAProxy's `struct stream` (stream-t.h:243) is the model; what the session owns there
   (`vars_sess`, session stick counters, the frontend, the listener) stays on the connection.
@@ -346,9 +346,9 @@ Objects:
   `send_head(&HtxSliceRef)`, `send_interim`, body as the transport bytes (fast-forward always)
   with DATA blocks on demand (X6). h1's "mux" is the in-place parser + the encoder.
 
-### 3.2 Where Ibex beats HAProxy, by design
+### 3.2 Where Alcyon beats HAProxy, by design
 
-| item | HAProxy pays | Ibex after the overhaul | rows |
+| item | HAProxy pays | Alcyon after the overhaul | rows |
 |---|---|---|---|
 | stream object per keep-alive request | `stream_new` + `stream_free` ~4.4k | reset of one pooled `Stream`, ~0.3k | 4 |
 | server connection between requests | idle list give + take ~1k | parked on the session (`SRV_PARK_MS`) | 5 |
@@ -363,10 +363,10 @@ Objects:
 Sum of the advantages: ~12-15k on h1, ~15-18k on h2 (TLS). That is the whole margin the 0.9x aim
 rests on; §5 says how much of it the slices are expected to realise.
 
-### 3.3 Where Ibex must copy HAProxy
+### 3.3 Where Alcyon must copy HAProxy
 
 - **State-gated stream processing**: `process_stream` runs only what its flags say (wake reason,
-  `analysers` bits, `CF_*_EVENT`); Ibex's run re-derives rare conditions every time (L3).
+  `analysers` bits, `CF_*_EVENT`); Alcyon's run re-derives rare conditions every time (L3).
 - **Housekeeping from timers, not the pass** (L1).
 - **Rules compiled to function pointers with parsed arguments; samples as views** (R1, R2).
 - **Dense indices and per-thread lists for servers and idle connections** (O2).
@@ -408,7 +408,7 @@ The h3 mux shares `HtxMux` and the owner/stream model, so every engine saving la
 
 | quinn slice | depends on the overhaul? | order |
 |---|---|---|
-| Q1 (glue by handle, slab, timers) | no (Ibex glue, `quic_listener.rs`/`endpoint.rs`) | **now** |
+| Q1 (glue by handle, slab, timers) | no (Alcyon glue, `quic_listener.rs`/`endpoint.rs`) | **now** |
 | Q2 mechanical half (option (a): `FrameStats`, `VarInt`, `PacketSpace::take`, `ArrayRangeSet`) | no (vendored quinn internals) | **now**, parallel |
 | Q2 b1 (one drive + one `poll_transmit` per connection per pass) | **yes: L2** defines when the owner runs; doing b1 first would be redone | after L2 |
 | Q4 (b2-b5: dirty flag, ACK-only skip, `SendBuffer.acks`, loss detection on advance) | no | any time, parallel |
@@ -434,7 +434,7 @@ brief is mechanical and the test pins it.
 
 **Budgets after X0 (2026-11-01).** Every "expected" cell below is rewritten from §2.1's measured
 rows and names its base; the pre-X0 reasoning in the same cell is gone. Base figures (user
-instructions a request): Ibex keepalive 45.9k, rules 75.7k, h2s1 71.6k, h3fit 98.9k; HAProxy
+instructions a request): Alcyon keepalive 45.9k, rules 75.7k, h2s1 71.6k, h3fit 98.9k; HAProxy
 36.2k, 43.8k, 53.2k, 64.0k (dev10). Delivery so far against a design range: R1 (T574) measured
 -1.06k on a -1.5 to -3k range (X0: the name lookup was not the cost); S7/E2 left 4.0k where
 ~2.5k was estimated (htx §1.3 row 1). §5 therefore reads the sums at a **delivery factor of
@@ -462,7 +462,7 @@ with these changes (the "expected" cells there are superseded by the ranges here
 - **X5**: unchanged, neutral. Its `ConnMode` flags are K1's (T575) flags: K1 lands first, X5
   consumes them (`h1_make_eoh`'s mode rule emits the token; K1's interim token write goes).
 - **X2**: also the request-phase `SampleContext` built once per rule run (not per rule) and the
-  `tune.ibex.h1-lowercase-headers` passthrough leg (D-E, default off). Expected: **keepalive
+  `tune.alcyon.h1-lowercase-headers` passthrough leg (D-E, default off). Expected: **keepalive
   -3 to -5k** (the parse 10.1k -> 5-7k with X1's parser, `req_htx_init` 0.6k and the `htx_buf`
   take/give gone, +0.2k descriptor writes; T575's UTF-8 -0.8k and K1's Connection path are
   **excluded** because they land first; K1's remaining token write folds into
@@ -491,15 +491,15 @@ with these changes (the "expected" cells there are superseded by the ranges here
 
 | slice | goal | files | test that fails first | expected ins/req (reasoning) | size | depends | model |
 |---|---|---|---|---|---|---|---|
-| **L1** | housekeeping out of the pass: idle purge, buffer trim, stick-table expiry, `pool::pass`, the three `publish`es, accept-limit and CLI-retry checks become `Kind::Housekeeping` tasks on the wait queue (one per concern, HAProxy's `srv_cleanup_idle_conns`/`process_table_expire` model) run when their timer expires; QUIC admit/adopt/serve behind `!quic_listeners.is_empty()`; `EngineDispatcher` built once per `Engine` | `engine.rs` `step_at` 5923-6230, `sched.rs` (a task kind), `pool.rs` (`pass` from a task) | `crates/ibex-rt/tests/it/engine_pass.rs` (new module): `a_pass_with_nothing_due_does_no_housekeeping` — `#[cfg(debug_assertions)]` `work::Op::Housekeeping` counter 0 over 100 idle passes and 1 per timer period; red today (every pass). `show pools`/`show info` rows stay identical under the stats battery | **keepalive/rules -0.3 to -0.8k** (§2.1 row 1: housekeeping calls 0.2-0.35k a request + `step_at` self 0.3-0.4k); **h2s1/h3fit -1 to -2k at today's 8 passes** (housekeeping 1.0k + `step_at` self 1.2k), **-0.5 to -1k once L2 holds 3 passes**; kernel 0 | M | - | Sonnet |
-| **L2** | instant wakeup: `Dispatch` gets `wake_now(TaskRef)` which pushes to the current pass's tasklet list; `run_tasks_from_lists` drains what arrives while it runs (budget-bounded, as HAProxy's lists); the `last_run == loops` guard (sched.rs:703) allows a second run per pass and refuses a third; the owner<->child wakes (engine.rs:11212, `h2_owner_pass`'s `wake_queue`) and `wants_rerun` use it; `wake_queue` keeps only cross-pass uses (buffer waiters, mailbox) | `sched.rs` 637-740, `engine.rs` dispatcher (`wake_queue` sites), `h2_owner_pass` | `engine_pass.rs`: `an_h2_request_completes_in_three_passes` and `an_h1_keepalive_request_completes_in_two` — debug counter of `step_at` per request through a local h2load/ab run in the test harness (as `h2_per_request_work.rs` counts); red today on h2 (8 passes undisturbed, X0; the h1 row is already 2.00 and only pins). `ibex-sched` unit tests: a task woken twice in a pass runs twice, a third wake waits; the Bulk demotion still applies to self-wakes | **h2s1 -4 to -5.5k** (§2.1: 7.99 passes against HAProxy's 3.00, 1.05k a pass outside the tasks; 5 passes removed) and **kernel -5 `epoll_wait` a request**; **h3fit -4 to -6k** (7-8 passes to <= 3-4); **keepalive/rules 0**: 2.00 passes under every observer on both proxies, no third pass exists; the slice names no h1 saving | M | - | Opus |
+| **L1** | housekeeping out of the pass: idle purge, buffer trim, stick-table expiry, `pool::pass`, the three `publish`es, accept-limit and CLI-retry checks become `Kind::Housekeeping` tasks on the wait queue (one per concern, HAProxy's `srv_cleanup_idle_conns`/`process_table_expire` model) run when their timer expires; QUIC admit/adopt/serve behind `!quic_listeners.is_empty()`; `EngineDispatcher` built once per `Engine` | `engine.rs` `step_at` 5923-6230, `sched.rs` (a task kind), `pool.rs` (`pass` from a task) | `crates/alcyon-rt/tests/it/engine_pass.rs` (new module): `a_pass_with_nothing_due_does_no_housekeeping` — `#[cfg(debug_assertions)]` `work::Op::Housekeeping` counter 0 over 100 idle passes and 1 per timer period; red today (every pass). `show pools`/`show info` rows stay identical under the stats battery | **keepalive/rules -0.3 to -0.8k** (§2.1 row 1: housekeeping calls 0.2-0.35k a request + `step_at` self 0.3-0.4k); **h2s1/h3fit -1 to -2k at today's 8 passes** (housekeeping 1.0k + `step_at` self 1.2k), **-0.5 to -1k once L2 holds 3 passes**; kernel 0 | M | - | Sonnet |
+| **L2** | instant wakeup: `Dispatch` gets `wake_now(TaskRef)` which pushes to the current pass's tasklet list; `run_tasks_from_lists` drains what arrives while it runs (budget-bounded, as HAProxy's lists); the `last_run == loops` guard (sched.rs:703) allows a second run per pass and refuses a third; the owner<->child wakes (engine.rs:11212, `h2_owner_pass`'s `wake_queue`) and `wants_rerun` use it; `wake_queue` keeps only cross-pass uses (buffer waiters, mailbox) | `sched.rs` 637-740, `engine.rs` dispatcher (`wake_queue` sites), `h2_owner_pass` | `engine_pass.rs`: `an_h2_request_completes_in_three_passes` and `an_h1_keepalive_request_completes_in_two` — debug counter of `step_at` per request through a local h2load/ab run in the test harness (as `h2_per_request_work.rs` counts); red today on h2 (8 passes undisturbed, X0; the h1 row is already 2.00 and only pins). `alcyon-sched` unit tests: a task woken twice in a pass runs twice, a third wake waits; the Bulk demotion still applies to self-wakes | **h2s1 -4 to -5.5k** (§2.1: 7.99 passes against HAProxy's 3.00, 1.05k a pass outside the tasks; 5 passes removed) and **kernel -5 `epoll_wait` a request**; **h3fit -4 to -6k** (7-8 passes to <= 3-4); **keepalive/rules 0**: 2.00 passes under every observer on both proxies, no third pass exists; the slice names no h1 saving | M | - | Opus |
 | **L3** | the stream run gated by state: `step_stream_run` reads the wake reason (`WOKEN_TIMER` -> `check_timeouts`; `WOKEN_IO` -> clear the fired side's `cant_recv`), a `pending: u16` on `TcpSession` for the rare conditions (set where each arises: deferred session rules, tcp inspect x2, scrape, stick stores, glitches, park expiry, retry, connect-log, rate-max, srv handshake failure, checkcache), `stream_vars_enter/leave` and `stream_timeouts_enter` replaced by `&Proxy`/timeouts passed down (Q6: no `Arc` clone), `update_interests` only on a changed `(Want, Want)`, `req/rep.release()` at txn end | `engine.rs` 10889-11270, 7927-8000, 9485; `proxy.rs` (`pending`) | `engine_pass.rs`: `a_keepalive_stream_run_does_only_io_and_http` — `work::Op` counters for each rare check are 0 on a plain GET and 1 when the condition is set (deferred rule, inspect, scrape); red today. The timeout battery (T140-era `timeouts_*` modules) and `h2_per_request_work.rs` green; `Arc` strong count of the capture table constant across a request | **keepalive/rules -1.5 to -2.5k** (§2.1 row 3: fixed cost 1.5k a run x 2 runs; the 150 target leaves 0.3k), **h2s1/h3fit -3 to -4k after L2** (0.95k a run; 9 runs today, 5-7 after L2; -4 to -5k if L3 lands first, then L2's figure shrinks by the same) | L | L2 (run counts) | Opus |
 
 ### 4.3 Track O, stream objects and the backend side (survey S2 = E3)
 
 | slice | goal | files | test that fails first | expected | size | depends | model |
 |---|---|---|---|---|---|---|---|
-| **O1a** | the `Stream` object: `txn`, `log`, txn/reqres vars, captures, backend side, task, timers out of `TcpSession` into a pooled `Stream` (`ibex_alloc::Pool`, 1 KiB class, counted in `show pools`); the h1 session holds one and **resets** it at txn end (`Stream::reset`: the fields that change, no `Default`); `end_txn` becomes reset + the connection-level decisions | `proxy.rs` 653-894 (`TcpSession` split), `txn.rs`, `txnlog.rs`, `engine.rs` `end_txn` 10476, `account_stream` | `crates/ibex-rt/tests/it/stream_object.rs` (new module): `a_keepalive_request_resets_its_stream_in_place` (debug counter: 0 `Stream` allocations and 0 `StreamLog` constructions per keep-alive request after the first; red today: `end_txn` rebuilds), `stream_is_at_most_1_kib` (`size_of` pin), the log-format battery (`%Tr`, `%Tw`, `%ST`, captures, vars) identical | **keepalive/rules -0.3 to -0.8k** (§2.1 row 4: `end_txn` is 1.70k / 2.04k measured, not 2.7k: `reset_for_next_request` 0.97k proxy.rs:2190, `IdlePool::note_used` 0.33k; to ~1.2k); h2 0. The slice's worth is structural: O1b (-4 to -4.5k) and R4 (-1 to -2k) stand on the object, not its own saving | L | X2 (the stream's buffers are the layout) | Opus |
+| **O1a** | the `Stream` object: `txn`, `log`, txn/reqres vars, captures, backend side, task, timers out of `TcpSession` into a pooled `Stream` (`alcyon_alloc::Pool`, 1 KiB class, counted in `show pools`); the h1 session holds one and **resets** it at txn end (`Stream::reset`: the fields that change, no `Default`); `end_txn` becomes reset + the connection-level decisions | `proxy.rs` 653-894 (`TcpSession` split), `txn.rs`, `txnlog.rs`, `engine.rs` `end_txn` 10476, `account_stream` | `crates/alcyon-rt/tests/it/stream_object.rs` (new module): `a_keepalive_request_resets_its_stream_in_place` (debug counter: 0 `Stream` allocations and 0 `StreamLog` constructions per keep-alive request after the first; red today: `end_txn` rebuilds), `stream_is_at_most_1_kib` (`size_of` pin), the log-format battery (`%Tr`, `%Tw`, `%ST`, captures, vars) identical | **keepalive/rules -0.3 to -0.8k** (§2.1 row 4: `end_txn` is 1.70k / 2.04k measured, not 2.7k: `reset_for_next_request` 0.97k proxy.rs:2190, `IdlePool::note_used` 0.33k; to ~1.2k); h2 0. The slice's worth is structural: O1b (-4 to -4.5k) and R4 (-1 to -2k) stand on the object, not its own saving | L | X2 (the stream's buffers are the layout) | Opus |
 | **O1b** | h2 children as `Stream`s: the owner holds `Vec<Stream>` by stream id with a task each; `h2_child_of`/`h2_child_done`/`spawn_h2_children` become `Stream::start`/`finish`; `h2_owner_pass` iterates its streams (no `sessions.get2_mut` per child per pass); `end_stream` for a child is `finish` + pool give | `engine.rs` 6237, 10607-10660, 11272; `h2_bridge.rs`; `proxy.rs` (`h2_owner`) | `stream_object.rs`: `an_h2_stream_is_not_a_session` (debug counter: 0 `TcpSession` constructions per h2 request; red today 1), `h2_per_request_work.rs` rows green, the h2 battery (T280, T409, GOAWAY/RST rows) green | **h2s1 -4 to -4.5k** (§2.1 row 4: set-up + tear-down 7.1k measured, `h2_child_of` 2.03k, `end_txn` 2.47k, `end_stream` 2.60k with `h2_child_released` 1.42k; HAProxy 5.6k; target 2.5-3k) | L | O1a, X4 (D-F) | Opus |
 | **O1c** | h3 streams as `Stream`s: `step_h3_owner`'s children, `read_stream`/`write_stream` into the stream's layout (Q1's handle) | `engine.rs` `step_h3_owner`, `quic_listener.rs`, `mux_h3.rs` | `stream_object.rs`: the h3 row of the counter test; `h3_request_framing_to_backend.rs` green; h3fit measured | **h3fit -3 to -5k** (the h2s1 object figures carried over; X0 took no post-E2 h3 per-function table, T544's stands) | M | O1b, Q1 | Opus |
 | **O2** | backend side without hashes or locks: servers by dense index (Q5: `engine.rs:170,179,369,427`), idle connections as per-thread per-server `Vec<IdleConn>` (own thread first, cross-thread take only on a miss, as `conn_backend_get`), `IdlePools::with_count` and the `RwLock` read gone from the take, `route_to_server`/`select_server` on the compiled backend (precomputed server list, no name compares) | `engine.rs` `connect_http_backend` 12840-13100, `route_to_server` 14016, `select_server` 2054, `IdlePool` 265-600 | `stream_object.rs`: `taking_an_idle_connection_takes_no_lock_and_hashes_nothing` (debug counters on the lock and on `IdleKey` hashing; red today), `http_reuse_*` rows (safe/aggressive/always, the 64-thread `vtc` port at `engine.rs:1036`) green | **h2s1/h3fit -2 to -3.5k** (§2.1 row 5: `connect_http_backend` 6.4k on h2s1 without rules: `route_to_server` 2.55k, `select_server` 1.38k, `IdlePools` 0.78k; HAProxy 1.8k; target <= 3k); keepalive/rules ~0 (parked; the lock/hash rows are 0.3k there); kernel 0 | M | - | Sonnet |
@@ -508,18 +508,18 @@ with these changes (the "expected" cells there are superseded by the ranges here
 
 | slice | goal | files | test that fails first | expected | size | depends | model |
 |---|---|---|---|---|---|---|---|
-| **R1** | compiled dispatch: `Expr::parse` resolves `fetch_name` to `FetchFn` (+ `MultiFetchFn`/`VisitFetchFn`), parses args into `Arg` (lowercase header name bytes, int, regex, var name, table ref), resolves converters to `ConvFn`; `Registry::eval_g`/`any_acl`/`eval_all_g` take the compiled form; the by-name entry points stay for the CLI and tests only. Covers `tcp-request`/`tcp-response`, `use_backend`, `stick`, `log-format %[...]`, `track-sc` (the "Expr::cached" remainder) | `crates/ibex-sample/src/expr.rs`, `registry.rs` 1290-1330, `rule_compiled.rs`, `logfmt.rs` | `crates/ibex-sample/tests/it/compiled_expr.rs` (new module): `evaluating_a_compiled_expression_looks_up_no_name` (debug counter on `fetches.get`/`converters.get`: 0 per eval; red today 1 per fetch), the fetch/converter batteries (T80, T81) green through the compiled path | **closed: T574 measured rules -1.06k, keepalive flat** (design range was -1.5 to -3k; §2.1 row 8: the lookup was ~0.44k a fetch x 3 fetches, not 8 x 200-350; the rest of `Expr::eval`'s 3.75k is the materialised sample and the per-rule context, R2's and X2's) | M | - | Sonnet |
-| **R2** | samples as bytes, borrowed (user decision 2026-11-01: Ibex keeps data as bytes like HAProxy, no UTF-8 validation or re-encoding; replaces the "`str` samples stay UTF-8, validated once at the fetch" half of tradeoff 6.12 / D-B): `Sample<'a>` with `Str(Cow<'a, [u8]>)`/`Bin(Cow<'a, [u8]>)` views into the HTX block for header, path, method, query, cookie fetches (HAProxy's `SMP_F_CONST`, `smp->data.u.str` is bytes); owned bytes only after a converter produces new ones; **matchers and converters on bytes** (`-m str/sub/beg/end/dir/dom`, `lower`/`upper`/`word`/`field` as ASCII byte ops, HAProxy's `pat_match_*`); **regex**: `UserRegex::Linear` becomes `regex::bytes::Regex` (ibex-regex/src/lib.rs:596-601; no lookaround/backrefs), `Backtracking` stays `fancy_regex` on `str` and validates at the match only (one `from_utf8` per such match, a non-match on invalid bytes, as HAProxy's `regex_exec` on bytes it cannot decode); no `from_utf8` anywhere else on the fetch/ACL/action path; `spare::string_from` off the fetch path; `%[...]` in a `str` position (log, var, format) takes the bytes and escapes as `%r` does | `ibex-sample` (`sample.rs`, the ~1,200 lines of fetches, `matcher.rs`, converters), `rule_compiled.rs`, `ibex-regex/src/lib.rs`, the 290 test sites tradeoff 6.12 counted | `compiled_expr.rs`: `a_header_acl_takes_no_spare_string` (spare counter 0 for `hdr(host) -m sub` and `path_reg`; red today), `a_rule_run_validates_no_utf8` (debug counter on `from_utf8` from the rules path: 0 for the rules scenario's 2 ACLs + 7 rules; red today: 17), `a_non_utf8_header_matches_as_bytes` (`hdr(x) -m sub \xff` and `-m reg` on a Latin-1 value: same verdict as HAProxy, recorded from the oracle), `request_allocations*.rs` pins | **rules -3 to -4.5k** (§2.1 row 8: spares 2.26k, the rules' 17 `from_utf8` ~0.3-0.5k, the `String` materialisation inside `Expr::eval`/`any_acl` ~1k); 0 elsewhere | L | X2 (the HTX views), R1 | Opus |
+| **R1** | compiled dispatch: `Expr::parse` resolves `fetch_name` to `FetchFn` (+ `MultiFetchFn`/`VisitFetchFn`), parses args into `Arg` (lowercase header name bytes, int, regex, var name, table ref), resolves converters to `ConvFn`; `Registry::eval_g`/`any_acl`/`eval_all_g` take the compiled form; the by-name entry points stay for the CLI and tests only. Covers `tcp-request`/`tcp-response`, `use_backend`, `stick`, `log-format %[...]`, `track-sc` (the "Expr::cached" remainder) | `crates/alcyon-sample/src/expr.rs`, `registry.rs` 1290-1330, `rule_compiled.rs`, `logfmt.rs` | `crates/alcyon-sample/tests/it/compiled_expr.rs` (new module): `evaluating_a_compiled_expression_looks_up_no_name` (debug counter on `fetches.get`/`converters.get`: 0 per eval; red today 1 per fetch), the fetch/converter batteries (T80, T81) green through the compiled path | **closed: T574 measured rules -1.06k, keepalive flat** (design range was -1.5 to -3k; §2.1 row 8: the lookup was ~0.44k a fetch x 3 fetches, not 8 x 200-350; the rest of `Expr::eval`'s 3.75k is the materialised sample and the per-rule context, R2's and X2's) | M | - | Sonnet |
+| **R2** | samples as bytes, borrowed (user decision 2026-11-01: Alcyon keeps data as bytes like HAProxy, no UTF-8 validation or re-encoding; replaces the "`str` samples stay UTF-8, validated once at the fetch" half of tradeoff 6.12 / D-B): `Sample<'a>` with `Str(Cow<'a, [u8]>)`/`Bin(Cow<'a, [u8]>)` views into the HTX block for header, path, method, query, cookie fetches (HAProxy's `SMP_F_CONST`, `smp->data.u.str` is bytes); owned bytes only after a converter produces new ones; **matchers and converters on bytes** (`-m str/sub/beg/end/dir/dom`, `lower`/`upper`/`word`/`field` as ASCII byte ops, HAProxy's `pat_match_*`); **regex**: `UserRegex::Linear` becomes `regex::bytes::Regex` (alcyon-regex/src/lib.rs:596-601; no lookaround/backrefs), `Backtracking` stays `fancy_regex` on `str` and validates at the match only (one `from_utf8` per such match, a non-match on invalid bytes, as HAProxy's `regex_exec` on bytes it cannot decode); no `from_utf8` anywhere else on the fetch/ACL/action path; `spare::string_from` off the fetch path; `%[...]` in a `str` position (log, var, format) takes the bytes and escapes as `%r` does | `alcyon-sample` (`sample.rs`, the ~1,200 lines of fetches, `matcher.rs`, converters), `rule_compiled.rs`, `alcyon-regex/src/lib.rs`, the 290 test sites tradeoff 6.12 counted | `compiled_expr.rs`: `a_header_acl_takes_no_spare_string` (spare counter 0 for `hdr(host) -m sub` and `path_reg`; red today), `a_rule_run_validates_no_utf8` (debug counter on `from_utf8` from the rules path: 0 for the rules scenario's 2 ACLs + 7 rules; red today: 17), `a_non_utf8_header_matches_as_bytes` (`hdr(x) -m sub \xff` and `-m reg` on a Latin-1 value: same verdict as HAProxy, recorded from the oracle), `request_allocations*.rs` pins | **rules -3 to -4.5k** (§2.1 row 8: spares 2.26k, the rules' 17 `from_utf8` ~0.3-0.5k, the `String` materialisation inside `Expr::eval`/`any_acl` ~1k); 0 elsewhere | L | X2 (the HTX views), R1 | Opus |
 | **R4** | vars and format scratch in the `Stream`, as bytes: `set-var(txn.*)` into the stream's var slots (no 4 KiB `VarStore` spare take/give per txn; var values are bytes, R2's rule), `%[rand]`/log-format fragments rendered into a stream scratch `[u8; 256]` with overflow to a pool buffer (no `String`: the last rules-side `from_utf8`/`String` sites go here) | `vars.rs`, `logfmt.rs`, `txn.rs`, `engine.rs` `render_rule_format` 3262 | `stream_object.rs`: `set_var_takes_no_spare` (counter; red today), `a_format_render_takes_no_string` (counter on `String` construction in `render_rule_format`: 0; red today 2) | **rules -1 to -2k** (§2.1 row 8: `VarStore`/`vars::` 1.31k, `render_rule_format` 1.71k incl.) | S | O1a, R2 | Sonnet |
 
 ### 4.5 Tracks K, IO and C: connection mode, send/recv, accounting
 
 | slice | goal | files | test that fails first | expected | size | depends | model |
 |---|---|---|---|---|---|---|---|
-| **K1** (new after X0; **in flight as T575**, with "parse path in bytes" as its Part 2) | HTTP/1.0 keep-alive by flags: the request parse records the `Connection` tokens and the version as connection-mode flags on the txn (HAProxy's `H1_MF_CONN_KAL`/`H1_MF_CONN_CLO`/`H1_MF_CLEAN_CONN_HDR`, `h1_set_cli_conn_mode`/`h1_set_srv_conn_mode`, mux_h1.c); `strip_request_connection` (proxy.rs:2344, 2.29k), `rewrite_request_connection` (engine.rs:15273, 5.50k: `write_req_head` 3.08k, the 8 KiB stack `memset` 1.14k, `add_req_header` 0.33k, `Buf::eoh` re-scans 0.21k) and the response `inject_connection_token_zero_alloc` (engine.rs:9605, 0.38k + memset 0.31k) go; the token the server and the client see is decided from the flags when the head is written (pre-X5: one bounded in-place token edit; after X5: the encoder's `h1_make_eoh` mode rule); HTTP/1.1 clients keep the `scan.count == 0` fast path; no 8 KiB scratch zeroing anywhere (`MaybeUninit` or a pool buffer if a scratch is needed). Part 2: `H1Parser`, `HeadFacts` and the facts on `&[u8]`, no `from_utf8` on the parse path (22 calls a request today), no `unsafe` | `proxy.rs` (`strip_request_connection` 2344, `validate_request_head` 2398, `reset_for_next_request` 2190), `engine.rs` (15273, 9605, the send site), `txn.rs` (flags, `HeadFacts`), `crates/ibex-proto/src/h1.rs` | `tasks/T575-k1-connection-flags-bytes-parse.md`: a debug `work::Op` counter on head rebuilds, 0 per HTTP/1.0 keep-alive request (red today: 1); wire equality with HAProxy for 1.0 keep-alive, 1.0 close, 1.1 `Connection: close`, `Connection: keep-alive, foo` (other tokens kept), `option http-server-close`, `option httpclose`, both directions (oracle bytes recorded); Part 2: a counter on `from_utf8` from the parse path, 0 per keepalive request (red today: 22); the connection-mode batteries and E1/E2's non-UTF-8 forwarding rows green | **keepalive -4 to -6k, rules -4 to -6k** (§2.1: the `Connection` path is 8.1k / 6.5k against HAProxy's ~0.5k; <= 1-2k before X5, <= 0.5k after); **Part 2 keepalive -0.8 to -1.2k** (`from_utf8` 1.45k incl. on the parse/facts path), rules the same; h2s1/h3fit 0; kernel 0 | S + S | - (X5 takes the last ~1k) | Sonnet |
+| **K1** (new after X0; **in flight as T575**, with "parse path in bytes" as its Part 2) | HTTP/1.0 keep-alive by flags: the request parse records the `Connection` tokens and the version as connection-mode flags on the txn (HAProxy's `H1_MF_CONN_KAL`/`H1_MF_CONN_CLO`/`H1_MF_CLEAN_CONN_HDR`, `h1_set_cli_conn_mode`/`h1_set_srv_conn_mode`, mux_h1.c); `strip_request_connection` (proxy.rs:2344, 2.29k), `rewrite_request_connection` (engine.rs:15273, 5.50k: `write_req_head` 3.08k, the 8 KiB stack `memset` 1.14k, `add_req_header` 0.33k, `Buf::eoh` re-scans 0.21k) and the response `inject_connection_token_zero_alloc` (engine.rs:9605, 0.38k + memset 0.31k) go; the token the server and the client see is decided from the flags when the head is written (pre-X5: one bounded in-place token edit; after X5: the encoder's `h1_make_eoh` mode rule); HTTP/1.1 clients keep the `scan.count == 0` fast path; no 8 KiB scratch zeroing anywhere (`MaybeUninit` or a pool buffer if a scratch is needed). Part 2: `H1Parser`, `HeadFacts` and the facts on `&[u8]`, no `from_utf8` on the parse path (22 calls a request today), no `unsafe` | `proxy.rs` (`strip_request_connection` 2344, `validate_request_head` 2398, `reset_for_next_request` 2190), `engine.rs` (15273, 9605, the send site), `txn.rs` (flags, `HeadFacts`), `crates/alcyon-proto/src/h1.rs` | `tasks/T575-k1-connection-flags-bytes-parse.md`: a debug `work::Op` counter on head rebuilds, 0 per HTTP/1.0 keep-alive request (red today: 1); wire equality with HAProxy for 1.0 keep-alive, 1.0 close, 1.1 `Connection: close`, `Connection: keep-alive, foo` (other tokens kept), `option http-server-close`, `option httpclose`, both directions (oracle bytes recorded); Part 2: a counter on `from_utf8` from the parse path, 0 per keepalive request (red today: 22); the connection-mode batteries and E1/E2's non-UTF-8 forwarding rows green | **keepalive -4 to -6k, rules -4 to -6k** (§2.1: the `Connection` path is 8.1k / 6.5k against HAProxy's ~0.5k; <= 1-2k before X5, <= 0.5k after); **Part 2 keepalive -0.8 to -1.2k** (`from_utf8` 1.45k incl. on the parse/facts path), rules the same; h2s1/h3fit 0; kernel 0 | S + S | - (X5 takes the last ~1k) | Sonnet |
 | **IO1** | the h1 I/O state machine: `advance` driven by the poller's readiness bits (no `interests` recompute unless changed), `MsgState` advanced by what the parser returned (no re-derivation per run), the buffer kept while the txn is open (`release` at txn end), `Buf` accessors without the `nominal` indirection; written from X0 item 4 | `proxy.rs` 2489-2700, 3471-3800, `buf.rs`, `txn.rs` (`MsgState`) | `engine_pass.rs`: `a_keepalive_request_takes_its_buffers_once` (buffer take/give counter: 2 per request, red today: per run), the I/O batteries (half-close T88, pipelining, `timeout http-keep-alive`) green | **keepalive/rules -0.5 to -1k** (§2.1 row 9: the I/O state machine's self is 2.1k measured against HAProxy's ~4k; the gain is the re-walk and the buffer take/give per run, not the self), **h2s1 -0.5 to -1k** (3.0k). **Conditional**: scheduled only if the week-5 re-measure leaves keepalive above 1.0x | M | X2 (the parse owns `MsgState`'s advance) | Opus |
-| **C1** | accounting once: Q6 (`TimeStat::add` load + store-if-greater, `Arc` borrows), `account_stream` from the pass clock (no `now_ms` read), one `count_status`, `StreamLog`/`set_stream_log` (engine.rs:3581) fields and `SystemTime::now` only when a log target exists (X0 item 10: 0.47k / 0.45k / 0.78k with none), `RateCtr` ticks from the pass. **First a short design for D-4 "both"**: per-thread (or per-tgroup) counter rows as a `tune.ibex.*` setting, memory per server x thread, how `show stat`/`show info` sum the rows; the user approves it before the code | `statcnt.rs`, `engine.rs` 3349-3480, 3581, `txnlog.rs` | `engine_pass.rs`: `accounting_a_request_does_at_most_n_atomic_rmws` (X0 could not count them: pin n from a `#[cfg(debug_assertions)]` counter at the `statcnt` sites in the slice; red at today's count), `a_request_with_no_log_target_builds_no_log_line` (counter 0; red today: `StreamLog::start` once per request, twice on h2), `show stat`/`show info` rows identical under the stats battery | **keepalive/rules -0.3 to -0.6k** (§2.1 row 13: accounting 0.9-1.0k, HAProxy 0.5-0.6k; the no-target `StreamLog` 0.47k is most of it), **h2s1/h3fit -0.8 to -1.2k** (2.0k: `set_stream_log` 0.86k, `statcnt` 0.46k, `account_stream` 0.48k) | S | - | Sonnet |
-| **C2** | clock residue: `%t`/`%Tl` from the pass clock (HAProxy's `date`), one `Instant::now` a pass (today two: `run_loop` and `step_at`), ticks as the pass's `u32` ms, `Duration::as_millis`/`Timespec` conversions off the path; the `rand` fetch (registry.rs:3637) seeded from a per-thread RNG, not `SystemTime::now` per call | `txnlog.rs`, `tick.rs`, `engine.rs` `tick_at`/`run_loop`, `ibex-sample/src/registry.rs` | `engine_pass.rs`: `a_request_reads_the_clock_once_per_pass_and_never_for_a_log_it_does_not_write` (counter: X0 item 8 measured 5.0 / 6.0 / 14-16.6; pin 1 a pass + 0; red today) | **keepalive/rules -0.3 to -0.6k** (§2.1 "Clock reads": `StreamLog::start`'s `SystemTime::now` 0.30k, one of the two per-pass `Instant::now` 0.27k, the `rand` fetch's read on rules), **h2s1/h3fit -0.5 to -1.5k before L2, -0.3 to -0.8k after** (two reads a pass x the pass count) | S | - | Sonnet |
+| **C1** | accounting once: Q6 (`TimeStat::add` load + store-if-greater, `Arc` borrows), `account_stream` from the pass clock (no `now_ms` read), one `count_status`, `StreamLog`/`set_stream_log` (engine.rs:3581) fields and `SystemTime::now` only when a log target exists (X0 item 10: 0.47k / 0.45k / 0.78k with none), `RateCtr` ticks from the pass. **First a short design for D-4 "both"**: per-thread (or per-tgroup) counter rows as a `tune.alcyon.*` setting, memory per server x thread, how `show stat`/`show info` sum the rows; the user approves it before the code | `statcnt.rs`, `engine.rs` 3349-3480, 3581, `txnlog.rs` | `engine_pass.rs`: `accounting_a_request_does_at_most_n_atomic_rmws` (X0 could not count them: pin n from a `#[cfg(debug_assertions)]` counter at the `statcnt` sites in the slice; red at today's count), `a_request_with_no_log_target_builds_no_log_line` (counter 0; red today: `StreamLog::start` once per request, twice on h2), `show stat`/`show info` rows identical under the stats battery | **keepalive/rules -0.3 to -0.6k** (§2.1 row 13: accounting 0.9-1.0k, HAProxy 0.5-0.6k; the no-target `StreamLog` 0.47k is most of it), **h2s1/h3fit -0.8 to -1.2k** (2.0k: `set_stream_log` 0.86k, `statcnt` 0.46k, `account_stream` 0.48k) | S | - | Sonnet |
+| **C2** | clock residue: `%t`/`%Tl` from the pass clock (HAProxy's `date`), one `Instant::now` a pass (today two: `run_loop` and `step_at`), ticks as the pass's `u32` ms, `Duration::as_millis`/`Timespec` conversions off the path; the `rand` fetch (registry.rs:3637) seeded from a per-thread RNG, not `SystemTime::now` per call | `txnlog.rs`, `tick.rs`, `engine.rs` `tick_at`/`run_loop`, `alcyon-sample/src/registry.rs` | `engine_pass.rs`: `a_request_reads_the_clock_once_per_pass_and_never_for_a_log_it_does_not_write` (counter: X0 item 8 measured 5.0 / 6.0 / 14-16.6; pin 1 a pass + 0; red today) | **keepalive/rules -0.3 to -0.6k** (§2.1 "Clock reads": `StreamLog::start`'s `SystemTime::now` 0.30k, one of the two per-pass `Instant::now` 0.27k, the `rand` fetch's read on rules), **h2s1/h3fit -0.5 to -1.5k before L2, -0.3 to -0.8k after** (two reads a pass x the pass count) | S | - | Sonnet |
 
 ### 4.6 Order, critical path, parallelism (after X0)
 
@@ -527,8 +527,8 @@ Four gate slots (disk, T570) and two measure slots (A, CPUs 4-6: claims; B, CPUs
 C/D may be added for counts). Every slice merges alone and is measured on the four scenarios
 against its parent. **At most two large `engine.rs` slices in flight, three only in weeks 3-4**
 (D-15): every merge of one forces the others to rebase (risk 5), about half a day of agent time
-each. The remaining slots take slices outside `engine.rs` (`ibex-proto`, `ibex-sample`,
-`ibex-regex`, `h2_bridge.rs`, h3) or Sonnet S slices with small `engine.rs` touches.
+each. The remaining slots take slices outside `engine.rs` (`alcyon-proto`, `alcyon-sample`,
+`alcyon-regex`, `h2_bridge.rs`, h3) or Sonnet S slices with small `engine.rs` touches.
 
 - Large `engine.rs` slices: L2 (with `sched.rs`), L3, X2, X3, O1a (with `proxy.rs`), O1b, O2,
   IO1.
@@ -551,7 +551,7 @@ track's Q1/Q2a/Q4 in any free slot (no shared files); X7/X6/X8 last.
 | 1 | R1 close (T574), then **L1** (M, Sonnet) | **K1 + Part 2** (T575, Sonnet) | **X1** (L, Opus: `htx.rs`, `buf.rs`, `h1.rs`) | **X5** (M, Opus: the encoder), then **C2** (S, Sonnet) | 0 |
 | 2 | **L2** (M, Opus) | **O2** (M, Sonnet) | X1 (cont.) | X5 -> **C1** (D-4 design, then code; S, Sonnet); **Q1** (h3) when free | 2 |
 | 3 | **X2** (L, Opus) | **X3** (L, Opus; the second to merge rebases) | **L3** (L, Opus) | Q2a / Q4 (h3) | 3 (the limit) |
-| 4 | X2 (cont.) | X3 -> **O1a** (L, Opus) | L3 (cont.) | **X4** (M, Opus) after X2; then **R2** (L, Opus, `ibex-sample`/`ibex-regex`) | 3 |
+| 4 | X2 (cont.) | X3 -> **O1a** (L, Opus) | L3 (cont.) | **X4** (M, Opus) after X2; then **R2** (L, Opus, `alcyon-sample`/`alcyon-regex`) | 3 |
 | 5 | **O1b** (L, Opus) after X4 + O1a | O1a -> **R4** (S, Sonnet) after R2 | **re-measure 1**: keepalive and rules verdicts (D-13, D-16); **IO1** only if keepalive > 1.0x | R2 (cont.); **X7** (M, Sonnet) | 2 |
 | 6 | O1b (cont.) | **O1c** (M, Opus) after O1b | Q2 b1 (h3, after L2) | X6, X8 (Sonnet fillers) | 2 |
 | 7 | **re-measure 2**: the landing table, non-PGO and the PGO column (§5) | slack: rebases, a stopped slice's re-plan | | | |
@@ -571,7 +571,7 @@ in-flight slices at their budgets (R1 at its measured -1.06k, K1 -4 to -6k, T575
 -1.2k); IO1 excluded (conditional, D-16); **Σ = the sum of the midpoints**; **central = base -
 0.7 x Σ** (the delivery factor of §4: R1 delivered 47 % of its midpoint, S7/E2 about 60 %);
 **range = base - 1.0 x Σ (every slice at its midpoint) to base - 0.5 x Σ**. The PGO column is
-x 0.87 (T435's -13 %) and is the shipped figure, not the merge criterion (§6.1). Kernel: Ibex
+x 0.87 (T435's -13 %) and is the shipped figure, not the merge criterion (§6.1). Kernel: Alcyon
 is already 3.4-7.0k a request below HAProxy on every scenario (§2.1); every slice holds kernel
 at or below its parent, L2 removes 5 `epoll_wait` a request on h2s1.
 
@@ -628,7 +628,7 @@ PGO column as the shipped answer.
 3. **O1's split** of `TcpSession` touches every log/counter/stick-key site (what the child
    copies today). The log-format battery and the `show stat` rows are the specification; the
    `size_of` pin stops the object regrowing.
-4. **R2's lifetimes** across `ibex-sample`: 290 test sites; a `Cow` that is always `Owned` would
+4. **R2's lifetimes** across `alcyon-sample`: 290 test sites; a `Cow` that is always `Owned` would
    measure as nothing: the spare counter test is what proves the view.
 5. **Merge contention in `engine.rs`**: three tracks edit it in different regions; the second to
    merge rebases; no two Opus L slices touching `step_stream_run` run at once.
@@ -646,14 +646,14 @@ converted and reports the rest); do not weaken a `tools/checkin.sha256` test to 
 | | question | recommendation |
 |---|---|---|
 | **D-1** | Four tracks (X, L, O, R + IO/C) in parallel with two gate slots and the h3 track, ~6 weeks, 9 Opus (5 L) + 9 Sonnet slices | **Approve**; the critical path is X's, the others fill the second slot |
-| **D-2** | L2's instant wakeup: adopt HAProxy's `task_instant_wakeup` semantics (a task may run twice per pass, budget-bounded) even though HAProxy's own stream path does not use it | **Yes**: it is where Ibex goes below HAProxy's pass count; the scheduler's budgets keep fairness |
+| **D-2** | L2's instant wakeup: adopt HAProxy's `task_instant_wakeup` semantics (a task may run twice per pass, budget-bounded) even though HAProxy's own stream path does not use it | **Yes**: it is where Alcyon goes below HAProxy's pass count; the scheduler's budgets keep fairness |
 | **D-3** | O1: one scheduler task per stream (HAProxy's model; per-stream timers in the wait queue) rather than one task per connection stepping streams inline | **Task per stream**; the connection's I/O stays in the owner's tasklet |
 | **D-4** | C1: keep shared `Relaxed` atomics for counters (parity with HAProxy's per-tgroup counters) rather than per-thread rows | **Keep shared**: per-thread rows cost 128 MB at 10k servers x 64 threads; the gain is ~0.5k |
-| **D-5** | R2's `Sample<'a>` API change across `ibex-sample` (L, Opus) for ~3k on rules | **Yes, after X2**; without it rules stays >= 1.2x |
+| **D-5** | R2's `Sample<'a>` API change across `alcyon-sample` (L, Opus) for ~3k on rules | **Yes, after X2**; without it rules stays >= 1.2x |
 | **D-6** | O1a after X2 (not after X4, which D-F set for E3 as a whole): the h1 reset does not depend on the h2 child's buffers | **Yes**; O1b keeps D-F's "after X4" |
 | **D-7** | quinn: Q1 and Q2's mechanical half now, Q4 in parallel, Q2 b1 after L2, O1c after O1b | **Yes** (§3.6) |
 | **D-8** | PGO stays outside the A/B (D9 unchanged); the landing table is non-PGO | **Unchanged**; report the PGO figure as "shipped" beside it |
-| **D-9** | Safety extras on by default (X0 item 9): each becomes a `tune.ibex.*` setting whose cost is reported, with the user ruling per item under "fair benchmark defaults" | **Decide after X0**; `crash::contain` stays on unless it costs > 0.3k |
+| **D-9** | Safety extras on by default (X0 item 9): each becomes a `tune.alcyon.*` setting whose cost is reported, with the user ruling per item under "fair benchmark defaults" | **Decide after X0**; `crash::contain` stays on unless it costs > 0.3k |
 | **D-10** | Restate the target per scenario: keepalive <= 1.0x, h2s1 <= 1.0x (aim 0.9x), rules <= 1.1x first landing with 1.0x the stretch after R2/X2 measure | **Yes**: rules carries HAProxy's own ~1k-a-rule floor plus the base |
 | **D-11** | X0's extended scope (§1.2, ten items, both proxies, three scenarios + h3fit): ~1 day Sonnet on a quiet host, before any L/O/C slice sets its budget | **Approve now**; it is the only measurement the programme waits for |
 
@@ -663,8 +663,8 @@ converted and reports the rest); do not weaken a `tools/checkin.sha256` test to 
 |---|---:|---|
 | `crash::contain` per task run (T447) | 0.03k / 0.13k / 0.08k | **keep on, no setting**: under the 0.3k threshold of §5 (c) in the pre-X0 text; `catch_unwind` costs nothing when nothing panics |
 | `watchdog::progress`/`sleeping`/`set_streams`, 3 a pass | 0.04k / 0.10k / 0.11k | **keep on, no setting**; L1 folds the three stores into one per pass as a side effect |
-| buffer wipe, `tune.ibex.zero-buffers` | 0.03k / 0.05k / 0.05k with the default **off** (an atomic load) | **nothing to decide**: already a setting, default off |
-| TLS record wipe, `tune.ibex.ssl-zero-buffers` | h2s1 ~0.12k (0.17 %; a memset under `encrypt_records`, attribution uncertain) | **keep on by default**: a security trade that is already a setting (memory: "Security trade = setting"); the cost is under the +-0.5 % budget noise |
+| buffer wipe, `tune.alcyon.zero-buffers` | 0.03k / 0.05k / 0.05k with the default **off** (an atomic load) | **nothing to decide**: already a setting, default off |
+| TLS record wipe, `tune.alcyon.ssl-zero-buffers` | h2s1 ~0.12k (0.17 %; a memset under `encrypt_records`, attribution uncertain) | **keep on by default**: a security trade that is already a setting (memory: "Security trade = setting"); the cost is under the +-0.5 % budget noise |
 | `fault_point` | 0: compiled out in release (`#[cfg(debug_assertions)]`, crash.rs:101) | nothing |
 | `StreamLog`/`set_stream_log` with no `log` target | 0.47k / 0.45k / 0.78k | not a safety extra: **C1 removes it** (item 10); no decision |
 | pool `Guard` bookkeeping | 0.14k / 0.25k / 0.21k | not a safety extra (AGENTS §8's accounting, `show pools`); keep |
@@ -689,17 +689,17 @@ needed.** D-9 is thereby closed unless the user rules otherwise.
 **Earlier decisions touched.** D1 (h3 ratios): unchanged, h3 gains from every engine slice.
 D5 (HTX-primary plan first): this document is the superset; D5's slices stand. D-A..D-H:
 unchanged (D-E's setting is built in X5/X2 as decided; D-F refined by D-6 above). D9 (PGO outside
-the A/B): unchanged. Fair benchmark defaults: applied through D-9. `tune.ibex.*` for a security
+the A/B): unchanged. Fair benchmark defaults: applied through D-9. `tune.alcyon.*` for a security
 trade: no slice trades security; L3's timer gating fires timers through the wait queue exactly as
 HAProxy. Memory-safety-only dependencies: none added. `unsafe`: none added. AGENTS §8 (pools,
-no cross-thread writes on the fast path): O1's `Stream` is an `ibex_alloc::Pool`; O2 removes a
+no cross-thread writes on the fast path): O1's `Stream` is an `alcyon_alloc::Pool`; O2 removes a
 lock from the path; every slice reports its ins/req before and after, user and kernel.
 
 ### 6.1 User decisions, 2026-11-01 (16:05)
 
 - **D-1, D-2, D-3, D-5, D-6, D-7, D-8, D-11**: approved as recommended.
 - **D-4: both.** Shared `Relaxed` atomics stay the default. Per-thread (or per-thread-group)
-  counter rows become an operator setting (`tune.ibex.*`) for CPU-bound deployments that can pay
+  counter rows become an operator setting (`tune.alcyon.*`) for CPU-bound deployments that can pay
   the memory. This is the programme's first explicit memory-versus-CPU trade: C1 gets a short
   design first (the setting, memory cost per server x thread, how `show stat`/`show info` sum the
   rows). The shared default is a recorded exception to AGENTS §8 ("the fast path writes nothing
@@ -720,7 +720,7 @@ lock from the path; every slice reports its ins/req before and after, user and k
 ### 6.2 Re-budget after X0 (2026-11-01)
 
 - **Refs**: HAProxy keepalive 36.2k, rules 43.8k, h2s1 53.2k, h3fit 64.0k (dev10; not 73.7k).
-  Kernel: Ibex 3.4-7.0k below HAProxy on every scenario; no slice needs a kernel saving.
+  Kernel: Alcyon 3.4-7.0k below HAProxy on every scenario; no slice needs a kernel saving.
 - **New**: K1 + parse path in bytes (T575, in flight): the largest single keepalive item (8.1k,
   the HTTP/1.0 `Connection` rewrite) was in no slice. R1 closed at -1.06k (T574).
 - **Grown**: X1 M -> L (the parse scan: 10.1k -> <= 3.5k a head); X2 keepalive -3 to -5k (was
@@ -744,7 +744,7 @@ lock from the path; every slice reports its ins/req before and after, user and k
 User: "debloat your estimates… without safety factors… doing things in parallel doesn't mean we
 have to repeat work that can be run on one code junction… ok with a bit fuzzier result for the
 moment." §4.6's week table is replaced by this; §4's slice rows and budgets stand. Starting point
-`ibex-rc4`.
+`alcyon-rc4`.
 
 - **Measured durations, 2026-11-01:** X0 (sized ~1 day) 45 min; R1/T574 (M) ~25 min of agent time
   including two measured builds; gate 4-10 min since T570; release-perf build ~7 min cold, serial.
@@ -804,12 +804,12 @@ HAProxy = §2.1's dev8 (dev10 for h3fit), non-PGO. Board: `~/ibex-worktrees/boar
 - **h3fit 1.18x with PGO**: O1c and T586 item 3 (h3 same-pass wake) are the h3 slices.
 - PGO gains here: keepalive -12 %, rules -13 %, h2s1 -11 %, h3fit -14 % over release-perf.
 
-### 6.6 ibex-rc5, measured (2026-11-02 03:55, 8d456329)
+### 6.6 alcyon-rc5, measured (2026-11-02 03:55, 8d456329)
 
 After wave 1 plus T584-T598, X1, X2, X3, X5 (T599 merged after the tag). Same method as §6.5:
 `tools/measure/perfbase.sh` (release-perf: fat LTO, 1 codegen unit) and the same scenarios on a
 `tools/pgo-build.sh` binary, counts slot, min of 5 (h3fit: median of 3 fits at 1.97 dg/req). User
-ins/req. Ratio = Ibex ÷ HAProxy, **above 1 = Ibex does more work**. HAProxy = §2.1 (dev8, dev10 for
+ins/req. Ratio = Alcyon ÷ HAProxy, **above 1 = Alcyon does more work**. HAProxy = §2.1 (dev8, dev10 for
 h3fit), gcc 16.2.1 `-O2 -g -fwrapv`, **no LTO, no PGO**. Board:
 `~/ibex-worktrees/boards/pgo-rc5-8d456329/`.
 
@@ -824,18 +824,18 @@ Kernel per request (release-perf) 65.7k keepalive, 65.7k rules, 66.6k h2s1 (HAPr
 keepalive, 76.3k h2s1, §2.1): the kernel is the larger half of every request on both.
 
 - **The fair comparison is not either column yet.** release-perf has fat LTO and HAProxy has none;
-  PGO-Ibex against non-PGO HAProxy flatters Ibex by roughly the PGO gain (10-15 % on both, as a
+  PGO-Alcyon against non-PGO HAProxy flatters Alcyon by roughly the PGO gain (10-15 % on both, as a
   rule). T603 builds HAProxy o2/lto/pgo/pgo-lto. Until then, read release-perf vs HAProxy -O2 as
-  the nearest like-for-like (Ibex has LTO, HAProxy doesn't).
+  the nearest like-for-like (Alcyon has LTO, HAProxy doesn't).
 - **rules is still the gap** (1.30x release-perf): R2 (samples as bytes) and R4 are in waves A-B.
 - **h3fit** (1.35x): O1c and X8 (wave C). T599 (after the tag) cut h3fit by -2.5k and h2s1 by -4.0k
   on release-perf: not in this table.
 - Instructions only. Cycles, IPC, cache and branch misses on both proxies (`perf stat`) come with
   T603, so a gap can be split into work, memory and kernel. T582's waived +0.5% (C582) lands after.
 
-### 6.7 HAProxy built the same four ways as Ibex (T603, 2026-11-02, Ibex main 06bdbce0)
+### 6.7 HAProxy built the same four ways as Alcyon (T603, 2026-11-02, Alcyon main 06bdbce0)
 
-§6.5/6.6 set PGO-Ibex against a `-O2` HAProxy with no LTO and no PGO. T603 builds HAProxy from
+§6.5/6.6 set PGO-Alcyon against a `-O2` HAProxy with no LTO and no PGO. T603 builds HAProxy from
 copies of the oracle sources (`git archive HEAD` of `~/reference/haproxy` = 3.5-dev8 for h1/h2 and
 `~/reference/haproxy-quic` = 3.5-dev10 for h3fit; the oracle trees and binaries were not touched) in
 `~/ibex-targets/t603/<d8|q10>/<variant>/`, same `USE_*` as the oracles' `-vv`
@@ -857,9 +857,9 @@ the same order, against `tools/pgo/train.cfg` (nbthread 1; h1 keep-alive/close, 
 TLS h2, h2c; q10 also the h3 part: h3bench best/worst GET/POST and h2load `--alpn-list=h3`; d8 has no QUIC, so no `fe_h3`).
 One difference: HAProxy jails itself in an empty chroot, where gcov cannot write at exit, so the
 training config gets `chroot /` (not in the measured configs). 190 `.gcda` files (d8), 234 (q10);
-the profile is written when SIGUSR1 stops the process. Ibex PGO: `tools/pgo-build.sh --target-dir
-~/ibex-targets/t603-ibex` (952 s: 533 s build, 51 s training, 368 s final build), the binary copied to
-`~/ibex-targets/t603-ibex/ibex-pgo`. Ibex release-perf: `perfbase/06bdbce07c6d/release-perf/ibex`.
+the profile is written when SIGUSR1 stops the process. Alcyon PGO: `tools/pgo-build.sh --target-dir
+~/ibex-targets/t603-alcyon` (952 s: 533 s build, 51 s training, 368 s final build), the binary copied to
+`~/ibex-targets/t603-alcyon/alcyon-pgo`. Alcyon release-perf: `perfbase/06bdbce07c6d/release-perf/alcyon`.
 
 **Checks.** (a) `-vv` CFLAGS as in the table, `.gcda` present (above). (b) The o2 rebuild reproduces the
 oracle: user ins/req keepalive 36,236 (§2.1: 36,230), rules 43,830 (43,830), h2s1 53,298 (53,171),
@@ -875,26 +875,26 @@ lto and pgo identical (107 pass / 26 fail), pgo-lto differs in two tests (`h1_bi
 10/10 pass on rerun; `ssl_client_hello_ext` fail to pass), both flakes. So **no PGO build changed
 behaviour in this subset**; a full vtest run was not done (no vtest binary here).
 
-**Which comparison is like-for-like.** Ibex release-perf is fat LTO, no PGO: its peer is HAProxy
-**lto**. Ibex PGO is the best Ibex build: its peer is HAProxy **pgo-lto**. HAProxy o2 is what §2.1, §6.5
-and §6.6 used (the oracle's own build); against it Ibex release-perf already had LTO that HAProxy lacked,
-and Ibex PGO had PGO. Both Ibex and HAProxy PGO are trained on the same mix, with the Ibex profile from
+**Which comparison is like-for-like.** Alcyon release-perf is fat LTO, no PGO: its peer is HAProxy
+**lto**. Alcyon PGO is the best Alcyon build: its peer is HAProxy **pgo-lto**. HAProxy o2 is what §2.1, §6.5
+and §6.6 used (the oracle's own build); against it Alcyon release-perf already had LTO that HAProxy lacked,
+and Alcyon PGO had PGO. Both Alcyon and HAProxy PGO are trained on the same mix, with the Alcyon profile from
 LLVM (instrumentation) and the HAProxy one from gcc `-fprofile-generate` (not the same counters, and
 HAProxy's training has no `fe_h3` for d8). The post-wave baseline HAProxy figure is **pgo-lto**.
 
 **Instructions per request** (user; kernel in brackets), slot A (`flock -x /tmp/ibex-load.lock`, CPUs
 4-6, governor performance, no `wwm.exe`), `insreq.sh`: keepalive and rules `ab -k -c 1` 5 x 20,000, min
-total round; h2s1 5 x 10,000; h3fit median of 3 at 1.97 dg/req, 5,000. Ibex rp was re-measured on slot A (the board
+total round; h2s1 5 x 10,000; h3fit median of 3 at 1.97 dg/req, 5,000. Alcyon rp was re-measured on slot A (the board
 `insreq-06bdbce07c6d.json` came from another slot and agrees within 3 ins/req).
 
-| scenario | Ibex rp | Ibex PGO | HA o2 | HA lto | HA pgo | HA pgo-lto |
+| scenario | Alcyon rp | Alcyon PGO | HA o2 | HA lto | HA pgo | HA pgo-lto |
 |---|---:|---:|---:|---:|---:|---:|
 | keepalive ab1 | 36,717 (65,947) | **31,240** (65,869) | 36,236 (69,626) | 35,700 (69,655) | 33,454 (69,602) | **32,114** (69,564) |
 | rules ab1 | 52,867 (66,032) | **44,707** (65,972) | 43,830 (69,698) | 43,276 (69,753) | 40,422 (69,618) | **38,915** (69,649) |
 | h2s1 | 51,259 (66,660) | **44,726** (66,465) | 53,298 (76,091) | 52,667 (76,151) | 50,244 (76,056) | **48,896** (76,047) |
 | h3fit | 83,447 | **72,053** | 63,977 | 62,679 | 59,294 | **57,011** |
 
-Ratios, Ibex / HAProxy, user instructions (above 1 = Ibex does more work):
+Ratios, Alcyon / HAProxy, user instructions (above 1 = Alcyon does more work):
 
 | scenario | rp / lto (like-for-like, no PGO) | **PGO / pgo-lto (like-for-like, best)** | rp / o2 (§6.6 convention) | PGO / o2 (§6.6 "PGO ratio") |
 |---|---:|---:|---:|---:|
@@ -904,10 +904,10 @@ Ratios, Ibex / HAProxy, user instructions (above 1 = Ibex does more work):
 | h3fit | 1.33x | **1.26x** | 1.30x | 1.13x |
 
 What each build is worth on HAProxy (user ins, from o2): lto -1.5 % keepalive, -1.3 % rules, -1.2 %
-h2s1, -2.0 % h3fit; pgo -7.7 / -7.8 / -5.7 / -7.3 %; pgo-lto -11.4 / -11.2 / -8.3 / -10.9 %. Ibex PGO
-over release-perf: -14.9 / -15.4 / -12.7 / -13.7 %. So the PGO gain flattered Ibex by about 3-4 points,
+h2s1, -2.0 % h3fit; pgo -7.7 / -7.8 / -5.7 / -7.3 %; pgo-lto -11.4 / -11.2 / -8.3 / -10.9 %. Alcyon PGO
+over release-perf: -14.9 / -15.4 / -12.7 / -13.7 %. So the PGO gain flattered Alcyon by about 3-4 points,
 not by 10-15: HAProxy gains 8-11 % from the same treatment. Kernel instructions do not move with the
-build (Ibex 66k, HAProxy 69.6k / 76.1k): Ibex is 3.7k (keepalive, rules) and 9.6k (h2s1) below.
+build (Alcyon 66k, HAProxy 69.6k / 76.1k): Alcyon is 3.7k (keepalive, rules) and 9.6k (h2s1) below.
 
 **Cycles, IPC and misses per request** (`hwcounters.sh`: `perf stat -p <proxy>`, 5 rounds of 20,000
 (h2s1 10,000), median per event; two event groups of four so the PMU never multiplexes, "min run 100 %").
@@ -915,7 +915,7 @@ build (Ibex 66k, HAProxy 69.6k / 76.1k): Ibex is 3.7k (keepalive, rules) and 9.6
 `l2_cache_req_stat.ic_dc_miss_in_l2`; the cache and branch miss events have no `:u`/`:k` split
 (user + kernel together).
 
-| scenario | metric | Ibex rp | Ibex PGO | HA o2 | HA lto | HA pgo | HA pgo-lto |
+| scenario | metric | Alcyon rp | Alcyon PGO | HA o2 | HA lto | HA pgo | HA pgo-lto |
 |---|---|---:|---:|---:|---:|---:|---:|
 | keepalive | cycles user | 30,674 | 21,107 | 40,446 | 40,428 | 24,928 | 23,257 |
 | keepalive | cycles kernel | 109,498 | 103,987 | 118,082 | 119,712 | 112,241 | 111,371 |
@@ -933,35 +933,35 @@ build (Ibex 66k, HAProxy 69.6k / 76.1k): Ibex is 3.7k (keepalive, rules) and 9.6
 | h2s1 | L1d / L1i miss | 3,521 / 1,480 | 3,437 / 1,118 | 3,049 / 2,084 | 3,074 / 2,153 | 2,930 / 1,656 | 2,905 / 1,627 |
 | h2s1 | branch miss / L2 miss | 2,018 / 10,097 | 1,690 / 5,692 | 2,726 / 13,246 | 2,758 / 13,586 | 2,212 / 7,771 | 2,265 / 8,349 |
 
-Total cycles a request (user + kernel), Ibex PGO against HAProxy pgo-lto: keepalive 125.1k vs 134.6k
+Total cycles a request (user + kernel), Alcyon PGO against HAProxy pgo-lto: keepalive 125.1k vs 134.6k
 (0.93x), rules 139.7k vs 140.9k (0.99x), h2s1 137.2k vs 177.2k (0.77x); release-perf against lto:
 140.2k vs 160.1k (0.88x), 158.6k vs 162.3k (0.98x), 169.9k vs 214.3k (0.79x).
 
 Reading it:
-- **Work (instructions).** On the like-for-like pair Ibex does 3 % fewer user instructions on
+- **Work (instructions).** On the like-for-like pair Alcyon does 3 % fewer user instructions on
   keepalive, 9 % fewer on h2s1, **15 % more on rules** and **26 % more on h3fit**. The rules and h3 gaps
   are what the waves are for; keepalive and h2s1 are at or past parity.
-- **Memory and branches.** Ibex does not lose on misses: with PGO, L1i misses are 1.0-1.1k against
+- **Memory and branches.** Alcyon does not lose on misses: with PGO, L1i misses are 1.0-1.1k against
   1.1-1.6k, L2 (ic+dc) misses 3.0-5.7k against 3.6-8.3k and branch misses are lower on all three.
   The gap on rules is instructions, not memory.
-- **IPC.** Ibex PGO runs user code at IPC 1.43-1.48 against HAProxy pgo-lto 1.00-1.38; on h2s1 that is
-  why 9 % fewer instructions become 38 % fewer user cycles (30.2k vs 48.7k). Without PGO Ibex's IPC is
-  1.0-1.2, HAProxy's 0.7-0.97. On rules Ibex's higher IPC (1.43 vs 1.34) is not enough to cover +15 % instructions:
+- **IPC.** Alcyon PGO runs user code at IPC 1.43-1.48 against HAProxy pgo-lto 1.00-1.38; on h2s1 that is
+  why 9 % fewer instructions become 38 % fewer user cycles (30.2k vs 48.7k). Without PGO Alcyon's IPC is
+  1.0-1.2, HAProxy's 0.7-0.97. On rules Alcyon's higher IPC (1.43 vs 1.34) is not enough to cover +15 % instructions:
   user cycles are 31.3k vs 29.1k (+8 %).
-- **Kernel.** 72-83 % of the cycles of a request are kernel on both proxies (IPC about 0.6). Ibex's
+- **Kernel.** 72-83 % of the cycles of a request are kernel on both proxies (IPC about 0.6). Alcyon's
   kernel cycles are 7 % (keepalive), 3 % (rules) and 17 % (h2s1) below HAProxy pgo-lto, with fewer
   kernel instructions at the same IPC: the kernel part is not where the user-space gap is.
-- h2s1 note: Ibex is not at parity in the pass count (§2.1); the cycle figure above says the extra
+- h2s1 note: Alcyon is not at parity in the pass count (§2.1); the cycle figure above says the extra
   passes are cheap in cycles (hot caches) on this host, not that they are free.
 
 **Throughput** (`hwcounters.sh tp1/tp50`: `ab -k -c 1` 5 x 50,000, and `measure-bench fixed` with 50
-connections 5 x 200,000, wall time, median; client on CPU 5): Ibex rp 17,823 / 35,694 req/s, Ibex PGO
+connections 5 x 200,000, wall time, median; client on CPU 5): Alcyon rp 17,823 / 35,694 req/s, Alcyon PGO
 18,823 / 39,970, HAProxy o2 16,825 / 32,853, lto 16,915 / 32,246, pgo 18,286 / 33,818, pgo-lto 18,265 /
 34,192 (1-conn / 50-conn). **These are not clean timing claims**: the host was not quiet, load average at
 the start of each run 6.0 to 14.1 (other sessions' builds and a gate on other cores; load by variant is
-in `t603-tp.log`; the Ibex PGO runs happened at load 12-14, the spread between the 5 rounds is
+in `t603-tp.log`; the Alcyon PGO runs happened at load 12-14, the spread between the 5 rounds is
 2-6 %, and the 50-conn client is one measure-bench process on one CPU). The ranking agrees with the cycle counts
-(Ibex PGO > HAProxy PGO builds > o2/lto) but differences below ~5 % should not be read. Instruction and cycle counts
+(Alcyon PGO > HAProxy PGO builds > o2/lto) but differences below ~5 % should not be read. Instruction and cycle counts
 above are per request and do not depend on host load; no `wwm.exe` was seen before or after any run.
 
 Not done / caveats: no BOLT; no vtest full reg-test run (the Python runner subset above); the
@@ -969,10 +969,10 @@ h2s1/keepalive/rules training for q10 variants covers dev10's code but the q10 b
 only on h3fit; HAProxy's build ran through ccache (`/usr/lib64/ccache/gcc`, a cache hit is the same object);
 the version string of the copies reads `3.5-dev8-88576119c` (no `.git` in `git archive`, harmless).
 
-### 6.8 ibex-rc6, measured (2026-11-02 23:45, 694eabcc)
+### 6.8 alcyon-rc6, measured (2026-11-02 23:45, 694eabcc)
 
 After the CP/X/O waves (§6.7's main 06bdbce0 plus T617, T618, T614/T614b), the red-ibex fixes
-RV-A..RV-D, the ring-ibex zeroize review and Miri (T623). Same method as §6.6/6.7, slot A, governor
+RV-A..RV-D, the ring-alcyon zeroize review and Miri (T623). Same method as §6.6/6.7, slot A, governor
 performance, no `wwm.exe`; release-perf from `tools/measure/perfbase.sh`, PGO from `tools/pgo-build.sh`,
 h3fit median of 3 at 1.97 dg/req. HAProxy columns = §6.7 (dev8, dev10 for h3fit). Board:
 `~/ibex-worktrees/boards/pgo-rc6-694eabcc/`, `boards/insreq-694eabcc4d1c.json`.
@@ -984,7 +984,7 @@ h3fit median of 3 at 1.97 dg/req. HAProxy columns = §6.7 (dev8, dev10 for h3fit
 | h2s1 | 58.6k | **51,217** (66,425) | 0.97x | 51.1k | **44,802** (66,264) | **0.92x** |
 | h3fit | 86.7k | **82,817** | 1.32x | 74.5k | **71,493** | **1.25x** |
 
-User ins/req, kernel in brackets. Above 1 = Ibex does more work.
+User ins/req, kernel in brackets. Above 1 = Alcyon does more work.
 
 - **The measuring gate on main failed** (23:18, ref 8d456329 = rc5): keepalive ab1 36,540 against
   35,990, **+1.5%** (limit +1%); every other row passed (rules -7.2%, allocations 0, 50-conn CPU/req
@@ -996,5 +996,5 @@ User ins/req, kernel in brackets. Above 1 = Ibex does more work.
   is for. The next measuring gate's ref is 694eabcc.
 - rc5 -> rc6: rules -7 %, h2s1 -13 %, h3fit -4.5 % (rp); PGO rules -7 %, h2s1 -12 %, h3fit -4 %.
   keepalive +1.6 % rp, +1.0 % PGO.
-- Like-for-like (best builds both sides): Ibex is ahead on keepalive and h2s1, 15 % behind on rules and
+- Like-for-like (best builds both sides): Alcyon is ahead on keepalive and h2s1, 15 % behind on rules and
   25 % behind on h3fit. Those two are where the work is.

@@ -7,9 +7,9 @@
     python3 harness/malloc_per_request.py [--binary PATH] [--table-only]
     python3 -m unittest harness/test_malloc_per_request.py     (skips without a release binary)
 
-Why this and not the in-process counters: crates/ibex-rt/tests/request_allocations.rs and
-tools/allocprofile count with ibex-alloc's counting allocator around an in-process engine.
-They cannot see what the real `ibex` binary allocates (its own accept/session path, the log
+Why this and not the in-process counters: crates/alcyon-rt/tests/request_allocations.rs and
+tools/allocprofile count with alcyon-alloc's counting allocator around an in-process engine.
+They cannot see what the real `alcyon` binary allocates (its own accept/session path, the log
 sink, libc callers, rustls), and the user's requirement (tradeoff.md §6.13) is about the
 binary. So this builds tools/allocshim/shim.c (an LD_PRELOAD interposer on malloc, calloc,
 realloc and the aligned calls), starts the real binary under it with `nbthread 1`, warms up
@@ -91,7 +91,7 @@ frontend fe
     use_backend be if is_static
     default_backend be
 backend be
-    http-response set-header X-Served-By ibex
+    http-response set-header X-Served-By alcyon
     server s1 127.0.0.1:{back}
 """,
 }
@@ -195,7 +195,7 @@ def measure(binary: str, so: str, workdir: str, config: str, shape: str):
             except OSError:
                 time.sleep(0.1)
         else:
-            raise RuntimeError("ibex did not start")
+            raise RuntimeError("alcyon did not start")
         a = socket.create_connection(("127.0.0.1", FRONT_PORT))
         a.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
@@ -260,12 +260,12 @@ def verdict(rows):
 
 def default_binary() -> str:
     t = os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target"))
-    return os.path.join(t, "release", "ibex")
+    return os.path.join(t, "release", "alcyon")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--binary", default=os.environ.get("IBEX_BIN") or default_binary())
+    ap.add_argument("--binary", default=os.environ.get("ALCYON_BIN") or default_binary())
     ap.add_argument("--table-only", action="store_true", help="print the table, always exit 0")
     args = ap.parse_args()
     rows = run(args.binary)

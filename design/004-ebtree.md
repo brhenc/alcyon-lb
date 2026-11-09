@@ -31,7 +31,7 @@ only if the item happens to also be a branch point. The first node inserted uses
 leaf half. **N items, N nodes, zero separate internal-node allocation.** That is the
 elasticity.
 
-Two consequences that matter for Ibex:
+Two consequences that matter for Alcyon:
 
 - **Intrusive.** The node is embedded in the payload (`struct task` embeds *two*:
   `rq` and `wq`). Insertion allocates nothing. For a no-allocation-in-the-data-path
@@ -95,7 +95,7 @@ Three things to carry across:
   list (`eb_insert_dup`). `EB_UNIQUE` trees refuse duplicates and return the existing node
   instead. The timer tree needs duplicates — many tasks share an expiry millisecond.
 
-## 4. Why Ibex wants it, specifically
+## 4. Why Alcyon wants it, specifically
 
 | Property | Why it matters here |
 |---|---|

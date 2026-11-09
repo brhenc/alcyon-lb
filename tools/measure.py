@@ -3,10 +3,10 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 """
-tools/measure.py — Unified Ibex Continuous Measurement Suite
+tools/measure.py — Unified Alcyon Continuous Measurement Suite
 
 Automates benchmarking, memory profiling, regression testing (VTC),
-and telemetry verification for Ibex. Outputs structured JSON and
+and telemetry verification for Alcyon. Outputs structured JSON and
 a Markdown dashboard.
 """
 
@@ -70,7 +70,7 @@ def run_alloc_profile() -> Dict[str, Any]:
     if not os.path.exists(alloc_src):
         return {"status": "error", "error": f"Path not found: {alloc_src}"}
 
-    with tempfile.TemporaryDirectory(prefix="ibex_allocprof_") as td:
+    with tempfile.TemporaryDirectory(prefix="alcyon_allocprof_") as td:
         dest_dir = os.path.join(td, "allocprofile")
         shutil.copytree(alloc_src, dest_dir)
         
@@ -275,8 +275,8 @@ def run_vtc_suite(
 
 
 def run_prom_verification() -> Dict[str, Any]:
-    """Verify Prometheus format and allocation zero-cost in ibex-rt."""
-    print("==> [4/4] Verifying Prometheus Telemetry (ibex-rt promex)...")
+    """Verify Prometheus format and allocation zero-cost in alcyon-rt."""
+    print("==> [4/4] Verifying Prometheus Telemetry (alcyon-rt promex)...")
     cmd = ["cargo", "test", "--test", "promex", "--", "--nocapture"]
     start_t = time.monotonic()
     res = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
@@ -289,17 +289,17 @@ def run_prom_verification() -> Dict[str, Any]:
     }
 
     stdout = res.stdout + "\n" + res.stderr
-    m_ibex = re.search(r"Ibex emits (\d+) metrics", stdout)
-    if m_ibex:
-        data["ibex_metrics_count"] = int(m_ibex.group(1))
+    m_alcyon = re.search(r"Alcyon emits (\d+) metrics", stdout)
+    if m_alcyon:
+        data["alcyon_metrics_count"] = int(m_alcyon.group(1))
 
     m_ha = re.search(r"HAProxy emits (\d+) metrics", stdout)
     if m_ha:
         data["haproxy_metrics_count"] = int(m_ha.group(1))
 
-    if data.get("ibex_metrics_count") and data.get("haproxy_metrics_count"):
+    if data.get("alcyon_metrics_count") and data.get("haproxy_metrics_count"):
         data["coverage_pct"] = round(
-            (data["ibex_metrics_count"] / data["haproxy_metrics_count"]) * 100, 2
+            (data["alcyon_metrics_count"] / data["haproxy_metrics_count"]) * 100, 2
         )
 
     m_alloc = re.search(r"Allocations:\s*(\d+)\s+allocs,\s*(\d+)\s+bytes", stdout)
@@ -331,7 +331,7 @@ def generate_markdown_dashboard(snapshot: Dict[str, Any]) -> str:
     cur_rps50 = bench.get("rps_50_conn", "N/A")
     cur_vtc_pass = vtc.get("passed", "N/A")
     cur_vtc_tot = vtc.get("in_scope_total", "N/A")
-    cur_prom_cnt = prom.get("ibex_metrics_count", "N/A")
+    cur_prom_cnt = prom.get("alcyon_metrics_count", "N/A")
     cur_prom_alloc = prom.get("render_alloc_count", "N/A")
 
     lines = []
@@ -435,7 +435,7 @@ def generate_markdown_dashboard(snapshot: Dict[str, Any]) -> str:
     # Section 4: Prometheus Telemetry
     lines.append("## 4. Prometheus Telemetry Verification")
     lines.append("")
-    lines.append(f"- **Ibex Emits:** `{prom.get('ibex_metrics_count', 0)}` metrics")
+    lines.append(f"- **Alcyon Emits:** `{prom.get('alcyon_metrics_count', 0)}` metrics")
     lines.append(f"- **HAProxy Oracle:** `{prom.get('haproxy_metrics_count', 0)}` metrics")
     lines.append(f"- **Metric Parity Coverage:** `{prom.get('coverage_pct', 0.0)}%`")
     lines.append(f"- **Rendering Allocations:** `{prom.get('render_alloc_count', 0)}` allocs, `{prom.get('render_bytes_allocated', 0)}` bytes (Zero-Allocation verified: `{prom.get('allocations_test_passed', False)}`)")
@@ -447,7 +447,7 @@ def generate_markdown_dashboard(snapshot: Dict[str, Any]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Ibex Continuous Measurement Suite — Benchmark & Metric Recorder"
+        description="Alcyon Continuous Measurement Suite — Benchmark & Metric Recorder"
     )
     parser.add_argument("--all", action="store_true", help="Run all measurement suites")
     parser.add_argument("--allocs", action="store_true", help="Run allocation profiler")
@@ -470,7 +470,7 @@ def main() -> None:
     do_prom = run_all or args.prom
 
     print("================================================================")
-    print("        IBEX CONTINUOUS MEASUREMENT SUITE                       ")
+    print("        ALCYON CONTINUOUS MEASUREMENT SUITE                       ")
     print("================================================================")
 
     git_info = get_git_info()

@@ -7,7 +7,7 @@ frontend fe
     acl bad hdr(user-agent) -i -m sub curl
     http-request deny if bad
     http-request set-header X-Forwarded-Proto https if { ssl_fc }
-    http-response set-header Server ibex
+    http-response set-header Server alcyon
     use_backend api if is_api
     default_backend web
 backend api

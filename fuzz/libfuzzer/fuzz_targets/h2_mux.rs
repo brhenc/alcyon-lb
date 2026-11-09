@@ -8,11 +8,11 @@
 //! what the connection holds (input, output, CONTINUATION and request blocks) stays under
 //! 2 MiB -- the shape of review #1/#3, unbounded growth from a peer.
 #![no_main]
-use ibex_proto::conn::ConnId;
-use ibex_proto::h2::H2_CONN_PREFACE;
-use ibex_proto::htx::HtxBlock;
-use ibex_proto::mux_h2::{H2MuxContext, MuxH2};
-use ibex_proto::Mux;
+use alcyon_proto::conn::ConnId;
+use alcyon_proto::h2::H2_CONN_PREFACE;
+use alcyon_proto::htx::HtxBlock;
+use alcyon_proto::mux_h2::{H2MuxContext, MuxH2};
+use alcyon_proto::Mux;
 use libfuzzer_sys::fuzz_target;
 
 const BOUND: usize = 2 << 20;

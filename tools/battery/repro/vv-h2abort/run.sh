@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 # VV-12: a backend restart while h2 streams are in flight on it takes down the whole client h2
-# connection on Ibex (sibling streams to other backends included); HAProxy completes every stream.
-#   run.sh BIN PORT [CONNS] [CORES]     e.g. run.sh ./ibex 19780 10 50-51
+# connection on Alcyon (sibling streams to other backends included); HAProxy completes every stream.
+#   run.sh BIN PORT [CONNS] [CORES]     e.g. run.sh ./alcyon 19780 10 50-51
 # Uses PORT..PORT+3 (frontend, bigapp, unused, slowbe). Prints one line per h2 client connection.
 set -u
 export PYTHONDONTWRITEBYTECODE=1

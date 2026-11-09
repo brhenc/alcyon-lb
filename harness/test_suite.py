@@ -22,12 +22,12 @@ import suite  # noqa: E402
 
 class SlowTargets(unittest.TestCase):
     def test_names_tests_over_10s_slowest_first(self):
-        line = suite.slow_targets_line({"ibex-rt/it::a": 3.0, "ibex-rt/it::b::t": 12.25,
-                                        "ibex-rt/c::t": 70.5, "ibex-rt/it::d": 10.0})
-        self.assertEqual(line, "suite: slow tests (over 10s): ibex-rt/c::t 70.5s, ibex-rt/it::b::t 12.2s")
+        line = suite.slow_targets_line({"alcyon-rt/it::a": 3.0, "alcyon-rt/it::b::t": 12.25,
+                                        "alcyon-rt/c::t": 70.5, "alcyon-rt/it::d": 10.0})
+        self.assertEqual(line, "suite: slow tests (over 10s): alcyon-rt/c::t 70.5s, alcyon-rt/it::b::t 12.2s")
 
     def test_none(self):
-        self.assertEqual(suite.slow_targets_line({"ibex-rt/it::a": 9.9}),
+        self.assertEqual(suite.slow_targets_line({"alcyon-rt/it::a": 9.9}),
                          "suite: slow tests (over 10s): none")
 
 
@@ -57,18 +57,18 @@ class OneProcessPerTest(unittest.TestCase):
 
     def test_instrumented_processes_merge_into_a_pool_not_one_profile_each(self):
         # One profile per process would be one per test: thousands of files of megabytes.
-        self.assertEqual(suite.pooled_profile("/t/llvm-cov-target/ibex-%p-%64m.profraw"),
-                         "/t/llvm-cov-target/ibex-%16m.profraw")
+        self.assertEqual(suite.pooled_profile("/t/llvm-cov-target/alcyon-%p-%64m.profraw"),
+                         "/t/llvm-cov-target/alcyon-%16m.profraw")
         self.assertEqual(suite.pooled_profile("/t/x-%p.profraw"), "/t/x-%16m.profraw")
 
     def test_serial_entries_are_tests_or_prefixes(self):
-        self.assertTrue(suite.is_serial("ibex-rt/it::fd_hygiene::an_idle_server_connection"))
-        self.assertTrue(suite.is_serial("ibex-rt/request_allocations::sixty_thousand"))
-        self.assertFalse(suite.is_serial("ibex-rt/it::fd_hygiene_x::t"))
-        self.assertFalse(suite.is_serial("ibex-rt/it::http_txn::t"))
+        self.assertTrue(suite.is_serial("alcyon-rt/it::fd_hygiene::an_idle_server_connection"))
+        self.assertTrue(suite.is_serial("alcyon-rt/request_allocations::sixty_thousand"))
+        self.assertFalse(suite.is_serial("alcyon-rt/it::fd_hygiene_x::t"))
+        self.assertFalse(suite.is_serial("alcyon-rt/it::http_txn::t"))
 
     def test_cargo_output_is_read_per_binary_with_one_binary_per_crate(self):
-        out = """     Running unittests src/lib.rs (/t/debug/deps/ibex_rt-0123abcd)
+        out = """     Running unittests src/lib.rs (/t/debug/deps/alcyon_rt-0123abcd)
 test proxy::tests::x ... FAILED
      Running tests/it/main.rs (/t/debug/deps/it-89abcdef01234567)
 test cli_show_sess::a ... FAILED
@@ -110,12 +110,12 @@ class FailureText(unittest.TestCase):
         import io
         from contextlib import redirect_stdout
         from unittest import mock
-        job = ("ibex-rt", "lib", "m::t", ["/fake/bin"], "/", None)
+        job = ("alcyon-rt", "lib", "m::t", ["/fake/bin"], "/", None)
         out = io.StringIO()
         with mock.patch.object(suite, "BASELINE", "/nonexistent.json"), \
                 mock.patch.object(suite, "instrument", return_value=None), \
                 mock.patch.object(suite, "run_parallel", return_value=([job], {"lib": {"m::t"}}, 10, 1)), \
-                mock.patch.dict(suite.FAILURE_TEXT, {"ibex-rt/lib::m::t": suite.failure_excerpt(self.FAILED)}, clear=True), \
+                mock.patch.dict(suite.FAILURE_TEXT, {"alcyon-rt/lib::m::t": suite.failure_excerpt(self.FAILED)}, clear=True), \
                 mock.patch.object(suite, "confirm_cmd", return_value=(set(), 0)), \
                 mock.patch.dict(os.environ, {"SUITE_SERIAL": "0"}), redirect_stdout(out):
             suite.main()
@@ -149,7 +149,7 @@ class KnownFlaky(unittest.TestCase):
         base = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
         json.dump({"known_failures": failures or {}, "known_flaky": {flaky_key: "a reason"}}, base)
         base.close()
-        job = ("ibex-rt", "lib", "proxy::tests::t", ["/fake/bin", "--exact", "proxy::tests::t"], "/", None)
+        job = ("alcyon-rt", "lib", "proxy::tests::t", ["/fake/bin", "--exact", "proxy::tests::t"], "/", None)
 
         def confirm(cmd, runs, cwd=None, env=None, test=None):
             n = min(runs, bad_runs)
@@ -166,15 +166,15 @@ class KnownFlaky(unittest.TestCase):
         return rc, out.getvalue()
 
     def test_failing_alone_1_of_3_is_the_excused_flake(self):
-        rc, out = self.run_main(1, "ibex-rt/lib::proxy::tests::t")
+        rc, out = self.run_main(1, "alcyon-rt/lib::proxy::tests::t")
         self.assertEqual(rc, 0, out)
         self.assertNotIn("NEW FAILURES", out)
 
     def test_failing_alone_3_of_3_is_new(self):
-        rc, out = self.run_main(3, "ibex-rt/lib::proxy::tests::t")
+        rc, out = self.run_main(3, "alcyon-rt/lib::proxy::tests::t")
         self.assertEqual(rc, 1, out)
         self.assertIn("NEW FAILURES", out)
 
     def test_another_tests_flaky_entry_excuses_nothing(self):
-        rc, out = self.run_main(1, "ibex-rt/lib::proxy::tests::other")
+        rc, out = self.run_main(1, "alcyon-rt/lib::proxy::tests::other")
         self.assertEqual(rc, 1, out)

@@ -8,16 +8,16 @@
 # them `src/tests/` (the end-to-end suite, which needs rcgen); `bloom` (fastbloom, not cached)
 # is off. Works on a copy in /tmp; the vendored tree is not touched.
 #
-# Usage: [QP_FEATURES=ibex-pools] tools/quinn-proto-tests.sh [test filter...]
+# Usage: [QP_FEATURES=alcyon-pools] tools/quinn-proto-tests.sh [test filter...]
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
-work=${QP_WORK:-/tmp/ibex-quinn-proto-tests}
+work=${QP_WORK:-/tmp/alcyon-quinn-proto-tests}
 rm -rf "$work"
 mkdir -p "$work/shims/assert_matches/src" "$work/shims/hex-literal/src"
 cp -a "$here/vendor/quinn-proto" "$work/quinn-proto"
 cp "$here/Cargo.lock" "$work/quinn-proto/Cargo.lock"
-# P1: the optional ibex-alloc dependency (feature ibex-pools) is a path outside the copy
-sed -i "s|path = \"../../crates/ibex-alloc\"|path = \"$here/crates/ibex-alloc\"|" "$work/quinn-proto/Cargo.toml"
+# P1: the optional alcyon-alloc dependency (feature alcyon-pools) is a path outside the copy
+sed -i "s|path = \"../../crates/alcyon-alloc\"|path = \"$here/crates/alcyon-alloc\"|" "$work/quinn-proto/Cargo.toml"
 
 cat > "$work/shims/assert_matches/Cargo.toml" <<'EOF'
 [package]

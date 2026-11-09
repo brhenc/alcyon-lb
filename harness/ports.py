@@ -2,7 +2,7 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 """Loopback ports for the harness, handed out the way the Rust tests' `common::reserve_addr`
-(`crates/ibex-rt/tests/common/mod.rs`) does.
+(`crates/alcyon-rt/tests/common/mod.rs`) does.
 
 A port taken by binding `:0` and closing the socket is in the kernel's ephemeral range
 (32768-60999 by default): until the proxy binds it, the kernel can hand it to any outgoing
@@ -40,7 +40,7 @@ def _bindable(port: int) -> bool:
 
 def reserve_port() -> int:
     """A loopback port no other test is given, held until this process exits."""
-    d = os.path.join(tempfile.gettempdir(), "ibex-test-ports")
+    d = os.path.join(tempfile.gettempdir(), "alcyon-test-ports")
     os.makedirs(d, exist_ok=True)
     start = (os.getpid() * 97) % COUNT
     with _lock:

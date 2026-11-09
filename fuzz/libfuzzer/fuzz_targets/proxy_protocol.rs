@@ -2,7 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use ibex_proto::proxy_protocol::ProxyHeader;
+use alcyon_proto::proxy_protocol::ProxyHeader;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(Some((h, _n))) = ProxyHeader::parse(data) {

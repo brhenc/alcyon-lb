@@ -29,7 +29,7 @@ version of that problem.
 "a tractable project" to the structural one below.**
 
 The line count is the least of it. `quic*.c` is 21,386 lines and `h3*.c` another 4,226, but
-the real objection is that **Ibex has no datagram I/O at all.** The entire UDP surface in
+the real objection is that **Alcyon has no datagram I/O at all.** The entire UDP surface in
 the runtime is three lines in `syslog.rs`. QUIC is not a protocol you add on top of the
 existing I/O path; it needs a second one:
 
@@ -40,7 +40,7 @@ existing I/O path; it needs a second one:
 - **Throughput needs `recvmmsg`, `sendmmsg`, GSO and GRO.** None of that machinery exists,
   and without it a QUIC implementation is a demo rather than a load balancer.
 - **TLS moves inside the transport.** rustls terminates TLS over a byte stream, which is
-  what `ibex-tls` does today. QUIC needs the handshake driven at the record layer with its
+  what `alcyon-tls` does today. QUIC needs the handshake driven at the record layer with its
   own key schedule and 0-RTT handling — a different integration, not a reuse.
 - **Loss recovery and congestion control are the actual work.** They are where QUIC
   implementations are won or lost, they are stateful and timing-sensitive, and they would
@@ -75,7 +75,7 @@ serves traffic. It also closes the last dark row in the capability matrix.
 
 **Oracle:** a real client negotiating h2 over TLS against a listener and getting a
 response — `curl --http2`, then the existing `http2_conformance` suite driven through the
-daemon rather than against `ibex-proto` directly. The `+H2` in the `-vv` banner goes back
+daemon rather than against `alcyon-proto` directly. The `+H2` in the `-vv` banner goes back
 in the same commit, and not before.
 
 ### 2. `struct server` — the 60,000-backend claim

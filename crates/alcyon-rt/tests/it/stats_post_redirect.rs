@@ -1,0 +1,403 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+//! VV-18: the stats page's admin POST answers `303 See Other` to `<uri>;st=<CODE>` (POST,
+//! redirect, GET), as `stats_process_http_post` and `stats_send_http_redirect` do in
+//! HAProxy 3.5-dev8, and the next GET shows the banner for the code. Every expected value
+//! below was measured on the reference binary with the same configuration. A POST without
+//! `stats admin` (or whose condition is false) is refused with `st=DENY` and changes nothing.
+
+use crate::common;
+
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::process::{Child, Command, Stdio};
+
+const AUTH: &str = "Authorization: Basic dTpw\r\n";
+
+struct Stats {
+    addr: SocketAddr,
+    child: Child,
+}
+
+impl Stats {
+    fn start(admin: &str) -> Stats {
+        Stats::start_with(admin, "", "server s1 127.0.0.1:1\n  server s2 127.0.0.1:1")
+    }
+
+    fn start_with(admin: &str, fe_extra: &str, servers: &str) -> Stats {
+        let addr = common::reserve_addr();
+        let dir = std::path::PathBuf::from(format!("/tmp/vv18-post-{}-{}", std::process::id(), addr.port()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("c.cfg");
+        std::fs::write(
+            &cfg,
+            format!(
+                "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 3s\n  timeout server 3s\n\
+                 frontend f\n  bind {addr}\n  stats enable\n  stats uri /st\n  stats auth u:p\n  {fe_extra}\n  {admin}\n  default_backend app\n\
+                 backend app\n  {servers}\n"
+            ),
+        )
+        .unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        assert!(common::wait_listening(addr));
+        Stats { addr, child }
+    }
+
+    fn send(&self, req: &[u8]) -> Vec<u8> {
+        let mut c = TcpStream::connect(self.addr).expect("connect");
+        c.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+        c.write_all(req).unwrap();
+        let mut out = Vec::new();
+        let _ = c.read_to_end(&mut out);
+        out
+    }
+
+    fn post_with(&self, path: &str, extra: &str, body: &str) -> String {
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\n{AUTH}Content-Length: {}\r\nContent-Type: application/x-www-form-urlencoded\r\n{extra}Connection: close\r\n\r\n{body}",
+            body.len()
+        );
+        String::from_utf8_lossy(&self.send(req.as_bytes())).into_owned()
+    }
+
+    fn post(&self, body: &str) -> String {
+        self.post_with("/st", "", body)
+    }
+
+    fn get(&self, uri: &str) -> String {
+        let req = format!("GET {uri} HTTP/1.1\r\nHost: x\r\n{AUTH}Connection: close\r\n\r\n");
+        String::from_utf8_lossy(&self.send(req.as_bytes())).into_owned()
+    }
+
+    /// The status column of a server in `;csv`.
+    fn status(&self, sv: &str) -> String {
+        let csv = self.get("/st;csv");
+        csv.lines().find(|l| l.starts_with(&format!("app,{sv},"))).and_then(|l| l.split(',').nth(17)).unwrap_or("?").to_string()
+    }
+}
+
+impl Drop for Stats {
+    fn drop(&mut self) {
+        common::stop(&mut self.child);
+    }
+}
+
+fn see_other(code: &str) -> String {
+    format!(
+        "HTTP/1.1 303 See Other\r\ncache-control: no-cache\r\ncontent-type: text/plain\r\ncontent-length: 0\r\nlocation: /st;st={code}\r\nconnection: close\r\n\r\n"
+    )
+}
+
+#[test]
+fn admin_post_answers_303_with_the_result_code() {
+    let s = Stats::start("stats admin if TRUE");
+    // (body, code) measured on the reference binary.
+    let cases = [
+        ("s=s1&action=maint&b=app", "DONE"),
+        ("s=s1&s=nope&action=maint&b=app", "PART"),
+        ("s=nope&action=maint&b=app", "ERRP"),
+        ("s=s1&action=maint&b=nobe", "ERRP"),
+        ("s=s1&action=bogus&b=app", "ERRP"),
+        ("s=s1&action=maint", "NONE"),
+        ("b=app", "NONE"),
+        ("", "NONE"),
+        ("garbage", "NONE"),
+        ("action=ready&b=app&s=s1&s=s2", "DONE"),
+        ("s=s1&&action=maint&b=app", "DONE"),
+        ("s=s1&action=maint&b=ap%zz", "NONE"),
+        // A verb that leaves the server as it is (not in maintenance, no check) changes and counts nothing.
+        ("s=s1&s=s2&b=app&action=ready", "DONE"),
+        ("s=s1&b=app&action=enable", "NONE"),
+        ("s=s1&b=app&action=dhlth", "NONE"),
+    ];
+    for (body, code) in cases {
+        assert_eq!(s.post(body), see_other(code), "body {body:?}");
+    }
+}
+
+#[test]
+fn admin_post_applies_the_action_once_and_the_redirect_target_does_not_repeat_it() {
+    let s = Stats::start("stats admin if TRUE");
+    assert_eq!(s.status("s1"), "no check");
+    assert_eq!(s.post("s=s1&action=maint&b=app"), see_other("DONE"));
+    assert_eq!(s.status("s1"), "MAINT");
+    assert_eq!(s.status("s2"), "no check");
+    // The page the redirect leads to is a GET: it changes nothing.
+    assert_eq!(s.post("s=s1&action=ready&b=app"), see_other("DONE"));
+    let page = s.get("/st;st=DONE");
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    assert_eq!(s.status("s1"), "no check");
+    // `action=drain` on one server only.
+    assert_eq!(s.post("s=s2&action=drain&b=app"), see_other("DONE"));
+    assert_eq!(s.status("s2"), "DRAIN");
+    assert_eq!(s.status("s1"), "no check");
+}
+
+#[test]
+fn admin_post_is_denied_without_admin_or_with_a_false_condition() {
+    for admin in ["", "stats admin if FALSE"] {
+        let s = Stats::start(admin);
+        assert_eq!(s.post("s=s1&action=maint&b=app"), see_other("DENY"), "admin line {admin:?}");
+        assert_eq!(s.status("s1"), "no check", "admin line {admin:?}: the action must not apply");
+    }
+}
+
+#[test]
+fn admin_post_from_another_origin_is_denied() {
+    let s = Stats::start("stats admin if TRUE");
+    assert_eq!(s.post_with("/st", "Origin: http://evil\r\n", "s=s1&action=maint&b=app"), see_other("DENY"));
+    assert_eq!(s.status("s1"), "no check");
+    assert_eq!(s.post_with("/st", "Origin: http://x\r\n", "s=s1&action=maint&b=app"), see_other("DONE"));
+    assert_eq!(s.status("s1"), "MAINT");
+    // A bare authority names the host as well as a URL does.
+    assert_eq!(s.post_with("/st", "Origin: x\r\n", "s=s1&action=ready&b=app"), see_other("DONE"));
+}
+
+#[test]
+fn admin_post_with_a_too_long_key_or_too_large_body() {
+    let s = Stats::start("stats admin if TRUE");
+    let long = format!("s=s1&action=maint&b=app&{}=1", "k".repeat(3000));
+    assert_eq!(s.post(&long), see_other("ERRP"));
+    assert_eq!(s.status("s1"), "no check");
+    let big = format!("s=s1&action=maint&b=app{}", "&x".repeat(8100));
+    assert_eq!(s.post(&big), see_other("EXCD"));
+    assert_eq!(s.status("s1"), "no check");
+}
+
+#[test]
+fn redirect_keeps_the_page_flags_of_the_post_uri() {
+    let s = Stats::start("stats admin if TRUE");
+    let r = s.post_with("/st;up", "", "s=s1&action=ready&b=app");
+    assert!(r.contains("location: /st;st=DONE;up\r\n"), "{r}");
+}
+
+#[test]
+fn get_with_a_status_code_shows_its_banner() {
+    let s = Stats::start("stats admin if TRUE");
+    let banners = [
+        ("DONE", "<p><div class=active_up><a class=lfsb href=\"/st\" title=\"Remove this message\">[X]</a> Action processed successfully.</div>"),
+        ("NONE", "<p><div class=active_going_down><a class=lfsb href=\"/st\" title=\"Remove this message\">[X]</a> Nothing has changed.</div>"),
+        ("PART", "<p><div class=active_going_down><a class=lfsb href=\"/st\" title=\"Remove this message\">[X]</a> Action partially processed.<br>Some server names are probably unknown or ambiguous (duplicated names in the backend).</div>"),
+        ("ERRP", "<p><div class=active_down><a class=lfsb href=\"/st\" title=\"Remove this message\">[X]</a> Action not processed because of invalid parameters.<ul><li>The action is maybe unknown.</li><li>Invalid key parameter (empty or too long).</li><li>The backend name is probably unknown or ambiguous (duplicated names).</li><li>Some server names are probably unknown or ambiguous (duplicated names in the backend).</li></ul></div>"),
+        ("EXCD", "<p><div class=active_down><a class=lfsb href=\"/st\" title=\"Remove this message\">[X]</a> <b>Action not processed : the buffer couldn't store all the data.<br>You should retry with less servers at a time.</b></div>"),
+        ("DENY", "<p><div class=active_down><a class=lfsb href=\"/st\" title=\"Remove this message\">[X]</a> <b>Action denied.</b></div>"),
+        ("IVAL", "<p><div class=active_down><a class=lfsb href=\"/st\" title=\"Remove this message\">[X]</a> <b>Invalid requests (unsupported method or chunked encoded request).</b></div>"),
+        ("UNKN", "<p><div class=active_no_check><a class=lfsb href=\"/st\" title=\"Remove this message\">[X]</a> Unexpected result.</div>"),
+        ("BOGU", "<p><div class=active_no_check><a class=lfsb href=\"/st\" title=\"Remove this message\">[X]</a> Unexpected result.</div>"),
+    ];
+    for (code, banner) in banners {
+        let page = s.get(&format!("/st;st={code}"));
+        assert!(page.contains(banner), "st={code}: banner missing");
+    }
+    let plain = s.get("/st");
+    assert!(!plain.contains("Remove this message"));
+    let up = s.get("/st;st=DONE;up");
+    assert!(up.contains("href=\"/st;up\" title=\"Remove this message\""));
+}
+
+#[test]
+fn admin_post_waits_for_the_whole_body_and_applies_once() {
+    let s = Stats::start("stats admin if TRUE");
+    let body = "s=s1&action=maint&b=app";
+    let head = format!(
+        "POST /st HTTP/1.1\r\nHost: x\r\n{AUTH}Content-Length: {}\r\nContent-Type: application/x-www-form-urlencoded\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut c = TcpStream::connect(s.addr).unwrap();
+    c.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+    c.write_all(head.as_bytes()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    c.write_all(&body.as_bytes()[..10]).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    c.write_all(&body.as_bytes()[10..]).unwrap();
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out);
+    assert_eq!(String::from_utf8_lossy(&out), see_other("DONE"));
+    assert_eq!(s.status("s1"), "MAINT");
+}
+
+#[test]
+fn admin_get_with_an_action_is_ignored_without_admin() {
+    let s = Stats::start("stats admin if FALSE");
+    let page = s.get("/st?action=maint&backend=app&server=s1");
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    assert_eq!(s.status("s1"), "no check");
+}
+
+#[test]
+fn any_stats_admin_line_that_holds_allows_the_post() {
+    let addr = common::reserve_addr();
+    let dir = std::path::PathBuf::from(format!("/tmp/vv18-post-multi-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = dir.join("c.cfg");
+    std::fs::write(
+        &cfg,
+        format!(
+            "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 3s\n  timeout server 3s\n\
+             frontend f\n  bind {addr}\n  stats enable\n  stats uri /st\n  stats auth u:p\n  stats admin if TRUE\n  stats admin if FALSE\n  default_backend app\n\
+             backend app\n  server s1 127.0.0.1:1\n"
+        ),
+    )
+    .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+    assert!(common::wait_listening(addr));
+    let s = Stats { addr, child };
+    assert_eq!(s.post("s=s1&action=maint&b=app"), see_other("DONE"));
+}
+
+#[test]
+fn every_form_verb_answers_as_the_reference_does() {
+    // Measured on the reference with `s1` checked (and down), `s2` unchecked, `t1` tracking `s1`.
+    let s = Stats::start_with(
+        "stats admin if TRUE",
+        "stats refresh 9s",
+        "server s1 127.0.0.1:1 check inter 1h\n  server s2 127.0.0.1:1\n  server t1 127.0.0.1:1 track s1",
+    );
+    let steps = [
+        ("s=s1&b=app&action=dhlth", "DONE", ("s1", "DOWN")),
+        ("s=s1&b=app&action=ehlth", "DONE", ("s1", "DOWN")),
+        ("s=s2&b=app&action=dhlth", "NONE", ("s2", "no check")),
+        ("s=s2&b=app&action=ehlth", "NONE", ("s2", "no check")),
+        ("s=s1&b=app&action=hrunn", "DONE", ("s1", "UP")),
+        ("s=s1&b=app&action=hdown", "DONE", ("s1", "DOWN")),
+        ("s=t1&b=app&action=hrunn", "NONE", ("t1", "DOWN")),
+        ("s=t1&b=app&action=hdown", "NONE", ("t1", "DOWN")),
+        ("s=s2&b=app&action=hdown", "DONE", ("s2", "DOWN")),
+        ("s=s2&b=app&action=hrunn", "DONE", ("s2", "no check")),
+        ("s=s2&b=app&action=stop", "DONE", ("s2", "DRAIN")),
+        ("s=s2&b=app&action=stop", "NONE", ("s2", "DRAIN")),
+        ("s=s2&b=app&action=start", "DONE", ("s2", "no check")),
+        ("s=s2&b=app&action=start", "NONE", ("s2", "no check")),
+        ("s=s2&b=app&action=disable", "DONE", ("s2", "MAINT")),
+        ("s=s2&b=app&action=disable", "NONE", ("s2", "MAINT")),
+        ("s=s2&b=app&action=enable", "DONE", ("s2", "no check")),
+        ("s=s2&b=app&action=enable", "NONE", ("s2", "no check")),
+        ("s=s%32&b=app&action=drain", "DONE", ("s2", "DRAIN")),
+        ("s=s2&b=app&action=ready", "DONE", ("s2", "no check")),
+    ];
+    // The first check (a closed port) has to have failed.
+    for _ in 0..60 {
+        if s.status("s1") == "DOWN" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    for (body, code, (sv, status)) in steps {
+        assert_eq!(s.post(body), see_other(code), "body {body:?}");
+        assert_eq!(s.status(sv), status, "body {body:?}");
+    }
+    // `+` is a space: no server of that name.
+    assert_eq!(s.post("s=s2+x&b=app&action=ready"), see_other("ERRP"));
+    // With `stats refresh`, `;norefresh` and `;up` go on to the page they redirect to and its banner.
+    let r = s.post_with("/st;norefresh;up", "", "s=s2&b=app&action=ready");
+    assert!(r.contains("location: /st;st=DONE;up;norefresh\r\n"), "{r}");
+    let page = s.get("/st;st=DONE;norefresh;up");
+    assert!(page.contains("href=\"/st;up;norefresh\" title=\"Remove this message\""));
+}
+
+#[test]
+fn a_get_never_acts_and_a_cross_origin_api_post_changes_nothing() {
+    let s = Stats::start("stats admin if TRUE");
+    for req in [
+        "GET /st?b=app&s=s1&action=maint",
+        "GET /st?action=maint&backend=app&server=s1",
+        "HEAD /st?b=app&s=s1&action=maint",
+    ] {
+        let r = String::from_utf8_lossy(&s.send(format!("{req} HTTP/1.1\r\nHost: x\r\n{AUTH}Origin: http://evil.example\r\nConnection: close\r\n\r\n").as_bytes())).into_owned();
+        assert!(r.starts_with("HTTP/1.1 200"), "{req}: {r}");
+        assert_eq!(s.status("s1"), "no check", "{req}");
+    }
+    let json = r#"{"action":"maint","backend":"app","server":"s1"}"#;
+    let r = s.post_with("/st/api/admin", "Origin: http://evil.example\r\nAccept: application/json\r\n", json);
+    assert_eq!(r, see_other("DENY"));
+    assert_eq!(s.status("s1"), "no check");
+    let r = s.post_with("/st", "Origin: http://evil.example\r\n", "action=maint&backend=app&server=s1");
+    assert_eq!(r, see_other("DENY"));
+    assert_eq!(s.status("s1"), "no check");
+    // The same request from the page's own origin acts.
+    let r = s.post_with("/st", "Origin: http://x\r\n", "action=maint&backend=app&server=s1");
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    assert_eq!(s.status("s1"), "MAINT");
+}
+
+/// A stats frontend that logs `%ts %ST %r` to the returned socket, with `timeout http-request 1s`.
+fn logged() -> (Stats, std::net::UdpSocket) {
+    let collector = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    collector.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+    let s = Stats::start_with(
+        "stats admin if TRUE",
+        &format!("timeout http-request 1s\n  log {} local0\n  log-format \"%ts %ST %r\"", collector.local_addr().unwrap()),
+        "server s1 127.0.0.1:1",
+    );
+    (s, collector)
+}
+
+fn log_of(c: &std::net::UdpSocket) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 2048];
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while out.is_empty() && std::time::Instant::now() < end {
+        while let Ok(n) = c.recv(&mut buf) {
+            let l = String::from_utf8_lossy(&buf[..n]).into_owned();
+            out.push(l[l.rfind(": ").map_or(0, |i| i + 2)..].trim_end().to_string());
+        }
+    }
+    out
+}
+
+fn raw_conversation(s: &Stats, parts: &[&str], then_close: bool) -> String {
+    let mut c = TcpStream::connect(s.addr).unwrap();
+    c.set_read_timeout(Some(std::time::Duration::from_secs(4))).unwrap();
+    for p in parts {
+        c.write_all(p.as_bytes()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    if then_close {
+        return String::new();
+    }
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out);
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// Measured on the reference with the same configuration.
+#[test]
+fn stats_answers_are_logged_by_the_applet_and_a_body_that_is_not_one_is_cut_off() {
+    let (s, col) = logged();
+    let head = format!("POST /st HTTP/1.1\r\nHost: x\r\n{AUTH}");
+    // The listening probe of the harness is logged as a bad request: drop it.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut junk = [0u8; 2048];
+    while col.recv(&mut junk).is_ok() {}
+    // The page and the redirect: LR.
+    s.get("/st");
+    assert_eq!(log_of(&col), ["LR 200 GET /st HTTP/1.1"]);
+    assert_eq!(s.post("s=s1&action=ready&b=app"), see_other("DONE"));
+    assert_eq!(log_of(&col), ["LR 303 POST /st HTTP/1.1"]);
+    // A body that never comes: 408 after `timeout http-request`.
+    let r = raw_conversation(&s, &[&format!("{head}Content-Length: 10\r\nConnection: close\r\n\r\n")], false);
+    assert!(r.starts_with("HTTP/1.1 408 Request Time-out\r\n"), "{r}");
+    assert_eq!(log_of(&col), ["LR 408 POST /st HTTP/1.1"]);
+    // A client that leaves in the middle of the body: 400.
+    raw_conversation(&s, &[&format!("{head}Content-Length: 30\r\nConnection: close\r\n\r\ns=s1&ac")], true);
+    assert_eq!(log_of(&col), ["LR 400 POST /st HTTP/1.1"]);
+    // A chunked body that turns out not to be one once the head is in: cut off, no answer.
+    let r = raw_conversation(
+        &s,
+        &[&format!("{head}Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"), "ZZ\r\nxx\r\n"],
+        false,
+    );
+    assert_eq!(r, "");
+    assert_eq!(log_of(&col), ["LR 400 POST /st HTTP/1.1"]);
+}
+
+#[test]
+fn a_percent_sign_before_a_plus_is_not_an_escape_and_alcyon_only_verbs_still_work() {
+    let s = Stats::start("stats admin if TRUE");
+    // `%+1` is not `%XX` (reference: NONE, nothing altered).
+    assert_eq!(s.post("s=%+1&b=app&action=maint"), see_other("NONE"));
+    assert_eq!(s.status("s1"), "no check");
+    // A verb only the dashboard's API has, without any of its other keys: not the form's.
+    let r = s.post("action=clear_counters");
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+}

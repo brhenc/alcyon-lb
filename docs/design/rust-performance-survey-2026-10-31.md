@@ -1,7 +1,7 @@
-# Rust performance survey: do Rust projects beat C, and what Ibex can take from them (T550, 2026-10-31)
+# Rust performance survey: do Rust projects beat C, and what Alcyon can take from them (T550, 2026-10-31)
 
 Status: research and audit only. No code was changed and nothing was timed or counted for this
-report: both measuring slots were busy. Every Ibex number below comes from an earlier
+report: both measuring slots were busy. Every Alcyon number below comes from an earlier
 measurement, named where it is used. Most are from T544's IBS profile
 (`docs/design/quic-profile-2026-11-01.md`, raw data in `~/ibex-worktrees/review/t544-2026-11-01/`).
 T539's `instructions:u` samples are not used, because T544 showed they skid onto syscalls.
@@ -21,13 +21,13 @@ safe to write" holds up.**
 - **No language-level win.** No source we found credits a measured speedup to the language
   itself (noalias, monomorphisation).
 
-For Ibex the lesson is the same. Ibex is 1.49x HAProxy on h2: 79.6k against 53.4k instructions
+For Alcyon the lesson is the same. Alcyon is 1.49x HAProxy on h2: 79.6k against 53.4k instructions
 per request (T544 §1). The gap is not a Rust tax:
 
 - **Rust taxes are small.** UTF-8 validation, `str` char-boundary checks, and bounds checks
   together cost about 2-3k per request (3 %), which is in line with rav1d and zlib-rs.
 - **Most of the gap is design.** Of the h2 request, 63.6k is the common stream engine, against
-  HAProxy's 26.9k (T544 §2). In that engine, Ibex parses and re-encodes the same head several
+  HAProxy's 26.9k (T544 §2). In that engine, Alcyon parses and re-encodes the same head several
   times through HTTP/1.1 text, reads the clock about 40 times per request, and builds a new
   session per h2 stream.
 - **The one large build-level lever is already measured.** PGO gave -13.4 % instructions and
@@ -52,7 +52,7 @@ language itself.
 | uutils coreutils | No "beats GNU" figure. Issue #13204: GNU `sort` 3.4x faster on 95 MB. The 20-35x `wc` claims are a different project (fcoreutils: SIMD + threads, **A**) | - | https://github.com/uutils/coreutils/issues/13204 |
 | fish 4.0 | No benchmark; reviewers say "about the same". The port was for concurrency and maintainability | - | https://fishshell.com/blog/rustport/ |
 | Pingora vs NGINX | -70 % CPU and -67 % memory, measured against Cloudflare's old NGINX+**Lua** service. Connection reuse went from 87.1 % to 99.92 %. Cloudflare: "This is not because we run code faster." | **A**: a connection pool shared by all threads (NGINX has one per worker), and Rust replacing Lua. HAProxy already shares idle connections across threads | https://blog.cloudflare.com/how-we-built-pingora-the-proxy-that-connects-cloudflare-to-the-internet/ |
-| **Ibex itself** | QUIC crypto: ring HP+AEAD 3.9k per request against OpenSSL's 15.1k (T544 §2) | **L/A**: ring's assembly, and OpenSSL's `evp_cipher_init_internal` running on every packet. Not the language | T544 |
+| **Alcyon itself** | QUIC crypto: ring HP+AEAD 3.9k per request against OpenSSL's 15.1k (T544 §2) | **L/A**: ring's assembly, and OpenSSL's `evp_cipher_init_internal` running on every packet. Not the language | T544 |
 
 Tooling status:
 - `std::simd` (portable SIMD) is still nightly-only in 2026, and tracking issue #86656 is open
@@ -65,26 +65,26 @@ Tooling status:
 
 | technique | what it buys | cost in safety and maintenance |
 |---|---|---|
-| SIMD through crates (`memchr`, `simdutf8`) | Long-haystack search and validation at memory speed, with runtime CPU detection | The crate's internal `unsafe` (std::arch intrinsics). Ibex already depends on `memchr` (`Cargo.toml:47`). **Short haystacks gain little**: a header line is 20-60 B, and per-line calls pay the setup each time (see §3.4) |
+| SIMD through crates (`memchr`, `simdutf8`) | Long-haystack search and validation at memory speed, with runtime CPU detection | The crate's internal `unsafe` (std::arch intrinsics). Alcyon already depends on `memchr` (`Cargo.toml:47`). **Short haystacks gain little**: a header line is 20-60 B, and per-line calls pay the setup each time (see §3.4) |
 | Our own `std::arch` | The same | `unsafe` of ours: ruled out (AGENTS.md, memory-safety rule) |
 | `std::simd` | Portable, safe SIMD | Nightly only: ruled out for a stable build |
 | SWAR (`u64::from_ne_bytes` over `chunks_exact(8)`) | 8 bytes per step in safe Rust, e.g. "first non-zero byte", "any byte >= 0x80", "any `\n`". LLVM does not vectorise early-exit loops such as `position()` | None (safe, no dependency). Needs a scalar tail and a test against the byte loop |
 | Bounds-check elision | Iterators, `chunks_exact`, slice patterns, one `assert!(i + n <= s.len())` that hoists the checks out of a loop | None. The checks are usually well predicted, so the gain is instructions, not cycles (zlib-rs: +37-58 % instructions, 3-20 % time) |
 | `&[u8]` instead of `&str` for wire bytes | No UTF-8 validation, no char-boundary checks on slicing | None. HTTP field bytes are not UTF-8 by contract anyway |
-| Less `Vec`/`String`/`Arc` churn | Borrowed slices, reused buffers, `SmallVec`, arenas | Ibex rule 8: a pool or arena is `ibex_alloc::Pool`/`Arena`. The request path is already at 0 mallocs on h2 (T544: malloc 0) |
+| Less `Vec`/`String`/`Arc` churn | Borrowed slices, reused buffers, `SmallVec`, arenas | Alcyon rule 8: a pool or arena is `alcyon_alloc::Pool`/`Arena`. The request path is already at 0 mallocs on h2 (T544: malloc 0) |
 | Lookup tables, `match` on length and first byte | Replaces linear scans (HPACK static table) | None |
 | `#[cold]`, `#[inline]`, `#[inline(never)]` on error paths | Keeps hot loops small. `likely`/`unlikely` are still unstable; `#[cold]` on a function is the stable lever | Low. Easy to overdo without a profile |
 | Hashers | SipHash-1-3 is ~4x FxHash on small keys. Fx, or our `HandleHasher`, for keys the peer does not choose; a keyed fast hash (foldhash/ahash) or re-keying by index for keys it does | Fx on a peer-chosen key opens HashDoS. foldhash contains `unsafe` internally (13 occurrences in 0.2.0) and is a new dependency |
 | `bytes`-style zero-copy | Shared buffers without copies | An atomic refcount per clone/drop: 1.9k per h3 request (T544, hypothesis 7). Not free |
 | Enum/struct layout | Niches (`Option<NonZeroU32>`), smaller hot structs (T540) | None |
-| LTO fat, `codegen-units=1` | Measured on Ibex: -9.1 % user cycles, -5.1 % CPU (T433). Already in `release-perf` (`Cargo.toml:110-113`) | ~7 min cold build |
-| `panic = "abort"` | Smaller code, no landing pads | **Not available**: T447's per-stream panic containment needs unwinding (`crates/ibex-rt/src/crash.rs:32-33` refuses to compile with it) |
+| LTO fat, `codegen-units=1` | Measured on Alcyon: -9.1 % user cycles, -5.1 % CPU (T433). Already in `release-perf` (`Cargo.toml:110-113`) | ~7 min cold build |
+| `panic = "abort"` | Smaller code, no landing pads | **Not available**: T447's per-stream panic containment needs unwinding (`crates/alcyon-rt/src/crash.rs:32-33` refuses to compile with it) |
 | `target-cpu` | AVX2 for LLVM's autovectoriser; it is the flag that made zlib-rs look faster than zlib-ng | The binary refuses older CPUs. `memchr` already picks AVX2 at runtime |
-| PGO | Ibex, T435: keep-alive 44,114 -> 38,197 instructions per request (-13.4 %), user cycles -35 %. External: rustc -20 % (Android), rust-analyzer up to -20 % | A training load and a 2x build (`tools/pgo-build.sh`). Not the default |
-| BOLT | Ibex, T435: +1.7 % cycles on top of PGO, only from an instrumented profile, reorder only. `--bolt` in the script fails on mold's PLT | Low gain, fragile |
-| Allocator (mimalloc/jemalloc) | Real gains are for allocation-heavy servers | Ibex's request path does no mallocs on h2 (T544 §2: malloc 0). Not worth a C dependency (mimalloc and jemalloc are C) |
+| PGO | Alcyon, T435: keep-alive 44,114 -> 38,197 instructions per request (-13.4 %), user cycles -35 %. External: rustc -20 % (Android), rust-analyzer up to -20 % | A training load and a 2x build (`tools/pgo-build.sh`). Not the default |
+| BOLT | Alcyon, T435: +1.7 % cycles on top of PGO, only from an instrumented profile, reorder only. `--bolt` in the script fails on mold's PLT | Low gain, fragile |
+| Allocator (mimalloc/jemalloc) | Real gains are for allocation-heavy servers | Alcyon's request path does no mallocs on h2 (T544 §2: malloc 0). Not worth a C dependency (mimalloc and jemalloc are C) |
 
-## 3. Ibex audit
+## 3. Alcyon audit
 
 ### 3.1 Build settings
 
@@ -96,8 +96,8 @@ Tooling status:
 - **`target-cpu`.** None set (`.cargo/config.toml` has only the linker and test threads).
 - **PGO.** Available (`tools/pgo-build.sh`, T435) but not used for the default build or the
   board figures.
-- **Global allocator.** `crates/ibex-rt/src/bin/ibex.rs:24`. It is `IbexAllocator`, which is
-  glibc `System` plus zero-on-free (`crates/ibex-alloc/src/zero_on_free.rs:570-576`).
+- **Global allocator.** `crates/alcyon-rt/src/bin/alcyon.rs:24`. It is `AlcyonAllocator`, which is
+  glibc `System` plus zero-on-free (`crates/alcyon-alloc/src/zero_on_free.rs:570-576`).
 
 The only open build-level lever is PGO.
 
@@ -107,28 +107,28 @@ T544's phase rows: HTTP engine and backend h1 35.4k; scheduler, loop, and `engin
 mux<->stream bridge 10.5k; h2+HPACK 7.5k; TLS record 3.4k; shared header codec 2.2k.
 
 The per-function figures below are mine, from T544's folded IBS stacks
-(`ibs/ibex-h2.folded`). I dropped the samples on syscall entry, as T544 did (29.2 %), and
+(`ibs/alcyon-h2.folded`). I dropped the samples on syscall entry, as T544 did (29.2 %), and
 scaled the rest to 79,609. They are dispatched ops, not instructions: read each as ±10-20 %.
 Figures are inclusive unless marked "self".
 
 | what | per request | where |
 |---|---:|---|
-| h2 bridge `start_request` | 7.2k | `crates/ibex-rt/src/h2_bridge.rs:154` |
+| h2 bridge `start_request` | 7.2k | `crates/alcyon-rt/src/h2_bridge.rs:154` |
 | of which `H1Parser::parse` of the HTTP/1.1 text the h2 mux just wrote (the re-parse) | **4.7k** | `h2_bridge.rs:208` |
-| `H2ReqHead::write` (HPACK fields -> HTTP/1.1 text) | 1.9k | `crates/ibex-proto/src/mux_h2.rs:213` |
+| `H2ReqHead::write` (HPACK fields -> HTTP/1.1 text) | 1.9k | `crates/alcyon-proto/src/mux_h2.rs:213` |
 | `send_h1_head` (response HTTP/1.1 text -> `from_utf8_lossy`, `lines`, `split_once`, `trim` -> HPACK) | **3.4k** | `mux_h2.rs:935-955` |
-| of which `hpack::find_table_entry`: a linear scan of the 61-entry static table with `eq_ignore_ascii_case`, once per header | **1.9k** | `crates/ibex-proto/src/hpack.rs:656-669` |
+| of which `hpack::find_table_entry`: a linear scan of the 61-entry static table with `eq_ignore_ascii_case`, once per header | **1.9k** | `crates/alcyon-proto/src/hpack.rs:656-669` |
 | `apply_http_response_rules`, with **no** response rules configured | 5.7k | engine.rs (`grep -n 'fn apply_http_response_rules'`) |
-| of which `HeadFacts::scan` (a further pass over the response head: `is_ascii`, memchr per line, framing fields) | 2.4k | `crates/ibex-rt/src/txn.rs:1644-1660` |
+| of which `HeadFacts::scan` (a further pass over the response head: `is_ascii`, memchr per line, framing fields) | 2.4k | `crates/alcyon-rt/src/txn.rs:1644-1660` |
 | of which `check_response_head`, `status_of_line`, `websocket::check_response` (three more passes) | 1.3k | same caller |
-| `rewrite_header_names_before` (lowercases names: one more pass, memchr per line) | 0.7k | `crates/ibex-rt/src/engine.rs:16574-16590` |
+| `rewrite_header_names_before` (lowercases names: one more pass, memchr per line) | 0.7k | `crates/alcyon-rt/src/engine.rs:16574-16590` |
 | clock reads: vDSO `clock_gettime` (`Engine::step` 4 reads per pass at `engine.rs:5900, 5968, 6053, 6146`, `current_tick` `engine.rs:5548`, `statcnt::now_ms` `statcnt.rs:177-179`, `StreamLog::start`'s `SystemTime::now` `txnlog.rs:160`) | ~2.2k (T544: 37.6 reads at ~50 instructions; IBS ops say 3.8k) | as listed |
-| `TcpSession::h2_child_of` (a new session per h2 stream: `new_with_mode` 1.1k, `StreamLog` clone 0.3k) | 2.5k | `crates/ibex-rt/src/proxy.rs` (`grep -n 'fn h2_child_of'`) |
+| `TcpSession::h2_child_of` (a new session per h2 stream: `new_with_mode` 1.1k, `StreamLog` clone 0.3k) | 2.5k | `crates/alcyon-rt/src/proxy.rs` (`grep -n 'fn h2_child_of'`) |
 | `IdlePools::with_count`: `RwLock` read plus a SipHash lookup on `(usize, usize)` per request | 0.7k | `engine.rs:369, 427-431` (also `engine.rs:170, 179`) |
-| `Arc<[(String, usize)]>` clone and drop (`capture_write::enter/leave`, `stream_vars_enter`) | 0.7k | `crates/ibex-sample/src/capture_write.rs`, engine `stream_vars_enter` |
-| `TimeStat::add` `fetch_max` (a `lock cmpxchg` loop on a shared counter) and other atomics | 0.35k (all atomics 1.0k) | `crates/ibex-rt/src/statcnt.rs:34` |
+| `Arc<[(String, usize)]>` clone and drop (`capture_write::enter/leave`, `stream_vars_enter`) | 0.7k | `crates/alcyon-sample/src/capture_write.rs`, engine `stream_vars_enter` |
+| `TimeStat::add` `fetch_max` (a `lock cmpxchg` loop on a shared counter) and other atomics | 0.35k (all atomics 1.0k) | `crates/alcyon-rt/src/statcnt.rs:34` |
 | UTF-8 validation (`from_utf8`, `run_utf8_validation`: `req_htx_init`, `start_request`, `send_h1_head`) | 1.0k | as listed |
-| `str` char-boundary checks (`check_range`) in `DecodedFields::iter` | 0.5k | `crates/ibex-proto/src/hpack.rs:860-861` (`&self.text[n..v]` on a `String`) |
+| `str` char-boundary checks (`check_range`) in `DecodedFields::iter` | 0.5k | `crates/alcyon-proto/src/hpack.rs:860-861` (`&self.text[n..v]` on a `String`) |
 | memmove (head copies between text buffers) | 3.4k | spread; T544 cross-cut 3.5k |
 | `memchr` (the crate, AVX2) | 3.0k | spread; mostly per-line calls on 20-60 B lines |
 
@@ -156,11 +156,11 @@ These exist only because the code is Rust, or because it uses `str` where C woul
 That is about 2-3k per request, or 3 % of h2. It matches rav1d and zlib-rs. Removing it is
 mostly a matter of keeping wire data in `&[u8]`, which is safe.
 
-### 3.4 SIMD in Ibex
+### 3.4 SIMD in Alcyon
 
 `memchr` is already used, with AVX2 picked at runtime (it appears as `find_avx2` in the profile).
 
-**More SIMD is not the lever.** HTTP heads are a few hundred bytes, and Ibex calls `memchr`
+**More SIMD is not the lever.** HTTP heads are a few hundred bytes, and Alcyon calls `memchr`
 once per line (`engine.rs:16576-16579`, `txn.rs` `scan_plain`). On 20-60 B haystacks the call
 and setup cost about as much as the search. The win is fewer passes, not wider ones.
 
@@ -176,10 +176,10 @@ does not vectorise that early-exit loop. A safe SWAR loop over `chunks_exact(8)`
   SipHash: `engine.rs:170, 179, 369` (`(usize, usize)` server keys). T544's h2 cross-cut puts
   SipHash at 0.6k per request.
 - **ConnectionId maps.** The maps keyed by the client-chosen `ConnectionId` are at
-  `crates/ibex-quic/src/table.rs:55`, `crates/ibex-rt/src/quic_listener.rs:94, 109, 130, 141`,
+  `crates/alcyon-quic/src/table.rs:55`, `crates/alcyon-rt/src/quic_listener.rs:94, 109, 130, 141`,
   and `endpoint.rs:428` `get_handle`. They cost 3.1k per h3 request (T544 hypothesis 9). These
   need a keyed hash, or better, re-keying by `ConnectionHandle` once the packet is routed.
-- **Already in the tree.** `ibex_quic::table::HandleHasher` (`table.rs:27`, our own code, no
+- **Already in the tree.** `alcyon_quic::table::HandleHasher` (`table.rs:27`, our own code, no
   `unsafe`) is the right tool for index keys. `rustc-hash` (Fx, no `unsafe`) is already in
   `Cargo.lock` as a transitive dependency.
 
@@ -193,12 +193,12 @@ add them.
 
 | # | candidate | where | expected saving | sureness | effort | risk | unsafe |
 |---|---|---|---|---|---|---|---|
-| Q1 | **PGO for the deployed build** (the script exists) | `tools/pgo-build.sh`, `Cargo.toml:110` | -10 to -14 % instructions (8-11k on h2), about -35 % user cycles (T435, keep-alive) | high: measured on Ibex | low (packaging and CI time) | a stale profile only warns; build time doubles; A/B against a non-PGO HAProxy is no longer like for like | no |
+| Q1 | **PGO for the deployed build** (the script exists) | `tools/pgo-build.sh`, `Cargo.toml:110` | -10 to -14 % instructions (8-11k on h2), about -35 % user cycles (T435, keep-alive) | high: measured on Alcyon | low (packaging and CI time) | a stale profile only warns; build time doubles; A/B against a non-PGO HAProxy is no longer like for like | no |
 | Q2 | One clock read per loop pass: pass `pass_start` down; `current_tick`, `statcnt::now_ms`, and the QUIC `Instant::now`s read a per-pass cell (`txnlog::loop_now` already exists, `txnlog.rs:152`) | `engine.rs:5548, 5900, 5968, 6053, 6146`; `statcnt.rs:177`; `txnlog.rs:160` | 1.2-2.0k (from 37.6 reads to ~7) | medium-high (call count measured, T544 §3) | low | timer semantics (a deadline computed from a stale `now`); HAProxy does the same thing (`now_ms` per loop) | no |
 | Q3 | HPACK static-table lookup by `match` on length and first byte (or a sorted name table with a binary search), as `qpack::static_ref` does since T539 | `hpack.rs:656-669`, `hpack.rs:693` | 1.4-1.8k | high (1.9k measured; the linear scan is 61 `eq_ignore_ascii_case` per header) | low | low: one exhaustive test against the scan, as `h3_mux::the_static_encoder_finds_what_a_scan_of_the_table_finds` | no |
 | Q4 | Wire bytes as `&[u8]`: `DecodedFields::text` as bytes (no `check_range`), no `from_utf8_lossy` in `send_h1_head`, no `from_utf8` in `req_htx_init`/`start_request` | `hpack.rs:860-861`, `mux_h2.rs:942`, `h2_bridge.rs`, engine `req_htx_init` (`engine.rs:15428`) | 1.0-1.5k | medium | medium (API churn through `&str` users) | low | no |
 | Q5 | Internal-key maps off SipHash and off the `RwLock`: servers by dense index into a `Vec` (or `HandleHasher`) | `engine.rs:170, 179, 369, 427-431` | 0.5-0.9k | medium | low | low; the keys are not peer-chosen | no |
-| Q6 | Request-path refcount and atomic churn: borrow the `Arc<[(String, usize)]>` instead of clone/drop per stream; `TimeStat::add` does `load` and stores only when greater instead of `fetch_max` | `ibex-sample` `capture_write`, engine `stream_vars_enter`; `statcnt.rs:34` | 0.5-1.0k | medium | low | `fetch_max` semantics under races (a lost max between threads; the counter is advisory) | no |
+| Q6 | Request-path refcount and atomic churn: borrow the `Arc<[(String, usize)]>` instead of clone/drop per stream; `TimeStat::add` does `load` and stores only when greater instead of `fetch_max` | `alcyon-sample` `capture_write`, engine `stream_vars_enter`; `statcnt.rs:34` | 0.5-1.0k | medium | low | `fetch_max` semantics under races (a lost max between threads; the counter is advisory) | no |
 | Q7 (h3) | SWAR PADDING scan in the vendored quinn | fix/t542 `vendor/quinn-proto/src/frame.rs:584` | 1.3-1.5k per h3 request | high (1.75k measured) | low | low; a test on run lengths 0-1500 | no |
 | Q8 (h3) | Drop `getsockname` per h3 request: take `bc_src` from the idle connection that is reused | `proxy.rs:1733` | one syscall (~0.3-0.5k user plus kernel) | high | low | `%bi/%bp` must stay right | no |
 
@@ -224,7 +224,7 @@ add them.
 ## 5. Decisions for the user
 
 1. **PGO (Q1).** Should the shipped `release-perf` binary be PGO-built, and should the board
-   report PGO figures as well? Ibex's rule is fair A/B against HAProxy, and HAProxy is built
+   report PGO figures as well? Alcyon's rule is fair A/B against HAProxy, and HAProxy is built
    without PGO. One option is to report both, with the non-PGO figure as the comparison.
 2. **A keyed fast hasher for peer-chosen keys (h3 ConnectionId maps).** foldhash or ahash would
    be a new dependency with internal `unsafe`. The safe alternative is to re-key the maps by
@@ -242,7 +242,7 @@ HAProxy is at 53.4k, so 1.1x is 58.8k. That is -20.8k (-26 %) from 79.6k.
 - **Quick wins.** Q2-Q6 together: ~5-7k, giving ~73k (1.37x).
 - **Parse once.** S1 adds 8-13k, giving ~61-65k (1.14-1.22x).
 - **PGO.** -10 to -14 % on top of that gives ~53-58k, which is at or under 1.1x. That comparison
-  is a PGO Ibex against a non-PGO HAProxy.
+  is a PGO Alcyon against a non-PGO HAProxy.
 - **Without PGO, at like-for-like builds.** 1.1x also needs S2 and S3: 5-10k out of the
   per-stream session and the loop. The rows add up to it, but S3 is the least certain.
 

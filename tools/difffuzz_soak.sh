@@ -4,14 +4,14 @@
 #
 # tools/difffuzz_soak.sh [MINUTES]    (default 60)
 #
-# Long differential-fuzz run (T293): the generator in rounds against a release ibex and the
+# Long differential-fuzz run (T293): the generator in rounds against a release alcyon and the
 # reference HAProxy, end to end (fuzz/difffuzz.py soak). Runs under the shared load lock
 # (a red-team measurement holds it exclusive and we wait) at nice 19 on cores 48-55.
 # New DIFFs (not in fuzz/known_diffs.json, or a known input whose shape changed) go to
 #   ~/ibex-worktrees/review/difffuzz/<date>-<sha>.md      (outside the repository)
 # One summary line goes to stdout. Exit 0: nothing new; 1: new DIFFs; 2: could not run.
 #
-# Env: IBEX_BIN (default: a release build of this checkout in $DIFFFUZZ_TARGET),
+# Env: ALCYON_BIN (default: a release build of this checkout in $DIFFFUZZ_TARGET),
 #      DIFFFUZZ_TARGET (default ~/ibex-targets/difffuzz), DIFFFUZZ_SEED (default: day number,
 #      so each night explores other seeds), DIFFFUZZ_OUT (report dir), DIFFFUZZ_CORES (48-55).
 # A clean run appends its row to data/verification_runs.csv (T292's ledger, columns
@@ -32,9 +32,9 @@ START=$(date '+%F %H:%M'); T0=$(date +%s)
 free_gb=$(df -BG --output=avail "$HOME" | tail -1 | tr -dc '0-9')
 [ "$free_gb" -ge 40 ] || { echo "difffuzz-soak: only ${free_gb}G free on /home" >&2; exit 2; }
 export CARGO_TARGET_DIR=$T CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=4
-if [ -z "${IBEX_BIN:-}" ]; then
-  nice -n 19 cargo build -q --release -p ibex-rt --bin ibex 2>&1 | grep -E '^error' && exit 2
-  IBEX_BIN=$T/release/ibex
+if [ -z "${ALCYON_BIN:-}" ]; then
+  nice -n 19 cargo build -q --release -p alcyon-rt --bin alcyon 2>&1 | grep -E '^error' && exit 2
+  ALCYON_BIN=$T/release/alcyon
 fi
 nice -n 19 cargo build -q --release --manifest-path fuzz/Cargo.toml 2>&1 | grep -E '^error' && exit 2
 mkdir -p "$OUTDIR"
@@ -43,7 +43,7 @@ exec 9>>/tmp/ibex-load.lock
 # -o: the lock is not inherited by the children, only this script holds it while it waits
 RES=$(mktemp /tmp/difffuzz-soak.XXXXXX)
 flock -o -s 9 nice -n 19 taskset -c "$CORES" python3 fuzz/difffuzz.py soak \
-  --ibex "$IBEX_BIN" --gen "$T/release/ibex-fuzz" --minutes "$MIN" --seed "$SEED" --iters 500 \
+  --alcyon "$ALCYON_BIN" --gen "$T/release/alcyon-fuzz" --minutes "$MIN" --seed "$SEED" --iters 500 \
   --workers 6 --base-port 18500 --out "$OUT" > "$RES" 2>&1
 RC=$?
 LINE=$(tail -n 1 "$RES"); rm -f "$RES"

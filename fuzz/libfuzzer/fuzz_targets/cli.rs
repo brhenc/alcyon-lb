@@ -6,12 +6,12 @@
 //! changes the shared state between runs). First byte: bit 0 enters `prompt` mode
 //! (every line runs), bit 1 picks operator.
 #![no_main]
-use ibex_rt::applet::CliLevel;
-use ibex_rt::engine::Proxies;
-use ibex_rt::mailbox::Mailboxes;
-use ibex_rt::{AppletContext, CliApplet, Engine};
-use ibex_sched::task::TaskRef;
-use ibex_sched::Tick;
+use alcyon_rt::applet::CliLevel;
+use alcyon_rt::engine::Proxies;
+use alcyon_rt::mailbox::Mailboxes;
+use alcyon_rt::{AppletContext, CliApplet, Engine};
+use alcyon_sched::task::TaskRef;
+use alcyon_sched::Tick;
 use libfuzzer_sys::fuzz_target;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, LazyLock};
@@ -19,7 +19,7 @@ use std::time::Instant;
 
 const CONFIG: &str = "
 global
-    stats socket /tmp/ibex-fuzz-cli.sock level admin
+    stats socket /tmp/alcyon-fuzz-cli.sock level admin
 defaults
     mode http
     timeout connect 1s
@@ -35,7 +35,7 @@ backend be
 ";
 
 static STATE: LazyLock<(Proxies, Arc<Mailboxes>)> = LazyLock::new(|| {
-    let cfg = ibex_config::parse_str(CONFIG).expect("fuzz config parses");
+    let cfg = alcyon_config::parse_str(CONFIG).expect("fuzz config parses");
     let proxies = Engine::build_shared_state(&cfg).expect("fuzz config builds");
     (proxies, Mailboxes::new(1).expect("mailboxes"))
 });

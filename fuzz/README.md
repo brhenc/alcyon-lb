@@ -1,7 +1,7 @@
-# Ibex HTTP/1 Parser Differential Fuzzing Harness
+# Alcyon HTTP/1 Parser Differential Fuzzing Harness
 
-This directory contains the differential fuzzing harness for Ibex's HTTP/1 parser (`crates/ibex-proto`).
-It performs automated differential testing against a live reference oracle—**HAProxy 3.5-dev8** (`/home/bhenc/reference/haproxy/haproxy`)—as well as self-differential testing across streaming modes within Ibex itself.
+This directory contains the differential fuzzing harness for Alcyon's HTTP/1 parser (`crates/alcyon-proto`).
+It performs automated differential testing against a live reference oracle—**HAProxy 3.5-dev8** (`/home/bhenc/reference/haproxy/haproxy`)—as well as self-differential testing across streaming modes within Alcyon itself.
 
 ---
 
@@ -16,7 +16,7 @@ A memory-safe proxy in Rust that is merely unexploitable to memory corruption is
 ## Architecture & Generator Strategy
 
 ### Safe Stable Rust (`#![forbid(unsafe_code)]`)
-Traditional fuzzing tools like `cargo-fuzz`/`libFuzzer` require nightly Rust and introduce unsafe memory hooks. To strictly uphold Ibex's workspace contract (`#![forbid(unsafe_code)]` on safe stable Rust), we built a **property-based structured and combinatorial mutation generator**.
+Traditional fuzzing tools like `cargo-fuzz`/`libFuzzer` require nightly Rust and introduce unsafe memory hooks. To strictly uphold Alcyon's workspace contract (`#![forbid(unsafe_code)]` on safe stable Rust), we built a **property-based structured and combinatorial mutation generator**.
 
 ### Why Hand-Rolled Structured + Combinatorial Generation?
 1. **Targeted CVE Exploration:** Pure random byte streams are rejected immediately at byte 0 by both parsers, yielding minimal semantic coverage. The generator specifically biases toward known HTTP request smuggling vectors:
@@ -43,7 +43,7 @@ Before running fuzzing cases, the harness executes a mandatory **Self-Test** on 
 4. `POST /chunked HTTP/1.1` with `Transfer-Encoding: chunked`
 5. Pipelined back-to-back GET requests
 
-If either Ibex or HAProxy rejects any baseline valid request, the harness fails loudly and aborts immediately, preventing false findings.
+If either Alcyon or HAProxy rejects any baseline valid request, the harness fails loudly and aborts immediately, preventing false findings.
 
 ---
 
@@ -56,7 +56,7 @@ Discrepancies are categorized into 4 distinct classes:
 | **Category 1 (Acceptance)** | One parser accepts input as valid HTTP/1 while the other rejects it (HTTP 400 Bad Request or parse syntax error). | Attack surface divergence; parser differential. |
 | **Category 2 (Framing)** | Both parsers accept the input, but disagree on parsed method, URI, header count, or body length. | Request misinterpretation, cache poisoning, routing bypass. |
 | **Category 3 (Smuggling Boundary)** | Disagreements on message boundaries (where this request ends and the next begins), unconsumed trailing bytes, or keep-alive connection reuse on ambiguous framing. | **Critical:** Direct HTTP Request Smuggling (CL.TE / TE.CL / pipeline desync). |
-| **Self-Differential** | Ibex parser produces different results when receiving the full buffer at once vs incremental single-byte streaming. | Streaming parser state machine desynchronization. |
+| **Self-Differential** | Alcyon parser produces different results when receiving the full buffer at once vs incremental single-byte streaming. | Streaming parser state machine desynchronization. |
 
 ---
 
@@ -93,10 +93,10 @@ cargo run --manifest-path fuzz/Cargo.toml -- \
 
 # libFuzzer targets (`fuzz/libfuzzer/`) — crash-finding, no oracle
 
-The harness above compares Ibex with HAProxy. The targets below only look for
+The harness above compares Alcyon with HAProxy. The targets below only look for
 **panics, hangs and out-of-memory** on arbitrary input (task R1, `docs/milestones.md`).
 They are a separate crate, `fuzz/libfuzzer/` (its own `[workspace]`, not a member of the
-Ibex workspace); libFuzzer links only into those binaries, never into Ibex. The normal
+Alcyon workspace); libFuzzer links only into those binaries, never into Alcyon. The normal
 `cargo build --workspace` and `tools/checkin.sh` do not build it and need no nightly.
 
 | target | what it feeds |
@@ -106,11 +106,11 @@ Ibex workspace); libFuzzer links only into those binaries, never into Ibex. The 
 | `h2_frames` | HTTP/2 frame decoder, frames then fed to a server `H2Multiplexer` |
 | `hpack` | HPACK decoder (two blocks on one decoder) and the Huffman decoder |
 | `proxy_protocol` | PROXY protocol v1 and v2 header + TLV accessors |
-| `config` | `ibex_config::parse_str` |
+| `config` | `alcyon_config::parse_str` |
 | `logfmt` | log-format compiler (`LogFormat::compile`, `compile_unique_id`) |
-| `sample_expr` | `ibex_sample::Expr::parse` |
-| `regex` | `ibex_regex::UserRegex::new` |
-| `check_reply` | health-check replies: Redis, SMTP, PgSQL, SSL hello, http-check, tcp-check expect (`ibex_rt::check_reply`) |
+| `sample_expr` | `alcyon_sample::Expr::parse` |
+| `regex` | `alcyon_regex::UserRegex::new` |
+| `check_reply` | health-check replies: Redis, SMTP, PgSQL, SSL hello, http-check, tcp-check expect (`alcyon_rt::check_reply`) |
 | `check_ldap_mysql` | LDAP and MySQL check replies (apart: known panics, review #7) |
 | `cookie` | `cookie::client_side` and `process_response` over hostile Cookie / Set-Cookie values |
 | `syslog` | log-forward stream framing (`logfwd::read_frame`), RFC 5424/3164 parse, header rebuild |
@@ -177,7 +177,7 @@ stream logic from its three hand-made seeds. Two aids (2026-10-12):
 - `fuzz/libfuzzer/dicts/h1.dict` and `h2.dict` (`-dict=`): methods, header names and
   framing tokens; frame headers, SETTINGS ids, HPACK static indexes and literal names.
 - `h1_request`: the differential generator's cases make good seeds:
-  `ibex-fuzz --emit-dir DIR --seed S --iters 1000`.
+  `alcyon-fuzz --emit-dir DIR --seed S --iters 1000`.
 
 Measured over one night (edges covered at the end of a 3 h plain run, then of a 5.5 h run
 with seeds and dictionaries, which also included new code): `h2_mux` 1487 -> 1703,
@@ -207,23 +207,23 @@ with seeds and dictionaries, which also included new code): `h2_mux` 1487 -> 170
 
 # Continuous end-to-end differential fuzzing (T293)
 
-`fuzz/difffuzz.py` runs the generator's cases through a real `ibex` and a real HAProxy 3.5
+`fuzz/difffuzz.py` runs the generator's cases through a real `alcyon` and a real HAProxy 3.5
 (same config, each in front of a recording backend; a raw socket, no half-close) and compares
 the *shape* of each outcome: the status lines answered and a hash of the bytes the backend
 received. `fuzz/known_diffs.json` lists every input known to differ, keyed by the first 16 hex
 of the sha256 of its bytes, with the shape it shows, the tracking T-number and the input
-(base64). The generator itself, `ibex-fuzz --emit-dir DIR --seed S --iters N`, only writes the
+(base64). The generator itself, `alcyon-fuzz --emit-dir DIR --seed S --iters N`, only writes the
 cases as `DIR/case_NNNNN.bin` (no HAProxy needed).
 
 | mode | command | what it does |
 |---|---|---|
 | gate (30 s budget) | `./tools/gate.sh --log /tmp/g.log --only diff-fuzz` (stage `diff-fuzz` of `tools/checkin.sh`) | replays `fuzz/corpus` and a rotating slice of the baseline (`--replay`, 50 entries, offset by day; `--replay 0` = all), then fresh cases (seed 293, fixed so the gate is reproducible: the baseline holds its DIFFs; other seeds are for `soak` and `--seed`; `--seed`/`--iters`) until the budget ends. FAILS on a DIFF not in the baseline, on a known input whose shape changed, and on a known input that became SAME (prints the hash to remove). Ports 18400-18423. |
 | soak (default 60 min) | `tools/difffuzz_soak.sh [MINUTES]` | generator rounds (seed = day number, 500 cases per round) under `flock -o -s /tmp/ibex-load.lock`, `nice -n 19 taskset -c 48-55`; new DIFFs go to `~/ibex-worktrees/review/difffuzz/<date>-<sha>.md`; one summary line on stdout; a row to `data/verification_runs.csv` if that ledger exists. |
-| nightly | `tools/systemd/ibex-difffuzz.{service,timer}` (03:00) | NOT installed by anything; copy to `~/.config/systemd/user/` and enable by hand. |
+| nightly | `tools/systemd/alcyon-difffuzz.{service,timer}` (03:00) | NOT installed by anything; copy to `~/.config/systemd/user/` and enable by hand. |
 
-By hand: `python3 fuzz/difffuzz.py gate --ibex <ibex> --gen <ibex-fuzz>` (defaults:
-`$CARGO_TARGET_DIR/debug/...`; build with `cargo build --bin ibex` and
-`cargo build --manifest-path fuzz/Cargo.toml --bin ibex-fuzz`).
+By hand: `python3 fuzz/difffuzz.py gate --alcyon <alcyon> --gen <alcyon-fuzz>` (defaults:
+`$CARGO_TARGET_DIR/debug/...`; build with `cargo build --bin alcyon` and
+`cargo build --manifest-path fuzz/Cargo.toml --bin alcyon-fuzz`).
 
 ## Updating the baseline
 
@@ -232,6 +232,6 @@ By hand: `python3 fuzz/difffuzz.py gate --ibex <ibex> --gen <ibex-fuzz>` (defaul
 - A deliberate new known difference, or a known input whose shape changed on purpose:
   `python3 fuzz/difffuzz.py record --dir <dir-of-.bin> --task T<n> --write` (it adds the stable DIFFs
   it finds; to re-record a changed shape, delete the old key first). Read the shape before you
-  accept it: a DIFF that is Ibex more permissive than HAProxy is a smuggling candidate, not
+  accept it: a DIFF that is Alcyon more permissive than HAProxy is a smuggling candidate, not
   a baseline entry, unless a task tracks it.
 - A soak report with new DIFFs: confirm with `fuzz/e2e.py`, file a task, then `record --write`.

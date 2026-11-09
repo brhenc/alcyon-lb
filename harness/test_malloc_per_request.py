@@ -5,7 +5,7 @@
 """The malloc-per-request ratchet on the release binary (harness/malloc_per_request.py).
 
 Run:  CARGO_TARGET_DIR=... python3 -m unittest harness/test_malloc_per_request.py
-(needs `cargo build --release -p ibex-rt --bin ibex`; skipped when there is no binary).
+(needs `cargo build --release -p alcyon-rt --bin alcyon`; skipped when there is no binary).
 """
 import os
 import sys
@@ -14,7 +14,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import malloc_per_request as M  # noqa: E402
 
-BIN = os.environ.get("IBEX_BIN") or M.default_binary()
+BIN = os.environ.get("ALCYON_BIN") or M.default_binary()
 
 
 class Verdict(unittest.TestCase):

@@ -3,7 +3,7 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 """
-Ibex Continuous Measurement Suite (`tools/measure/measure.py`)
+Alcyon Continuous Measurement Suite (`tools/measure/measure.py`)
 
 Automates tracking and regression detection for:
 - Allocations per request (tools/allocprofile)
@@ -45,7 +45,7 @@ os.environ["PATH"] = f"{Path.home()}/.cargo/bin:{os.environ.get('PATH', '')}"
 
 
 # Limits for the A/B against the reference build, both measured in alternating rounds of
-# the same run. Measured between identical builds (A/A, 2026-10-02): ibex CPU per request
+# the same run. Measured between identical builds (A/A, 2026-10-02): alcyon CPU per request
 # at 50 connections within 0.3% (samples 2%), 1-conn requests/s within 3% (samples 10%:
 # mostly wake-up latency of three processes).
 # T452 (2026-10-24): on CPUs 4;5;6 the 1-conn samples of either build fall in two modes,
@@ -91,14 +91,14 @@ _HELD_PORT_LOCKS: List[Any] = []
 def get_free_port() -> int:
     """A loopback port nothing else in the test runs will be given.
 
-    Same scheme as crates/ibex-rt/tests/common/mod.rs, sharing its lock directory: a port
+    Same scheme as crates/alcyon-rt/tests/common/mod.rs, sharing its lock directory: a port
     below the kernel's ephemeral range (so no connect() or bind(:0) is handed it between
     our check and the proxy's bind), flock'ed until this process exits (so no concurrent
-    test or measurement takes it; ibex binds with SO_REUSEPORT, so a shared port does not
+    test or measurement takes it; alcyon binds with SO_REUSEPORT, so a shared port does not
     fail, it splits the traffic)."""
     import fcntl
     first, count = 20000, 12768
-    lock_dir = Path(tempfile.gettempdir()) / "ibex-test-ports"
+    lock_dir = Path(tempfile.gettempdir()) / "alcyon-test-ports"
     lock_dir.mkdir(exist_ok=True)
     start = (os.getpid() * 97) % count
     for i in range(count):
@@ -110,8 +110,8 @@ def get_free_port() -> int:
             f.close()
             continue
         try:
-            # Bound, not listening, SO_REUSEADDR: the way ibex binds, so a copy of this
-            # probe held by a concurrently forked child cannot make ibex's bind fail.
+            # Bound, not listening, SO_REUSEADDR: the way alcyon binds, so a copy of this
+            # probe held by a concurrently forked child cannot make alcyon's bind fail.
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind(("127.0.0.1", port))
@@ -202,10 +202,10 @@ def get_target_dir(custom_target: Optional[str] = None) -> Path:
     return REPO_ROOT / "target"
 
 
-def ensure_ibex_binary(target_dir: Path, profile: str = "release") -> Path:
-    """Build ibex binary under given target_dir with specified profile if not present or stale."""
-    bin_path = target_dir / profile / "ibex"
-    cmd = ["cargo", "build", "--bin", "ibex"]
+def ensure_alcyon_binary(target_dir: Path, profile: str = "release") -> Path:
+    """Build alcyon binary under given target_dir with specified profile if not present or stale."""
+    bin_path = target_dir / profile / "alcyon"
+    cmd = ["cargo", "build", "--bin", "alcyon"]
     if profile == "release":
         cmd.append("--release")
     elif profile in ("livepatch", "release-perf"):
@@ -218,10 +218,10 @@ def ensure_ibex_binary(target_dir: Path, profile: str = "release") -> Path:
 
     res = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True)
     if res.returncode != 0:
-        raise RuntimeError(f"Failed to build ibex ({profile}): {res.stderr}\n{res.stdout}")
+        raise RuntimeError(f"Failed to build alcyon ({profile}): {res.stderr}\n{res.stdout}")
 
     if not bin_path.exists():
-        raise FileNotFoundError(f"ibex binary not found at {bin_path}")
+        raise FileNotFoundError(f"alcyon binary not found at {bin_path}")
     return bin_path
 
 
@@ -282,12 +282,12 @@ def get_process_cpu_ticks(pid: int) -> Tuple[int, int]:
 
 
 def measure_throughput(
-    proxy_type: str, # 'ibex' or 'haproxy'
+    proxy_type: str, # 'alcyon' or 'haproxy'
     conns: int,
     target_dir: Path,
     runs: int = 3,
     duration: float = 2.0,
-    ibex_bin: Optional[Path] = None,
+    alcyon_bin: Optional[Path] = None,
 ) -> Tuple[int, Dict[str, Any], float]:
     """
     Measure throughput (RPS) over multiple runs and compute average, spread, and CPU %.
@@ -329,10 +329,10 @@ backend be
         time.sleep(0.15)
 
         # Start proxy
-        if proxy_type == "ibex":
-            if not ibex_bin:
-                ibex_bin = ensure_ibex_binary(target_dir, profile="release-perf")
-            proxy_proc = subprocess.Popen([str(ibex_bin), "-f", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if proxy_type == "alcyon":
+            if not alcyon_bin:
+                alcyon_bin = ensure_alcyon_binary(target_dir, profile="release-perf")
+            proxy_proc = subprocess.Popen([str(alcyon_bin), "-f", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elif proxy_type == "haproxy":
             if not HAPROXY_BIN.exists():
                 raise FileNotFoundError(f"HAProxy oracle binary not found at {HAPROXY_BIN}")
@@ -417,14 +417,14 @@ BUILD_INPUTS = ("crates", "Cargo.toml", "Cargo.lock")
 def reference_sha(repo: Path | str = REPO_ROOT, env: dict | None = None) -> str:
     """The commit a throughput change is judged against.
 
-    `IBEX_MEASURE_REF` if set. Otherwise: off main, the merge-base with main (what the
+    `ALCYON_MEASURE_REF` if set. Otherwise: off main, the merge-base with main (what the
     branch would change); on main with uncommitted source changes, HEAD; on a clean main,
     HEAD's first parent (what the last commit changed). Only a change to what builds the
     binary counts as uncommitted (`BUILD_INPUTS`): a task note or the record every run
     appends to `data/measurements.jsonl` once made a merge commit its own reference."""
     env = os.environ if env is None else env
-    if env.get("IBEX_MEASURE_REF"):
-        return _git("rev-parse", env["IBEX_MEASURE_REF"], repo=repo)
+    if env.get("ALCYON_MEASURE_REF"):
+        return _git("rev-parse", env["ALCYON_MEASURE_REF"], repo=repo)
     head = _git("rev-parse", "HEAD", repo=repo)
     try:
         main = _git("rev-parse", "main", repo=repo)
@@ -438,14 +438,14 @@ def reference_sha(repo: Path | str = REPO_ROOT, env: dict | None = None) -> str:
 
 
 def ensure_reference_binary(sha: str, target_dir: Path) -> Path:
-    """A release-perf ibex built from `sha`, cached under the target directory by commit.
+    """A release-perf alcyon built from `sha`, cached under the target directory by commit.
 
     T518: the instruction budget is judged on `release-perf` (fat LTO, one codegen unit: one
     layout), `release` moved +-0.7% between near-identical builds. The cache file name carries
     the profile so an old `release` binary is never reused. A cache hit costs nothing; a miss is
     one fat-LTO build (~7 min)."""
     cache = target_dir / "measure-ref"
-    bin_path = cache / f"ibex-perf-{sha[:12]}"
+    bin_path = cache / f"alcyon-perf-{sha[:12]}"
     if bin_path.exists():
         return bin_path
     src = cache / "src"
@@ -458,13 +458,15 @@ def ensure_reference_binary(sha: str, target_dir: Path) -> Path:
                        capture_output=True)
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = str(cache / "target")
-    res = subprocess.run(["cargo", "build", "--profile", "release-perf", "--bin", "ibex"], cwd=src, env=env,
+    # A reference from before the rename (2026-11-08) builds the binary under its old name.
+    name = "ibex" if (src / "crates" / "ibex-rt").is_dir() else "alcyon"
+    res = subprocess.run(["cargo", "build", "--profile", "release-perf", "--bin", name], cwd=src, env=env,
                          capture_output=True, text=True)
     if res.returncode != 0:
-        raise RuntimeError(f"Failed to build reference ibex at {sha[:12]}: {res.stderr[-2000:]}")
-    shutil.copy2(cache / "target" / "release-perf" / "ibex", bin_path)
+        raise RuntimeError(f"Failed to build reference alcyon at {sha[:12]}: {res.stderr[-2000:]}")
+    shutil.copy2(cache / "target" / "release-perf" / name, bin_path)
     # Keep the newest few reference binaries.
-    for old in sorted(cache.glob("ibex-*"), key=lambda q: q.stat().st_mtime)[:-4]:
+    for old in sorted(cache.glob("alcyon-*"), key=lambda q: q.stat().st_mtime)[:-4]:
         old.unlink()
     return bin_path
 
@@ -472,7 +474,7 @@ def ensure_reference_binary(sha: str, target_dir: Path) -> Path:
 def _cpu_ns(pid: int) -> int:
     """CPU time all threads of a process have used, in nanoseconds.
 
-    `/proc/<pid>/schedstat` is the main thread alone; ibex runs its loop on a worker."""
+    `/proc/<pid>/schedstat` is the main thread alone; alcyon runs its loop on a worker."""
     total = 0
     for task in os.listdir(f"/proc/{pid}/task"):
         try:
@@ -564,7 +566,7 @@ def host_problems(stat_a: str, stat_b: str, cpus: List[int], sysfs: str = "/sys/
 
 def measure_cpus() -> List[str]:
     """The CPUs measure_ab pins to: proxy, client, backend."""
-    return os.environ.get("IBEX_MEASURE_CPUS", "4,5,6").split(",")
+    return os.environ.get("ALCYON_MEASURE_CPUS", "4,5,6").split(",")
 
 
 def check_host_quiet(cpus: List[int]) -> List[str]:
@@ -618,9 +620,9 @@ def measure_ab(cand_bin: Path, ref_bin: Path, target_dir: Path, rounds: int = 4,
 
     Each sample measures two things on the same proxy:
       * 1-connection requests/s: latency-bound, a request at a time;
-      * ibex CPU time per request under `load_conns` connections. Busy, ibex rarely sleeps,
+      * alcyon CPU time per request under `load_conns` connections. Busy, alcyon rarely sleeps,
         so this is what a request costs. At one connection the CPU figure also moves with
-        how often ibex sleeps: 964e201 raised it 30% there by sleeping a quarter as often
+        how often alcyon sleeps: 964e201 raised it 30% there by sleeping a quarter as often
         (and gained 21% requests/s), while at 50 connections the two builds cost the same.
 
     Machine load drifts over seconds; alternating puts both builds under the same drift, and
@@ -718,7 +720,7 @@ def measure_ins_per_req(cand_bin: Path, ref_bin: Path, target_dir: Path,
                         rounds: int = INS_ROUNDS) -> Dict[str, List[int]]:
     """Instructions per request of every round, keyed "<scenario>_<client>_<side>", by running
     tools/measure/insreq.sh (one implementation of the measurement; pinned by it the way
-    measure_ab pins: IBEX_MEASURE_CPUS). The judged client is ab1 (one connection: the count
+    measure_ab pins: ALCYON_MEASURE_CPUS). The judged client is ab1 (one connection: the count
     does not depend on how many requests an epoll pass batches); mb50 is reported only.
     Needs perf to count the user's own processes."""
     bench_bin = ensure_parity_bench_binary(target_dir)
@@ -744,7 +746,7 @@ def measure_60k_backends_memory(target_dir: Path) -> float:
     env = os.environ.copy()
     env["CARGO_TARGET_DIR"] = str(target_dir)
     cmd = [
-        "cargo", "test", "-p", "ibex-rt", "--test", "request_allocations",
+        "cargo", "test", "-p", "alcyon-rt", "--test", "request_allocations",
         "sixty_thousand_backends_memory_bounded", "--", "--nocapture"
     ]
     res = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True)
@@ -768,8 +770,8 @@ def measure_vtc_board(target_dir: Path) -> Dict[str, int]:
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
         json_tmp = tf.name
 
-    ibex_bin = ensure_ibex_binary(target_dir, profile="release")
-    cmd = [sys.executable, str(VTC_RUNNER), str(VTC_TESTS_DIR), "--binary", str(ibex_bin), "--json", json_tmp]
+    alcyon_bin = ensure_alcyon_binary(target_dir, profile="release")
+    cmd = [sys.executable, str(VTC_RUNNER), str(VTC_TESTS_DIR), "--binary", str(alcyon_bin), "--json", json_tmp]
 
     try:
         subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
@@ -792,7 +794,7 @@ def measure_vtc_board(target_dir: Path) -> Dict[str, int]:
 
 def generate_flamegraph(target_dir: Path, duration: int = 30) -> Tuple[Path, List[Tuple[str, float]]]:
     """
-    Profile Ibex under livepatch/frame-pointer profile with perf and generate flamegraph.
+    Profile Alcyon under livepatch/frame-pointer profile with perf and generate flamegraph.
     Returns (svg_path, top_5_frames).
     """
     fe_port = get_free_port()
@@ -801,7 +803,7 @@ def generate_flamegraph(target_dir: Path, duration: int = 30) -> Tuple[Path, Lis
         be_port = get_free_port()
 
     bench_bin = ensure_parity_bench_binary(target_dir)
-    ibex_bin = ensure_ibex_binary(target_dir, profile="livepatch")
+    alcyon_bin = ensure_alcyon_binary(target_dir, profile="livepatch")
     git_info = get_git_info()
     sha_short = git_info["sha"][:8]
 
@@ -835,11 +837,11 @@ backend be
     try:
         be_proc = subprocess.Popen([str(bench_bin), "backend", str(be_port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.15)
-        proxy_proc = subprocess.Popen([str(ibex_bin), "-f", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proxy_proc = subprocess.Popen([str(alcyon_bin), "-f", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.3)
 
         if proxy_proc.poll() is not None:
-            raise RuntimeError(f"ibex proxy failed to start (exit {proxy_proc.returncode})")
+            raise RuntimeError(f"alcyon proxy failed to start (exit {proxy_proc.returncode})")
 
         # Start continuous load for duration + 5s
         load_proc = subprocess.Popen(
@@ -878,11 +880,11 @@ backend be
         matches = re.findall(r"<title>(.*?)\s*\(([\d,]+)\s+samples,\s*([\d\.]+)%\)</title>", svg_text)
         seen = set()
         candidates = []
-        skip_prefixes = ("__GI_", "start_thread", "all", "ibex", "[unknown]")
+        skip_prefixes = ("__GI_", "start_thread", "all", "alcyon", "[unknown]")
         for frame_raw, samples_str, pct_str in matches:
             frame = html.unescape(frame_raw).strip()
             if (frame in seen or any(frame.startswith(p) for p in skip_prefixes)
-                or "Thread>::new" in frame or "call_once" in frame or "ibex::main" in frame
+                or "Thread>::new" in frame or "call_once" in frame or "alcyon::main" in frame
                 or "FnOnce<()" in frame or "Layout>::for_value" in frame or "size_of_val" in frame):
                 continue
             seen.add(frame)
@@ -1020,7 +1022,7 @@ def check_regressions(
             status = "FAIL (>15% drop)" if is_reg else "PASS"
             deltas.append(MetricDelta("rps_1conn", "1-conn Throughput", f"{c:,}", f"{p:,}", diff_str, status, is_reg, "req/s"))
 
-    # 3b. ibex CPU per request under 50 connections, A/B only.
+    # 3b. alcyon CPU per request under 50 connections, A/B only.
     if current.get("cpu_ns_per_req_50conn") is not None and current.get("cpu_ns_per_req_50conn_ref"):
         c, p = current["cpu_ns_per_req_50conn"], current["cpu_ns_per_req_50conn_ref"]
         pct_diff = ((c - p) / p) * 100.0
@@ -1028,7 +1030,7 @@ def check_regressions(
         if is_reg:
             has_regression = True
         status = f"FAIL (>{AB_MAX_CPU_RISE_PCT:g}% above ref)" if is_reg else "PASS"
-        deltas.append(MetricDelta("cpu_ns_per_req_50conn", "50-conn ibex CPU / req", f"{c:,}",
+        deltas.append(MetricDelta("cpu_ns_per_req_50conn", "50-conn alcyon CPU / req", f"{c:,}",
                                   f"{p:,} (ref)", f"{pct_diff:+.1f}%", status, is_reg, "ns"))
 
     # 3c. Instructions per request, A/B only, +1%.
@@ -1159,7 +1161,7 @@ def render_diff_table(current: Dict[str, Any], deltas: List[MetricDelta], verdic
     """Render a clean human-readable diff table against the previous run."""
     lines = []
     lines.append("=" * 80)
-    lines.append("                       IBEX CONTINUOUS MEASUREMENT")
+    lines.append("                       ALCYON CONTINUOUS MEASUREMENT")
     lines.append("=" * 80)
     lines.append(f"Git SHA:     {current.get('sha', 'unknown')[:12]} (dirty: {current.get('dirty', False)})")
     lines.append(f"Timestamp:   {current.get('at', 'unknown')}")
@@ -1188,7 +1190,7 @@ def render_diff_table(current: Dict[str, Any], deltas: List[MetricDelta], verdic
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Ibex Continuous Measurement Suite")
+    parser = argparse.ArgumentParser(description="Alcyon Continuous Measurement Suite")
     parser.add_argument("--fast", action="store_true", help="Run fast suite under 60s (allocs, binary size, 1-conn rps)")
     parser.add_argument("--full", action="store_true", help="Run full suite (adds VTC board, 50-conn rps, 60k mem, HAProxy)")
     parser.add_argument("--flame", action="store_true", help="Produce flamegraph for a 30s load run using perf and inferno")
@@ -1221,7 +1223,7 @@ def main() -> int:
     mode_fast = args.fast or (not mode_full)
 
     mode_label = "FULL" if mode_full else "FAST"
-    print(f"==> Starting Ibex Continuous Measurement Suite [{mode_label} mode]...")
+    print(f"==> Starting Alcyon Continuous Measurement Suite [{mode_label} mode]...")
     start_total_t = time.monotonic()
 
     git_info = get_git_info()
@@ -1240,9 +1242,9 @@ def main() -> int:
     record["bytes_per_request"] = bytes_per_req
 
     # Step 2: Binary & Section size
-    print("[2/5] Measuring ibex binary and .text section size...")
-    ibex_bin = ensure_ibex_binary(target_dir, profile="release-perf")
-    bin_bytes, text_bytes = measure_binary_size(ibex_bin)
+    print("[2/5] Measuring alcyon binary and .text section size...")
+    alcyon_bin = ensure_alcyon_binary(target_dir, profile="release-perf")
+    bin_bytes, text_bytes = measure_binary_size(alcyon_bin)
     record["binary_bytes"] = bin_bytes
     record["text_bytes"] = text_bytes
 
@@ -1258,7 +1260,7 @@ def main() -> int:
     if why:
         print("      refusing to measure, the host is not quiet (T452): " + "; ".join(why))
         return 1
-    ab = measure_ab(ibex_bin, ref_bin, target_dir)
+    ab = measure_ab(alcyon_bin, ref_bin, target_dir)
     record["rps_1conn"] = ab["cand"]
     record["rps_1conn_ref"] = ab["ref"]
     record["rps_1conn_ref_sha"] = ref_sha
@@ -1283,10 +1285,10 @@ def main() -> int:
         if modes["cand"] != modes["ref"]:
             print("      the builds landed in the modes in different proportions: the medians "
                   "compare the mix, not the builds (T452)")
-    print(f"      ibex CPU ns/req at 50 conns: this build {ab['cand_ns_samples']} median {ab['cand_ns']:,}; "
+    print(f"      alcyon CPU ns/req at 50 conns: this build {ab['cand_ns_samples']} median {ab['cand_ns']:,}; "
           f"reference {ab['ref_ns_samples']} median {ab['ref_ns']:,}")
 
-    ins = measure_ins_per_req(ibex_bin, ref_bin, target_dir)
+    ins = measure_ins_per_req(alcyon_bin, ref_bin, target_dir)
     for sc in INS_SCENARIOS:
         record[f"ins_per_req_{sc}"] = min(ins[f"{sc}_ab1_cand"])
         record[f"ins_per_req_{sc}_ref"] = min(ins[f"{sc}_ab1_ref"])
@@ -1316,8 +1318,8 @@ def main() -> int:
 
     # If full mode: add 50-conn, 60k backend memory, HAProxy oracle, and VTC board
     if mode_full:
-        print("[4/5] Measuring 50-connection throughput and CPU % (ibex rps_50conn)...")
-        rps_50, rps_50_spread, cpu_50 = measure_throughput("ibex", conns=50, target_dir=target_dir, ibex_bin=ibex_bin)
+        print("[4/5] Measuring 50-connection throughput and CPU % (alcyon rps_50conn)...")
+        rps_50, rps_50_spread, cpu_50 = measure_throughput("alcyon", conns=50, target_dir=target_dir, alcyon_bin=alcyon_bin)
         record["rps_50conn"] = rps_50
         record["rps_50conn_spread"] = rps_50_spread
         record["cpu_pct_50conn"] = cpu_50

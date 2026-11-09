@@ -8,7 +8,7 @@ The dominant defect this project has shipped is one thing wearing several hats: 
 does not execute the code the feature lives in. T48's test called `lb::balance_uri`
 directly and never entered the engine, so `balance uri` sent every request to one server
 while its test passed, through two reviewers and a green check-in. T40's module was never
-called. T26 never measured Ibex. T51's first attempt changed nothing and reported SUCCESS.
+called. T26 never measured Alcyon. T51's first attempt changed nothing and reported SUCCESS.
 
 All four are the same question -- did a test run the lines you changed? -- and that question
 is mechanical. This answers it.
@@ -22,7 +22,7 @@ The second form (T609) is for an agent before it reports: it builds only the nam
 candidates. Advisory: exit 0. It takes no gate or load lock; run it under `nice -n 19`.
 
 The base is what a change is judged against (`default_base`): `[base]`, else
-`IBEX_COVERCHECK_BASE` (or the older `COVERCHECK_BASE`), else the same rule as
+`ALCYON_COVERCHECK_BASE` (or the older `COVERCHECK_BASE`), else the same rule as
 tools/measure/measure.py `reference_sha()` -- on a branch with commits of its own, the
 merge-base with main (everything the branch would bring in); on main, or on a branch with
 nothing of its own, HEAD when the tree is dirty (the uncommitted change) and HEAD^ when it is
@@ -31,7 +31,7 @@ clean (what the last commit changed; for a merge, everything the merge brought i
 It used to be `origin/main`. This repository is pushed rarely, so on a local main 18 commits
 ahead of origin that judged every change since the last push, reviewed and merged work
 included. To audit a range of merges, set the base explicitly:
-    IBEX_COVERCHECK_BASE=03f2b75 python3 harness/covercheck.py
+    ALCYON_COVERCHECK_BASE=03f2b75 python3 harness/covercheck.py
 """
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # One report per checkout: agy runs several worktrees at once, and a shared path let one
 # checkout's covercheck read another's coverage.
 LCOV = os.path.join(tempfile.gettempdir(),
-                    f"ibex-covercheck-{hashlib.sha1(REPO.encode()).hexdigest()[:10]}.lcov")
+                    f"alcyon-covercheck-{hashlib.sha1(REPO.encode()).hexdigest()[:10]}.lcov")
 # Only source. Tests are expected to run; that is not the question being asked.
 SRC = re.compile(r"^crates/[^/]+/src/.*\.rs$")
 # What `cargo llvm-cov report` leaves out of its report (its --ignore-filename-regex, made
@@ -70,7 +70,7 @@ def default_base(repo: str = REPO, env: dict | None = None, rev: str = "HEAD") -
 
     `rev` is the commit judged, HEAD unless the gate asks what the base was at another (T608)."""
     env = os.environ if env is None else env
-    override = env.get("IBEX_COVERCHECK_BASE") or env.get("COVERCHECK_BASE")
+    override = env.get("ALCYON_COVERCHECK_BASE") or env.get("COVERCHECK_BASE")
     if override:
         r = _git(repo, "rev-parse", "--verify", f"{override}^{{commit}}")
         if r.returncode != 0:
@@ -208,7 +208,7 @@ def covered(paths: set[str], scope=None) -> tuple[dict[str, set[int]], dict[str,
 # Set in the environment `instrumented_env` returns, to the instrumented target directory:
 # a second call (suite.py after tools/checkin.sh exported it) returns it unchanged rather than
 # nesting `llvm-cov-target` inside itself.
-INSTRUMENTED = "IBEX_INSTRUMENTED"
+INSTRUMENTED = "ALCYON_INSTRUMENTED"
 # What suite.py leaves in the instrumented target directory after its run (T257): the test
 # executables it built and ran. Its presence means the profiles beside it are that run's.
 SUITE_RUN = "suite-run.json"
@@ -230,7 +230,7 @@ def instrumented_env(base: dict | None = None) -> dict:
     outer = env.get("CARGO_TARGET_DIR") or os.path.join(REPO, "target")
     env["CARGO_TARGET_DIR"] = os.path.join(outer, "llvm-cov-target")
     # --no-rustc-wrapper: with cargo-llvm-cov's wrapper, a build into a directory it has not
-    # built before left most crates (ibex-sample, ibex-rt ...) uninstrumented: 22 of 148
+    # built before left most crates (alcyon-sample, alcyon-rt ...) uninstrumented: 22 of 148
     # binaries wrote a profile, every changed line read as "not executed" or, worse, the
     # report held none of them and covercheck passed. RUSTFLAGS instruments everything.
     show = subprocess.run(["cargo", "llvm-cov", "show-env", "--sh", "--no-cfg-coverage",
@@ -397,8 +397,8 @@ def drop_corrupt_profiles(tdir: str, env: dict, out: str = os.devnull) -> list[s
 def report_objects(debug: str, built: set[str]) -> list[str]:
     """The executables the report reads: those in debug/deps, debug/ and debug/examples
     that this run of the suite built (`built`, cargo's `executable` paths), each once:
-    debug/ibex is a hard link of a file in deps/. Anything else there is another build's
-    (debug/ibex-fuzz is built by the diff-fuzz stage after this one), and its counts sit
+    debug/alcyon is a hard link of a file in deps/. Anything else there is another build's
+    (debug/alcyon-fuzz is built by the diff-fuzz stage after this one), and its counts sit
     on the line numbers of older sources."""
     wanted = set()
     for b in built:
@@ -497,7 +497,7 @@ def prune_stale_binaries(deps: str, current: set[str]) -> int:
     `cargo llvm-cov report` reads every executable there. An earlier tree's test binary
     (same target, another hash) carries that tree's line numbers, none executed in this run,
     and the report then marks comments and blank lines of the current tree "not executed"."""
-    # By inode: cargo names a binary target by its uplifted copy (target/debug/ibex), a hard
+    # By inode: cargo names a binary target by its uplifted copy (target/debug/alcyon), a hard
     # link of the one in deps/ that the report reads.
     def inode(p):
         st = os.stat(p)
@@ -632,11 +632,11 @@ def main() -> int:
     if len(rest) > 1 or any(a.startswith("-") for a in rest):
         raise SystemExit("usage: covercheck.py [--tests <crate>:<target>[:<filter>] ...] [base]")
     if rest:
-        base = default_base(REPO, {"IBEX_COVERCHECK_BASE": rest[0]})
+        base = default_base(REPO, {"ALCYON_COVERCHECK_BASE": rest[0]})
     else:
         base = default_base()
     desc = _git(REPO, "log", "-1", "--format=%h %s", base).stdout.strip()
-    print(f"covercheck: base {desc}  (override: IBEX_COVERCHECK_BASE)")
+    print(f"covercheck: base {desc}  (override: ALCYON_COVERCHECK_BASE)")
 
     changed = changed_lines(base)
     if not changed:

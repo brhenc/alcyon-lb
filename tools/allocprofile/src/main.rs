@@ -11,13 +11,13 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ibex_config::ast::{BackendSection, Config, FrontendSection, HttpReqAction, HttpReqRule, Mode, Server};
-use ibex_rt::engine::Engine;
+use alcyon_config::ast::{BackendSection, Config, FrontendSection, HttpReqAction, HttpReqRule, Mode, Server};
+use alcyon_rt::engine::Engine;
 
 thread_local! {
     static IN_ALLOC: Cell<bool> = const { Cell::new(false) };
     static ARMED: Cell<bool> = const { Cell::new(false) };
-    // `ALLOCPROFILE_DEPTH`: how many ibex frames name a site (default 1).
+    // `ALLOCPROFILE_DEPTH`: how many alcyon frames name a site (default 1).
     static DEPTH: Cell<usize> = Cell::new(
         std::env::var("ALLOCPROFILE_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(1));
     static SITES: RefCell<HashMap<String, (usize, usize)>> = RefCell::new(HashMap::new());
@@ -32,13 +32,13 @@ unsafe impl GlobalAlloc for Attributing {
         if armed && !busy {
             let _ = IN_ALLOC.try_with(|b| b.set(true));
             let bt = format!("{}", std::backtrace::Backtrace::force_capture());
-            let mut site = String::from("<no ibex frame>");
+            let mut site = String::from("<no alcyon frame>");
             let depth = DEPTH.try_with(|d| d.get()).unwrap_or(1);
             let mut found = Vec::new();
             for line in bt.lines() {
                 let l = line.trim();
-                if (l.contains("ibex_rt::") || l.contains("ibex_sample::")
-                    || l.contains("ibex_config::") || l.contains("ibex_proto::"))
+                if (l.contains("alcyon_rt::") || l.contains("alcyon_sample::")
+                    || l.contains("alcyon_config::") || l.contains("alcyon_proto::"))
                     && !l.contains("Attributing")
                 {
                     found.push(l.split_whitespace().skip(1).collect::<Vec<_>>().join(" "));
@@ -46,8 +46,8 @@ unsafe impl GlobalAlloc for Attributing {
                 }
             }
             if !found.is_empty() { site = found.join(" <- "); }
-            // `ALLOCPROFILE_RAW`: an allocation with no ibex frame is named by its whole backtrace.
-            else if std::env::var_os("ALLOCPROFILE_RAW").is_some() { site = format!("<no ibex frame>\n{bt}"); }
+            // `ALLOCPROFILE_RAW`: an allocation with no alcyon frame is named by its whole backtrace.
+            else if std::env::var_os("ALLOCPROFILE_RAW").is_some() { site = format!("<no alcyon frame>\n{bt}"); }
             let _ = SITES.try_with(|s| {
                 let mut m = s.borrow_mut();
                 let e = m.entry(site).or_insert((0, 0));
@@ -89,7 +89,7 @@ fn drive(fe: SocketAddr, e: &mut Engine) {
     c.set_nonblocking(true).unwrap();
     c.write_all(b"GET /api/test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
     // The response goes into a stack buffer: a `Vec` here was the one allocation per request
-    // with no ibex frame (59 B, the client's own), counted as if Ibex made it.
+    // with no alcyon frame (59 B, the client's own), counted as if Alcyon made it.
     let st = Instant::now(); let mut r = [0u8; 2048]; let mut len = 0;
     while st.elapsed() < Duration::from_secs(2) && len < r.len() {
         let _ = e.run_once();
@@ -117,7 +117,7 @@ fn startup(n: usize) {
     for i in 0..n {
         text.push_str(&format!("backend b{i}\n    server s{i} 127.0.0.1:{}\n", 20_000 + i % 1_000));
     }
-    let cfg = ibex_config::parse_str(&text).unwrap();
+    let cfg = alcyon_config::parse_str(&text).unwrap();
     ARMED.with(|a| a.set(true));
     let p = Engine::build_shared_state(&cfg).unwrap();
     ARMED.with(|a| a.set(false));
@@ -186,7 +186,7 @@ fn keepalive_profile(fe_file: &str) {
         "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
          frontend fe\n  bind {fa}\n{fe}  default_backend be\nbackend be\n  server s1 {sa}\n"
     );
-    let cfg = ibex_config::parse_str(&text).unwrap();
+    let cfg = alcyon_config::parse_str(&text).unwrap();
     let mut e = Engine::new(&cfg, 64).unwrap();
     let mut c = TcpStream::connect(fa).unwrap();
     c.set_nonblocking(true).unwrap();
@@ -257,8 +257,8 @@ fn main() {
                 "{ring}frontend fe\n  mode http\n  option httplog\n  bind {fa}\n  timeout client 5s\n{log}  default_backend be\n\
                  backend be\n  mode http\n  timeout connect 5s\n  timeout server 5s\n  server s1 {sa}\n"
             );
-            let cfg = ibex_config::parse_str(&text).unwrap();
-            ibex_rt::logfwd::start(&cfg).unwrap();
+            let cfg = alcyon_config::parse_str(&text).unwrap();
+            alcyon_rt::logfwd::start(&cfg).unwrap();
             std::mem::forget(collector);
             cfg
         }

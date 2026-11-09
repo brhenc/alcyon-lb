@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-"""Continuous differential fuzzing, end to end: Ibex vs HAProxy through real binaries (T293).
+"""Continuous differential fuzzing, end to end: Alcyon vs HAProxy through real binaries (T293).
 
 usage: difffuzz.py gate|soak|record [options]       (fuzz/README.md has the long form)
 
-Every case goes over a raw socket to a real HAProxy and a real Ibex (same config, each in
+Every case goes over a raw socket to a real HAProxy and a real Alcyon (same config, each in
 front of its own recording backend). The outcome of a case is its *shape*: the status lines
 each proxy answered and a hash of the bytes each backend received. A case is SAME when the two
 shapes are equal, DIFF otherwise. fuzz/known_diffs.json lists the DIFFs we know about, keyed by
@@ -45,7 +45,7 @@ for _s in (signal.SIGTERM, signal.SIGINT):
 
 
 def norm(data):
-    """The bytes a backend got, with chunked framing decoded: HAProxy and Ibex re-emit chunk
+    """The bytes a backend got, with chunked framing decoded: HAProxy and Alcyon re-emit chunk
     sizes differently (`A` vs `a`, merged chunks), which is not a difference that matters."""
     i = data.find(b'\r\n\r\n')
     if i < 0 or b'transfer-encoding: chunked' not in data[:i].lower():
@@ -139,17 +139,17 @@ def wait_port(port, tries=100):
 
 
 class Pair:
-    """One worker: a haproxy and an ibex, each with its own backend, on 4 consecutive ports."""
+    """One worker: a haproxy and an alcyon, each with its own backend, on 4 consecutive ports."""
 
     def __init__(s, ha, ib, base, tmp):
         s.px = {}
-        for i, (name, binp) in enumerate((('haproxy', ha), ('ibex', ib))):
+        for i, (name, binp) in enumerate((('haproxy', ha), ('alcyon', ib))):
             fe, be = base + 2 * i, base + 2 * i + 1
             f = f'{tmp}/{name}-{base}.cfg'
             cfg = CFG.format(fe=fe, be=be)
-            if name == 'ibex':
-                # Header names as HAProxy writes them (X5, D-E: Ibex's default keeps their case).
-                cfg = cfg.replace('global\n', 'global\n  tune.ibex.h1-lowercase-headers on\n', 1)
+            if name == 'alcyon':
+                # Header names as HAProxy writes them (X5, D-E: Alcyon's default keeps their case).
+                cfg = cfg.replace('global\n', 'global\n  tune.alcyon.h1-lowercase-headers on\n', 1)
             open(f, 'w').write(cfg)
             bk = Backend(be)
             p = subprocess.Popen([binp, '-f', f], stdout=open(f'{tmp}/{name}-{base}.log', 'w'),
@@ -205,7 +205,7 @@ def key(raw):
 
 
 def same(sh):
-    return sh['haproxy'] == sh['ibex']
+    return sh['haproxy'] == sh['alcyon']
 
 
 def run_cases(pairs, cases, deadline=None):
@@ -235,9 +235,9 @@ def confirm(pair, k, raw, first):
 
 
 # Baseline `task` values that name an accepted class, not a tracked defect: any DIFF with the
-# shape of such an entry is known, whatever its input (T315). `note:ibex-stricter` is
-# "HAProxy closes without a status, Ibex answers 400, nothing reaches the server".
-ACCEPTED_CLASSES = ('note:ibex-stricter',)
+# shape of such an entry is known, whatever its input (T315). `note:alcyon-stricter` is
+# "HAProxy closes without a status, Alcyon answers 400, nothing reaches the server".
+ACCEPTED_CLASSES = ('note:alcyon-stricter',)
 
 
 def accepted_shapes(base):
@@ -271,14 +271,14 @@ def gen_cases(gen, seed, iters, tmp):
 
 
 def setup(a):
-    tmp = tempfile.mkdtemp(prefix='ibex-difffuzz-')
-    pairs = [Pair(a.haproxy, a.ibex, a.base_port + 4 * i, tmp) for i in range(a.workers)]
+    tmp = tempfile.mkdtemp(prefix='alcyon-difffuzz-')
+    pairs = [Pair(a.haproxy, a.alcyon, a.base_port + 4 * i, tmp) for i in range(a.workers)]
     return pairs
 
 
 def self_test(pair):
     sh, _ = pair.shape(b'GET / HTTP/1.1\r\nHost: x\r\n\r\n')
-    if not (same(sh) and sh['ibex']['status'] == ['200']):
+    if not (same(sh) and sh['alcyon']['status'] == ['200']):
         raise SystemExit(f'difffuzz: self-test failed (a plain GET is not 200/200): {sh}')
 
 
@@ -326,7 +326,7 @@ def cmd_gate(a):
             elif not same(sh):
                 sh2 = confirm(pairs[0], k, raw, sh)
                 if not same(sh2) and not is_accepted(sh2, base):
-                    fails.append(f'NEW DIFF {k}: ha={sh2["haproxy"]} ibex={sh2["ibex"]} raw={raw[:160]!r}')
+                    fails.append(f'NEW DIFF {k}: ha={sh2["haproxy"]} alcyon={sh2["alcyon"]} raw={raw[:160]!r}')
         if not all(p.alive() for p in pairs):
             fails.append('a proxy died during the run')
         ran_fresh = sum(1 for k, _ in fresh if k in res)
@@ -408,14 +408,14 @@ def cmd_soak(a):
         if a.out and new:
             os.makedirs(os.path.dirname(a.out), exist_ok=True)
             with open(a.out, 'w') as f:
-                f.write(f'# difffuzz soak {time.strftime("%F")} ibex {sha}\n\n{total} cases, {len(new)} new DIFFs '
+                f.write(f'# difffuzz soak {time.strftime("%F")} alcyon {sha}\n\n{total} cases, {len(new)} new DIFFs '
                         f'(not in fuzz/known_diffs.json, or shape changed), seeds {a.seed}..{a.seed + rnd - 1}\n\n')
                 for k, (sh, raw, seed, changed) in sorted(new.items()):
                     f.write(f'## {k} (seed {seed}{", known input, shape changed" if changed else ""})\n\n'
-                            f'- haproxy: {sh.get("haproxy")}\n- ibex: {sh.get("ibex")}\n- raw: `{raw[:300]!r}`\n'
+                            f'- haproxy: {sh.get("haproxy")}\n- alcyon: {sh.get("alcyon")}\n- raw: `{raw[:300]!r}`\n'
                             f'- input_b64: `{base64.b64encode(raw).decode()}`\n\n')
         print(f'difffuzz-soak: {total} cases in {secs:.0f}s, {rnd} rounds (seeds {a.seed}..{a.seed + rnd - 1}), '
-              f'{len(new)} new DIFFs, ibex {sha}' + (f' ({accepted} more of an accepted class)' if accepted else '') + (f', report {a.out}' if a.out and new else ''))
+              f'{len(new)} new DIFFs, alcyon {sha}' + (f' ({accepted} more of an accepted class)' if accepted else '') + (f', report {a.out}' if a.out and new else ''))
         return 1 if new else 0
     finally:
         killall()
@@ -425,8 +425,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('mode', choices=['gate', 'soak', 'record'])
     tgt = os.environ.get('CARGO_TARGET_DIR', 'target')
-    ap.add_argument('--ibex', default=os.path.join(tgt, 'debug', 'ibex'))
-    ap.add_argument('--gen', default=os.path.join(tgt, 'debug', 'ibex-fuzz'))
+    ap.add_argument('--alcyon', default=os.path.join(tgt, 'debug', 'alcyon'))
+    ap.add_argument('--gen', default=os.path.join(tgt, 'debug', 'alcyon-fuzz'))
     ap.add_argument('--haproxy', default=HA_DEFAULT)
     ap.add_argument('--baseline', default=os.path.join(HERE, 'known_diffs.json'))
     ap.add_argument('--corpus', default=os.path.join(HERE, 'corpus'))

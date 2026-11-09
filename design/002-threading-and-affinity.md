@@ -43,7 +43,7 @@ atomics on large NUMA machines: the shared runqueue and lock scope are per-group
 than global, so a 128-core box does not turn every wakeup into a 128-way cache-line
 bounce.
 
-For Ibex this is a later concern. Single group until there is a machine that needs more.
+For Alcyon this is a later concern. Single group until there is a machine that needs more.
 
 ## 3. Placement: power-of-two-choices, once, at accept
 
@@ -86,7 +86,7 @@ takeover is used to free a connection — i.e. even upstream treats this as deli
 
 That this needs three cooperating layers and ~60 lines of careful code *for the easy case
 of an idle connection with no in-flight data* is the strongest available evidence for how
-load-bearing affinity is. Ibex should expect the same, and should not offer a general
+load-bearing affinity is. Alcyon should expect the same, and should not offer a general
 migration API.
 
 ## 5. Consequences for the Rust implementation
@@ -120,5 +120,5 @@ small, enumerable set — which is the point.
 `src/wdt.c`. A timer signal checks per-thread progress; a thread that fails to clear
 `TH_FL_STUCK` between two checks triggers `ha_panic()` (`src/wdt.c:192`). With hard
 affinity and no stealing, a wedged thread silently strands every connection assigned to
-it, so detecting it is not optional. Ibex needs an equivalent before it is ever run in
+it, so detecting it is not optional. Alcyon needs an equivalent before it is ever run in
 anger.

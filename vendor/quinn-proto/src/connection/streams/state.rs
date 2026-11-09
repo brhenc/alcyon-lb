@@ -54,7 +54,7 @@ impl StreamRecv {
     }
 
     // Reinitialize the stream so the inner `Recv` can be reused
-    #[cfg_attr(feature = "ibex-pools", allow(dead_code))]
+    #[cfg_attr(feature = "alcyon-pools", allow(dead_code))]
     pub(super) fn free(self, initial_max_data: u64) -> Self {
         match self {
             Self::Free(_) => unreachable!("Self::Free on reinit()"),
@@ -73,7 +73,7 @@ pub struct StreamsState {
     pub(super) send: FxHashMap<StreamId, Option<SendBox>>,
     pub(super) recv: FxHashMap<StreamId, Option<StreamRecv>>,
     pub(super) free_recv: RecvSpares,
-    /// Freed `Send`s, reset, kept for the next stream of this connection (Ibex T543): a stream
+    /// Freed `Send`s, reset, kept for the next stream of this connection (Alcyon T543): a stream
     /// costs no allocation once the connection has had as many streams open at once
     pub(super) free_send: SendSpares,
     pub(super) next: [u64; 2],
@@ -961,7 +961,7 @@ impl StreamsState {
         if bi || remote {
             // A freed `Recv` is taken at the stream's first use (`get_or_insert_recv`), not here:
             // slots are made available up to the stream limit ahead of use, so popping here
-            // left the free list empty for the streams already made available (Ibex T543)
+            // left the free list empty for the streams already made available (Alcyon T543)
             assert!(self.recv.insert(id, None).is_none());
         }
     }
@@ -1014,15 +1014,15 @@ impl StreamsState {
         }
     }
 
-    /// Keep a freed `Send` for the next stream, its data released (Ibex T543)
+    /// Keep a freed `Send` for the next stream, its data released (Alcyon T543)
     pub(super) fn send_freed(&mut self, mut send: SendBox) {
-        // With `ibex-pools` the pool resets it (`Send::free`) on the drop
-        #[cfg(not(feature = "ibex-pools"))]
+        // With `alcyon-pools` the pool resets it (`Send::free`) on the drop
+        #[cfg(not(feature = "alcyon-pools"))]
         {
             send.free();
             self.free_send.push(send);
         }
-        #[cfg(feature = "ibex-pools")]
+        #[cfg(feature = "alcyon-pools")]
         {
             let _ = &mut send;
             drop(send);
@@ -1030,9 +1030,9 @@ impl StreamsState {
     }
 
     pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
-        #[cfg(not(feature = "ibex-pools"))]
+        #[cfg(not(feature = "alcyon-pools"))]
         self.free_recv.push(recv.free(self.stream_receive_window));
-        #[cfg(feature = "ibex-pools")]
+        #[cfg(feature = "alcyon-pools")]
         drop(recv); // the pool resets it
         self.stream_freed(id, StreamHalf::Recv);
     }
@@ -1056,12 +1056,12 @@ pub(super) fn get_or_insert_send(
 ) -> impl FnOnce(&mut Option<SendBox>) -> &mut SendBox + '_ {
     move |opt| {
         opt.get_or_insert_with(|| {
-            #[cfg(not(feature = "ibex-pools"))]
+            #[cfg(not(feature = "alcyon-pools"))]
             if let Some(mut s) = free.pop() {
                 s.reinit(max_data);
                 return s;
             }
-            #[cfg(feature = "ibex-pools")]
+            #[cfg(feature = "alcyon-pools")]
             let _ = free;
             Send::new(max_data)
         })
@@ -1078,13 +1078,13 @@ pub(super) fn get_or_insert_recv(
             StreamRecv::Free(recv) => StreamRecv::Open(recv),
             s => s,
         });
-        // A freed `Recv` (already reinitialised by `StreamRecv::free`) before a new one (Ibex T543)
+        // A freed `Recv` (already reinitialised by `StreamRecv::free`) before a new one (Alcyon T543)
         opt.get_or_insert_with(|| {
-            #[cfg(not(feature = "ibex-pools"))]
+            #[cfg(not(feature = "alcyon-pools"))]
             if let Some(s) = free.pop() {
                 return StreamRecv::Open(s.into_inner());
             }
-            #[cfg(feature = "ibex-pools")]
+            #[cfg(feature = "alcyon-pools")]
             let _ = free;
             StreamRecv::Open(Recv::new(initial_max_data))
         })

@@ -1,4 +1,4 @@
-# Per-thread counter rows: `tune.ibex.counters` (T582 Part A, D-4 "both")
+# Per-thread counter rows: `tune.alcyon.counters` (T582 Part A, D-4 "both")
 
 Status: **design for approval, no code.** Inputs: engine doc §2.1 row 13 and §6.1 (D-4), the C1
 row; `memory-2026-10-24.md` (one owner); HAProxy `include/haproxy/counters-t.h`,
@@ -14,8 +14,8 @@ marked *(est.)* are mine; the rest are X0's or counted in the source.
 | server `TxnCounters` (`srv[i]`) | same | as backend (7 RMW + the same stores) | `connect`/`reuse` | `chkdown`, `last_chg`, `down_since`, `downtime_ms` |
 | `ProxyStats` (per proxy) | engine.rs:1475 | `fe_req_rate`, `be_sess_rate` ticks | `cum_conn`, `fe_sess_rate`, `act_conn`, `be_streams`, `bytes_in/out` | `denied_*`, `failed_conn`, `queue_*` |
 | global (`show info`) | `stats.rs` `CUM_STREAMS`; engine.rs:1374 `ThreadRates` | `CUM_STREAMS` (1 RMW) | conn/sess rates (**already per thread**) | `SSL_*` |
-| listener | none: Ibex has no listener rows (`stats_typed.rs:331`) | - | - | - |
-| stick tables | `ibex-stick` | entries are read by rules (rate limits must be global) | | **out of scope**: stay shared, as HAProxy's |
+| listener | none: Alcyon has no listener rows (`stats_typed.rs:331`) | - | - | - |
+| stick tables | `alcyon-stick` | entries are read by rules (rate limits must be global) | | **out of scope**: stay shared, as HAProxy's |
 
 That is T579's pinned 19 RMWs per request (`engine_pass.rs`: 4 + 7 + 7 + `CUM_STREAMS`) plus
 ~12 plain stores to the same shared lines (4 `TimeStat` sums, `last_sess`, `sess_rate` x2 rows).
@@ -31,9 +31,9 @@ The timing sums (`q_time`...`t_time`), every maximum (`*_max`, `sps_max`, `cur_s
 rate counters behind the maxima stay in the non-tg `be_counters`/`fe_counters`: one copy,
 shared. The `swrate` window uses the **own tgroup's** `cum_req` (stream.c:2881), the reader the
 total (stats-proxy.c:836). Default `nbtgroups` is 1, so a default HAProxy writes one shared set:
-Ibex's `shared` is parity.
+Alcyon's `shared` is parity.
 
-**Ibex, `per-thread`.** Split `TxnCounters` (today 280 B, 320 with `align(64)`) into:
+**Alcyon, `per-thread`.** Split `TxnCounters` (today 280 B, 320 with `align(64)`) into:
 - `HotRow` (written once per stream by its owner thread): `hrsp[6]`, `req_tot`, `stot`, `lbtot`,
   `connect`, `reuse`, `bin`, `bout`, `cli_abrt`, `srv_abrt`, `eresp`, `ereq`, `eint` (18 x u64 =
   144 B), the four `TimeStat` sums (32 B), `last_sess` (8 B), `sess_rate: RateCtr` (16 B) =
@@ -51,10 +51,10 @@ prefix); readers on other threads `load`. `shared` keeps today's `fetch_add` on 
 Both modes run the same `account_stream::<M: CounterMode>` monomorphised, chosen once per stream
 end, so `shared` adds one predictable branch, not one per site.
 
-**Owner (AGENTS §8).** The slabs are an `ibex_alloc` arena of fixed size: a `CounterTable` that
+**Owner (AGENTS §8).** The slabs are an `alcyon_alloc` arena of fixed size: a `CounterTable` that
 registers with `PoolRegistry` as `counters` (`show pools`: allocated = slots x 200 B, used =
 rows), never grows, and is never compacted (`Arena::compact` returns 0). Indexed by
-`ibex_alloc`'s `thread_slot()`; allocated **eagerly at worker start** with `try_reserve_exact`
+`alcyon_alloc`'s `thread_slot()`; allocated **eagerly at worker start** with `try_reserve_exact`
 (a failure refuses the start, naming the size), never on the request path.
 
 ## 3. Memory
@@ -99,13 +99,13 @@ shared `ColdRow`, as today.
 
 ## 5. The setting
 
-`tune.ibex.counters shared|per-thread` in `global`, default **`shared`**. `per-tgroup` is
-refused: Ibex refuses `thread-groups` > 1 (`parser/global.rs:764`), so it would be `shared` under
-another name, which is the §5 trap. Message: `'tune.ibex.counters': 'per-tgroup' is not
+`tune.alcyon.counters shared|per-thread` in `global`, default **`shared`**. `per-tgroup` is
+refused: Alcyon refuses `thread-groups` > 1 (`parser/global.rs:764`), so it would be `shared` under
+another name, which is the §5 trap. Message: `'tune.alcyon.counters': 'per-tgroup' is not
 implemented (one thread group); expected 'shared' or 'per-thread'`; any other word is refused
 the same way. It reaches the data path where the engine builds `CounterTable::new(mode, rows,
 nbthread)` and each worker picks `account_stream::<Shared|PerThread>`. Read at start only: a
-reload (new process) applies a change, and counters restart at zero as they do today (Ibex has no
+reload (new process) applies a change, and counters restart at zero as they do today (Alcyon has no
 `shm-stats-file`). The startup notice prints the table's bytes when `per-thread` is set.
 
 ## 6. Expected saving
@@ -132,7 +132,7 @@ Sum: **keepalive/rules -0.1 to -0.2k, h2s1 -0.2 to -0.4k** at the bench's server
 
 ## 7. Questions for the user
 
-1. **Values now**: `shared` and `per-thread`, with `per-tgroup` refused until Ibex runs more
+1. **Values now**: `shared` and `per-thread`, with `per-tgroup` refused until Alcyon runs more
    than one thread group? *Recommendation: yes.* Default taken: yes.
 2. **Timing averages in `per-thread`**: per-thread `swrate` (reader averages the threads'; equal
    at `nbthread 1`, close but not HAProxy's figure otherwise) or keep the sums shared (one shared

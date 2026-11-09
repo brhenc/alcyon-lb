@@ -1,6 +1,6 @@
-# Ibex: High-Performance Soft-Realtime Reverse Proxy & Load Balancer
+# Alcyon: High-Performance Soft-Realtime Reverse Proxy & Load Balancer
 
-**Ibex** is a memory-safe, soft-realtime reverse proxy and load balancer written in pure Rust with Pingora integration. Designed to meet modern CISA memory-safety directives and aerospace-grade soft-realtime reliability (NASA JPL Power of 10), Ibex provides seamless migration from HAProxy via configuration compatibility, stick-table synchronization (Peers protocol), and support for HAProxy's `vtest` regression framework.
+**Alcyon** is a memory-safe, soft-realtime reverse proxy and load balancer written in pure Rust with Pingora integration. Designed to meet modern CISA memory-safety directives and aerospace-grade soft-realtime reliability (NASA JPL Power of 10), Alcyon provides seamless migration from HAProxy via configuration compatibility, stick-table synchronization (Peers protocol), and support for HAProxy's `vtest` regression framework.
 
 ---
 
@@ -19,7 +19,7 @@
 - **Elastic Binary Trees (`ebtree`)**:
   - Safe, deterministic $O(k)$ bit-indexed radix search trees (`eb32`, `eb64`, `ebst`, `ebmb`) for IP prefixes, URIs, and binary tokens.
 - **Stick Tables & HAProxy Peers Protocol (v2 / v2.1)**:
-  - Wire-compatible binary synchronization protocol allowing mixed clusters of HAProxy and Ibex instances.
+  - Wire-compatible binary synchronization protocol allowing mixed clusters of HAProxy and Alcyon instances.
   - Sliding-window frequency and connection rate limiters.
 - **Runtime-Swappable Dual HTTP Parsers**:
   - Pure Rust rewrite of HAProxy's **HTX** (HTTP Transfer eXchange) intermediate representation.
@@ -39,16 +39,16 @@ project-ibex/
 ├── Cargo.toml
 ├── ARCHITECTURE.md
 ├── crates/
-│   ├── ibex-core/          # Soft-realtime primitives, JPL rules, arenas, fixed pools
-│   ├── ibex-ebtree/        # Elastic Binary Trees (eb32, eb64, ebst, ebmb)
-│   ├── ibex-stick-table/   # Stick table storage, rates, connection counters
-│   ├── ibex-peers/         # HAProxy Peers Protocol v2 binary synchronization
-│   ├── ibex-parser/        # Dual HTTP Parsers (HTX + Pingora) & SIMD scanner
-│   ├── ibex-tls/           # Multi-TLS engine provider (Rustls / OpenSSL)
-│   ├── ibex-config/        # HAProxy syntax parser, AST, ACL evaluation engine
-│   ├── ibex-vtest/         # HAProxy vtest / VTC regression test runner
-│   ├── ibex-runtime/       # Pingora runtime, RCU dynamic table, proxy engine
-│   └── ibex-lb/            # Daemon executable & CLI
+│   ├── alcyon-core/          # Soft-realtime primitives, JPL rules, arenas, fixed pools
+│   ├── alcyon-ebtree/        # Elastic Binary Trees (eb32, eb64, ebst, ebmb)
+│   ├── alcyon-stick-table/   # Stick table storage, rates, connection counters
+│   ├── alcyon-peers/         # HAProxy Peers Protocol v2 binary synchronization
+│   ├── alcyon-parser/        # Dual HTTP Parsers (HTX + Pingora) & SIMD scanner
+│   ├── alcyon-tls/           # Multi-TLS engine provider (Rustls / OpenSSL)
+│   ├── alcyon-config/        # HAProxy syntax parser, AST, ACL evaluation engine
+│   ├── alcyon-vtest/         # HAProxy vtest / VTC regression test runner
+│   ├── alcyon-runtime/       # Pingora runtime, RCU dynamic table, proxy engine
+│   └── alcyon-lb/            # Daemon executable & CLI
 ├── examples/
 │   ├── haproxy.cfg         # Sample HAProxy-compatible configuration
 │   └── regression.vtc      # Sample VTC regression test case
@@ -60,7 +60,7 @@ project-ibex/
 
 ## Quick Start & Build Automation
 
-Project Ibex provides a production-grade, standardized Unix `Makefile` adhering to standard packaging conventions (`PREFIX ?= /usr/local`, `DESTDIR ?=`, `CARGO ?= cargo`, `CARGO_FLAGS ?= --release`).
+Project Alcyon provides a production-grade, standardized Unix `Makefile` adhering to standard packaging conventions (`PREFIX ?= /usr/local`, `DESTDIR ?=`, `CARGO ?= cargo`, `CARGO_FLAGS ?= --release`).
 
 ### 1. Self-Documenting Help
 ```bash
@@ -70,16 +70,16 @@ Displays an aligned, ANSI-colored summary of all build targets, verification wor
 
 ### 2. Compilation & Execution
 ```bash
-# Build optimized release binary (target/release/ibex)
+# Build optimized release binary (target/release/alcyon)
 make build
 
-# Build debug binary (target/debug/ibex)
+# Build debug binary (target/debug/alcyon)
 make debug
 
-# Run Ibex with the canonical HAProxy 3.5 configuration
+# Run Alcyon with the canonical HAProxy 3.5 configuration
 make run
 
-# Launch Ibex with the dedicated single-page Web Stats Dashboard on port 8404
+# Launch Alcyon with the dedicated single-page Web Stats Dashboard on port 8404
 make run-stats
 ```
 
@@ -97,7 +97,7 @@ make fmt-check
 # Run differential test harness against reference HAProxy 1.0.2
 make difftest
 
-# Run differential comparison (reference HAProxy vs candidate Ibex)
+# Run differential comparison (reference HAProxy vs candidate Alcyon)
 make difftest-candidate
 
 # Run standalone VTC test runner against HAProxy regression tests
@@ -109,11 +109,11 @@ make vtc-all
 
 ### 4. Installation & Packaging
 ```bash
-# Install ibex binary with mode 755
+# Install alcyon binary with mode 755
 sudo make install
 
 # Install to custom staging directory for packaging
-make install DESTDIR=/tmp/ibex-pkg PREFIX=/usr
+make install DESTDIR=/tmp/alcyon-pkg PREFIX=/usr
 
 # Remove installed binary
 sudo make uninstall

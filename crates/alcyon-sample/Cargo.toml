@@ -1,0 +1,54 @@
+[package]
+name = "alcyon-sample"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "Alcyon Sample / Converter / Matcher lattice (design/007-sample-lattice.md)"
+autotests = false
+
+[dependencies]
+alcyon-alloc = { workspace = true }
+alcyon-crypt = { path = "../alcyon-crypt" }
+alcyon-proto = { path = "../alcyon-proto" }
+alcyon-tls = { path = "../alcyon-tls" }
+getrandom = "0.2"
+alcyon-regex = { workspace = true }
+memchr = { workspace = true }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+ctr = "0.9"
+ghash = "0.5"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest.workspace = true
+# Cross-checks the GCM composition in src/aes.rs for the nonce lengths it supports.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# One integration-test binary (T260): tests/it/main.rs declares each test file as a module.
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+# Own process: sets the process's TZ environment variable, which local-time formatting in every other test reads
+[[test]]
+name = "vars_limits"
+path = "tests/vars_limits.rs"
+
+[[test]]
+name = "ltime_local"
+path = "tests/ltime_local.rs"
+
+# Own process: listed in tools/checkin.sha256 (reviewed specification): its path and content may not change
+[[test]]
+name = "sample_semantics"
+path = "tests/sample_semantics.rs"

@@ -2,7 +2,7 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 """Shared helpers for the tools/measure/m1_*.py scripts (T180).
 
-Binaries come from the environment: IBEX (default $CARGO_TARGET_DIR/release/ibex),
+Binaries come from the environment: ALCYON (default $CARGO_TARGET_DIR/release/alcyon),
 HAPROXY (default /home/bhenc/reference/haproxy/haproxy). Every script runs both proxies
 on the same generated config, with one HAProxy as the shared origin server.
 """
@@ -18,7 +18,7 @@ import time
 import multiprocessing as mp
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-IBEX = os.environ.get("IBEX", os.path.join(os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target")), "release", "ibex"))
+ALCYON = os.environ.get("ALCYON", os.path.join(os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target")), "release", "alcyon"))
 HAPROXY = os.environ.get("HAPROXY", "/home/bhenc/reference/haproxy/haproxy")
 ORIGIN_HAPROXY = os.environ.get("ORIGIN_HAPROXY", HAPROXY)
 RUNS = int(os.environ.get("RUNS", "3"))
@@ -87,8 +87,8 @@ def stop(proc):
 
 
 def start(kind, cfg_path, port, wait=True):
-    """kind: 'ibex' or 'haproxy'. Returns Popen."""
-    cmd = [IBEX, "-f", cfg_path] if kind == "ibex" else [HAPROXY, "-db", "-f", cfg_path]
+    """kind: 'alcyon' or 'haproxy'. Returns Popen."""
+    cmd = [ALCYON, "-f", cfg_path] if kind == "alcyon" else [HAPROXY, "-db", "-f", cfg_path]
     p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if wait:
         wait_listen(p, port)
@@ -279,7 +279,7 @@ def median_of(fn, runs=None):
 def header(script):
     la = os.getloadavg()
     return (f"# {script} date={time.strftime('%F %T')} load={la[0]:.1f} {la[1]:.1f} {la[2]:.1f} "
-            f"nofile={raise_nofile()} runs={RUNS} ibex={IBEX} haproxy={HAPROXY}")
+            f"nofile={raise_nofile()} runs={RUNS} alcyon={ALCYON} haproxy={HAPROXY}")
 
 
 def emit(**row):

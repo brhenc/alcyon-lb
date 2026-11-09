@@ -14,7 +14,7 @@ frontend fe
     http-request add-header X-Id %[rand]
     http-request set-var(txn.p) path
     http-request deny if api !hosty
-    http-response set-header X-Served ibex
+    http-response set-header X-Served alcyon
     http-response del-header Server
     default_backend be
 backend be

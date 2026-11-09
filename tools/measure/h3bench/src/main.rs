@@ -6,7 +6,7 @@
 //! `requests:` and `UDP datagram:` lines (what `tools/measure/insreq.sh` reads), then the
 //! client's datagrams per request over the requests alone. Exits 1 if a request failed.
 
-// A measuring tool run from a shell: its errors go to stderr (the clippy.toml ban is for ibex).
+// A measuring tool run from a shell: its errors go to stderr (the clippy.toml ban is for alcyon).
 #![allow(clippy::disallowed_macros)]
 
 mod client;

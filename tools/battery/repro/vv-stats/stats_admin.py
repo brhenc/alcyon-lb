@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 """Stats page admin actions vs HAProxy (VV-18, VV-19): stats admin absent / if FALSE / if TRUE /
-by source, with stats auth; cross-origin Origin/Referer; ;st= codes and banners; Ibex-only
-query-string and JSON admin calls.  stats_admin.py IBEX [HAPROXY]
+by source, with stats auth; cross-origin Origin/Referer; ;st= codes and banners; Alcyon-only
+query-string and JSON admin calls.  stats_admin.py ALCYON [HAPROXY]
 Each request runs against a fresh process; prints status, Location, banner and s1's status
 from ;csv afterwards, for both proxies, SAME/DIFF per case.  Port 19970, s1 at 19971 (no listener)."""
 import base64, os, re, socket, subprocess, sys, tempfile, time
@@ -118,7 +118,7 @@ for name, extra in CASES:
             if cred is None and name == "auth-admin" and not r[0].startswith(("post maint", "get ?action")): continue
             a, h = one(IB, f, r, cred), one(HA, f, r, cred)
             ok &= a == h
-            rows.append("   %-26s %-4s ibex %s\n   %-31s haproxy %s%s" % (r[0], "cred" if cred else "", a, "", h, "" if a == h else "   <--"))
+            rows.append("   %-26s %-4s alcyon %s\n   %-31s haproxy %s%s" % (r[0], "cred" if cred else "", a, "", h, "" if a == h else "   <--"))
     same += ok; diff += not ok
     print(("SAME " if ok else "DIFF ") + name); print("\n".join(rows))
 print("same %d, diff %d" % (same, diff))

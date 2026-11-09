@@ -2,7 +2,7 @@ vtest "Test basic HTTP routing and stick table sync"
 
 server s1 {
     rxreq
-    txresp -status 200 -body "Ibex Upstream Response"
+    txresp -status 200 -body "Alcyon Upstream Response"
 } -start
 
 haproxy h1 -conf {

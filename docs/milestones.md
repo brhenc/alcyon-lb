@@ -48,32 +48,32 @@ compression (moved to M5, decided 2026-10-18), cache, FastCGI, DNS-resolved serv
 beyond what already works, OpenSSL-specific engines/keywords. Each refusal names the
 keyword and says it is unsupported (AGENTS.md §5); listed in `docs/differences.md`.
 
-HTTP/3 and QUIC are **not** in M1 and not refused either: Ibex has an experimental QUIC
-listener with tests (`ibex-quic`). They are the next milestone, **M2**, planned for the
+HTTP/3 and QUIC are **not** in M1 and not refused either: Alcyon has an experimental QUIC
+listener with tests (`alcyon-quic`). They are the next milestone, **M2**, planned for the
 weekend of 2026-10-10 (user, 2026-10-05).
 
 ### Practical testing (the point of the milestone)
 
-Run real software in front of and behind Ibex, the way a small deployment would. Each
+Run real software in front of and behind Alcyon, the way a small deployment would. Each
 topology is a script under `tools/practical/` that starts everything, drives traffic,
 checks results and tears down; each runs against HAProxy too, and the results are
 compared.
 
 Topologies:
 
-1. `client → ibex → node.js` (express): keep-alive, chunked uploads (100 MB), large
+1. `client → alcyon → node.js` (express): keep-alive, chunked uploads (100 MB), large
    downloads, SSE (10 min stream), WebSocket echo (socket.io and raw `ws`), slow
    responses, backend returning 5xx, gzip done by the backend.
-2. `client → ibex (TLS, h2) → nginx → node.js`: h2 to the client, h1 to nginx; nginx as
+2. `client → alcyon (TLS, h2) → nginx → node.js`: h2 to the client, h1 to nginx; nginx as
    a static-file server on the side (`use_backend` by path).
-3. `client → ibex → apache2 (httpd, mod_proxy) → node.js`, and apache2 serving static files
+3. `client → alcyon → apache2 (httpd, mod_proxy) → node.js`, and apache2 serving static files
    and a PHP or CGI app if available.
-4. `nginx → ibex → node.js`: Ibex as the inner balancer behind nginx (PROXY protocol on,
+4. `nginx → alcyon → node.js`: Alcyon as the inner balancer behind nginx (PROXY protocol on,
    `X-Forwarded-For` chain correct).
 5. Three node.js instances, roundrobin + health checks: restart one (`kill`, then start
    again) under load, then all three one after another (a rolling deploy); deploy with
    cookie persistence and check sessions stay put.
-6. Real browsers: Firefox and Chromium through Ibex to a node.js single-page app
+6. Real browsers: Firefox and Chromium through Alcyon to a node.js single-page app
    (h2, WebSocket, SSE); look at the developer tools for errors.
 
 Load tools: `curl`, `wrk2` (h1, constant rate, latency histogram; built from source
@@ -85,9 +85,9 @@ in Fedora's repositories, which made the first `dnf install` fail as a whole).
 
 ### M1 exit criteria
 
-- All six topologies pass their scripts against Ibex, with the same observable results
+- All six topologies pass their scripts against Alcyon, with the same observable results
   as HAProxy (status codes, headers that matter, bodies, logs fields), for 3 runs.
-- Every config used in `tools/practical/` passes `ibex -c` and runs; no keyword in it is
+- Every config used in `tools/practical/` passes `alcyon -c` and runs; no keyword in it is
   warned-and-ignored.
 - Resource and operations parameters below met.
 - One week of the practical setup running (topology 5, light constant load) with no
@@ -100,7 +100,7 @@ in Fedora's repositories, which made the first `dnf install` fail as a whole).
 
 ## Resource parameters (exit criteria for M1)
 
-Measure each on Ibex (release build) and HAProxy, same config; record in `tradeoff.md` §6.5
+Measure each on Alcyon (release build) and HAProxy, same config; record in `tradeoff.md` §6.5
 and as a script under `tools/measure/`.
 
 | parameter | how | target |
@@ -123,7 +123,7 @@ and as a script under `tools/measure/`.
 - **Reload** (SIGUSR2) under constant load: zero failed requests, zero reset connections,
   old worker drains within `hard-stop-after`; repeated 100 times, RSS and fds flat.
 - **Graceful stop** (SIGUSR1): in-flight requests complete; SIGTERM fast stop as HAProxy.
-- **Config check** `ibex -c`: same exit codes as HAProxy; errors name file and line.
+- **Config check** `alcyon -c`: same exit codes as HAProxy; errors name file and line.
 - **Logs**: `option httplog` and the default `log-format` lines byte-identical to HAProxy
   for the practical topologies (except timings); syslog UDP, unix socket, stdout.
 - **Stats**: `show stat` CSV fields that a monitoring tool reads (status, scur, smax, stot,
@@ -132,7 +132,7 @@ and as a script under `tools/measure/`.
 - **Runtime changes** from the CLI visible to every worker immediately (`set server`,
   `set weight`, `add map`), and they survive nothing (as HAProxy) unless a state file is
   configured (`server-state-file`).
-- **systemd**: an example unit (`Type=notify` if Ibex supports `sd_notify`, else
+- **systemd**: an example unit (`Type=notify` if Alcyon supports `sd_notify`, else
   `Type=forking`/master-worker), `ExecReload` with SIGUSR2; documented in `docs/`.
 - **Failure behaviour**: a backend down is detected within `inter × fall`, traffic moves
   away, comes back after `rise`; all servers down gives HAProxy's 503 page.
@@ -156,7 +156,7 @@ or `fuzz/`, kept outside the workspace if it needs `unsafe` or a non-Rust depend
 (as `tools/allocprofile` does), and runs in CI or nightly, not in every gate.
 
 1. **Fuzzing** with cargo-fuzz (libFuzzer; allowed by the user 2026-10-04: it links only
-   into the fuzz binaries under `fuzz/`, never into Ibex):
+   into the fuzz binaries under `fuzz/`, never into Alcyon):
    HTTP/1 request and response parser, HTTP/2 frame decoder, HPACK, PROXY protocol v1/v2,
    config parser, log-format parser, CLI command parser, sample-fetch/converter
    expressions, regex translation (T154). Target: 24 h per target with no crash, no
@@ -164,7 +164,7 @@ or `fuzz/`, kept outside the workspace if it needs `unsafe` or a non-Rust depend
 2. **Differential testing against HAProxy**: the same byte stream to both, compare what
    reaches the server and what reaches the client. Corpus: request smuggling (CL/TE,
    duplicate CL, obs-fold, bare LF, chunk extensions), header case and whitespace, very
-   long/large heads, invalid methods/URIs. Any difference is a bug in Ibex or a
+   long/large heads, invalid methods/URIs. Any difference is a bug in Alcyon or a
    documented decision.
 3. **Hostile clients**: slowloris (slow headers), slow body, slow read (tiny window),
    HTTP/2 rapid reset (CVE-2023-44487), CONTINUATION flood (2024), HPACK bomb, SETTINGS
@@ -199,7 +199,7 @@ detailed scope and exit criteria written when it starts, as M1's were.
 
 Stick-table synchronisation between nodes, moved forward from M4 by the user.
 
-- **Wire-compatible with HAProxy's peers protocol**: an Ibex node and an HAProxy node in
+- **Wire-compatible with HAProxy's peers protocol**: an Alcyon node and an HAProxy node in
   one `peers` section exchange table updates both ways. That is what makes a mixed
   cluster (and a migration one node at a time) possible, and it lets HAProxy serve as the
   oracle peer in tests.
@@ -210,16 +210,16 @@ Stick-table synchronisation between nodes, moved forward from M4 by the user.
   HAProxy does, so counters and stickiness survive SIGUSR2.
 - **Multi-threaded sync — the reason to do it early.** In HAProxy a peer session runs on
   one thread, so a busy cluster's table sync is bounded by one core (the user's
-  observation; measure it on the reference binary first and record the numbers). Ibex
+  observation; measure it on the reference binary first and record the numbers). Alcyon
   spreads sync across worker threads (per table shard, or per peer) while keeping the
-  wire protocol unchanged. Exit: under the same update rate, Ibex peers keep up where
+  wire protocol unchanged. Exit: under the same update rate, Alcyon peers keep up where
   HAProxy's sync lags, measured with both on the same machine, and no update is lost.
-- Practical topology: two Ibex nodes plus one HAProxy node behind a client that alternates
+- Practical topology: two Alcyon nodes plus one HAProxy node behind a client that alternates
   between them; stickiness and `sc_*` counters agree on all three.
 
 **Reproducible builds (added by the user, 2026-10-05).** This is a must-have for a
 modern proxy, and it is cheapest to start early, before M4 packaging depends on it.
-Anyone who builds a given commit with the pinned toolchain gets a bit-identical `ibex`
+Anyone who builds a given commit with the pinned toolchain gets a bit-identical `alcyon`
 binary, and can check that a released binary came from the published source.
 
 - **Pinned inputs.**
@@ -235,7 +235,7 @@ binary, and can check that a released binary came from the published source.
     could.
   - `codegen-units` and LTO settings fixed in the release profile.
   - sccache must not change the output.
-- **The release binary contains no C.** The only build script, `crates/ibex-h1-sys` (the
+- **The release binary contains no C.** The only build script, `crates/alcyon-h1-sys` (the
   test-only `haproxy-ffi` feature, which compiles HAProxy's `h1.c` from
   `/home/bhenc/reference/haproxy`), stays out of release builds. A check in the script
   proves it.

@@ -1,0 +1,32 @@
+[package]
+name = "alcyon-config"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "HAProxy 1.0 configuration parser for Alcyon"
+# One integration-test binary (tests/it/main.rs), not one per file: see tests/it/main.rs (T260).
+autotests = false
+
+[dependencies]
+alcyon-regex = { workspace = true }
+alcyon-crypt = { path = "../alcyon-crypt" }
+thiserror = "1.0"
+# `getpwnam_r` / `getgrnam_r` for `user` and `group`, as HAProxy resolves them while parsing.
+nix = { version = "0.31", default-features = false, features = ["user"] }
+
+[dev-dependencies]
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+disallowed_macros = "deny"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"

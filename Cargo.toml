@@ -2,21 +2,21 @@
 resolver = "2"
 members = [
     "crates/ebtree",
-    "crates/ibex-sched",
-    "crates/ibex-proto",
-    "crates/ibex-rt",
-    "crates/ibex-config",
-    "crates/ibex-sample",
-    "crates/ibex-regex",
-    "crates/ibex-crypt",
-    "crates/ibex-stick-table",
-    "crates/ibex-tls",
-    "crates/ibex-alloc",
-    "crates/ibex-h1-sys", "crates/slz", "crates/ibex-mmsg", "crates/ibex-dns", "crates/ibex-quic",
+    "crates/alcyon-sched",
+    "crates/alcyon-proto",
+    "crates/alcyon-rt",
+    "crates/alcyon-config",
+    "crates/alcyon-sample",
+    "crates/alcyon-regex",
+    "crates/alcyon-crypt",
+    "crates/alcyon-stick-table",
+    "crates/alcyon-tls",
+    "crates/alcyon-alloc",
+    "crates/alcyon-h1-sys", "crates/slz", "crates/alcyon-mmsg", "crates/alcyon-dns", "crates/alcyon-quic",
 ]
 # T460: the vendored ring fork and its rustls provider are dependencies, not members: `cargo test
 # --workspace` and clippy do not run ring's suite or lint upstream code (vendor/README.md).
-exclude = ["vendor/ringibex", "vendor/rustls-ringibex", "vendor/quinn-proto"]
+exclude = ["vendor/ringalcyon", "vendor/rustls-ringalcyon", "vendor/quinn-proto"]
 
 # T542: quinn-proto vendored and patched here (vendor/README.md); every user in the graph takes it.
 [patch.crates-io]
@@ -28,21 +28,21 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Willy Tarreau and HAProxy contributors"]
 license = "GPL-2.0-or-later"
-repository = "https://github.com/project-ibex/ibex"
+repository = "https://github.com/brhenc/alcyon-lb"
 rust-version = "1.80.0"
 
 [workspace.dependencies]
 # Internal workspace crates
-ibex-alloc = { path = "crates/ibex-alloc" }
-ibex-core = { path = "crates/ibex-core" }
+alcyon-alloc = { path = "crates/alcyon-alloc" }
+alcyon-core = { path = "crates/alcyon-core" }
 ebtree = { path = "crates/ebtree" }
-ibex-stick-table = { path = "crates/ibex-stick-table" }
-ibex-peers = { path = "crates/ibex-peers" }
-ibex-parser = { path = "crates/ibex-parser" }
-ibex-tls = { path = "crates/ibex-tls" }
-ibex-config = { path = "crates/ibex-config" }
-ibex-vtest = { path = "crates/ibex-vtest" }
-ibex-runtime = { path = "crates/ibex-runtime" }
+alcyon-stick-table = { path = "crates/alcyon-stick-table" }
+alcyon-peers = { path = "crates/alcyon-peers" }
+alcyon-parser = { path = "crates/alcyon-parser" }
+alcyon-tls = { path = "crates/alcyon-tls" }
+alcyon-config = { path = "crates/alcyon-config" }
+alcyon-vtest = { path = "crates/alcyon-vtest" }
+alcyon-runtime = { path = "crates/alcyon-runtime" }
 
 # Async & Networking
 tokio = { version = "1.40", features = ["full"] }
@@ -60,20 +60,20 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 regex = "1.10"
 fancy-regex = "0.19"
-ibex-regex = { path = "crates/ibex-regex" }
+alcyon-regex = { path = "crates/alcyon-regex" }
 
 
 # TLS & Cryptography
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 tokio-rustls = "0.26"
-# T440: the TCP TLS path (ibex-tls transport, ibex-rt xprt) on the 0.24 pre-release, whose
+# T440: the TCP TLS path (alcyon-tls transport, alcyon-rt xprt) on the 0.24 pre-release, whose
 # connections decrypt and encrypt in buffers the caller owns. QUIC (quinn-proto 0.11) and the test
 # clients stay on 0.23 above. Pinned exactly: a pre-release (tradeoff.md 6.21).
 rustls24 = { package = "rustls", version = "=0.24.0-dev.2", default-features = false, features = ["webpki"] }
 rustls24-ring = { package = "rustls-ring", version = "=0.24.0-dev.2" }
-# T460: `tune.ibex.crypto-provider ring-ibex`: the zeroizing ring fork (vendor/README.md). Its own
+# T460: `tune.alcyon.crypto-provider ring-alcyon`: the zeroizing ring fork (vendor/README.md). Its own
 # `links` value and C symbol prefix, so it links next to upstream ring.
-rustls24-ringibex = { package = "rustls-ringibex", path = "vendor/rustls-ringibex" }
+rustls24-ringalcyon = { package = "rustls-ringalcyon", path = "vendor/rustls-ringalcyon" }
 
 # CLI & Logging
 tracing = "0.1"
@@ -119,7 +119,7 @@ codegen-units = 1
 # Debug builds (and the tests) keep line tables only: backtraces still name the function and
 # the line, but the ~350 test binaries are half the size and link several times faster
 # (measured 2026-10-10: 26 GB -> 13-14 GB per target; with mold, relinking every test after a
-# change to ibex-rt costs ~180 s of CPU instead of ~1,140 s). Coverage is unaffected: it
+# change to alcyon-rt costs ~180 s of CPU instead of ~1,140 s). Coverage is unaffected: it
 # comes from the instrumentation, not the debug info.
 [profile.dev]
 debug = "line-tables-only"
@@ -133,10 +133,10 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.sha2]
 opt-level = 3
-[profile.dev.package.ibex-crypt]
+[profile.dev.package.alcyon-crypt]
 opt-level = 3
 
-# `ibex_alloc::wipe` runs on every released buffer; at opt-level 0 its volatile stores cost
+# `alcyon_alloc::wipe` runs on every released buffer; at opt-level 0 its volatile stores cost
 # ~0.3 ms per 16 KB and stalled the h2 upload test (T437 5b).
-[profile.dev.package.ibex-alloc]
+[profile.dev.package.alcyon-alloc]
 opt-level = 3

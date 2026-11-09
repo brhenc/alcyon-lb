@@ -7,7 +7,7 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(s) = std::str::from_utf8(data) {
         // bounded: a huge pattern only measures the compiler, not a bug
         if s.len() <= 4096 {
-            let _ = ibex_regex::UserRegex::new(s);
+            let _ = alcyon_regex::UserRegex::new(s);
         }
     }
 });

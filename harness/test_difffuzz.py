@@ -6,7 +6,7 @@
 
 Run:  python3 -m unittest harness/test_difffuzz.py
 
-What must hold: a DIFF whose shape equals that of a `note:ibex-stricter` entry of the
+What must hold: a DIFF whose shape equals that of a `note:alcyon-stricter` entry of the
 baseline is accepted, on any input; a DIFF of another shape is not; an entry tracked by a
 T-number does not make its shape an accepted class; and the committed baseline has the class.
 """
@@ -21,19 +21,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "fuzz"))
 import difffuzz as D  # noqa: E402
 
 FWD = {"fwd": "e3b0c44298fc", "fwd_len": 0}
-STRICTER = {"haproxy": {**FWD, "status": []}, "ibex": {**FWD, "status": ["400"]}}
-TIMEOUT = {"haproxy": {**FWD, "status": []}, "ibex": {**FWD, "status": ["408"]}}
+STRICTER = {"haproxy": {**FWD, "status": []}, "alcyon": {**FWD, "status": ["400"]}}
+TIMEOUT = {"haproxy": {**FWD, "status": []}, "alcyon": {**FWD, "status": ["408"]}}
 
 
 class AcceptedClass(unittest.TestCase):
     def test_shape_of_the_class_is_accepted(self):
-        base = {"a": {"task": "note:ibex-stricter", "shape": STRICTER}}
+        base = {"a": {"task": "note:alcyon-stricter", "shape": STRICTER}}
         self.assertTrue(D.is_accepted(STRICTER, base))
 
     def test_other_shapes_are_not(self):
-        base = {"a": {"task": "note:ibex-stricter", "shape": STRICTER}}
+        base = {"a": {"task": "note:alcyon-stricter", "shape": STRICTER}}
         self.assertFalse(D.is_accepted(TIMEOUT, base))
-        forwarded = {"haproxy": STRICTER["haproxy"], "ibex": {"fwd": "abc", "fwd_len": 5, "status": ["400"]}}
+        forwarded = {"haproxy": STRICTER["haproxy"], "alcyon": {"fwd": "abc", "fwd_len": 5, "status": ["400"]}}
         self.assertFalse(D.is_accepted(forwarded, base))
 
     def test_a_tracked_entry_is_not_a_class(self):

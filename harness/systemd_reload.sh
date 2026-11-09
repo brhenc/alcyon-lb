@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
-# End-to-end hitless reload under a real systemd, using admin/systemd/ibex.service.
+# End-to-end hitless reload under a real systemd, using admin/systemd/alcyon.service.
 #
-# Starts Ibex as a user unit, keeps opening fresh connections against it the whole time,
+# Starts Alcyon as a user unit, keeps opening fresh connections against it the whole time,
 # and in the middle: reloads it several times, reloads it onto a broken configuration,
 # then stops it. Reports every request that did not get a 200, and what systemd believed
 # at each step. A reload that drops anything, or that systemd reads as the service
@@ -11,13 +11,13 @@
 #
 # Needs a systemd user manager (`systemctl --user is-system-running`). Takes ~15s.
 #
-#   harness/systemd_reload.sh [path/to/ibex]
+#   harness/systemd_reload.sh [path/to/alcyon]
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-BIN=$(realpath "${1:-${CARGO_TARGET_DIR:-target}/debug/ibex}")
-TMP=$(mktemp -d /tmp/ibex-sd.XXXXXX)
-UNIT="ibex-e2e-$$"
+BIN=$(realpath "${1:-${CARGO_TARGET_DIR:-target}/debug/alcyon}")
+TMP=$(mktemp -d /tmp/alcyon-sd.XXXXXX)
+UNIT="alcyon-e2e-$$"
 UNITFILE="$HOME/.config/systemd/user/$UNIT.service"
 port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 FE=$(port); BE=$(port)
@@ -38,7 +38,7 @@ python3 -m http.server "$BE" --bind 127.0.0.1 -d "$TMP" >/dev/null 2>&1 &
 BEPID=$!
 mkdir -p "$TMP/conf.d" "$(dirname "$UNITFILE")"
 good_cfg() {
-  cat > "$TMP/ibex.cfg" <<EOF
+  cat > "$TMP/alcyon.cfg" <<EOF
 defaults
   mode http
   timeout connect 2s
@@ -53,12 +53,12 @@ EOF
 }
 good_cfg
 
-sed -e "s|/usr/local/sbin/ibex|$BIN|g" \
-    -e "s|CONFIG=/etc/ibex/ibex.cfg|CONFIG=$TMP/ibex.cfg|" \
-    -e "s|PIDFILE=/run/ibex.pid|PIDFILE=$TMP/ibex.pid|" \
-    -e "s|CFGDIR=/etc/ibex/conf.d|CFGDIR=$TMP/conf.d|" \
+sed -e "s|/usr/local/sbin/alcyon|$BIN|g" \
+    -e "s|CONFIG=/etc/alcyon/alcyon.cfg|CONFIG=$TMP/alcyon.cfg|" \
+    -e "s|PIDFILE=/run/alcyon.pid|PIDFILE=$TMP/alcyon.pid|" \
+    -e "s|CFGDIR=/etc/alcyon/conf.d|CFGDIR=$TMP/conf.d|" \
     -e "/^EnvironmentFile=/d" \
-    admin/systemd/ibex.service > "$UNITFILE"
+    admin/systemd/alcyon.service > "$UNITFILE"
 systemctl --user daemon-reload
 
 echo "=== start ==="
@@ -108,8 +108,8 @@ for i in 1 2 3; do
 done
 
 echo "=== reload onto a broken configuration ==="
-cp "$TMP/ibex.cfg" "$TMP/ibex.cfg.good"
-printf 'frontend fe\n  this-is-not-a-keyword\n' > "$TMP/ibex.cfg"
+cp "$TMP/alcyon.cfg" "$TMP/alcyon.cfg.good"
+printf 'frontend fe\n  this-is-not-a-keyword\n' > "$TMP/alcyon.cfg"
 if systemctl --user reload "$UNIT" 2>/dev/null; then
   note_fail "systemctl reload succeeded on a broken configuration"
 else
@@ -121,7 +121,7 @@ echo "state=$(show ActiveState)/$(show SubState) MainPID=$(show MainPID) status=
 [ "$(show MainPID)" = "$prev" ] || note_fail "MainPID changed on a failed reload"
 [ "$(show SubState)" = running ] || note_fail "not running after a failed reload"
 case "$(show StatusText)" in *"Reload failed"*) ;; *) note_fail "systemd was not told the reload failed" ;; esac
-cp "$TMP/ibex.cfg.good" "$TMP/ibex.cfg"
+cp "$TMP/alcyon.cfg.good" "$TMP/alcyon.cfg"
 
 echo "=== reload after the failure ==="
 systemctl --user reload "$UNIT" || note_fail "reload after failure"

@@ -4,12 +4,12 @@
 |---|---|
 | Found by | V&V, 2026-10-31 (ledger row on `vv/ledger-1101` 0444e120), A1 dry run on main 61bb0771 |
 | Severity | medium: a difference from HAProxy; no crash, no leak; connections fail |
-| Affects | every Ibex with QUIC since the listener was written; not a regression of tonight's quinn work (b7e5bfc1, before T542, fails the same way) |
+| Affects | every Alcyon with QUIC since the listener was written; not a regression of tonight's quinn work (b7e5bfc1, before T542, fails the same way) |
 | Fix | T552 (`tasks/T552-quic-wildcard-source-address.md`) |
 
 ## What goes wrong
 
-With QUIC bound to every address, e.g. `bind quic4@0.0.0.0:443`, Ibex sends its replies from
+With QUIC bound to every address, e.g. `bind quic4@0.0.0.0:443`, Alcyon sends its replies from
 whatever source address the kernel picks for the route back to the client, not from the address the
 client sent to. On a host with one address the two are the same and nothing shows. On a host with
 secondary or floating addresses (a VIP, keepalived, several IPv6 addresses on one interface) they
@@ -17,20 +17,20 @@ differ. A client on a connected UDP socket, which is what curl, browsers and mos
 only accepts datagrams from the address it connected to. It drops our replies, so the handshake never
 completes.
 
-Reproduction (V&V): Ibex with `bind quic4@0.0.0.0:<port>`, then
+Reproduction (V&V): Alcyon with `bind quic4@0.0.0.0:<port>`, then
 `curl --http3-only https://127.0.0.2:<port>/` times out (rc=28) on the mux and the relay. The same
 config on HAProxy 3.5-dev10 returns 200. The dev10 reg-test `reg-tests/quic/retry_wildcard.vtc` fails
-on Ibex, also with `quic-force-retry` removed.
+on Alcyon, also with `quic-force-retry` removed.
 
 ## Why
 
 The receive side is right: the listener enables `IP_PKTINFO` / `IPV6_RECVPKTINFO`
-(`crates/ibex-mmsg/src/lib.rs` `set_ip_pktinfo` ~319, `set_ipv6_recvpktinfo` ~343) and reads each
+(`crates/alcyon-mmsg/src/lib.rs` `set_ip_pktinfo` ~319, `set_ipv6_recvpktinfo` ~343) and reads each
 datagram's destination address from the cmsg (~95-101). It hands that address to quinn, and quinn puts
 it in each outgoing `Transmit.src_ip`.
 
-The send side drops it. `crates/ibex-rt/src/quic_listener.rs` ~719-735 copies `tx.src_ip` into
-`DgramOut.src_addr`, but `ibex_mmsg::sendmmsg` never reads that field: it always sets
+The send side drops it. `crates/alcyon-rt/src/quic_listener.rs` ~719-735 copies `tx.src_ip` into
+`DgramOut.src_addr`, but `alcyon_mmsg::sendmmsg` never reads that field: it always sets
 `msg_control = NULL, msg_controllen = 0` (~282-283). With no `IP_PKTINFO` (`ipi_spec_dst`) /
 `IPV6_PKTINFO` cmsg, the kernel chooses the source. That breaks AGENTS.md §5, "a field populated and
 never read": the source address was computed per datagram and thrown away at the last step.

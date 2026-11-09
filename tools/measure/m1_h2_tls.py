@@ -71,10 +71,10 @@ if __name__ == "__main__":
     pem = m.make_cert()
     o, op = m.start_origin()
     try:
-        for kind in ("ibex", "haproxy"):
+        for kind in ("alcyon", "haproxy"):
             med, rs = m.median_of(lambda: h2(kind, op, pem))
             m.emit(param="h2_cpu", kind=kind, **med)
-        for kind in ("ibex", "haproxy"):
+        for kind in ("alcyon", "haproxy"):
             med, rs = m.median_of(lambda: tls(kind, op, pem))
             m.emit(param="tls_handshake", kind=kind, **med)
     finally:

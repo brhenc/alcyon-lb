@@ -3,7 +3,7 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 """M1: backend connections opened per second under uneven load (T214).
 
-The scenario of crates/ibex-rt/tests/idle_pool_shared.rs (T159 B): `http-reuse always`, one
+The scenario of crates/alcyon-rt/tests/idle_pool_shared.rs (T159 B): `http-reuse always`, one
 server, one request per client connection, so which worker thread a client lands on is up to
 the listener (uneven by construction); a backend that counts the connections it accepts.
     tools/measure/m1_uneven_load.py [--threads 4,16] [--seconds 10] [--runs 3]
@@ -13,7 +13,7 @@ Scenarios, each on a fresh proxy:
   wrk    wrk2 -t2 -c100 -R1000 `Connection: close` on /slow, --seconds: conns accepted per second
   burst  cycles of {16 concurrent /slow (50 ms) clients, 20 sequential clients 10 ms apart}
          for --seconds; backend connections accepted per second and in total
-Ibex and HAProxy runs are interleaved; ratio = ibex / haproxy.
+Alcyon and HAProxy runs are interleaved; ratio = alcyon / haproxy.
 """
 import argparse
 import os
@@ -156,16 +156,16 @@ def main():
     print(m.header("m1_uneven_load"), f"seconds={a.seconds}", flush=True)
     m.wait_load(limit=16, patience=30)
     for nt in [int(x) for x in a.threads.split(",")]:
-        res = {"ibex": [], "haproxy": []}
+        res = {"alcyon": [], "haproxy": []}
         for run in range(a.runs):
-            for kind in ("ibex", "haproxy"):
+            for kind in ("alcyon", "haproxy"):
                 r = once(kind, nt, a.seconds)
                 res[kind].append(r)
                 m.emit(param="uneven", nbthread=nt, kind=kind, run=run, **r)
         med = {k: {f: statistics.median(r[f] for r in rs) for f in rs[0]} for k, rs in res.items()}
-        m.emit(param="uneven-median", nbthread=nt, ibex=med["ibex"], haproxy=med["haproxy"],
-               ratio_burst_conns_per_s=med["ibex"]["burst_conns_per_s"] / med["haproxy"]["burst_conns_per_s"],
-               ratio_wrk_conns_per_s=med["ibex"]["wrk_conns_per_s"] / med["haproxy"]["wrk_conns_per_s"])
+        m.emit(param="uneven-median", nbthread=nt, alcyon=med["alcyon"], haproxy=med["haproxy"],
+               ratio_burst_conns_per_s=med["alcyon"]["burst_conns_per_s"] / med["haproxy"]["burst_conns_per_s"],
+               ratio_wrk_conns_per_s=med["alcyon"]["wrk_conns_per_s"] / med["haproxy"]["wrk_conns_per_s"])
 
 
 if __name__ == "__main__":

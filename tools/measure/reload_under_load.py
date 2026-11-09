@@ -4,15 +4,15 @@
 
 """Reload under load (T166, M1 operations parameter "Reload").
 
-Runs either HAProxy or Ibex with -W, puts constant keep-alive h1 load, a few long
+Runs either HAProxy or Alcyon with -W, puts constant keep-alive h1 load, a few long
 downloads and one WebSocket through it, sends SIGUSR2 every --interval seconds,
 --reloads times, then SIGUSR1 with a download in flight. Prints what an operator
 observes: failed requests, resets, old-process drain times, WebSocket lifetime after
 the reload that retired its process, RSS and fd count of the master (HAProxy) or of the
-serving process (Ibex, which has no master).
+serving process (Alcyon, which has no master).
 
     tools/measure/reload_under_load.py --binary /path/haproxy --kind haproxy --reloads 100
-    tools/measure/reload_under_load.py --binary target/debug/ibex --kind ibex --reloads 100
+    tools/measure/reload_under_load.py --binary target/debug/alcyon --kind alcyon --reloads 100
 
 Exit 0 when every criterion holds, 1 otherwise; --json writes the numbers.
 
@@ -341,7 +341,7 @@ def children(pid):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", required=True)
-    ap.add_argument("--kind", choices=("haproxy", "ibex"), required=True)
+    ap.add_argument("--kind", choices=("haproxy", "alcyon"), required=True)
     ap.add_argument("--reloads", type=int, default=10)
     ap.add_argument("--interval", type=float, default=1.0)
     ap.add_argument("--hard-stop-after", type=float, default=4.0)
@@ -349,7 +349,7 @@ def main():
     ap.add_argument("--downloads", type=int, default=2)
     ap.add_argument("--json")
     ap.add_argument("--nbthread", type=int, default=1,
-                    help="global nbthread (Ibex defaults to 1, HAProxy to the CPU count)")
+                    help="global nbthread (Alcyon defaults to 1, HAProxy to the CPU count)")
     a = ap.parse_args()
 
     bport = start_backend()

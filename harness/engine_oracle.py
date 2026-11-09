@@ -13,7 +13,7 @@ import hashlib
 import re
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BINARY = os.path.join(REPO, "target", "debug", "ibex")
+BINARY = os.path.join(REPO, "target", "debug", "alcyon")
 
 def get_free_port():
     import socket
