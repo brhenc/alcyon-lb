@@ -118,8 +118,8 @@ fn forwards_bytes_in_both_directions() {
         b"HELLO_ALCYON".to_vec(),
         "payload must round-trip byte-exact through the proxy"
     );
-    assert_eq!(sess.bytes_in, 10);
-    assert_eq!(sess.bytes_out, 10);
+    assert_eq!(sess.bytes_in, 12);
+    assert_eq!(sess.bytes_out, 12);
     bh.join().ok();
 }
 
