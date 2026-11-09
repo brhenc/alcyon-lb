@@ -1,0 +1,45 @@
+==> Starting Alcyon Continuous Measurement Suite [FULL mode]...
+[1/5] Measuring allocations per request (tools/allocprofile)...
+[2/5] Measuring alcyon binary and .text section size...
+[3/5] Measuring 1-connection keep-alive throughput, A/B against f01d5ecb019a...
+      this build [19451, 18894, 19934, 19880] median 19,665; reference [19756, 19809, 19931, 19752] median 19,782
+      1-conn modes: one (no step wider than 12% between samples)
+      alcyon CPU ns/req at 50 conns: this build [16192, 15646, 15639, 15603] median 15,642; reference [15716, 15582, 15655, 15974] median 15,685
+      kernel instructions/req keepalive: n/a (perf cannot count instructions:k here)
+      instructions/req keepalive, ab1 (judged, min of 5): this build [35115, 35107, 35067, 35107, 35107]; reference [35115, 35106, 35070, 35107, 35107]; mb50 (reported): 28,023 vs 28,023
+      kernel instructions/req rules: n/a (perf cannot count instructions:k here)
+      instructions/req rules, ab1 (judged, min of 5): this build [50546, 50539, 50464, 50540, 50539]; reference [50556, 50548, 50479, 50548, 50548]; mb50 (reported): 42,269 vs 42,261
+[4/5] Measuring 50-connection throughput and CPU % (alcyon rps_50conn)...
+      Measuring 60,000 backend memory footprint...
+      Measuring HAProxy side-by-side throughput...
+[5/5] Running VTC regression test suite (harness/vtc_runner.py)...
+
+================================================================================
+                       ALCYON CONTINUOUS MEASUREMENT
+================================================================================
+Git SHA:     e98d04434f5f (dirty: True)
+Timestamp:   2026-11-09T12:45:30Z
+System Load: 1.26 (1-min avg), Active AGY sessions: 0
+
+Metric                              Current       Previous      Delta   Status    
+--------------------------------------------------------------------------------
+Allocations / req                         0              0          0   PASS      
+Bytes / req                               0              0      +0.0%   PASS      
+1-conn Throughput                    19,665   19,782 (ref)      -0.6%   PASS      
+50-conn alcyon CPU / req             15,642   15,685 (ref)      -0.3%   PASS      
+Instructions / req (keepalive, ab1)         35,067   35,070 (ref)      -0.0%   PASS      
+Instructions / req (rules, ab1)         50,464   50,479 (ref)      -0.0%   PASS      
+50-conn Throughput                  370,745         29,408   +1160.7%   PASS      
+50-conn CPU                         1840.7%          63.5%   +1777.2%   PASS      
+VTC Reg-tests Pass                      151              7       +144   PASS      
+  (Fail: 77, Skip: 71, Scope: 69)
+Binary Size                       171.45 MB 171.45 MB (ref)      -0.0%   PASS      
+Text Section Size                    8.7 MB   8.7 MB (ref)      +0.0%   PASS      
+60k Backend Memory                 18.59 MB       15.84 MB     +17.4%   FAIL (>10% inc / >20MB)
+HAProxy 1-conn Throughput            17,390          9,736     +78.6%   INFO      
+HAProxy 50-conn Throughput          282,775        276,758      +2.2%   INFO      
+--------------------------------------------------------------------------------
+Verdict: FAIL (1 regression detected!)
+================================================================================
+Total Wall Time: 445.19s
+

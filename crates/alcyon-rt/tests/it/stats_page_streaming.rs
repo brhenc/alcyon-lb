@@ -97,7 +97,12 @@ fn start_full(tag: &str, global: &str, nb: usize, per: usize, tls: bool, quic: b
     let child = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(&cfg).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(common::Alcyon).expect("spawn alcyon");
     let setup = Setup { child, st, ping, sock, cfg, tls, quic };
     let deadline = Instant::now() + Duration::from_secs(60);
-    while TcpStream::connect(ping).is_err() || UnixStream::connect(&setup.sock).is_err() {
+    // Every TCP listener the tests connect to, not only `ping`: each is bound on its own, and the
+    // TLS frontend could still refuse a connection after `ping` accepted one (2026-11-09, 1 in 3
+    // runs of h2_tls_page_is_streamed_with_bounded_memory alone).
+    let tls_addr = setup.tls.as_ref().map(|t| t.0);
+    let up = |a: SocketAddr| TcpStream::connect(a).is_ok();
+    while !up(ping) || !up(st) || !tls_addr.map_or(true, up) || UnixStream::connect(&setup.sock).is_err() {
         assert!(Instant::now() < deadline, "alcyon never started listening");
         std::thread::sleep(Duration::from_millis(20));
     }

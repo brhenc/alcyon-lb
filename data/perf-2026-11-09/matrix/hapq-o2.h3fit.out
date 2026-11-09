@@ -1,0 +1,6 @@
+hapq-o2-h3fit: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+hapq-o2-h3fit round 1: best 55137 ins/req at 1.0000 dgrams/req, worst 64089 at 2.0196, fit 63653 ins/req at 1.97
+hapq-o2-h3fit round 2: best 55161 ins/req at 1.0000 dgrams/req, worst 64078 at 2.0196, fit 63645 ins/req at 1.97
+hapq-o2-h3fit round 3: best 55123 ins/req at 1.0000 dgrams/req, worst 64267 at 2.0196, fit 63823 ins/req at 1.97
+hapq-o2-h3fit h3fit: fit 63653 ins/req at 1.97 client dgrams/req (median of 3, spread 0.28%); best 55137 at 1.0000, worst 64089 at 2.0196
+hapq-o2-h3fit done (proxy pid 1213098 and backend pid 1213096 stopped)

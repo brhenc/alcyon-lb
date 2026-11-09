@@ -1,0 +1,13 @@
+a-keepalive-mb50: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+a-keepalive-mb50 round 1: 562113070 instructions, 28105 ins/req
+a-keepalive-mb50 round 1 kernel: n/a
+a-keepalive-mb50 round 2: 592378161 instructions, 29618 ins/req
+a-keepalive-mb50 round 2 kernel: n/a
+a-keepalive-mb50 round 3: 592215110 instructions, 29610 ins/req
+a-keepalive-mb50 round 3 kernel: n/a
+a-keepalive-mb50 round 4: 592184288 instructions, 29609 ins/req
+a-keepalive-mb50 round 4 kernel: n/a
+a-keepalive-mb50 round 5: 561966859 instructions, 28098 ins/req
+a-keepalive-mb50 round 5 kernel: n/a
+a-keepalive-mb50 summary (min of 5): user 28098, kernel n/a, total n/a ins/req
+a-keepalive-mb50 done (proxy pid 730527 and backend pid 730524 stopped)

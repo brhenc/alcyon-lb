@@ -1,0 +1,13 @@
+alcyon-rp-keepalive: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+alcyon-rp-keepalive round 1: 702383067 instructions, 35119 ins/req
+alcyon-rp-keepalive round 1 kernel: n/a
+alcyon-rp-keepalive round 2: 702156070 instructions, 35107 ins/req
+alcyon-rp-keepalive round 2 kernel: n/a
+alcyon-rp-keepalive round 3: 702153056 instructions, 35107 ins/req
+alcyon-rp-keepalive round 3 kernel: n/a
+alcyon-rp-keepalive round 4: 702139215 instructions, 35106 ins/req
+alcyon-rp-keepalive round 4 kernel: n/a
+alcyon-rp-keepalive round 5: 702149694 instructions, 35107 ins/req
+alcyon-rp-keepalive round 5 kernel: n/a
+alcyon-rp-keepalive summary (min of 5): user 35106, kernel n/a, total n/a ins/req
+alcyon-rp-keepalive done (proxy pid 1194445 and backend pid 1194418 stopped)

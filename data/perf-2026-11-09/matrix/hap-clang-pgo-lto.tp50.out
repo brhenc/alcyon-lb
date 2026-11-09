@@ -1,0 +1,3 @@
+hap-clang-pgo-lto tp50 load-start 2.02 2.02 2.83
+hap-clang-pgo-lto tp50 requests/s: median 36274 min 36174 max 36294 of 5 [36273.90242534519, 36294.06480158346, 36174.02463777928, 36284.937400908166, 36239.86546428271]
+hap-clang-pgo-lto tp50 load-end 2.53 2.14 2.85

@@ -1,0 +1,8 @@
+a-h3-h3fit: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+a-h3-h3fit round 1: best 73590 ins/req at 1.0000 dgrams/req, worst 83708 at 2.0768, fit 82705 ins/req at 1.97
+a-h3-h3fit round 2: best 72926 ins/req at 1.0000 dgrams/req, worst 83578 at 2.0768, fit 82522 ins/req at 1.97
+a-h3-h3fit round 3: best 73072 ins/req at 1.0000 dgrams/req, worst 83743 at 2.0768, fit 82684 ins/req at 1.97
+a-h3-h3fit round 4: best 73079 ins/req at 1.0000 dgrams/req, worst 83903 at 2.0768, fit 82829 ins/req at 1.97
+a-h3-h3fit round 5: best 73090 ins/req at 1.0000 dgrams/req, worst 83945 at 2.0768, fit 82869 ins/req at 1.97
+a-h3-h3fit h3fit: fit 82705 ins/req at 1.97 client dgrams/req (median of 5, spread 0.42%); best 73079 at 1.0000, worst 83743 at 2.0768
+a-h3-h3fit done (proxy pid 789333 and backend pid 789331 stopped)

@@ -1,0 +1,13 @@
+hap-o2-keepalive: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+hap-o2-keepalive round 1: 722507166 instructions, 36125 ins/req
+hap-o2-keepalive round 1 kernel: n/a
+hap-o2-keepalive round 2: 722148996 instructions, 36107 ins/req
+hap-o2-keepalive round 2 kernel: n/a
+hap-o2-keepalive round 3: 722271786 instructions, 36113 ins/req
+hap-o2-keepalive round 3 kernel: n/a
+hap-o2-keepalive round 4: 722184070 instructions, 36109 ins/req
+hap-o2-keepalive round 4 kernel: n/a
+hap-o2-keepalive round 5: 722023804 instructions, 36101 ins/req
+hap-o2-keepalive round 5 kernel: n/a
+hap-o2-keepalive summary (min of 5): user 36101, kernel n/a, total n/a ins/req
+hap-o2-keepalive done (proxy pid 1198407 and backend pid 1198405 stopped)

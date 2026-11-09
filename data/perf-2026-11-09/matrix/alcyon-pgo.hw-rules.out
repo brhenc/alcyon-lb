@@ -1,0 +1,10 @@
+alcyon-pgo ab1 per request (median of rounds, min PMU run 100.0%):
+  cycles:u                                     26419.2
+  instructions:u                               42474.1
+  L1-dcache-load-misses:u                        976.2
+  L1-icache-load-misses:u                        180.7
+  branch-misses:u                                148.7
+  l2_cache_req_stat.ic_dc_miss_in_l2:u          2131.3
+Traceback (most recent call last):
+  File "<stdin>", line 14, in <module>
+KeyError: 'instructions:k'

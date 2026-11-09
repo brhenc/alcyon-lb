@@ -1,0 +1,6 @@
+hapq-clang-pgo-lto-h3fit: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+hapq-clang-pgo-lto-h3fit round 1: best 45385 ins/req at 1.0000 dgrams/req, worst 53170 at 2.0196, fit 52792 ins/req at 1.97
+hapq-clang-pgo-lto-h3fit round 2: best 45411 ins/req at 1.0000 dgrams/req, worst 53165 at 2.0196, fit 52788 ins/req at 1.97
+hapq-clang-pgo-lto-h3fit round 3: best 45365 ins/req at 1.0000 dgrams/req, worst 53320 at 2.0196, fit 52933 ins/req at 1.97
+hapq-clang-pgo-lto-h3fit h3fit: fit 52792 ins/req at 1.97 client dgrams/req (median of 3, spread 0.27%); best 45385 at 1.0000, worst 53170 at 2.0196
+hapq-clang-pgo-lto-h3fit done (proxy pid 1214151 and backend pid 1214123 stopped)

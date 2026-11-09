@@ -1,0 +1,13 @@
+hap-pgo-lto-keepalive: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+hap-pgo-lto-keepalive round 1: 640166570 instructions, 32008 ins/req
+hap-pgo-lto-keepalive round 1 kernel: n/a
+hap-pgo-lto-keepalive round 2: 639821397 instructions, 31991 ins/req
+hap-pgo-lto-keepalive round 2 kernel: n/a
+hap-pgo-lto-keepalive round 3: 639877833 instructions, 31993 ins/req
+hap-pgo-lto-keepalive round 3 kernel: n/a
+hap-pgo-lto-keepalive round 4: 639878394 instructions, 31993 ins/req
+hap-pgo-lto-keepalive round 4 kernel: n/a
+hap-pgo-lto-keepalive round 5: 639646469 instructions, 31982 ins/req
+hap-pgo-lto-keepalive round 5 kernel: n/a
+hap-pgo-lto-keepalive summary (min of 5): user 31982, kernel n/a, total n/a ins/req
+hap-pgo-lto-keepalive done (proxy pid 1206599 and backend pid 1206596 stopped)

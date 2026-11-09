@@ -4,108 +4,156 @@ Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 -->
 # Performance: Alcyon against HAProxy
 
-Measured 2026-11-09 on Alcyon `3ea291cb` against HAProxy 3.5-dev8 (HTTP/1, HTTP/2, TLS) and
-3.5-dev10 (HTTP/3), on one quiet host. Every figure below comes from the same harness, client
-and backend for both proxies. The previous version of this file (2026-10-02, when Alcyon used
-16-18% more CPU per request than HAProxy) is in `docs/history/performance-2026-10-02.md`.
+Measured 2026-11-09 on one quiet host. Alcyon is `3ea291cb`. HAProxy is 3.5-dev8 for HTTP/1,
+HTTP/2 and TLS, and 3.5-dev10 for HTTP/3. Every figure comes from the same harness, client,
+backend and configuration file for both proxies. The previous version of this file
+(2026-10-02, when Alcyon used 16-18% more CPU per request than HAProxy) is in
+`docs/history/performance-2026-10-02.md`.
 
 These figures are for one small, synthetic workload: an empty `GET /`, a 200 response, one
 core. They say where the per-request cost stands. They do not say how either proxy behaves
 under real traffic, with many cores, or with large bodies.
 
+## Built the same way
+
+A default HAProxy build is `-O2` without link-time optimisation. Alcyon's measured build is
+fat LTO. Comparing those two would credit the language with what the build did. So HAProxy was
+built seven ways from the reference sources (`tools/measure/haproxy-variants.sh`), and Alcyon
+two ways:
+
+| Build | Compiler | Optimisation |
+|---|---|---|
+| `alcyon-rp` | rustc 1.99.1 (LLVM) | `--profile release-perf`: fat LTO, 1 codegen unit |
+| `alcyon-pgo` | rustc 1.99.1 (LLVM) | release-perf plus PGO (`tools/pgo-build.sh`) |
+| `hap-o2` | gcc 16.2 | HAProxy's defaults, `-O2 -fwrapv` (the reference binary's flags) |
+| `hap-o2-jit` | gcc 16.2 | `-O2` with `USE_PCRE2_JIT=1`, as distribution packages ship it |
+| `hap-lto` | gcc 16.2 | `-O2 -flto=auto` |
+| `hap-pgo` | gcc 16.2 | `-O2` plus PGO |
+| `hap-pgo-lto` | gcc 16.2 | `-O2 -flto=auto` plus PGO |
+| `hap-clang-lto` | clang 23.1 (LLVM) | `-O2 -flto=full`, lld |
+| `hap-clang-pgo-lto` | clang 23.1 (LLVM) | `-O2 -flto=full` plus PGO |
+
+- **PGO training is the same for every PGO build.** Each is trained on one request mix: the
+  `train()` function of `tools/pgo-build.sh`, run against `tools/pgo/train.cfg`, with the
+  HTTP/3 part only for the QUIC build.
+- **The clang builds use the same LLVM backend as rustc.** So `alcyon-pgo` against
+  `hap-clang-pgo-lto` is the closest this setup gets to the language against the language.
+  The gcc against clang rows show how much the compiler alone moves HAProxy.
+- **The TLS library is still not the same.** Alcyon uses ring under rustls 0.24; HAProxy uses
+  OpenSSL 3.5. The HTTP/2-over-TLS rows include that difference.
+
 ## Setup
 
-- **Host:** AMD EPYC 7542 (32 cores), Linux 7.2.15, governor `performance`. Nothing else ran
-  (checked before and after, `/tmp/alcyon-load.lock` held).
-- **Pinning:** proxy on CPU 4, client on 5, backend on 6 (one L3 group), `nbthread 1`.
-- **Alcyon:** `cargo build --profile release-perf` (fat LTO, `codegen-units = 1`), rustc 1.99.1;
-  TLS is rustls 0.24 with ring.
-- **HAProxy:** built from source with its defaults: `CFLAGS = -O2 -g -fwrapv`, OpenSSL 3.5.8
-  (3.5.9 for the QUIC build), PCRE2 without JIT.
-- **Configurations:** `tools/measure/scenarios/*.body`. The same file runs on both proxies.
-  `keepalive` is a plain proxy; `rules` adds a typical set of `http-request` /
-  `http-response` rules; `tls` terminates TLS; `h3` binds QUIC.
+- **Host:** AMD EPYC 7542, Linux 7.2.15, governor `performance`. No other load: checked before
+  and after every run, with `/tmp/alcyon-load.lock` held.
+- **Pinning:** proxy on CPU 4, client on 5, backend on 6, `nbthread 1`. The configurations are
+  `tools/measure/scenarios/*.body`:
+  - `keepalive`: a plain HTTP/1.1 keep-alive proxy;
+  - `rules`: adds a typical set of `http-request` / `http-response` rules, including one
+    `path_reg`;
+  - `tls`: HTTP/2 over TLS with `h2load -c 1 -m 1`;
+  - `h3`: HTTP/3, measured with `h3fit`.
+- **Instructions** per request (`insreq.sh`, user space, minimum of 5 rounds) vary by under 0.3%
+  between runs.
+- **Cycles** per request (`hwcounters.sh`, user space, median of 5 rounds) are closer to time,
+  but code layout moves them. `hap-o2` and `hap-o2-jit` run the same code for `keepalive`, which
+  has no regex: 36,101 against 36,100 instructions, yet 36,468 against 39,395 cycles. **Read a
+  difference in cycles under about 8% as noise.**
+- **Kernel counters:** this host does not allow counting kernel instructions or cycles, so
+  neither appears here.
 
-Instructions per request (`tools/measure/insreq.sh`, `perf stat -e instructions:u` on the proxy
-process, minimum of 5 rounds) are the figure the project budgets on. They vary by under 0.3%
-between runs, where wall time varies by a few percent. They are user-space only, because this
-host does not allow counting kernel instructions. Fewer instructions is not the same as less
-time: the CPU-time figures are below.
+## Like for like
 
-## Instructions per request
+Instructions and cycles per request, user space. Lower is better.
 
-| Workload | Client | HAProxy | Alcyon | Alcyon vs HAProxy |
-|---|---|---:|---:|---:|
-| HTTP/1.1 keep-alive | 1 connection (`ab -k -c 1`) | 36,100 | 35,104 | -2.8% |
-| HTTP/1.1 keep-alive | 50 connections (`measure-bench`) | 32,637 | 28,098 | -13.9% |
-| HTTP/1.1 with rules | 1 connection | 43,711 | 50,492 | **+15.5%** |
-| HTTP/1.1 with rules | 50 connections | 41,438 | 42,373 | +2.3% |
-| HTTPS keep-alive | 1 connection (`ab1s`) | 49,354 | 41,211 | -16.5% |
-| HTTPS, one handshake per request | 1 connection (`hs1`) | 2,997,694 | 1,441,002 | -51.9% |
-| HTTP/2 over TLS | 1 connection, 1 stream (`h2load`) | 53,161 | 50,660 | -4.7% |
-| HTTP/3 | 1 connection (`h3fit`, at 1.97 client datagrams/request) | 63,783 | 82,705 | **+29.7%** |
+| Comparison | keep-alive | rules | HTTP/2 over TLS | HTTP/3 |
+|---|---:|---:|---:|---:|
+| **Best against best:** `alcyon-pgo` / `hap-clang-pgo-lto`, instructions | 29,494 / 30,638 (−4%) | 42,473 / 36,922 (**+15%**) | 44,051 / 47,205 (−7%) | 71,810 / 52,792 (**+36%**) |
+| the same, cycles | 19,654 / 20,401 (−4%) | 26,419 / 25,708 (+3%) | 29,340 / 40,938 (−28%) | |
+| **Same compiler, no PGO:** `alcyon-rp` / `hap-clang-lto`, instructions | 35,106 / 37,661 (−7%) | 50,490 / 45,392 (+11%) | 50,553 / 55,039 (−8%) | 82,983 / 64,169 (+29%) |
+| the same, cycles | 28,611 / 35,200 (−19%) | 44,865 / 44,888 (0%) | 48,434 / 70,480 (−31%) | |
+| **Default builds:** `alcyon-rp` / `hap-o2`, instructions | 35,106 / 36,101 (−3%) | 50,490 / 43,710 (+16%) | 50,553 / 52,772 (−4%) | 82,983 / 63,653 (+30%) |
 
-Notes:
+HTTP/3 is instructions only (`h3fit`, at 1.97 client datagrams per request, median of 3).
+HAProxy's QUIC is its own implementation; Alcyon's is vendored quinn-proto.
 
-- **TLS handshakes** compare two cryptography libraries (ring under rustls against OpenSSL 3.5)
-  as much as two proxies. The figure counts only the proxy's user-space instructions, so the
-  handshake's kernel work is not in it.
-- **HTTP/3** is measured with Alcyon's own client (`tools/measure/h3bench`, T555), because
-  `h2load`'s acknowledgement pattern varies too much between rounds. The client's datagram
-  rate is fixed by fitting two runs, as `insreq.sh` describes. Alcyon's QUIC is quinn-proto
-  (vendored); HAProxy's is its own.
-- **Rules at one connection** is the largest HTTP/1 gap. At 50 connections it shrinks to 2.3%,
-  so most of it is a fixed cost paid on every wakeup rather than work done per rule.
+What it shows:
 
-## CPU time and throughput, one core
+- **Plain proxying (keep-alive):** Alcyon is level with HAProxy or slightly ahead in every
+  pairing. The cycles gap without PGO (−19%) is larger than the noise. With PGO both proxies
+  gain 30-40% and end within 4% of each other.
+- **Rules:** HAProxy executes 11-16% fewer instructions in every pairing. In cycles the two are
+  level (0% and +3%), so Alcyon's extra instructions are cheap ones. PCRE2's JIT changes little
+  here: `hap-o2-jit` saves 178 instructions per request over `hap-o2`.
+- **HTTP/2 over TLS:** Alcyon's lead in cycles (−28 to −31%) is mostly the TLS library (ring
+  against OpenSSL 3.5), not the proxy. The instruction gap is smaller (−7%).
+- **HTTP/3** is the clear gap: 29-36% more instructions than HAProxy in every pairing.
+- **PGO matters more than the language.** It cuts 30-45% of cycles for both proxies. With PGO
+  and LTO on both, gcc and clang end within 7% of each other on HAProxy for HTTP/1, and 12% in
+  cycles on TLS, and clang PGO+LTO is
+  HAProxy's best build in every column.
 
-From `measure_ab` (`tools/measure/measure.py`), the gate's own A/B, with HAProxy as the second
-binary. It runs 6 rounds in alternating order, with a fresh proxy for each sample, on the
-`keepalive` configuration.
+## Every build
 
-| | HAProxy | Alcyon | |
+| Build | keep-alive ins | rules ins | h2 TLS ins | keep-alive cycles | rules cycles | h2 TLS cycles | IPC keep-alive | req/s 1 conn | req/s 50 conn |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| alcyon-rp | 35,106 | 50,490 | 50,553 | 28,611 | 44,865 | 48,434 | 1.23 | 18,783 | 37,204 |
+| alcyon-pgo | 29,494 | 42,473 | 44,051 | 19,654 | 26,419 | 29,340 | 1.51 | 19,824 | 43,782 |
+| hap-o2 | 36,101 | 43,710 | 52,772 | 36,468 | 43,112 | 71,254 | 0.99 | 17,819 | 34,075 |
+| hap-o2-jit | 36,100 | 43,532 | 52,773 | 39,395 | 45,256 | 71,539 | 0.92 | 17,768 | 34,425 |
+| hap-lto | 35,559 | 43,156 | 52,452 | 35,984 | 44,185 | 70,523 | 0.99 | 17,837 | 34,167 |
+| hap-pgo | 33,322 | 40,309 | 49,728 | 22,501 | 28,143 | 47,394 | 1.48 | 19,318 | 36,088 |
+| hap-pgo-lto | 31,982 | 38,765 | 48,359 | 21,896 | 27,514 | 45,999 | 1.46 | 19,282 | 36,268 |
+| hap-clang-lto | 37,661 | 45,392 | 55,039 | 35,200 | 44,888 | 70,480 | 1.07 | 17,917 | 34,329 |
+| hap-clang-pgo-lto | 30,638 | 36,922 | 47,205 | 20,401 | 25,708 | 40,938 | 1.50 | 19,442 | 36,274 |
+
+HTTP/3 instructions per request, by build: alcyon-rp 82,983; alcyon-pgo 71,810; hap o2 63,653;
+lto 62,352; pgo 58,955; pgo-lto 56,708; clang-lto 64,169; clang-pgo-lto 52,792.
+
+- **Requests per second** are the keep-alive scenario: `ab -k -c 1`, and `measure-bench` with
+  50 connections, median of 5. They are timing figures, valid because the host was quiet.
+- **At 50 connections** the client shares the machine and may limit both proxies, so these
+  differences are a lower bound.
+
+## Default builds, other workloads
+
+Measured the same day on `alcyon-rp` against `hap-o2` (the reference binary) only.
+
+| Workload | HAProxy `-O2` | Alcyon release-perf | |
 |---|---:|---:|---:|
-| CPU per request, 50 connections | 16.35 µs | 15.67 µs | -4.2% |
-| Requests/s, 1 connection | 18,495 | 19,774 | +6.9% |
-
-- **CPU per request at 50 connections** is the proxy's own CPU time (from `/proc/<pid>/schedstat`)
-  over a fixed number of requests. It is the figure to compare: the proxy is busy and rarely
-  sleeps.
-- **Requests/s at 1 connection** also measures how quickly each proxy goes to sleep and wakes
-  up again between requests.
-- **Samples:** HAProxy 16,539 / 16,456 / 16,367 / 16,323 / 16,326 / 16,288 ns; Alcyon 15,604 /
-  15,722 / 15,707 / 15,719 / 15,624 / 15,605 ns.
+| keep-alive, 50 connections, instructions | 32,637 | 28,098 | −14% |
+| rules, 50 connections, instructions | 41,438 | 42,373 | +2% |
+| HTTPS keep-alive, 1 connection, instructions | 49,354 | 41,211 | −17% |
+| HTTPS, a handshake per request, instructions | 2,997,694 | 1,441,002 | −52% (mostly ring against OpenSSL) |
+| CPU per request, 50 connections (`measure_ab`, 6 rounds) | 16.35 µs | 15.67 µs | −4% |
+| requests/s, 1 connection (`measure_ab`) | 18,495 | 19,774 | +7% |
 
 ## Memory and allocations
 
-- **Allocations per request:** 0 (0 bytes) for proxied HTTP/1 keep-alive, measured by
-  `tools/allocprofile` in the same run. The tests in `crates/alcyon-rt/tests/request_allocations*.rs`
-  pin the same for h2c, TLS, HTTP/2 to servers, rules, `return`, logging and HTTP/3
-  (RUST-FOOTGUNS.md section 2).
-- **60,000 backends** (`measure_60k_backends_memory`): 18.59 MB resident after loading, against
-  15.84 MB when last measured on 2026-09-24, before the memory pools (2026-10-24). This is
-  Alcyon only: HAProxy was not measured in this run.
+- **Allocations per request:** 0 for proxied HTTP/1 keep-alive (`tools/allocprofile`). The
+  tests in `crates/alcyon-rt/tests/request_allocations*.rs` pin the same for h2c, TLS, HTTP/2
+  to servers, rules, `return`, logging and HTTP/3.
+- **60,000 backends:** 18.59 MB resident after loading, against 15.84 MB when last measured
+  (2026-09-24, before the memory pools). This is Alcyon only.
 
 ## How to reproduce
 
 ```
 export ALCYON_REFERENCE=<directory with haproxy/ and haproxy-quic/>
-cargo build --profile release-perf --bin alcyon
-flock -x /tmp/alcyon-load.lock tools/measure/insreq.sh <label> <proxy-binary> \
-    tools/measure/scenarios/keepalive.body ab1 20000 5 /tmp/<label>
+tools/pgo-build.sh --target-dir <dir>/t603-alcyon --out <dir>/t603-alcyon/alcyon-pgo
+tools/measure/haproxy-variants.sh build d8        # 3.5-dev8, all seven variants
+tools/measure/haproxy-variants.sh build q10 o2 lto pgo pgo-lto clang-lto clang-pgo-lto
+tools/measure/variants-matrix.sh <out> <label> <binary> insreq   # then hw, tp; h3 for QUIC builds
 ```
-
-The other rows use the same command with the scenario and client from the first table
-(`tls.body` with `ab1s`, `hs1` and `h2s1`, at 5,000 requests; `h3.body` with `h3fit`). The CPU
-table calls `measure.measure_ab(alcyon, haproxy, target_dir, rounds=6)`. The check-in gate runs
-the keep-alive and rules A/B on every main commit, against the previous one
-(`data/measurements.jsonl`).
 
 ## Open
 
-- **HTTP/3 (+30%)** and **rules at one connection (+15%)** are the two gaps worth work. Profile them
-  with `tools/measure/insprof.sh` before choosing a change.
-- **Syscalls per request** were not counted in this run. The 2026-10-02 profile found 9 `EAGAIN`
-  reads per request, and that was fixed the same day (`docs/history/performance-2026-10-02.md`,
-  `crates/alcyon-rt/tests/it/reads_per_request.rs`).
-- **Multi-core scaling** and **large bodies** are not measured here.
+- **HTTP/3 (+29-36%)** and **rules (+11-16% in instructions)** are the gaps. Profile both with
+  `tools/measure/insprof.sh`.
+- **The TLS rows compare two cryptography libraries.** Building HAProxy against AWS-LC
+  (`USE_OPENSSL_AWSLC=1`), which shares ring's BoringSSL lineage, would make them compare the
+  proxies.
+- **Kernel instructions and cycles** need `kernel.perf_event_paranoid` of 1 or lower while
+  measuring.
+- **Not measured:** many cores (`nbthread` above 1, with HAProxy's thread groups) and large
+  bodies.

@@ -1,0 +1,10 @@
+hap-lto ab1 per request (median of rounds, min PMU run 100.0%):
+  cycles:u                                     35984.1
+  instructions:u                               35572.0
+  L1-dcache-load-misses:u                        753.2
+  L1-icache-load-misses:u                        460.7
+  branch-misses:u                                272.2
+  l2_cache_req_stat.ic_dc_miss_in_l2:u          2743.8
+Traceback (most recent call last):
+  File "<stdin>", line 14, in <module>
+KeyError: 'instructions:k'

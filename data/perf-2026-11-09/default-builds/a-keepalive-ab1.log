@@ -1,0 +1,13 @@
+a-keepalive-ab1: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+a-keepalive-ab1 round 1: 702390729 instructions, 35119 ins/req
+a-keepalive-ab1 round 1 kernel: n/a
+a-keepalive-ab1 round 2: 702152632 instructions, 35107 ins/req
+a-keepalive-ab1 round 2 kernel: n/a
+a-keepalive-ab1 round 3: 702157817 instructions, 35107 ins/req
+a-keepalive-ab1 round 3 kernel: n/a
+a-keepalive-ab1 round 4: 702095887 instructions, 35104 ins/req
+a-keepalive-ab1 round 4 kernel: n/a
+a-keepalive-ab1 round 5: 702157291 instructions, 35107 ins/req
+a-keepalive-ab1 round 5 kernel: n/a
+a-keepalive-ab1 summary (min of 5): user 35104, kernel n/a, total n/a ins/req
+a-keepalive-ab1 done (proxy pid 730028 and backend pid 730001 stopped)

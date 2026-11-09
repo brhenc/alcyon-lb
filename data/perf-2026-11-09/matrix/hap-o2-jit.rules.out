@@ -1,0 +1,13 @@
+hap-o2-jit-rules: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+hap-o2-jit-rules round 1: 871112498 instructions, 43555 ins/req
+hap-o2-jit-rules round 1 kernel: n/a
+hap-o2-jit-rules round 2: 870962547 instructions, 43548 ins/req
+hap-o2-jit-rules round 2 kernel: n/a
+hap-o2-jit-rules round 3: 870906672 instructions, 43545 ins/req
+hap-o2-jit-rules round 3 kernel: n/a
+hap-o2-jit-rules round 4: 870781671 instructions, 43539 ins/req
+hap-o2-jit-rules round 4 kernel: n/a
+hap-o2-jit-rules round 5: 870655971 instructions, 43532 ins/req
+hap-o2-jit-rules round 5 kernel: n/a
+hap-o2-jit-rules summary (min of 5): user 43532, kernel n/a, total n/a ins/req
+hap-o2-jit-rules done (proxy pid 1200624 and backend pid 1200621 stopped)

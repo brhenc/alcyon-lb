@@ -1,0 +1,3 @@
+alcyon-rp tp1 load-start 1.57 3.33 4.28
+alcyon-rp tp1 requests/s: median 18783 min 18699 max 18912 of 5 [18699.48, 18887.6, 18758.16, 18912.26, 18783.29]
+alcyon-rp tp1 load-end 1.44 3.22 4.23

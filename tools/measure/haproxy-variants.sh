@@ -6,7 +6,15 @@
 # sources, train the pgo builds with the same request mix as tools/pgo-build.sh, and measure.
 # The oracle trees and binaries under $ALCYON_REFERENCE are never touched (git archive reads them).
 #
-#   tools/measure/haproxy-variants.sh build  <d8|q10> [variant...]   o2 lto pgo pgo-lto (default all)
+#   tools/measure/haproxy-variants.sh build  <d8|q10> [variant...]   (default all)
+#
+# Variants: o2 (the oracle's own flags), lto, pgo, pgo-lto (gcc), and three added 2026-11-09:
+#   o2-jit         o2 with USE_PCRE2_JIT=1, as distribution builds ship it (the rules scenario
+#                  matches a path_reg; Alcyon's regex crate needs no JIT)
+#   clang-lto      clang -O2 -flto=full, linked with lld: the same LLVM backend as rustc, so
+#                  Alcyon against clang-lto is closer to language against language
+#   clang-pgo-lto  clang-lto trained like pgo (-fprofile-generate, llvm-profdata merge,
+#                  -fprofile-use): the counterpart of tools/pgo-build.sh's Alcyon
 #   tools/measure/haproxy-variants.sh check  <d8|q10>                -vv CFLAGS line, .gcda count
 #
 #   d8  = $ALCYON_REFERENCE/haproxy      (3.5-dev8, h1/h2: USE_OPENSSL USE_ZLIB USE_PCRE2, as its -vv)
@@ -33,9 +41,9 @@ opts_for() { # set -> USE_* options of the oracle's -vv
     *) die "unknown set $1";;
   esac
 }
-mk() { # dir optcflags ldflags set
-  (cd "$1" && nice -n 19 taskset -c "$BUILDCPUS" make -j24 TARGET=linux-glibc $(opts_for "$4") \
-     OPT_CFLAGS="$2" LDFLAGS="$3" >"$1/build.log" 2>&1) || { tail -20 "$1/build.log" >&2; die "build failed in $1"; }
+mk() { # dir optcflags ldflags set [cc] [extra USE_* option]
+  (cd "$1" && nice -n 19 taskset -c "$BUILDCPUS" make -j24 TARGET=linux-glibc $(opts_for "$4") ${6:-} \
+     CC="${5:-cc}" OPT_CFLAGS="$2" LDFLAGS="$3" >"$1/build.log" 2>&1) || { tail -20 "$1/build.log" >&2; die "build failed in $1"; }
 }
 clean_objs() { find "$1" -name '*.o' -delete; rm -f "$1/haproxy" "$1"/*.a "$1"/src/*.a 2>/dev/null; }
 port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
@@ -108,7 +116,7 @@ train() {
 
 cmd_build() {
   local SET=$1; shift
-  local V=${*:-o2 lto pgo pgo-lto} v
+  local V=${*:-o2 o2-jit lto pgo pgo-lto clang-lto clang-pgo-lto} v
   local SRC=$ROOT/src/$SET
   [ -d "$SRC" ] || { mkdir -p "$SRC"; git -C "${ALCYON_REFERENCE:?set ALCYON_REFERENCE}/$([ "$SET" = d8 ] && echo haproxy || echo haproxy-quic)" archive HEAD | tar -x -C "$SRC"; }
   local O2="-O2" LT="-O2 -flto=auto"
@@ -117,6 +125,21 @@ cmd_build() {
     case $v in
       o2)  rm -rf "$D"; mkdir -p "$ROOT/$SET"; cp -a "$SRC" "$D"; log "$SET o2"; mk "$D" "$O2" "" "$SET";;
       lto) rm -rf "$D"; mkdir -p "$ROOT/$SET"; cp -a "$SRC" "$D"; log "$SET lto"; mk "$D" "$LT" "-O2 -flto=auto" "$SET";;
+      o2-jit) rm -rf "$D"; mkdir -p "$ROOT/$SET"; cp -a "$SRC" "$D"; log "$SET o2-jit"; mk "$D" "$O2" "" "$SET" cc USE_PCRE2_JIT=1;;
+      clang-lto) rm -rf "$D"; mkdir -p "$ROOT/$SET"; cp -a "$SRC" "$D"; log "$SET clang-lto"
+        mk "$D" "-O2 -flto=full" "-O2 -flto=full -fuse-ld=lld" "$SET" clang;;
+      clang-pgo-lto)
+        rm -rf "$D"; mkdir -p "$ROOT/$SET"; cp -a "$SRC" "$D"
+        log "$SET clang-pgo-lto: instrumented build"
+        mk "$D" "-O2 -fprofile-generate=$D/prof" "-fprofile-generate=$D/prof -fuse-ld=lld" "$SET" clang
+        log "$SET clang-pgo-lto: training (flock -x /tmp/alcyon-load.lock)"
+        flock -x /tmp/alcyon-load.lock bash -c "$(declare -f train port log die); BENCHD=$BENCHD HERE=$HERE; train $SET $D/haproxy $ROOT/$SET/train-work-clang" \
+          || die "training failed"
+        llvm-profdata merge -o "$D/haproxy.profdata" "$D"/prof/*.profraw || die "no clang profile in $D/prof"
+        log "$SET clang-pgo-lto: $(ls "$D"/prof/*.profraw | wc -l) .profraw files merged"
+        clean_objs "$D"; log "$SET clang-pgo-lto: use build"
+        mk "$D" "-O2 -flto=full -fprofile-use=$D/haproxy.profdata -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date" \
+           "-O2 -flto=full -fuse-ld=lld -fprofile-use=$D/haproxy.profdata" "$SET" clang;;
       pgo|pgo-lto)
         if [ "$v" = pgo ]; then
           rm -rf "$D" "$ROOT/$SET/pgo-lto" "$ROOT/$SET/pgo-gen"; mkdir -p "$ROOT/$SET"; cp -a "$SRC" "$D"
@@ -142,9 +165,9 @@ cmd_build() {
 
 cmd_check() {
   local SET=$1 v
-  for v in o2 lto pgo pgo-lto; do
+  for v in o2 o2-jit lto pgo pgo-lto clang-lto clang-pgo-lto; do
     local D=$ROOT/$SET/$v
-    echo "== $SET $v: $(find "$D" -name '*.gcda' 2>/dev/null | wc -l) .gcda"
+    echo "== $SET $v: $(find "$D" -name '*.gcda' 2>/dev/null | wc -l) .gcda, $(ls "$D"/prof/*.profraw 2>/dev/null | wc -l) .profraw"
     "$D/haproxy" -vv 2>&1 | grep -E 'HAProxy version|CFLAGS|OPTIONS|compiler'
   done
 }

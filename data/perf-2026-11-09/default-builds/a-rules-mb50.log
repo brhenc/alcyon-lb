@@ -1,0 +1,13 @@
+a-rules-mb50: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+a-rules-mb50 round 1: 847464312 instructions, 42373 ins/req
+a-rules-mb50 round 1 kernel: n/a
+a-rules-mb50 round 2: 877975498 instructions, 43898 ins/req
+a-rules-mb50 round 2 kernel: n/a
+a-rules-mb50 round 3: 848101761 instructions, 42405 ins/req
+a-rules-mb50 round 3 kernel: n/a
+a-rules-mb50 round 4: 877836465 instructions, 43891 ins/req
+a-rules-mb50 round 4 kernel: n/a
+a-rules-mb50 round 5: 877815058 instructions, 43890 ins/req
+a-rules-mb50 round 5 kernel: n/a
+a-rules-mb50 summary (min of 5): user 42373, kernel n/a, total n/a ins/req
+a-rules-mb50 done (proxy pid 732857 and backend pid 732829 stopped)

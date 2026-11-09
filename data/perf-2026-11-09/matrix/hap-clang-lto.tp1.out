@@ -1,0 +1,3 @@
+hap-clang-lto tp1 load-start 1.61 1.85 2.88
+hap-clang-lto tp1 requests/s: median 17917 min 17887 max 18036 of 5 [17916.63, 17994.16, 17886.75, 18036.27, 17916.36]
+hap-clang-lto tp1 load-end 1.63 1.85 2.86

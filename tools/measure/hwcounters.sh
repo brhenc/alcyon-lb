@@ -79,8 +79,11 @@ m = {k: statistics.median(v) / n for k, v in med.items()}
 print(f"{label} {cl} per request (median of rounds, min PMU run {mux}%):")
 for k, v in m.items():
     print(f"  {k:<40}{v:>12.1f}")
-print(f"  IPC user {m['instructions:u']/m['cycles:u']:.3f}  IPC kernel {m['instructions:k']/m['cycles:k']:.3f}  "
-      f"cycles/req user {m['cycles:u']:.0f} kernel {m['cycles:k']:.0f}")
+# perf_event_paranoid >= 2 leaves the :k events out: say n/a rather than fail.
+ipc = lambda i, c: f"{m[i]/m[c]:.3f}" if i in m and c in m and m[c] else "n/a"
+cyc = lambda c: f"{m[c]:.0f}" if c in m else "n/a"
+print(f"  IPC user {ipc('instructions:u', 'cycles:u')}  IPC kernel {ipc('instructions:k', 'cycles:k')}  "
+      f"cycles/req user {cyc('cycles:u')} kernel {cyc('cycles:k')}")
 PY
     ;;
   tp1|tp50)

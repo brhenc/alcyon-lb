@@ -1,0 +1,13 @@
+hap-lto-rules: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+hap-lto-rules round 1: 863592116 instructions, 43179 ins/req
+hap-lto-rules round 1 kernel: n/a
+hap-lto-rules round 2: 863370054 instructions, 43168 ins/req
+hap-lto-rules round 2 kernel: n/a
+hap-lto-rules round 3: 863369643 instructions, 43168 ins/req
+hap-lto-rules round 3 kernel: n/a
+hap-lto-rules round 4: 863259887 instructions, 43162 ins/req
+hap-lto-rules round 4 kernel: n/a
+hap-lto-rules round 5: 863130922 instructions, 43156 ins/req
+hap-lto-rules round 5 kernel: n/a
+hap-lto-rules summary (min of 5): user 43156, kernel n/a, total n/a ins/req
+hap-lto-rules done (proxy pid 1202648 and backend pid 1202646 stopped)

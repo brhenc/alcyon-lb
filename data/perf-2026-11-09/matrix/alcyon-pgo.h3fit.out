@@ -1,0 +1,6 @@
+alcyon-pgo-h3fit: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+alcyon-pgo-h3fit round 1: best 63271 ins/req at 1.0000 dgrams/req, worst 72852 at 2.0768, fit 71902 ins/req at 1.97
+alcyon-pgo-h3fit round 2: best 62746 ins/req at 1.0000 dgrams/req, worst 72456 at 2.0768, fit 71493 ins/req at 1.97
+alcyon-pgo-h3fit round 3: best 63337 ins/req at 1.0000 dgrams/req, worst 72743 at 2.0768, fit 71810 ins/req at 1.97
+alcyon-pgo-h3fit h3fit: fit 71810 ins/req at 1.97 client dgrams/req (median of 3, spread 0.57%); best 63271 at 1.0000, worst 72743 at 2.0768
+alcyon-pgo-h3fit done (proxy pid 1212858 and backend pid 1212856 stopped)

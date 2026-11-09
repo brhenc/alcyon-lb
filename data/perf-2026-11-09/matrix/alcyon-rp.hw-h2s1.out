@@ -1,0 +1,10 @@
+alcyon-rp h2s1 per request (median of rounds, min PMU run 100.0%):
+  cycles:u                                     48434.1
+  instructions:u                               50556.8
+  L1-dcache-load-misses:u                       1676.2
+  L1-icache-load-misses:u                        599.0
+  branch-misses:u                                296.3
+  l2_cache_req_stat.ic_dc_miss_in_l2:u          4878.1
+Traceback (most recent call last):
+  File "<stdin>", line 14, in <module>
+KeyError: 'instructions:k'

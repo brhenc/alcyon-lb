@@ -1,0 +1,13 @@
+hap-pgo-rules: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+hap-pgo-rules round 1: 806654487 instructions, 40332 ins/req
+hap-pgo-rules round 1 kernel: n/a
+hap-pgo-rules round 2: 806385287 instructions, 40319 ins/req
+hap-pgo-rules round 2 kernel: n/a
+hap-pgo-rules round 3: 806424098 instructions, 40321 ins/req
+hap-pgo-rules round 3 kernel: n/a
+hap-pgo-rules round 4: 806401575 instructions, 40320 ins/req
+hap-pgo-rules round 4 kernel: n/a
+hap-pgo-rules round 5: 806182492 instructions, 40309 ins/req
+hap-pgo-rules round 5 kernel: n/a
+hap-pgo-rules summary (min of 5): user 40309, kernel n/a, total n/a ins/req
+hap-pgo-rules done (proxy pid 1204733 and backend pid 1204731 stopped)

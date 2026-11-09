@@ -1,0 +1,13 @@
+hap-clang-lto-h2s1: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+hap-clang-lto-h2s1 round 1: 550565406 instructions, 55056 ins/req
+hap-clang-lto-h2s1 round 1 kernel: n/a
+hap-clang-lto-h2s1 round 2: 550611687 instructions, 55061 ins/req
+hap-clang-lto-h2s1 round 2 kernel: n/a
+hap-clang-lto-h2s1 round 3: 550391441 instructions, 55039 ins/req
+hap-clang-lto-h2s1 round 3 kernel: n/a
+hap-clang-lto-h2s1 round 4: 550528670 instructions, 55052 ins/req
+hap-clang-lto-h2s1 round 4 kernel: n/a
+hap-clang-lto-h2s1 round 5: 550523580 instructions, 55052 ins/req
+hap-clang-lto-h2s1 round 5 kernel: n/a
+hap-clang-lto-h2s1 summary (min of 5): user 55039, kernel n/a, total n/a ins/req
+hap-clang-lto-h2s1 done (proxy pid 1208908 and backend pid 1208906 stopped)

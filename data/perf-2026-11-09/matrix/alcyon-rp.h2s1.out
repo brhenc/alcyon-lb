@@ -1,0 +1,13 @@
+alcyon-rp-h2s1: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+alcyon-rp-h2s1 round 1: 505695103 instructions, 50569 ins/req
+alcyon-rp-h2s1 round 1 kernel: n/a
+alcyon-rp-h2s1 round 2: 505549582 instructions, 50554 ins/req
+alcyon-rp-h2s1 round 2 kernel: n/a
+alcyon-rp-h2s1 round 3: 505538523 instructions, 50553 ins/req
+alcyon-rp-h2s1 round 3 kernel: n/a
+alcyon-rp-h2s1 round 4: 505538465 instructions, 50553 ins/req
+alcyon-rp-h2s1 round 4 kernel: n/a
+alcyon-rp-h2s1 round 5: 505542166 instructions, 50554 ins/req
+alcyon-rp-h2s1 round 5 kernel: n/a
+alcyon-rp-h2s1 summary (min of 5): user 50553, kernel n/a, total n/a ins/req
+alcyon-rp-h2s1 done (proxy pid 1194727 and backend pid 1194725 stopped)

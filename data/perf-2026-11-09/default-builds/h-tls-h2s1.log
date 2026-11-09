@@ -1,0 +1,13 @@
+h-tls-h2s1: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+h-tls-h2s1 round 1: 265909768 instructions, 53181 ins/req
+h-tls-h2s1 round 1 kernel: n/a
+h-tls-h2s1 round 2: 265908865 instructions, 53181 ins/req
+h-tls-h2s1 round 2 kernel: n/a
+h-tls-h2s1 round 3: 265850428 instructions, 53170 ins/req
+h-tls-h2s1 round 3 kernel: n/a
+h-tls-h2s1 round 4: 265851621 instructions, 53170 ins/req
+h-tls-h2s1 round 4 kernel: n/a
+h-tls-h2s1 round 5: 265809933 instructions, 53161 ins/req
+h-tls-h2s1 round 5 kernel: n/a
+h-tls-h2s1 summary (min of 5): user 53161, kernel n/a, total n/a ins/req
+h-tls-h2s1 done (proxy pid 789220 and backend pid 789217 stopped)

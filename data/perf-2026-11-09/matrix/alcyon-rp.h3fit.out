@@ -1,0 +1,6 @@
+alcyon-rp-h3fit: warning: perf cannot count instructions:k here (perf_event_paranoid=2); kernel: n/a
+alcyon-rp-h3fit round 1: best 73535 ins/req at 1.0000 dgrams/req, worst 83833 at 2.0768, fit 82812 ins/req at 1.97
+alcyon-rp-h3fit round 2: best 72980 ins/req at 1.0000 dgrams/req, worst 84085 at 2.0768, fit 82983 ins/req at 1.97
+alcyon-rp-h3fit round 3: best 73356 ins/req at 1.0000 dgrams/req, worst 84339 at 2.0768, fit 83249 ins/req at 1.97
+alcyon-rp-h3fit h3fit: fit 82983 ins/req at 1.97 client dgrams/req (median of 3, spread 0.53%); best 73356 at 1.0000, worst 84085 at 2.0768
+alcyon-rp-h3fit done (proxy pid 1212674 and backend pid 1212672 stopped)

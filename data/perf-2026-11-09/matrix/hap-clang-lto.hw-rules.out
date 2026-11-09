@@ -1,0 +1,10 @@
+hap-clang-lto ab1 per request (median of rounds, min PMU run 100.0%):
+  cycles:u                                     44887.8
+  instructions:u                               45405.3
+  L1-dcache-load-misses:u                        979.1
+  L1-icache-load-misses:u                        484.3
+  branch-misses:u                                366.6
+  l2_cache_req_stat.ic_dc_miss_in_l2:u          3769.6
+Traceback (most recent call last):
+  File "<stdin>", line 14, in <module>
+KeyError: 'instructions:k'

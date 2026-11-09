@@ -13,12 +13,15 @@
 
 use crate::common;
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 
-/// A UDP socket bound the way alcyon binds a QUIC listener (`SO_REUSEPORT`), on a free port.
+/// A UDP socket bound the way alcyon binds a QUIC listener (`SO_REUSEPORT`), on a port from
+/// [`common::reserve_addr`]: below the ephemeral range and locked for this process. A port from
+/// `bind(:0)` is ephemeral, and in the parallel run any other test's `connect()` could take it
+/// between the drop and the check (`a_free_port_is_bindable` failed so, 2026-11-09).
 fn hold_udp_reuseport() -> (rustix::fd::OwnedFd, SocketAddr) {
     use rustix::net::{AddressFamily, SocketFlags, SocketType};
-    let addr = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap().local_addr().unwrap();
+    let addr = common::reserve_addr();
     let fd = rustix::net::socket_with(AddressFamily::INET, SocketType::DGRAM, SocketFlags::CLOEXEC, None).unwrap();
     rustix::net::sockopt::set_socket_reuseport(&fd, true).unwrap();
     rustix::net::bind(&fd, &addr).unwrap();

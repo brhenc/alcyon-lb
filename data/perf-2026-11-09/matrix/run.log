@@ -1,0 +1,161 @@
+alcyon-rp keepalive try 1 start 14:28:16 loadavg 1.32 3.70 4.46 governor performance 
+alcyon-rp keepalive end 14:28:22 loadavg 1.35 3.63 4.43 rc 0
+alcyon-rp rules try 1 start 14:28:23 loadavg 1.35 3.63 4.43 governor performance 
+alcyon-rp rules end 14:28:30 loadavg 1.40 3.60 4.41 rc 0
+alcyon-rp h2s1 try 1 start 14:28:30 loadavg 1.40 3.60 4.41 governor performance 
+alcyon-rp h2s1 end 14:28:35 loadavg 1.29 3.54 4.39 rc 0
+alcyon-rp hw-keepalive try 1 start 14:28:35 loadavg 1.29 3.54 4.39 governor performance 
+alcyon-rp hw-keepalive end 14:28:49 loadavg 1.47 3.47 4.35 rc 0
+alcyon-rp hw-rules try 1 start 14:28:49 loadavg 1.47 3.47 4.35 governor performance 
+alcyon-rp hw-rules end 14:29:04 loadavg 1.58 3.39 4.31 rc 0
+alcyon-rp hw-h2s1 try 1 start 14:29:04 loadavg 1.58 3.39 4.31 governor performance 
+alcyon-rp hw-h2s1 end 14:29:13 loadavg 1.57 3.33 4.28 rc 0
+alcyon-rp tp1 try 1 start 14:29:13 loadavg 1.57 3.33 4.28 governor performance 
+alcyon-rp tp1 end 14:29:27 loadavg 1.44 3.22 4.23 rc 0
+alcyon-rp tp50 try 1 start 14:29:27 loadavg 1.44 3.22 4.23 governor performance 
+alcyon-rp tp50 end 14:29:54 loadavg 2.06 3.23 4.21 rc 0
+alcyon-pgo keepalive try 1 start 14:29:54 loadavg 2.06 3.23 4.21 governor performance 
+alcyon-pgo keepalive end 14:30:01 loadavg 1.90 3.16 4.17 rc 0
+alcyon-pgo rules try 1 start 14:30:01 loadavg 1.90 3.16 4.17 governor performance 
+alcyon-pgo rules end 14:30:08 loadavg 1.91 3.14 4.16 rc 0
+alcyon-pgo h2s1 try 1 start 14:30:08 loadavg 1.91 3.14 4.16 governor performance 
+alcyon-pgo h2s1 end 14:30:12 loadavg 1.92 3.12 4.15 rc 0
+alcyon-pgo hw-keepalive try 1 start 14:30:12 loadavg 1.92 3.12 4.15 governor performance 
+alcyon-pgo hw-keepalive end 14:30:25 loadavg 1.85 3.06 4.12 rc 0
+alcyon-pgo hw-rules try 1 start 14:30:26 loadavg 1.85 3.06 4.12 governor performance 
+alcyon-pgo hw-rules end 14:30:39 loadavg 1.81 2.99 4.08 rc 0
+alcyon-pgo hw-h2s1 try 1 start 14:30:39 loadavg 1.81 2.99 4.08 governor performance 
+alcyon-pgo hw-h2s1 end 14:30:48 loadavg 1.69 2.93 4.05 rc 0
+alcyon-pgo tp1 try 1 start 14:30:48 loadavg 1.69 2.93 4.05 governor performance 
+alcyon-pgo tp1 end 14:31:01 loadavg 1.54 2.83 4.00 rc 0
+alcyon-pgo tp50 try 1 start 14:31:01 loadavg 1.54 2.83 4.00 governor performance 
+alcyon-pgo tp50 end 14:31:25 loadavg 1.75 2.80 3.96 rc 0
+hap-o2 keepalive try 1 start 14:31:25 loadavg 1.75 2.80 3.96 governor performance 
+hap-o2 keepalive end 14:31:33 loadavg 1.56 2.72 3.92 rc 0
+hap-o2 rules try 1 start 14:31:33 loadavg 1.56 2.72 3.92 governor performance 
+hap-o2 rules end 14:31:40 loadavg 1.52 2.69 3.91 rc 0
+hap-o2 h2s1 try 1 start 14:31:40 loadavg 1.52 2.69 3.91 governor performance 
+hap-o2 h2s1 end 14:31:46 loadavg 1.39 2.65 3.88 rc 0
+hap-o2 hw-keepalive try 1 start 14:31:46 loadavg 1.36 2.62 3.87 governor performance 
+hap-o2 hw-keepalive end 14:32:00 loadavg 1.31 2.56 3.84 rc 0
+hap-o2 hw-rules try 1 start 14:32:00 loadavg 1.31 2.56 3.84 governor performance 
+hap-o2 hw-rules end 14:32:15 loadavg 1.46 2.54 3.81 rc 0
+hap-o2 hw-h2s1 try 1 start 14:32:15 loadavg 1.46 2.54 3.81 governor performance 
+hap-o2 hw-h2s1 end 14:32:25 loadavg 1.46 2.50 3.78 rc 0
+hap-o2 tp1 try 1 start 14:32:25 loadavg 1.46 2.50 3.78 governor performance 
+hap-o2 tp1 end 14:32:40 loadavg 1.66 2.49 3.76 rc 0
+hap-o2 tp50 try 1 start 14:32:40 loadavg 1.66 2.49 3.76 governor performance 
+hap-o2 tp50 end 14:33:10 loadavg 1.87 2.46 3.71 rc 0
+hap-o2-jit keepalive try 1 start 14:33:10 loadavg 1.87 2.46 3.71 governor performance 
+hap-o2-jit keepalive end 14:33:18 loadavg 1.66 2.40 3.67 rc 0
+hap-o2-jit rules try 1 start 14:33:18 loadavg 1.66 2.40 3.67 governor performance 
+hap-o2-jit rules end 14:33:25 loadavg 1.61 2.37 3.66 rc 0
+hap-o2-jit h2s1 try 1 start 14:33:25 loadavg 1.61 2.37 3.66 governor performance 
+hap-o2-jit h2s1 end 14:33:31 loadavg 1.44 2.31 3.62 rc 0
+hap-o2-jit hw-keepalive try 1 start 14:33:31 loadavg 1.44 2.31 3.62 governor performance 
+hap-o2-jit hw-keepalive end 14:33:45 loadavg 1.52 2.30 3.60 rc 0
+hap-o2-jit hw-rules try 1 start 14:33:45 loadavg 1.52 2.30 3.60 governor performance 
+hap-o2-jit hw-rules end 14:34:00 loadavg 1.42 2.24 3.56 rc 0
+hap-o2-jit hw-h2s1 try 1 start 14:34:01 loadavg 1.42 2.24 3.56 governor performance 
+hap-o2-jit hw-h2s1 end 14:34:11 loadavg 1.39 2.19 3.53 rc 0
+hap-o2-jit tp1 try 1 start 14:34:11 loadavg 1.39 2.19 3.53 governor performance 
+hap-o2-jit tp1 end 14:34:26 loadavg 1.46 2.17 3.50 rc 0
+hap-o2-jit tp50 try 1 start 14:34:26 loadavg 1.46 2.17 3.50 governor performance 
+hap-o2-jit tp50 end 14:34:56 loadavg 2.04 2.25 3.49 rc 0
+hap-lto keepalive try 1 start 14:34:56 loadavg 1.96 2.23 3.47 governor performance 
+hap-lto keepalive end 14:35:03 loadavg 1.88 2.21 3.46 rc 0
+hap-lto rules try 1 start 14:35:03 loadavg 1.88 2.21 3.46 governor performance 
+hap-lto rules end 14:35:10 loadavg 1.81 2.19 3.45 rc 0
+hap-lto h2s1 try 1 start 14:35:11 loadavg 1.81 2.19 3.45 governor performance 
+hap-lto h2s1 end 14:35:16 loadavg 1.69 2.15 3.42 rc 0
+hap-lto hw-keepalive try 1 start 14:35:16 loadavg 1.69 2.15 3.42 governor performance 
+hap-lto hw-keepalive end 14:35:30 loadavg 1.67 2.13 3.40 rc 0
+hap-lto hw-rules try 1 start 14:35:30 loadavg 1.67 2.13 3.40 governor performance 
+hap-lto hw-rules end 14:35:45 loadavg 1.45 2.05 3.35 rc 0
+hap-lto hw-h2s1 try 1 start 14:35:45 loadavg 1.45 2.05 3.35 governor performance 
+hap-lto hw-h2s1 end 14:35:55 loadavg 1.45 2.04 3.33 rc 0
+hap-lto tp1 try 1 start 14:35:56 loadavg 1.45 2.04 3.33 governor performance 
+hap-lto tp1 end 14:36:10 loadavg 1.29 1.97 3.29 rc 0
+hap-lto tp50 try 1 start 14:36:10 loadavg 1.29 1.97 3.29 governor performance 
+hap-lto tp50 end 14:36:40 loadavg 1.69 1.99 3.25 rc 0
+hap-pgo keepalive try 1 start 14:36:40 loadavg 1.69 1.99 3.25 governor performance 
+hap-pgo keepalive end 14:36:47 loadavg 1.51 1.94 3.22 rc 0
+hap-pgo rules try 1 start 14:36:47 loadavg 1.51 1.94 3.22 governor performance 
+hap-pgo rules end 14:36:54 loadavg 1.55 1.94 3.22 rc 0
+hap-pgo h2s1 try 1 start 14:36:54 loadavg 1.55 1.94 3.22 governor performance 
+hap-pgo h2s1 end 14:36:59 loadavg 1.50 1.93 3.20 rc 0
+hap-pgo hw-keepalive try 1 start 14:36:59 loadavg 1.50 1.93 3.20 governor performance 
+hap-pgo hw-keepalive end 14:37:13 loadavg 1.47 1.90 3.17 rc 0
+hap-pgo hw-rules try 1 start 14:37:13 loadavg 1.47 1.90 3.17 governor performance 
+hap-pgo hw-rules end 14:37:26 loadavg 1.37 1.85 3.14 rc 0
+hap-pgo hw-h2s1 try 1 start 14:37:27 loadavg 1.37 1.85 3.14 governor performance 
+hap-pgo hw-h2s1 end 14:37:36 loadavg 1.31 1.82 3.12 rc 0
+hap-pgo tp1 try 1 start 14:37:36 loadavg 1.31 1.82 3.12 governor performance 
+hap-pgo tp1 end 14:37:50 loadavg 1.26 1.80 3.09 rc 0
+hap-pgo tp50 try 1 start 14:37:50 loadavg 1.26 1.80 3.09 governor performance 
+hap-pgo tp50 end 14:38:18 loadavg 2.55 2.07 3.14 rc 0
+hap-pgo-lto keepalive try 1 start 14:38:18 loadavg 2.55 2.07 3.14 governor performance 
+hap-pgo-lto keepalive end 14:38:25 loadavg 2.43 2.05 3.13 rc 0
+hap-pgo-lto rules try 1 start 14:38:25 loadavg 2.43 2.05 3.13 governor performance 
+hap-pgo-lto rules end 14:38:32 loadavg 2.14 2.00 3.10 rc 0
+hap-pgo-lto h2s1 try 1 start 14:38:32 loadavg 2.14 2.00 3.10 governor performance 
+hap-pgo-lto h2s1 end 14:38:37 loadavg 2.04 1.98 3.09 rc 0
+hap-pgo-lto hw-keepalive try 1 start 14:38:37 loadavg 2.04 1.98 3.09 governor performance 
+hap-pgo-lto hw-keepalive end 14:38:51 loadavg 1.88 1.95 3.07 rc 0
+hap-pgo-lto hw-rules try 1 start 14:38:51 loadavg 1.88 1.95 3.07 governor performance 
+hap-pgo-lto hw-rules end 14:39:04 loadavg 1.69 1.90 3.03 rc 0
+hap-pgo-lto hw-h2s1 try 1 start 14:39:04 loadavg 1.69 1.90 3.03 governor performance 
+hap-pgo-lto hw-h2s1 end 14:39:14 loadavg 1.66 1.89 3.02 rc 0
+hap-pgo-lto tp1 try 1 start 14:39:14 loadavg 1.66 1.89 3.02 governor performance 
+hap-pgo-lto tp1 end 14:39:28 loadavg 1.51 1.85 2.98 rc 0
+hap-pgo-lto tp50 try 1 start 14:39:28 loadavg 1.51 1.85 2.98 governor performance 
+hap-pgo-lto tp50 end 14:39:56 loadavg 2.18 1.97 2.99 rc 0
+hap-clang-lto keepalive try 1 start 14:39:56 loadavg 2.18 1.97 2.99 governor performance 
+hap-clang-lto keepalive end 14:40:03 loadavg 2.09 1.96 2.98 rc 0
+hap-clang-lto rules try 1 start 14:40:03 loadavg 2.09 1.96 2.98 governor performance 
+hap-clang-lto rules end 14:40:11 loadavg 2.07 1.96 2.97 rc 0
+hap-clang-lto h2s1 try 1 start 14:40:11 loadavg 2.07 1.96 2.97 governor performance 
+hap-clang-lto h2s1 end 14:40:16 loadavg 1.99 1.94 2.96 rc 0
+hap-clang-lto hw-keepalive try 1 start 14:40:16 loadavg 1.99 1.94 2.96 governor performance 
+hap-clang-lto hw-keepalive end 14:40:31 loadavg 1.92 1.93 2.94 rc 0
+hap-clang-lto hw-rules try 1 start 14:40:31 loadavg 1.92 1.93 2.94 governor performance 
+hap-clang-lto hw-rules end 14:40:46 loadavg 1.72 1.88 2.90 rc 0
+hap-clang-lto hw-h2s1 try 1 start 14:40:46 loadavg 1.72 1.88 2.90 governor performance 
+hap-clang-lto hw-h2s1 end 14:40:56 loadavg 1.61 1.85 2.88 rc 0
+hap-clang-lto tp1 try 1 start 14:40:56 loadavg 1.61 1.85 2.88 governor performance 
+hap-clang-lto tp1 end 14:41:11 loadavg 1.63 1.85 2.86 rc 0
+hap-clang-lto tp50 try 1 start 14:41:11 loadavg 1.63 1.85 2.86 governor performance 
+hap-clang-lto tp50 end 14:41:41 loadavg 2.38 2.01 2.89 rc 0
+hap-clang-pgo-lto keepalive try 1 start 14:41:41 loadavg 2.38 2.01 2.89 governor performance 
+hap-clang-pgo-lto keepalive end 14:41:48 loadavg 2.27 1.99 2.88 rc 0
+hap-clang-pgo-lto rules try 1 start 14:41:48 loadavg 2.27 1.99 2.88 governor performance 
+hap-clang-pgo-lto rules end 14:41:55 loadavg 2.17 1.97 2.87 rc 0
+hap-clang-pgo-lto h2s1 try 1 start 14:41:55 loadavg 2.17 1.97 2.87 governor performance 
+hap-clang-pgo-lto h2s1 end 14:42:00 loadavg 3.12 2.17 2.93 rc 0
+hap-clang-pgo-lto hw-keepalive try 1 start 14:42:00 loadavg 3.12 2.17 2.93 governor performance 
+hap-clang-pgo-lto hw-keepalive end 14:42:13 loadavg 2.72 2.13 2.90 rc 0
+hap-clang-pgo-lto hw-rules try 1 start 14:42:13 loadavg 2.72 2.13 2.90 governor performance 
+hap-clang-pgo-lto hw-rules end 14:42:27 loadavg 2.42 2.09 2.87 rc 0
+hap-clang-pgo-lto hw-h2s1 try 1 start 14:42:27 loadavg 2.42 2.09 2.87 governor performance 
+hap-clang-pgo-lto hw-h2s1 end 14:42:36 loadavg 2.20 2.05 2.85 rc 0
+hap-clang-pgo-lto tp1 try 1 start 14:42:36 loadavg 2.20 2.05 2.85 governor performance 
+hap-clang-pgo-lto tp1 end 14:42:50 loadavg 2.02 2.02 2.83 rc 0
+hap-clang-pgo-lto tp50 try 1 start 14:42:50 loadavg 2.02 2.02 2.83 governor performance 
+hap-clang-pgo-lto tp50 end 14:43:18 loadavg 2.53 2.14 2.85 rc 0
+alcyon-rp h3fit try 1 start 14:43:18 loadavg 2.53 2.14 2.85 governor performance 
+alcyon-rp h3fit end 14:43:33 loadavg 2.19 2.09 2.82 rc 0
+alcyon-pgo h3fit try 1 start 14:43:33 loadavg 2.19 2.09 2.82 governor performance 
+alcyon-pgo h3fit end 14:43:47 loadavg 1.93 2.03 2.79 rc 0
+hapq-o2 h3fit try 1 start 14:43:47 loadavg 1.93 2.03 2.79 governor performance 
+hapq-o2 h3fit end 14:44:02 loadavg 1.72 1.98 2.76 rc 0
+hapq-lto h3fit try 1 start 14:44:02 loadavg 1.72 1.98 2.76 governor performance 
+hapq-lto h3fit end 14:44:17 loadavg 1.49 1.92 2.72 rc 0
+hapq-pgo h3fit try 1 start 14:44:17 loadavg 1.49 1.92 2.72 governor performance 
+hapq-pgo h3fit end 14:44:31 loadavg 1.38 1.87 2.70 rc 0
+hapq-pgo-lto h3fit try 1 start 14:44:31 loadavg 1.38 1.87 2.70 governor performance 
+hapq-pgo-lto h3fit end 14:44:46 loadavg 1.32 1.84 2.68 rc 0
+hapq-clang-lto h3fit try 1 start 14:44:46 loadavg 1.30 1.83 2.67 governor performance 
+hapq-clang-lto h3fit end 14:45:01 loadavg 1.33 1.82 2.66 rc 0
+hapq-clang-pgo-lto h3fit try 1 start 14:45:01 loadavg 1.30 1.80 2.65 governor performance 
+hapq-clang-pgo-lto h3fit end 14:45:15 loadavg 1.25 1.78 2.63 rc 0
+matrix done 14:45:15
