@@ -1,0 +1,10 @@
+alcyon-rp ab1 per request (median of rounds, min PMU run 100.0%):
+  cycles:u                                     28295.3
+  instructions:u                               35107.8
+  cycles:k                                    101550.8
+  instructions:k                               64245.1
+  L1-dcache-load-misses                         2464.7
+  L1-icache-load-misses                         1168.1
+  branch-misses                                 1660.4
+  l2_cache_req_stat.ic_dc_miss_in_l2            4661.5
+  IPC user 1.241  IPC kernel 0.633  cycles/req user 28295 kernel 101551

@@ -15,6 +15,10 @@
 #                  Alcyon against clang-lto is closer to language against language
 #   clang-pgo-lto  clang-lto trained like pgo (-fprofile-generate, llvm-profdata merge,
 #                  -fprofile-use): the counterpart of tools/pgo-build.sh's Alcyon
+#   o2-awslc, clang-pgo-lto-awslc
+#                  the same against AWS-LC (USE_OPENSSL_AWSLC=1) instead of the system OpenSSL:
+#                  AWS-LC shares BoringSSL's lineage with ring, so the TLS rows compare the proxies
+#                  rather than two crypto libraries. Needs HAPV_AWSLC=<AWS-LC install prefix>.
 #   tools/measure/haproxy-variants.sh check  <d8|q10>                -vv CFLAGS line, .gcda count
 #
 #   d8  = $ALCYON_REFERENCE/haproxy      (3.5-dev8, h1/h2: USE_OPENSSL USE_ZLIB USE_PCRE2, as its -vv)
@@ -45,6 +49,8 @@ mk() { # dir optcflags ldflags set [cc] [extra USE_* option]
   (cd "$1" && nice -n 19 taskset -c "$BUILDCPUS" make -j24 TARGET=linux-glibc $(opts_for "$4") ${6:-} \
      CC="${5:-cc}" OPT_CFLAGS="$2" LDFLAGS="$3" >"$1/build.log" 2>&1) || { tail -20 "$1/build.log" >&2; die "build failed in $1"; }
 }
+awslc_opts() { echo "USE_OPENSSL_AWSLC=1 SSL_INC=${HAPV_AWSLC:?set HAPV_AWSLC to the AWS-LC prefix}/include SSL_LIB=$HAPV_AWSLC/lib64"; }
+awslc_ld() { echo "-Wl,-rpath,${HAPV_AWSLC:?set HAPV_AWSLC}/lib64"; }
 clean_objs() { find "$1" -name '*.o' -delete; rm -f "$1/haproxy" "$1"/*.a "$1"/src/*.a 2>/dev/null; }
 port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 
@@ -128,18 +134,21 @@ cmd_build() {
       o2-jit) rm -rf "$D"; mkdir -p "$ROOT/$SET"; cp -a "$SRC" "$D"; log "$SET o2-jit"; mk "$D" "$O2" "" "$SET" cc USE_PCRE2_JIT=1;;
       clang-lto) rm -rf "$D"; mkdir -p "$ROOT/$SET"; cp -a "$SRC" "$D"; log "$SET clang-lto"
         mk "$D" "-O2 -flto=full" "-O2 -flto=full -fuse-ld=lld" "$SET" clang;;
-      clang-pgo-lto)
+      o2-awslc) rm -rf "$D"; mkdir -p "$ROOT/$SET"; cp -a "$SRC" "$D"; log "$SET o2-awslc"
+        mk "$D" "$O2" "$(awslc_ld)" "$SET" cc "$(awslc_opts)";;
+      clang-pgo-lto|clang-pgo-lto-awslc)
+        local X="" XL=""; [ "$v" = clang-pgo-lto-awslc ] && { X=$(awslc_opts); XL=$(awslc_ld); }
         rm -rf "$D"; mkdir -p "$ROOT/$SET"; cp -a "$SRC" "$D"
-        log "$SET clang-pgo-lto: instrumented build"
-        mk "$D" "-O2 -fprofile-generate=$D/prof" "-fprofile-generate=$D/prof -fuse-ld=lld" "$SET" clang
-        log "$SET clang-pgo-lto: training (flock -x /tmp/alcyon-load.lock)"
-        flock -x /tmp/alcyon-load.lock bash -c "$(declare -f train port log die); BENCHD=$BENCHD HERE=$HERE; train $SET $D/haproxy $ROOT/$SET/train-work-clang" \
+        log "$SET $v: instrumented build"
+        mk "$D" "-O2 -fprofile-generate=$D/prof" "-fprofile-generate=$D/prof -fuse-ld=lld $XL" "$SET" clang "$X"
+        log "$SET $v: training (flock -x /tmp/alcyon-load.lock)"
+        flock -x /tmp/alcyon-load.lock bash -c "$(declare -f train port log die); BENCHD=$BENCHD HERE=$HERE; train $SET $D/haproxy $ROOT/$SET/train-work-$v" \
           || die "training failed"
         llvm-profdata merge -o "$D/haproxy.profdata" "$D"/prof/*.profraw || die "no clang profile in $D/prof"
-        log "$SET clang-pgo-lto: $(ls "$D"/prof/*.profraw | wc -l) .profraw files merged"
-        clean_objs "$D"; log "$SET clang-pgo-lto: use build"
+        log "$SET $v: $(ls "$D"/prof/*.profraw | wc -l) .profraw files merged"
+        clean_objs "$D"; log "$SET $v: use build"
         mk "$D" "-O2 -flto=full -fprofile-use=$D/haproxy.profdata -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date" \
-           "-O2 -flto=full -fuse-ld=lld -fprofile-use=$D/haproxy.profdata" "$SET" clang;;
+           "-O2 -flto=full -fuse-ld=lld -fprofile-use=$D/haproxy.profdata $XL" "$SET" clang "$X";;
       pgo|pgo-lto)
         if [ "$v" = pgo ]; then
           rm -rf "$D" "$ROOT/$SET/pgo-lto" "$ROOT/$SET/pgo-gen"; mkdir -p "$ROOT/$SET"; cp -a "$SRC" "$D"
@@ -165,7 +174,7 @@ cmd_build() {
 
 cmd_check() {
   local SET=$1 v
-  for v in o2 o2-jit lto pgo pgo-lto clang-lto clang-pgo-lto; do
+  for v in o2 o2-jit lto pgo pgo-lto clang-lto clang-pgo-lto o2-awslc clang-pgo-lto-awslc; do
     local D=$ROOT/$SET/$v
     echo "== $SET $v: $(find "$D" -name '*.gcda' 2>/dev/null | wc -l) .gcda, $(ls "$D"/prof/*.profraw 2>/dev/null | wc -l) .profraw"
     "$D/haproxy" -vv 2>&1 | grep -E 'HAProxy version|CFLAGS|OPTIONS|compiler'

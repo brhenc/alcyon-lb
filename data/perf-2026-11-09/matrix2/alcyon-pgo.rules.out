@@ -1,0 +1,12 @@
+alcyon-pgo-rules round 1: 849709864 instructions, 42485 ins/req
+alcyon-pgo-rules round 1 kernel: 1277303662 instructions, 63865 ins/req, total 106350 ins/req
+alcyon-pgo-rules round 2: 849486100 instructions, 42474 ins/req
+alcyon-pgo-rules round 2 kernel: 1276281204 instructions, 63814 ins/req, total 106288 ins/req
+alcyon-pgo-rules round 3: 849479274 instructions, 42473 ins/req
+alcyon-pgo-rules round 3 kernel: 1279315653 instructions, 63965 ins/req, total 106439 ins/req
+alcyon-pgo-rules round 4: 849292267 instructions, 42464 ins/req
+alcyon-pgo-rules round 4 kernel: 1277567960 instructions, 63878 ins/req, total 106343 ins/req
+alcyon-pgo-rules round 5: 849486525 instructions, 42474 ins/req
+alcyon-pgo-rules round 5 kernel: 1277616538 instructions, 63880 ins/req, total 106355 ins/req
+alcyon-pgo-rules summary (min total of 5): user 42474, kernel 63814, total 106288 ins/req
+alcyon-pgo-rules done (proxy pid 1896365 and backend pid 1896363 stopped)

@@ -1,0 +1,12 @@
+hap-o2-awslc-keepalive round 1: 722527111 instructions, 36126 ins/req
+hap-o2-awslc-keepalive round 1 kernel: 1342083180 instructions, 67104 ins/req, total 103230 ins/req
+hap-o2-awslc-keepalive round 2: 722370543 instructions, 36118 ins/req
+hap-o2-awslc-keepalive round 2 kernel: 1342146399 instructions, 67107 ins/req, total 103225 ins/req
+hap-o2-awslc-keepalive round 3: 722274649 instructions, 36113 ins/req
+hap-o2-awslc-keepalive round 3 kernel: 1341502988 instructions, 67075 ins/req, total 103188 ins/req
+hap-o2-awslc-keepalive round 4: 722174614 instructions, 36108 ins/req
+hap-o2-awslc-keepalive round 4 kernel: 1342133881 instructions, 67106 ins/req, total 103215 ins/req
+hap-o2-awslc-keepalive round 5: 722031557 instructions, 36101 ins/req
+hap-o2-awslc-keepalive round 5 kernel: 1343060525 instructions, 67153 ins/req, total 103254 ins/req
+hap-o2-awslc-keepalive summary (min total of 5): user 36113, kernel 67075, total 103188 ins/req
+hap-o2-awslc-keepalive done (proxy pid 1983772 and backend pid 1983769 stopped)

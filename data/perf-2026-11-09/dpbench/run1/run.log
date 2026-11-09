@@ -1,0 +1,20 @@
+start 16:39:47 game=0 gov=performance load=0.52
+nb1 alcyon-pgo max: 26202 req/s, cpu .54 cores
+nb1 hap-clang-pgo-lto max: 27063 req/s, cpu .54 cores
+nb1 alcyon-rp max: 24766 req/s, cpu .56 cores
+nb1 hap-o2 max: 25167 req/s, cpu .55 cores
+nb1 fixed rate R=19000 req/s (80% of the weakest max 24766), probe 190 req/s
+nb1 alcyon-pgo at 19000: load 18301 req/s, cpu .44 cores; probe p50=0.169ms p90=0.269ms p99=0.591ms p99.9=14.4ms p99.99=26.656ms
+nb1 hap-clang-pgo-lto at 19000: load 18299 req/s, cpu .42 cores; probe p50=0.174ms p90=0.309ms p99=11.88ms p99.9=15.728ms p99.99=22.384ms
+nb1 alcyon-rp at 19000: load 18301 req/s, cpu .47 cores; probe p50=0.187ms p90=0.337ms p99=12.528ms p99.9=18.672ms p99.99=29.232ms
+nb1 hap-o2 at 19000: load 18300 req/s, cpu .46 cores; probe p50=0.204ms p90=0.374ms p99=1.182ms p99.9=13.32ms p99.99=16.512ms
+nb4 alcyon-pgo max: 101583 req/s, cpu 2.24 cores
+nb4 hap-clang-pgo-lto max: 106987 req/s, cpu 2.25 cores
+nb4 alcyon-rp max: 95942 req/s, cpu 2.31 cores
+nb4 hap-o2 max: 99546 req/s, cpu 2.29 cores
+nb4 fixed rate R=76000 req/s (80% of the weakest max 95942), probe 760 req/s
+nb4 alcyon-pgo at 76000: load 73122 req/s, cpu 1.67 cores; probe p50=0.17ms p90=0.536ms p99=2.63ms p99.9=4.448ms p99.99=9.856ms
+nb4 hap-clang-pgo-lto at 76000: load 73121 req/s, cpu 1.65 cores; probe p50=0.174ms p90=0.546ms p99=1.277ms p99.9=3.95ms p99.99=6.608ms
+nb4 alcyon-rp at 76000: load 73120 req/s, cpu 1.82 cores; probe p50=0.17ms p90=0.531ms p99=2.848ms p99.9=5.024ms p99.99=10.008ms
+nb4 hap-o2 at 76000: load 73117 req/s, cpu 1.81 cores; probe p50=0.226ms p90=0.652ms p99=1.786ms p99.9=4.2ms p99.99=11.36ms
+end 16:47:05 game=0 load=6.47

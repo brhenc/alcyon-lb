@@ -1,0 +1,12 @@
+hap-clang-pgo-lto-awslc-keepalive round 1: 613107902 instructions, 30655 ins/req
+hap-clang-pgo-lto-awslc-keepalive round 1 kernel: 1347816629 instructions, 67390 ins/req, total 98046 ins/req
+hap-clang-pgo-lto-awslc-keepalive round 2: 613172943 instructions, 30658 ins/req
+hap-clang-pgo-lto-awslc-keepalive round 2 kernel: 1347593533 instructions, 67379 ins/req, total 98038 ins/req
+hap-clang-pgo-lto-awslc-keepalive round 3: 613055779 instructions, 30652 ins/req
+hap-clang-pgo-lto-awslc-keepalive round 3 kernel: 1345506320 instructions, 67275 ins/req, total 97928 ins/req
+hap-clang-pgo-lto-awslc-keepalive round 4: 613032705 instructions, 30651 ins/req
+hap-clang-pgo-lto-awslc-keepalive round 4 kernel: 1346778736 instructions, 67338 ins/req, total 97990 ins/req
+hap-clang-pgo-lto-awslc-keepalive round 5: 612735756 instructions, 30636 ins/req
+hap-clang-pgo-lto-awslc-keepalive round 5 kernel: 1346448029 instructions, 67322 ins/req, total 97959 ins/req
+hap-clang-pgo-lto-awslc-keepalive summary (min total of 5): user 30652, kernel 67275, total 97928 ins/req
+hap-clang-pgo-lto-awslc-keepalive done (proxy pid 2028286 and backend pid 2028284 stopped)

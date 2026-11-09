@@ -1,0 +1,12 @@
+alcyon-rp-h2s1 round 1: 505728683 instructions, 50572 ins/req
+alcyon-rp-h2s1 round 1 kernel: 645721929 instructions, 64572 ins/req, total 115145 ins/req
+alcyon-rp-h2s1 round 2: 505584339 instructions, 50558 ins/req
+alcyon-rp-h2s1 round 2 kernel: 645899410 instructions, 64589 ins/req, total 115148 ins/req
+alcyon-rp-h2s1 round 3: 505565414 instructions, 50556 ins/req
+alcyon-rp-h2s1 round 3 kernel: 648375333 instructions, 64837 ins/req, total 115394 ins/req
+alcyon-rp-h2s1 round 4: 505566421 instructions, 50556 ins/req
+alcyon-rp-h2s1 round 4 kernel: 646189528 instructions, 64618 ins/req, total 115175 ins/req
+alcyon-rp-h2s1 round 5: 505571527 instructions, 50557 ins/req
+alcyon-rp-h2s1 round 5 kernel: 646227526 instructions, 64622 ins/req, total 115179 ins/req
+alcyon-rp-h2s1 summary (min total of 5): user 50572, kernel 64572, total 115145 ins/req
+alcyon-rp-h2s1 done (proxy pid 1867398 and backend pid 1867395 stopped)

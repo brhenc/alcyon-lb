@@ -1,0 +1,10 @@
+alcyon-pgo ab1 per request (median of rounds, min PMU run 100.0%):
+  cycles:u                                     27062.9
+  instructions:u                               42474.4
+  cycles:k                                    100232.5
+  instructions:k                               64227.0
+  L1-dcache-load-misses                         2674.7
+  L1-icache-load-misses                         1064.0
+  branch-misses                                 1640.8
+  l2_cache_req_stat.ic_dc_miss_in_l2            4508.8
+  IPC user 1.569  IPC kernel 0.641  cycles/req user 27063 kernel 100233

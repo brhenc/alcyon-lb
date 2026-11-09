@@ -1,0 +1,5 @@
+hapq-o2-awslc-h3fit round 1: best 53158 ins/req at 1.0000 dgrams/req, worst 61416 at 2.0196, fit 61015 ins/req at 1.97
+hapq-o2-awslc-h3fit round 2: best 53178 ins/req at 1.0000 dgrams/req, worst 61420 at 2.0196, fit 61019 ins/req at 1.97
+hapq-o2-awslc-h3fit round 3: best 53139 ins/req at 1.0000 dgrams/req, worst 61604 at 2.0196, fit 61192 ins/req at 1.97
+hapq-o2-awslc-h3fit h3fit: fit 61019 ins/req at 1.97 client dgrams/req (median of 3, spread 0.29%); best 53158 at 1.0000, worst 61420 at 2.0196
+hapq-o2-awslc-h3fit done (proxy pid 2072818 and backend pid 2072816 stopped)

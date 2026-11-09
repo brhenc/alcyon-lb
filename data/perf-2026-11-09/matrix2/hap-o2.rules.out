@@ -1,0 +1,12 @@
+hap-o2-rules round 1: 874699351 instructions, 43734 ins/req
+hap-o2-rules round 1 kernel: 1351072891 instructions, 67553 ins/req, total 111288 ins/req
+hap-o2-rules round 2: 874493362 instructions, 43724 ins/req
+hap-o2-rules round 2 kernel: 1349669467 instructions, 67483 ins/req, total 111208 ins/req
+hap-o2-rules round 3: 874477525 instructions, 43723 ins/req
+hap-o2-rules round 3 kernel: 1352262318 instructions, 67613 ins/req, total 111336 ins/req
+hap-o2-rules round 4: 874334730 instructions, 43716 ins/req
+hap-o2-rules round 4 kernel: 1432337285 instructions, 71616 ins/req, total 115333 ins/req
+hap-o2-rules round 5: 874223963 instructions, 43711 ins/req
+hap-o2-rules round 5 kernel: 1422107992 instructions, 71105 ins/req, total 114816 ins/req
+hap-o2-rules summary (min total of 5): user 43724, kernel 67483, total 111208 ins/req
+hap-o2-rules done (proxy pid 1925698 and backend pid 1925696 stopped)

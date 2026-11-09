@@ -1,0 +1,12 @@
+alcyon-pgo-keepalive round 1: 592399511 instructions, 29619 ins/req
+alcyon-pgo-keepalive round 1 kernel: 1275246881 instructions, 63762 ins/req, total 93382 ins/req
+alcyon-pgo-keepalive round 2: 592165591 instructions, 29608 ins/req
+alcyon-pgo-keepalive round 2 kernel: 1281611674 instructions, 64080 ins/req, total 93688 ins/req
+alcyon-pgo-keepalive round 3: 592162320 instructions, 29608 ins/req
+alcyon-pgo-keepalive round 3 kernel: 1283965902 instructions, 64198 ins/req, total 93806 ins/req
+alcyon-pgo-keepalive round 4: 592167515 instructions, 29608 ins/req
+alcyon-pgo-keepalive round 4 kernel: 1276548324 instructions, 63827 ins/req, total 93435 ins/req
+alcyon-pgo-keepalive round 5: 589432165 instructions, 29471 ins/req
+alcyon-pgo-keepalive round 5 kernel: 1276854779 instructions, 63842 ins/req, total 93314 ins/req
+alcyon-pgo-keepalive summary (min total of 5): user 29471, kernel 63842, total 93314 ins/req
+alcyon-pgo-keepalive done (proxy pid 1895962 and backend pid 1895959 stopped)

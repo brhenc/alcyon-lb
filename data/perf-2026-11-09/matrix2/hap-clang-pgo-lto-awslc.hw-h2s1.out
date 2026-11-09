@@ -1,0 +1,10 @@
+hap-clang-pgo-lto-awslc h2s1 per request (median of rounds, min PMU run 100.0%):
+  cycles:u                                     36815.1
+  instructions:u                               43020.7
+  cycles:k                                    120066.6
+  instructions:k                               74269.0
+  L1-dcache-load-misses                         2995.8
+  L1-icache-load-misses                         1455.7
+  branch-misses                                 2035.5
+  l2_cache_req_stat.ic_dc_miss_in_l2            5887.9
+  IPC user 1.169  IPC kernel 0.619  cycles/req user 36815 kernel 120067

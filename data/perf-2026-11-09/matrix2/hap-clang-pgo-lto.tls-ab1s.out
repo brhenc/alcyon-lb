@@ -1,0 +1,12 @@
+hap-clang-pgo-lto-tls-ab1s round 1: 219933723 instructions, 43986 ins/req
+hap-clang-pgo-lto-tls-ab1s round 1 kernel: 354361760 instructions, 70872 ins/req, total 114859 ins/req
+hap-clang-pgo-lto-tls-ab1s round 2: 219980223 instructions, 43996 ins/req
+hap-clang-pgo-lto-tls-ab1s round 2 kernel: 354481124 instructions, 70896 ins/req, total 114892 ins/req
+hap-clang-pgo-lto-tls-ab1s round 3: 219946217 instructions, 43989 ins/req
+hap-clang-pgo-lto-tls-ab1s round 3 kernel: 354287095 instructions, 70857 ins/req, total 114846 ins/req
+hap-clang-pgo-lto-tls-ab1s round 4: 219943721 instructions, 43988 ins/req
+hap-clang-pgo-lto-tls-ab1s round 4 kernel: 354158315 instructions, 70831 ins/req, total 114820 ins/req
+hap-clang-pgo-lto-tls-ab1s round 5: 219950886 instructions, 43990 ins/req
+hap-clang-pgo-lto-tls-ab1s round 5 kernel: 353956430 instructions, 70791 ins/req, total 114781 ins/req
+hap-clang-pgo-lto-tls-ab1s summary (min total of 5): user 43990, kernel 70791, total 114781 ins/req
+hap-clang-pgo-lto-tls-ab1s done (proxy pid 1955998 and backend pid 1955971 stopped)

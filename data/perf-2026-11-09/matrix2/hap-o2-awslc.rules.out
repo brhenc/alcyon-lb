@@ -1,0 +1,12 @@
+hap-o2-awslc-rules round 1: 874673515 instructions, 43733 ins/req
+hap-o2-awslc-rules round 1 kernel: 1344254541 instructions, 67212 ins/req, total 110946 ins/req
+hap-o2-awslc-rules round 2: 874420343 instructions, 43721 ins/req
+hap-o2-awslc-rules round 2 kernel: 1342913624 instructions, 67145 ins/req, total 110866 ins/req
+hap-o2-awslc-rules round 3: 874474749 instructions, 43723 ins/req
+hap-o2-awslc-rules round 3 kernel: 1342613113 instructions, 67130 ins/req, total 110854 ins/req
+hap-o2-awslc-rules round 4: 874338919 instructions, 43716 ins/req
+hap-o2-awslc-rules round 4 kernel: 1342601688 instructions, 67130 ins/req, total 110847 ins/req
+hap-o2-awslc-rules round 5: 874213821 instructions, 43710 ins/req
+hap-o2-awslc-rules round 5 kernel: 1342980958 instructions, 67149 ins/req, total 110859 ins/req
+hap-o2-awslc-rules summary (min total of 5): user 43716, kernel 67130, total 110847 ins/req
+hap-o2-awslc-rules done (proxy pid 1983968 and backend pid 1983929 stopped)

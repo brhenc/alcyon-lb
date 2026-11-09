@@ -1,0 +1,12 @@
+alcyon-rp-tls-ab1s round 1: 206149302 instructions, 41229 ins/req
+alcyon-rp-tls-ab1s round 1 kernel: 319143452 instructions, 63828 ins/req, total 105058 ins/req
+alcyon-rp-tls-ab1s round 2: 206138606 instructions, 41227 ins/req
+alcyon-rp-tls-ab1s round 2 kernel: 318817171 instructions, 63763 ins/req, total 104991 ins/req
+alcyon-rp-tls-ab1s round 3: 206082828 instructions, 41216 ins/req
+alcyon-rp-tls-ab1s round 3 kernel: 318952575 instructions, 63790 ins/req, total 105007 ins/req
+alcyon-rp-tls-ab1s round 4: 206068439 instructions, 41213 ins/req
+alcyon-rp-tls-ab1s round 4 kernel: 318824362 instructions, 63764 ins/req, total 104978 ins/req
+alcyon-rp-tls-ab1s round 5: 206065056 instructions, 41213 ins/req
+alcyon-rp-tls-ab1s round 5 kernel: 319086141 instructions, 63817 ins/req, total 105030 ins/req
+alcyon-rp-tls-ab1s summary (min total of 5): user 41213, kernel 63764, total 104978 ins/req
+alcyon-rp-tls-ab1s done (proxy pid 1868396 and backend pid 1868394 stopped)

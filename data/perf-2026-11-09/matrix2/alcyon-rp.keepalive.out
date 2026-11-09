@@ -1,0 +1,12 @@
+alcyon-rp-keepalive round 1: 702376191 instructions, 35118 ins/req
+alcyon-rp-keepalive round 1 kernel: 1274531082 instructions, 63726 ins/req, total 98845 ins/req
+alcyon-rp-keepalive round 2: 702154850 instructions, 35107 ins/req
+alcyon-rp-keepalive round 2 kernel: 1275329475 instructions, 63766 ins/req, total 98874 ins/req
+alcyon-rp-keepalive round 3: 702156860 instructions, 35107 ins/req
+alcyon-rp-keepalive round 3 kernel: 1273820038 instructions, 63691 ins/req, total 98798 ins/req
+alcyon-rp-keepalive round 4: 701830538 instructions, 35091 ins/req
+alcyon-rp-keepalive round 4 kernel: 1273919459 instructions, 63695 ins/req, total 98787 ins/req
+alcyon-rp-keepalive round 5: 702148680 instructions, 35107 ins/req
+alcyon-rp-keepalive round 5 kernel: 1273853641 instructions, 63692 ins/req, total 98800 ins/req
+alcyon-rp-keepalive summary (min total of 5): user 35091, kernel 63695, total 98787 ins/req
+alcyon-rp-keepalive done (proxy pid 1866965 and backend pid 1866962 stopped)

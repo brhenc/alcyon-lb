@@ -1,0 +1,12 @@
+alcyon-pgo-h2s1 round 1: 440674722 instructions, 44067 ins/req
+alcyon-pgo-h2s1 round 1 kernel: 643454210 instructions, 64345 ins/req, total 108412 ins/req
+alcyon-pgo-h2s1 round 2: 440540053 instructions, 44054 ins/req
+alcyon-pgo-h2s1 round 2 kernel: 644634179 instructions, 64463 ins/req, total 108517 ins/req
+alcyon-pgo-h2s1 round 3: 440509533 instructions, 44050 ins/req
+alcyon-pgo-h2s1 round 3 kernel: 642855232 instructions, 64285 ins/req, total 108336 ins/req
+alcyon-pgo-h2s1 round 4: 440507766 instructions, 44050 ins/req
+alcyon-pgo-h2s1 round 4 kernel: 642382210 instructions, 64238 ins/req, total 108288 ins/req
+alcyon-pgo-h2s1 round 5: 440516440 instructions, 44051 ins/req
+alcyon-pgo-h2s1 round 5 kernel: 642817688 instructions, 64281 ins/req, total 108333 ins/req
+alcyon-pgo-h2s1 summary (min total of 5): user 44050, kernel 64238, total 108288 ins/req
+alcyon-pgo-h2s1 done (proxy pid 1896568 and backend pid 1896566 stopped)

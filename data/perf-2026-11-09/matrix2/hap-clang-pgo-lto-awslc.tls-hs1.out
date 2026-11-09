@@ -1,0 +1,12 @@
+hap-clang-pgo-lto-awslc-tls-hs1 round 1: 7164811972 instructions, 1432962 ins/req
+hap-clang-pgo-lto-awslc-tls-hs1 round 1 kernel: 1852493576 instructions, 370498 ins/req, total 1803461 ins/req
+hap-clang-pgo-lto-awslc-tls-hs1 round 2: 7164858014 instructions, 1432971 ins/req
+hap-clang-pgo-lto-awslc-tls-hs1 round 2 kernel: 1852334686 instructions, 370466 ins/req, total 1803438 ins/req
+hap-clang-pgo-lto-awslc-tls-hs1 round 3: 7164812297 instructions, 1432962 ins/req
+hap-clang-pgo-lto-awslc-tls-hs1 round 3 kernel: 1852957588 instructions, 370591 ins/req, total 1803553 ins/req
+hap-clang-pgo-lto-awslc-tls-hs1 round 4: 7164839648 instructions, 1432967 ins/req
+hap-clang-pgo-lto-awslc-tls-hs1 round 4 kernel: 1856944907 instructions, 371388 ins/req, total 1804356 ins/req
+hap-clang-pgo-lto-awslc-tls-hs1 round 5: 7164948980 instructions, 1432989 ins/req
+hap-clang-pgo-lto-awslc-tls-hs1 round 5 kernel: 1851761173 instructions, 370352 ins/req, total 1803342 ins/req
+hap-clang-pgo-lto-awslc-tls-hs1 summary (min total of 5): user 1432989, kernel 370352, total 1803342 ins/req
+hap-clang-pgo-lto-awslc-tls-hs1 done (proxy pid 2029704 and backend pid 2029702 stopped)

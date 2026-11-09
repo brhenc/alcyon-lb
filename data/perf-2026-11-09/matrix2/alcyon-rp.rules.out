@@ -1,0 +1,12 @@
+alcyon-rp-rules round 1: 1011010604 instructions, 50550 ins/req
+alcyon-rp-rules round 1 kernel: 1276516639 instructions, 63825 ins/req, total 114376 ins/req
+alcyon-rp-rules round 2: 1010807089 instructions, 50540 ins/req
+alcyon-rp-rules round 2 kernel: 1275452960 instructions, 63772 ins/req, total 114313 ins/req
+alcyon-rp-rules round 3: 1010804545 instructions, 50540 ins/req
+alcyon-rp-rules round 3 kernel: 1275427338 instructions, 63771 ins/req, total 114311 ins/req
+alcyon-rp-rules round 4: 1009639235 instructions, 50481 ins/req
+alcyon-rp-rules round 4 kernel: 1276818040 instructions, 63840 ins/req, total 114322 ins/req
+alcyon-rp-rules round 5: 1010799574 instructions, 50539 ins/req
+alcyon-rp-rules round 5 kernel: 1275797390 instructions, 63789 ins/req, total 114329 ins/req
+alcyon-rp-rules summary (min total of 5): user 50540, kernel 63771, total 114311 ins/req
+alcyon-rp-rules done (proxy pid 1867220 and backend pid 1867217 stopped)

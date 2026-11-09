@@ -1,0 +1,10 @@
+hap-o2-awslc h2s1 per request (median of rounds, min PMU run 100.0%):
+  cycles:u                                     66137.6
+  instructions:u                               48703.2
+  cycles:k                                    130051.6
+  instructions:k                               74181.2
+  L1-dcache-load-misses                         2972.2
+  L1-icache-load-misses                         1997.3
+  branch-misses                                 2516.1
+  l2_cache_req_stat.ic_dc_miss_in_l2           11641.6
+  IPC user 0.736  IPC kernel 0.570  cycles/req user 66138 kernel 130052

@@ -1,0 +1,12 @@
+hap-o2-keepalive round 1: 722514771 instructions, 36125 ins/req
+hap-o2-keepalive round 1 kernel: 1434676128 instructions, 71733 ins/req, total 107859 ins/req
+hap-o2-keepalive round 2: 722189443 instructions, 36109 ins/req
+hap-o2-keepalive round 2 kernel: 1436092833 instructions, 71804 ins/req, total 107914 ins/req
+hap-o2-keepalive round 3: 722271149 instructions, 36113 ins/req
+hap-o2-keepalive round 3 kernel: 1348573113 instructions, 67428 ins/req, total 103542 ins/req
+hap-o2-keepalive round 4: 722104687 instructions, 36105 ins/req
+hap-o2-keepalive round 4 kernel: 1347876443 instructions, 67393 ins/req, total 103499 ins/req
+hap-o2-keepalive round 5: 722048050 instructions, 36102 ins/req
+hap-o2-keepalive round 5 kernel: 1349003371 instructions, 67450 ins/req, total 103552 ins/req
+hap-o2-keepalive summary (min total of 5): user 36105, kernel 67393, total 103499 ins/req
+hap-o2-keepalive done (proxy pid 1925547 and backend pid 1925544 stopped)

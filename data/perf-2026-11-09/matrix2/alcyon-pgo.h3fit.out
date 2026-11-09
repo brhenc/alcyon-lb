@@ -1,0 +1,5 @@
+alcyon-pgo-h3fit round 1: best 63232 ins/req at 1.0000 dgrams/req, worst 72300 at 2.0768, fit 71401 ins/req at 1.97
+alcyon-pgo-h3fit round 2: best 63308 ins/req at 1.0000 dgrams/req, worst 72378 at 2.0768, fit 71479 ins/req at 1.97
+alcyon-pgo-h3fit round 3: best 63360 ins/req at 1.0000 dgrams/req, worst 72747 at 2.0768, fit 71816 ins/req at 1.97
+alcyon-pgo-h3fit h3fit: fit 71479 ins/req at 1.97 client dgrams/req (median of 3, spread 0.58%); best 63308 at 1.0000, worst 72378 at 2.0768
+alcyon-pgo-h3fit done (proxy pid 2071972 and backend pid 2071969 stopped)

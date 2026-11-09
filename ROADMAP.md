@@ -63,15 +63,16 @@ All of these are refused when the configuration loads, never accepted and ignore
 From `performance.md` (2026-11-09, one core). HAProxy was also built with LTO, PGO and clang,
 so each comparison is between builds made the same way.
 
-- **HTTP/3:** 29-36% more instructions per request than HAProxy 3.5-dev10, in every pairing of
-  builds. Profile the QUIC path before choosing a change. It is quinn-proto, vendored and
-  already patched for allocations.
-- **Rules:** 11-16% more instructions than HAProxy, but level in cycles, so the extra
-  instructions are cheap ones. Look at what runs per request outside the rules themselves.
+- **HTTP/3:** 29-43% more instructions per request than HAProxy 3.5-dev10, in every pairing of
+  builds and with either TLS library. Profile the QUIC path before choosing a change. It is
+  quinn-proto, vendored and already patched for allocations.
+- **Rules:** 11-16% more user-space instructions than HAProxy, but level in cycles and +2% with
+  the kernel counted. Look at what runs per request outside the rules themselves.
 - **Plain proxying** is level or ahead in every pairing, and PGO is worth 30-45% of cycles to
   both proxies. Releases should ship the PGO build (`tools/pgo-build.sh`).
-- **Not measured yet:** scaling across many cores against HAProxy's thread groups, large bodies,
-  and the kernel side of each request. This host does not allow counting kernel instructions.
+- **dpbench** (a server connection per request, 1 and 4 threads): Alcyon 1-5% below HAProxy's
+  maximum, same latency. The connect path is the next place to look.
+- **Not measured yet:** more than 4 threads against HAProxy's thread groups, and large bodies.
 
 ## 4. The research questions
 

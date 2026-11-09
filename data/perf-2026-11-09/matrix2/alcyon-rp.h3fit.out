@@ -1,0 +1,5 @@
+alcyon-rp-h3fit round 1: best 73555 ins/req at 1.0000 dgrams/req, worst 83639 at 2.0768, fit 82639 ins/req at 1.97
+alcyon-rp-h3fit round 2: best 73339 ins/req at 1.0000 dgrams/req, worst 83928 at 2.0768, fit 82878 ins/req at 1.97
+alcyon-rp-h3fit round 3: best 73701 ins/req at 1.0000 dgrams/req, worst 83632 at 2.0768, fit 82647 ins/req at 1.97
+alcyon-rp-h3fit h3fit: fit 82647 ins/req at 1.97 client dgrams/req (median of 3, spread 0.29%); best 73555 at 1.0000, worst 83639 at 2.0768
+alcyon-rp-h3fit done (proxy pid 2071681 and backend pid 2071634 stopped)

@@ -1,0 +1,12 @@
+hap-o2-awslc-tls-hs1 round 1: 7198900613 instructions, 1439780 ins/req
+hap-o2-awslc-tls-hs1 round 1 kernel: 1835246947 instructions, 367049 ins/req, total 1806829 ins/req
+hap-o2-awslc-tls-hs1 round 2: 7198924506 instructions, 1439784 ins/req
+hap-o2-awslc-tls-hs1 round 2 kernel: 1838915633 instructions, 367783 ins/req, total 1807568 ins/req
+hap-o2-awslc-tls-hs1 round 3: 7198857339 instructions, 1439771 ins/req
+hap-o2-awslc-tls-hs1 round 3 kernel: 1824496591 instructions, 364899 ins/req, total 1804670 ins/req
+hap-o2-awslc-tls-hs1 round 4: 7199031309 instructions, 1439806 ins/req
+hap-o2-awslc-tls-hs1 round 4 kernel: 1828171234 instructions, 365634 ins/req, total 1805440 ins/req
+hap-o2-awslc-tls-hs1 round 5: 7198829632 instructions, 1439765 ins/req
+hap-o2-awslc-tls-hs1 round 5 kernel: 1836117316 instructions, 367223 ins/req, total 1806989 ins/req
+hap-o2-awslc-tls-hs1 summary (min total of 5): user 1439771, kernel 364899, total 1804670 ins/req
+hap-o2-awslc-tls-hs1 done (proxy pid 1985392 and backend pid 1985390 stopped)

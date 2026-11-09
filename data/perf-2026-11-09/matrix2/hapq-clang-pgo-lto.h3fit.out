@@ -1,0 +1,5 @@
+hapq-clang-pgo-lto-h3fit round 1: best 45386 ins/req at 1.0000 dgrams/req, worst 53200 at 2.0196, fit 52820 ins/req at 1.97
+hapq-clang-pgo-lto-h3fit round 2: best 45420 ins/req at 1.0000 dgrams/req, worst 53164 at 2.0196, fit 52787 ins/req at 1.97
+hapq-clang-pgo-lto-h3fit round 3: best 45362 ins/req at 1.0000 dgrams/req, worst 53318 at 2.0196, fit 52931 ins/req at 1.97
+hapq-clang-pgo-lto-h3fit h3fit: fit 52820 ins/req at 1.97 client dgrams/req (median of 3, spread 0.27%); best 45386 at 1.0000, worst 53200 at 2.0196
+hapq-clang-pgo-lto-h3fit done (proxy pid 2072571 and backend pid 2072568 stopped)
