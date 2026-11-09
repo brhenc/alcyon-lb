@@ -126,7 +126,7 @@ contract) and E1/E2 are Alcyon's. `vendor/README.md` lists each commit with "ups
 
 ## 3. Slices
 
-Measuring, all slices: release-perf, slot B (`flock -x /tmp/ibex-load-n1.lock`,
+Measuring, all slices: release-perf, slot B (`flock -x /tmp/alcyon-load-n1.lock`,
 `ALCYON_MEASURE_CPUS=12,13,14`), `tools/measure/insreq.sh <label> <bin>
 tools/measure/scenarios/h3.body h3c1 10000 7 <out>` for the change and for its parent commit,
 each round's `UDP datagram: N sent` from `<out>/<label>.rN.client`, the figure read from the

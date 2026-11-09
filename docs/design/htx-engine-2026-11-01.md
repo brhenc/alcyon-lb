@@ -299,7 +299,7 @@ One function per direction, the port of `h1_make_reqline`/`h1_make_stline`/`h1_m
 
 ## 3. Slices
 
-Measuring, all slices: release-perf, slot A (`flock -x /tmp/ibex-load.lock`), `insreq.sh` for
+Measuring, all slices: release-perf, slot A (`flock -x /tmp/alcyon-load.lock`), `insreq.sh` for
 `rules ab1`, `keepalive ab1`, `h2s1`, `h3fit` against the parent commit; kernel instructions
 reported beside user ones and counted (T568); `request_allocations*.rs` stay at their pins;
 `./tools/checkin.sh` green. **Budget: +0.5 % on every scenario the slice does not name as its

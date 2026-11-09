@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 #
-# T603: the measurement matrix on slot A (/tmp/ibex-load.lock, CPUs 4-6) for one binary:
+# T603: the measurement matrix on slot A (/tmp/alcyon-load.lock, CPUs 4-6) for one binary:
 #   insreq.sh  ab1 keepalive, ab1 rules, h2s1 (min of 5; user and kernel), h3fit when asked
 #   hwcounters.sh  per-request cycles/IPC/misses on the same three, throughput 1 and 50 connections
 #
@@ -27,7 +27,7 @@ run_locked() { # name cmd...
     game && { echo "$L $name: game running before, waiting 30 s"; sleep 30; continue; }
     [ "$(gov)" = "performance " ] || { echo "$L $name: governor $(gov), not performance" >&2; }
     echo "$L $name try $try start $(date +%H:%M:%S) loadavg $(cut -d' ' -f1-3 /proc/loadavg) governor $(gov)"
-    flock -x /tmp/ibex-load.lock "$@" > "$OUT/$L.$name.out" 2>&1
+    flock -x /tmp/alcyon-load.lock "$@" > "$OUT/$L.$name.out" 2>&1
     local rc=$?
     echo "$L $name end $(date +%H:%M:%S) loadavg $(cut -d' ' -f1-3 /proc/loadavg) rc $rc"
     if game; then echo "$L $name: game seen after the run, discarded"; continue; fi

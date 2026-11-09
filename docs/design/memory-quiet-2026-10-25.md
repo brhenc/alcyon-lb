@@ -1,7 +1,7 @@
 # Quiet measurement, 2026-10-25 04:40 (whole memory series)
 
 How it was run:
-- The supervisor ran `/tmp/q-measure.sh` under `flock -x /tmp/ibex-load.lock`, during a window
+- The supervisor ran `/tmp/q-measure.sh` under `flock -x /tmp/alcyon-load.lock`, during a window
   agreed with depeche-session: llama-server was stopped (state `T`) and the governor was
   `performance`.
 - Each line is the output of `tools/measure/insreq.sh <label> <bin> <scenario> <client> 30000 5`:

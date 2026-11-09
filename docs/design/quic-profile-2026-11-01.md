@@ -2,7 +2,7 @@
 
 Measurement and evidence only. The redesign is T545, which starts from here. All the numbers
 are user-space instructions (`instructions:u`). There are no wall-time claims: everything ran in
-measuring slot B (`flock -x /tmp/ibex-load-n1.lock`, `ALCYON_MEASURE_CPUS=12,13,14`, perf and the
+measuring slot B (`flock -x /tmp/alcyon-load-n1.lock`, `ALCYON_MEASURE_CPUS=12,13,14`, perf and the
 client on 13), governor `performance`, no `wwm.exe`, 21:55-22:16 CET.
 
 **Build measured**: branch `fix/t544` = main 5d7fea46 (T539: HandleMap hasher, qpack
@@ -238,7 +238,7 @@ bookkeeping. Fixable without restructuring quinn: the PADDING scan, the number o
 
 ### Measurement recipe (reuse it)
 
-1. Counts: `ALCYON_MEASURE_CPUS=12,13,14 flock -x /tmp/ibex-load-n1.lock tools/measure/insreq.sh
+1. Counts: `ALCYON_MEASURE_CPUS=12,13,14 flock -x /tmp/alcyon-load-n1.lock tools/measure/insreq.sh
    <label> <bin> tools/measure/scenarios/h3.body h3c1 10000 10 <out>`. Read `grep 'UDP datagram'
    <out>/<label>.r*.client` next to each round, and compare at equal client datagrams per request
    (or fit, as in 0b). HAProxy: the same command with `~/reference/haproxy-quic/haproxy`.

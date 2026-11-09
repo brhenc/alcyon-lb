@@ -15,7 +15,7 @@
 #   tp1, tp50  throughput, requests/s (ab -k -c 1; measure-bench fixed, 50 keep-alive connections), median of
 #              rounds, with the load average at start and end. A timing claim: hold the slot, no game running.
 #
-# Takes no lock: wrap in `flock -x /tmp/ibex-load.lock`, and check wwm.exe and the governor before and after.
+# Takes no lock: wrap in `flock -x /tmp/alcyon-load.lock`, and check wwm.exe and the governor before and after.
 set -u
 [ $# -eq 7 ] || { sed -n 5,19p "$0"; exit 2; }
 LABEL=$1; BIN=$2; BODY=$3; CL=$4; N=$5; ROUNDS=$6; OUT=$7

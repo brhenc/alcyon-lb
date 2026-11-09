@@ -3,14 +3,14 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 #
 # First free counts-only measure slot (instruction counts, never timing claims; slot A,
-# /tmp/ibex-load.lock CPUs 4-6, stays the only slot for timing). Holds the slot's lock while
+# /tmp/alcyon-load.lock CPUs 4-6, stays the only slot for timing). Holds the slot's lock while
 # the command runs and exports ALCYON_MEASURE_CPUS (what insreq.sh reads) and ALCYON_MEASURE_SLOT.
 #
 #   tools/measure/slot.sh [--wait] -- <cmd> [args...]
 #
-#   B  /tmp/ibex-load-n1.lock  CPUs 12,13,14  (node 1)
-#   C  /tmp/ibex-load-n2.lock  CPUs 20,21,22  (node 2; load on 16-23)
-#   D  /tmp/ibex-load-n3.lock  CPUs 28,29,30  (node 3, shared with another project; only
+#   B  /tmp/alcyon-load-n1.lock  CPUs 12,13,14  (node 1)
+#   C  /tmp/alcyon-load-n2.lock  CPUs 20,21,22  (node 2; load on 16-23)
+#   D  /tmp/alcyon-load-n3.lock  CPUs 28,29,30  (node 3, shared with another project; only
 #                                              when ALCYON_MEASURE_SLOT_D=1)
 #
 # Tries B, C, D in order without blocking. All held: exit 75 (EX_TEMPFAIL) and the command is not

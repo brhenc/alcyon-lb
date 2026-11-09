@@ -19,7 +19,7 @@ so it is an estimate for the stacks other than HAProxy (their own slope is unmea
 
 ## Measured
 
-Host: slot B (`flock -x /tmp/ibex-load-n1.lock`, CPUs 12,13,14 for server, client, backend),
+Host: slot B (`flock -x /tmp/alcyon-load-n1.lock`, CPUs 12,13,14 for server, client, backend),
 governor `performance`, no `wwm.exe`. Fedora 44, 2026-11-01 00:00 CET. Alcyon = main aa87cb3a,
 `--profile release-perf`. HAProxy = 3.5-dev10-38e65c-10 (`~/reference/haproxy-quic`).
 

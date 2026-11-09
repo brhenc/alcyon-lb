@@ -11,7 +11,7 @@
 #   T452_ONLY=base-aa-cand T452_ROUNDS=1 tools/measure/t452_night.sh   # smoke test
 #   T452_TAG_SUFFIX=-perfgov tools/measure/t452_night.sh   # again after a root setting change
 #
-# Per batch, holding `flock -x /tmp/ibex-load.lock` (waits up to 20 min, then skips):
+# Per batch, holding `flock -x /tmp/alcyon-load.lock` (waits up to 20 min, then skips):
 # checks wwm.exe, running VMs, llama-server CPU and busy CPUs over 3 s, and skips the batch
 # with the reason logged if the host is busy. Samples go to $T452_OUT (one JSON line each,
 # from t452_ab.py); batch records ("kind": "batch") say what ran or why it was skipped.
@@ -102,7 +102,7 @@ batch() {
     fi
     (
         if ! flock -x -w 1200 9; then
-            log "SKIP $tag: /tmp/ibex-load.lock busy for 20 min"; batch_record "$tag" skip "lock busy" '{}'; exit 0
+            log "SKIP $tag: /tmp/alcyon-load.lock busy for 20 min"; batch_record "$tag" skip "lock busy" '{}'; exit 0
         fi
         local pause=""
         [ -x "$MUSE" ] && pause=$("$MUSE" on --reason "T452 $tag" --max-minutes 20 --wait-seconds 120 2>/dev/null)
@@ -122,7 +122,7 @@ batch() {
             log "END  $tag: host $st"
         fi
         [ -n "$pause" ] && "$MUSE" off --id "$pause" >/dev/null 2>&1
-    ) 9>/tmp/ibex-load.lock
+    ) 9>/tmp/alcyon-load.lock
 }
 
 log "T452 night run: rounds $ROUNDS, out $OUT, only '${ONLY}', suffix '${SUFFIX}'"

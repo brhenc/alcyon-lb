@@ -10,7 +10,7 @@ parameters" is the source of the targets.)
 - Machine: 64 CPUs, quiet. Peers paused, no `wwm.exe`/`wineserver` before or after any run
   (checked with `ps`). `uptime` load average (1/5/15) at script start: 0.8-3.5 / 2.0-3.3 / 2.7-5.8
   (the 15 min figure still decaying from earlier work at the start); highest 1-min value at
-  the start or end of a run 4.95. Every script ran under `flock -o -x /tmp/ibex-load.lock`.
+  the start or end of a run 4.95. Every script ran under `flock -o -x /tmp/alcyon-load.lock`.
 - Each row: 3 runs of the script (each script itself takes the median of 3 internal runs
   where it has a loop), median of those. Both proxies on the same generated config
   (`tools/measure/m1lib.py` `proxy_cfg`), `nbthread 1`, frontend `maxconn` explicit.
@@ -31,7 +31,7 @@ parameters" is the source of the targets.)
 - `m1_reload.py` and `m1_uneven_load.py` are not executable; run as `python3 tools/measure/...`.
 
 Commands, from the repo root with `CARGO_TARGET_DIR=/home/bhenc/ibex-targets/T294`, wrapped as
-`flock -o -x /tmp/ibex-load.lock [taskset -c 0-15] <command>`.
+`flock -o -x /tmp/alcyon-load.lock [taskset -c 0-15] <command>`.
 
 | Parameter | Alcyon full | HAProxy full | Ratio | Alcyon 16 cores | HAProxy 16 cores | Ratio | M1 target | Result | Command |
 |---|---:|---:|---:|---:|---:|---:|---|---|---|

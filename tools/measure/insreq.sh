@@ -47,7 +47,7 @@
 # <k> ins/req, total <t> ins/req`; at the end `<L> summary (min total of R): user u, kernel k, total t
 # ins/req` (the round with the least total, its own user and kernel). If perf may not count :k (perf_event_paranoid), the kernel lines read `kernel: n/a`,
 # with one warning, and the run goes on. The h3fit mode counts user space only. Takes no lock: hold
-# `flock -x /tmp/ibex-load.lock` around a batch, and keep a batch under 15 minutes. Needs
+# `flock -x /tmp/alcyon-load.lock` around a batch, and keep a batch under 15 minutes. Needs
 # $HOME/ibex-targets/gate-slot1/release/measure-bench (MEASURE_BENCH overrides; for an h3 POST one
 # built since T555, which frames a body that arrives in a read of its own), and for h3best,
 # h3worst, h3fit $HOME/ibex-targets/h3bench/release/h3bench (H3BENCH overrides; built if missing).

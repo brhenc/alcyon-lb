@@ -3,7 +3,7 @@
 # Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 #
 # Tests for tools/gate.sh (T253). Runs fake gates (ALCYON_GATE_CMD) on locks and targets
-# under a private /tmp/t253-test.XXXX directory; never touches /tmp/ibex-gate*.lock.
+# under a private /tmp/t253-test.XXXX directory; never touches /tmp/alcyon-gate*.lock.
 #
 #   tools/test_gate.sh            test tools/gate.sh
 #   T253_LEGACY=1 tools/test_gate.sh disowned

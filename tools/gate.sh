@@ -8,7 +8,7 @@
 # nothing it starts holds that lock (T253). --only and --rerun-failed go to checkin.sh
 # (T267: rerun only the stages that failed on this tree); the lock and slot rules are the same.
 #
-# Why: the gate used to be run as `flock /tmp/ibex-gate.lock ./tools/checkin.sh`. flock hands
+# Why: the gate used to be run as `flock /tmp/alcyon-gate.lock ./tools/checkin.sh`. flock hands
 # the locked fd to its command and to everything that command starts. On 2026-10-10 cargo
 # started an sccache server during a gate; the daemon inherited the fd, outlived the gate,
 # and 14 queued gates waited on a lock no gate held. Here the lock fds are closed in every
@@ -16,10 +16,10 @@
 #
 # Slots: ALCYON_GATE_SLOTS (default 1) gates may run side by side. Slot K has its own lock
 # and its own target directory:
-#   slot 1:  /tmp/ibex-gate.lock          (the historical lock, so old-style
-#                                           `flock -o /tmp/ibex-gate.lock ...` waiters and
+#   slot 1:  /tmp/alcyon-gate.lock          (the historical lock, so old-style
+#                                           `flock -o /tmp/alcyon-gate.lock ...` waiters and
 #                                           this script exclude each other)
-#   slot K:  /tmp/ibex-gate.slot<K>.lock
+#   slot K:  /tmp/alcyon-gate.slot<K>.lock
 #   target:  ~/ibex-targets/gate-slot<K>
 # Inside the slot the worktree's *.rs and *.toml are touched, so the slot's target never
 # trusts mtimes another worktree left in it -- unless the last gate in the slot was this
@@ -37,7 +37,7 @@
 # it did not rebuild. Third-party artifacts and release builds stay. Only the slot's target.
 #
 # --exclusive (the supervisor's measuring gate on main) takes every slot, in order, after
-# announcing itself on /tmp/ibex-gate.exclusive.lock so non-exclusive gates stop taking
+# announcing itself on /tmp/alcyon-gate.exclusive.lock so non-exclusive gates stop taking
 # slots that free up meanwhile. Without --exclusive, ALCYON_GATE_SKIP_MEASURE=1 is forced.
 #
 # Refuses (exit 3) when the target filesystem has less than ALCYON_GATE_MIN_FREE_GB
@@ -51,7 +51,7 @@
 # Ends with `gate: rc=N slot=K`, and exits N.
 #
 # Overrides used by tools/test_gate.sh only (not for normal use):
-#   ALCYON_GATE_LOCK_PREFIX  (default /tmp/ibex-gate)  slot1 = <prefix>.lock, slotK = <prefix>.slot<K>.lock
+#   ALCYON_GATE_LOCK_PREFIX  (default /tmp/alcyon-gate)  slot1 = <prefix>.lock, slotK = <prefix>.slot<K>.lock
 #   ALCYON_GATE_TARGET_BASE  (default ~/ibex-targets)  slot K target = <base>/gate-slot<K>
 #   ALCYON_GATE_CMD          a bash command run instead of ./tools/checkin.sh
 #   ALCYON_GATE_POLL_SECS    (default 5) how often a waiting gate retries the slots
@@ -92,7 +92,7 @@ REPO=$(pwd)
 
 SLOTS=${ALCYON_GATE_SLOTS:-1}
 case "$SLOTS" in ''|*[!0-9]*|0) echo "gate: ALCYON_GATE_SLOTS must be a positive integer" >&2; exit 2 ;; esac
-PREFIX=${ALCYON_GATE_LOCK_PREFIX:-/tmp/ibex-gate}
+PREFIX=${ALCYON_GATE_LOCK_PREFIX:-/tmp/alcyon-gate}
 TARGET_BASE=${ALCYON_GATE_TARGET_BASE:-$HOME/ibex-targets}
 MIN_FREE_GB=${ALCYON_GATE_MIN_FREE_GB:-40}
 REPORT_SECS=${ALCYON_GATE_REPORT_SECS:-300}

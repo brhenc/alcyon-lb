@@ -882,7 +882,7 @@ and Alcyon PGO had PGO. Both Alcyon and HAProxy PGO are trained on the same mix,
 LLVM (instrumentation) and the HAProxy one from gcc `-fprofile-generate` (not the same counters, and
 HAProxy's training has no `fe_h3` for d8). The post-wave baseline HAProxy figure is **pgo-lto**.
 
-**Instructions per request** (user; kernel in brackets), slot A (`flock -x /tmp/ibex-load.lock`, CPUs
+**Instructions per request** (user; kernel in brackets), slot A (`flock -x /tmp/alcyon-load.lock`, CPUs
 4-6, governor performance, no `wwm.exe`), `insreq.sh`: keepalive and rules `ab -k -c 1` 5 x 20,000, min
 total round; h2s1 5 x 10,000; h3fit median of 3 at 1.97 dg/req, 5,000. Alcyon rp was re-measured on slot A (the board
 `insreq-06bdbce07c6d.json` came from another slot and agrees within 3 ins/req).

@@ -39,7 +39,7 @@ fi
 nice -n 19 cargo build -q --release --manifest-path fuzz/Cargo.toml 2>&1 | grep -E '^error' && exit 2
 mkdir -p "$OUTDIR"
 OUT=$OUTDIR/$(date +%F)-$SHA.md
-exec 9>>/tmp/ibex-load.lock
+exec 9>>/tmp/alcyon-load.lock
 # -o: the lock is not inherited by the children, only this script holds it while it waits
 RES=$(mktemp /tmp/difffuzz-soak.XXXXXX)
 flock -o -s 9 nice -n 19 taskset -c "$CORES" python3 fuzz/difffuzz.py soak \

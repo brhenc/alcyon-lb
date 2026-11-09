@@ -17,7 +17,7 @@
 # the HTTP/3 part and the fe_h3 frontend of tools/pgo/train.cfg, d8 (no QUIC) does not.
 # Needs the same tools as pgo-build.sh (h2load, socat, openssl, curl, nc) and its measure-bench/h3bench
 # (HAPV_BENCH_DIR, default ~/ibex-targets/t603-alcyon/pgo-bench/release). Training runs under
-# flock -x /tmp/ibex-load.lock (a synthetic load), builds run niced on CPUs 16-47.
+# flock -x /tmp/alcyon-load.lock (a synthetic load), builds run niced on CPUs 16-47.
 set -u
 ROOT=${HAPV_ROOT:-$HOME/ibex-targets/t603}
 HERE=$(cd "$(dirname "$0")/../.." && pwd) || exit 1
@@ -122,8 +122,8 @@ cmd_build() {
           log "$SET pgo: instrumented build"
           mk "$D" "-O2 -fprofile-generate -fprofile-update=atomic" "-fprofile-generate -fprofile-update=atomic" "$SET"
           cp "$D/haproxy" "$ROOT/$SET/haproxy-pgo-gen"
-          log "$SET pgo: training (flock -x /tmp/ibex-load.lock)"
-          flock -x /tmp/ibex-load.lock bash -c "$(declare -f train port log die); BENCHD=$BENCHD HERE=$HERE; train $SET $D/haproxy $ROOT/$SET/train-work" \
+          log "$SET pgo: training (flock -x /tmp/alcyon-load.lock)"
+          flock -x /tmp/alcyon-load.lock bash -c "$(declare -f train port log die); BENCHD=$BENCHD HERE=$HERE; train $SET $D/haproxy $ROOT/$SET/train-work" \
             || die "training failed"
           log "$SET pgo: $(find "$D" -name '*.gcda' | wc -l) .gcda files"
           rm -rf "$ROOT/$SET/pgo-lto"; cp -a "$D" "$ROOT/$SET/pgo-lto"

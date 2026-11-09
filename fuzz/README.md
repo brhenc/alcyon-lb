@@ -218,7 +218,7 @@ cases as `DIR/case_NNNNN.bin` (no HAProxy needed).
 | mode | command | what it does |
 |---|---|---|
 | gate (30 s budget) | `./tools/gate.sh --log /tmp/g.log --only diff-fuzz` (stage `diff-fuzz` of `tools/checkin.sh`) | replays `fuzz/corpus` and a rotating slice of the baseline (`--replay`, 50 entries, offset by day; `--replay 0` = all), then fresh cases (seed 293, fixed so the gate is reproducible: the baseline holds its DIFFs; other seeds are for `soak` and `--seed`; `--seed`/`--iters`) until the budget ends. FAILS on a DIFF not in the baseline, on a known input whose shape changed, and on a known input that became SAME (prints the hash to remove). Ports 18400-18423. |
-| soak (default 60 min) | `tools/difffuzz_soak.sh [MINUTES]` | generator rounds (seed = day number, 500 cases per round) under `flock -o -s /tmp/ibex-load.lock`, `nice -n 19 taskset -c 48-55`; new DIFFs go to `~/ibex-worktrees/review/difffuzz/<date>-<sha>.md`; one summary line on stdout; a row to `data/verification_runs.csv` if that ledger exists. |
+| soak (default 60 min) | `tools/difffuzz_soak.sh [MINUTES]` | generator rounds (seed = day number, 500 cases per round) under `flock -o -s /tmp/alcyon-load.lock`, `nice -n 19 taskset -c 48-55`; new DIFFs go to `~/ibex-worktrees/review/difffuzz/<date>-<sha>.md`; one summary line on stdout; a row to `data/verification_runs.csv` if that ledger exists. |
 | nightly | `tools/systemd/alcyon-difffuzz.{service,timer}` (03:00) | NOT installed by anything; copy to `~/.config/systemd/user/` and enable by hand. |
 
 By hand: `python3 fuzz/difffuzz.py gate --alcyon <alcyon> --gen <alcyon-fuzz>` (defaults:

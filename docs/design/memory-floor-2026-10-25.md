@@ -14,7 +14,7 @@ each burst (+0.6 s) and each idle: `VmRSS`, `show pools` buffer line, and (shim 
 calloc + realloc + aligned calls from `tools/allocshim/shim.c` via `LD_PRELOAD` on both proxies,
 divided by 3N requests (so it includes accept, session and close work, and the proxy's backend side).
 N > maxconn was not run. Binaries: Alcyon release of 07151b01 (`cargo build --release -p alcyon-rt --bin alcyon`),
-HAProxy 3.5-dev8-885761-29. Each series ran under its own `flock -x /tmp/ibex-load.lock`.
+HAProxy 3.5-dev8-885761-29. Each series ran under its own `flock -x /tmp/alcyon-load.lock`.
 
 Host state: governor `performance`; load average 3-45 from other agents' work (logged per series in
 `/tmp/t469/out/log`); `virsh list` shows 3 VMs (suspended from ~11:30 per the supervisor).
