@@ -1,0 +1,20 @@
+start 18:11:05 gov=performance load=0.70
+nb1 alcyon-pgo max: 26690 req/s, cpu .54 cores (process), .90 cores (CPUs incl. softirq)
+nb1 hap-clang-pgo-lto max: 27356 req/s, cpu .54 cores (process), .90 cores (CPUs incl. softirq)
+nb1 alcyon-rp max: 25086 req/s, cpu .56 cores (process), .90 cores (CPUs incl. softirq)
+nb1 hap-o2 max: 25571 req/s, cpu .55 cores (process), .90 cores (CPUs incl. softirq)
+nb1 fixed rate R=20000 req/s (80% of the weakest max 25086), probe 200 req/s
+nb1 alcyon-pgo at 20000: load 19260 req/s, cpu .44 cores (process), .74 cores (CPUs incl. softirq); probe p50=0.157ms p90=0.276ms p99=10.52ms p99.9=16.176ms p99.99=26.352ms
+nb1 hap-clang-pgo-lto at 20000: load 19260 req/s, cpu .43 cores (process), .73 cores (CPUs incl. softirq); probe p50=0.178ms p90=0.322ms p99=10.488ms p99.9=14.472ms p99.99=24.208ms
+nb1 alcyon-rp at 20000: load 19261 req/s, cpu .48 cores (process), .78 cores (CPUs incl. softirq); probe p50=0.182ms p90=0.301ms p99=1.137ms p99.9=13.616ms p99.99=22.56ms
+nb1 hap-o2 at 20000: load 19260 req/s, cpu .47 cores (process), .76 cores (CPUs incl. softirq); probe p50=0.219ms p90=0.425ms p99=11.016ms p99.9=16.896ms p99.99=19.088ms
+nb4 alcyon-pgo max: 105045 req/s, cpu 2.23 cores (process), 3.62 cores (CPUs incl. softirq)
+nb4 hap-clang-pgo-lto max: 106885 req/s, cpu 2.22 cores (process), 3.63 cores (CPUs incl. softirq)
+nb4 alcyon-rp max: 99300 req/s, cpu 2.27 cores (process), 3.62 cores (CPUs incl. softirq)
+nb4 hap-o2 max: 101088 req/s, cpu 2.30 cores (process), 3.62 cores (CPUs incl. softirq)
+nb4 fixed rate R=79000 req/s (80% of the weakest max 99300), probe 790 req/s
+nb4 alcyon-pgo at 79000: load 76002 req/s, cpu 1.71 cores (process), 2.86 cores (CPUs incl. softirq); probe p50=0.196ms p90=0.561ms p99=1.581ms p99.9=4.168ms p99.99=5.596ms
+nb4 hap-clang-pgo-lto at 79000: load 76007 req/s, cpu 1.69 cores (process), 2.83 cores (CPUs incl. softirq); probe p50=0.19ms p90=0.587ms p99=3.052ms p99.9=4.452ms p99.99=6.472ms
+nb4 alcyon-rp at 79000: load 76008 req/s, cpu 1.86 cores (process), 3.00 cores (CPUs incl. softirq); probe p50=0.192ms p90=0.551ms p99=1.55ms p99.9=4.532ms p99.99=9.728ms
+nb4 hap-o2 at 79000: load 76011 req/s, cpu 1.86 cores (process), 2.96 cores (CPUs incl. softirq); probe p50=0.234ms p90=0.666ms p99=3.462ms p99.9=5.38ms p99.99=8.784ms
+end 18:18:22 load=7.47

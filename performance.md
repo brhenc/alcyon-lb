@@ -192,31 +192,39 @@ with its `h1load` and `httpterm` (commit `622d9d4`) and its forwarder configurat
 at a time on CPU 8 (or 8-11, one CCX), servers on 16-23, the load generator (`h1load -t 8 -c 400`)
 on 24-31. First each proxy's maximum. Then every proxy at the same fixed rate, 80% of the
 weakest maximum, with a separate low-rate probe client (`-c 4`, 1% of the rate) whose
-percentiles are the latency. Two runs, 16:39 and 16:47, on the quiet host. `tools/measure/dpbench.sh`.
+percentiles are the latency. Runs 1 and 2 (16:39, 16:47) with `balance random` as in dpbench,
+run 3 (18:11) with `balance roundrobin` (`DPB_BALANCE=roundrobin`), all on the quiet host.
+`tools/measure/dpbench.sh`.
 
 | | alcyon-pgo | hap-clang-pgo-lto | alcyon-rp | hap-o2 |
 |---|---:|---:|---:|---:|
-| max req/s, 1 thread (run 1 / run 2) | 26,202 / 26,483 | 27,063 / 26,807 | 24,766 / 24,186 | 25,167 / 25,270 |
-| max req/s, 4 threads | 101,583 / 102,510 | 106,987 / 106,379 | 95,942 / 97,736 | 99,546 / 98,470 |
-| CPU at 19,000 req/s, 1 thread (cores) | 0.73 | 0.71 | 0.76 | 0.75 |
-| CPU at 78,000 req/s, 4 threads (cores) | 2.85 | 2.82 | 2.96 | 2.96 |
-| probe p50 / p99.9, 4 threads (ms) | 0.16 / 4.9 | 0.19 / 4.7 | 0.24 / 5.1 | 0.23 / 6.6 |
+| max req/s, 1 thread (run 1 / 2 / 3) | 26,202 / 26,483 / 26,690 | 27,063 / 26,807 / 27,356 | 24,766 / 24,186 / 25,086 | 25,167 / 25,270 / 25,571 |
+| max req/s, 4 threads (run 1 / 2 / 3) | 101,583 / 102,510 / 105,045 | 106,987 / 106,379 / 106,885 | 95,942 / 97,736 / 99,300 | 99,546 / 98,470 / 101,088 |
+| CPU at 19,000 req/s, 1 thread (cores; run 2) | 0.73 | 0.71 | 0.76 | 0.75 |
+| CPU at 78,000 req/s, 4 threads (cores; run 2) | 2.85 | 2.82 | 2.96 | 2.96 |
+| CPU at 79,000 req/s, 4 threads (cores; run 3) | 2.86 | 2.83 | 3.00 | 2.96 |
+| probe p50 / p99.9, 4 threads (ms; run 2) | 0.16 / 4.9 | 0.19 / 4.7 | 0.24 / 5.1 | 0.23 / 6.6 |
+| probe p50 / p99.9, 4 threads (ms; run 3) | 0.20 / 4.2 | 0.19 / 4.5 | 0.19 / 4.5 | 0.23 / 5.4 |
 
-- **Best against best,** Alcyon reaches 1-3% less than HAProxy at 1 thread and 4-5% less at 4 (3.6% and 5.1%),
-  and uses 1-3% more CPU at the same rate. That is one notch behind the one-core instruction
-  counts above (keep-alive 4% fewer instructions): this configuration opens **a new server
-  connection for nearly every request** (HAProxy's stop line: 405 client connections, 557,430
-  server connections in a 1-thread maximum run), since an idle connection is seldom on the server
-  `balance random` picks next. So it measures connection setup and the kernel's TCP path more than
-  request handling, and a quarter of every proxy CPU is loopback softirq.
-- **Default builds** are level: `alcyon-rp` 1-4% below `hap-o2` at the maximum, same CPU.
+- **Best against best,** Alcyon reaches 1-3% less than HAProxy at 1 thread and 2-5% less at 4,
+  and uses 1-3% more CPU at the same rate. The same binary varies by up to 3% between runs
+  (alcyon-pgo at 4 threads: 101.6k-105.0k), so the maxima are close to level; the CPU at a fixed
+  rate is the steadier figure, and it has Alcyon about 1% behind (2.85 and 2.86 cores against
+  2.82 and 2.83). The one-core counts above have Alcyon 4% ahead on keep-alive, so something on
+  this workload costs Alcyon more: 400 client connections, 8 servers, several threads. Not
+  profiled yet.
+- **Server connections are kept alive** by both proxies under either algorithm: with one server,
+  `strace` counts one `connect()` to the server per client connection (5 for 5, 420 requests).
+  HAProxy's stop line ("cumulated conns BE: ...") counts streams, not TCP connections.
+- **`balance random` and `roundrobin`** give the same picture; run 3 is 1-3% higher for all four.
+- **Default builds** are level: `alcyon-rp` 1-4% below `hap-o2` at the maximum, CPU within 3%.
 - **Latency** is the same for all four within run-to-run noise. At 1 thread the probe's p99 and
   above jump between runs by up to 20x for the same binary (alcyon-pgo p99 0.59 ms in run 1,
-  12.1 ms in run 2), so those percentiles say nothing about the proxies; the p50s (0.16-0.20 ms)
+  12.1 ms in run 2), so those percentiles say nothing about the proxies; the p50s (0.16-0.22 ms)
   do.
 - **CPU** is the proxy CPUs' busy time from `/proc/stat`, softirq included. The process's own
-  time (utime + stime, in the raw logs as well) leaves out the softirq, which the kernel does not
-  charge to the process, and shows about 0.55 of a core when the CPU is in fact saturated.
+  time (utime + stime, in the raw logs as well) leaves out the loopback softirq, which the kernel
+  does not charge to the process, and shows about 0.55 of a core when the CPU is in fact saturated.
 - Run 1's CPU column is the process time only; its throughput and percentiles stand. Raw output:
   `data/perf-2026-11-09/dpbench/`.
 
@@ -250,7 +258,7 @@ DPBENCH_BIN=<dpbench>/bin tools/measure/dpbench.sh <out> alcyon-pgo=<bin> hap-cl
 - **Rules** is +11-16% in user-space instructions, but level in cycles and +2% in total with the
   kernel. That makes it a smaller target than it first looked.
 - **Kernel cycles** were not measured cleanly; only kernel instructions are reported.
-- **dpbench** has Alcyon 4-5% behind at 4 threads, on a workload that opens a server connection
-  per request: the connect path, not the request path, is the place to look.
-- **Not measured:** more than 4 threads (HAProxy's thread groups), server-side keep-alive under
-  dpbench (`balance roundrobin` or one server), and large bodies.
+- **dpbench** has Alcyon about 1% behind in CPU at the same rate and 2-5% behind at the maximum
+  with 4 threads, against 4% ahead in the one-core counts. Profile the dpbench load (400
+  connections, 8 servers, 4 threads) on both proxies to see where the difference comes from.
+- **Not measured:** more than 4 threads (HAProxy's thread groups), and large bodies.

@@ -17,7 +17,7 @@ Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 The `hw-*.out` files end in a Python traceback: `hwcounters.sh` failed on its last line when the
 kernel counters were not permitted (fixed the same day). The per-request counts above it are complete.
 - `dpbench/`: `tools/measure/dpbench.sh` (dpbench's h1load and httpterm). `run1/` (16:39) and `run2/`
-  (16:47), each with `run.log` (the summary lines) and per proxy and thread count the load
+  (16:47) with `balance random`, `run3/` (18:11) with `balance roundrobin`, each with `run.log` (the summary lines) and per proxy and thread count the load
   generator's `max.out` and `fixed.out`, the probe's `probe.out` (percentiles), and the
-  configuration `p-<nbthread>.cfg`. Run 1 reports the process CPU only; run 2 adds the CPUs' busy
+  configuration `p-<nbthread>.cfg`. Run 1 reports the process CPU only; runs 2 and 3 add the CPUs' busy
   time with softirq, which is the figure performance.md uses.

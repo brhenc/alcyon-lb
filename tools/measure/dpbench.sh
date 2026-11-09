@@ -14,17 +14,18 @@
 #             (h1load -c 4 -R R/100 -A -P) whose percentiles are the latency figures
 # CPU is reported twice: the proxy process (utime+stime) and the proxy CPUs' busy time from
 # /proc/stat, which includes the loopback softirq work the kernel does not charge to the process.
+# DPB_BALANCE=roundrobin (default random, as dpbench) changes the balance algorithm.
 # CPUs (one EPYC 7542 CCX each): proxy 8 (or 8-11), servers 16-23, load 24-31, probe 0-1. Override
 # with DPB_PROXY_CPU0, DPB_SRV_CPUS, DPB_LOAD_CPUS, DPB_PROBE_CPUS. Take the measurement locks
 # yourself (flock -x /tmp/alcyon-load.lock flock -x /tmp/alcyon-load-n1.lock ...).
 set -u
-[ $# -ge 2 ] || { sed -n '5,19p' "$0"; exit 2; }
+[ $# -ge 2 ] || { sed -n '5,20p' "$0"; exit 2; }
 O=$1; shift; mkdir -p "$O"
 B=${DPBENCH_BIN:?set DPBENCH_BIN to the dpbench bin directory (h1load, httpterm)}
 C0=${DPB_PROXY_CPU0:-8}; SRVC=${DPB_SRV_CPUS:-16-23}; LOADC=${DPB_LOAD_CPUS:-24-31}; PROBEC=${DPB_PROBE_CPUS:-0-1}
 declare -A BIN; ORDER=""
 for a in "$@"; do BIN[${a%%=*}]=${a#*=}; ORDER="$ORDER ${a%%=*}"; [ -x "${a#*=}" ] || { echo "not executable: ${a#*=}"; exit 2; }; done
-FE=18000; SV=18100; URL=http://127.0.0.1:$FE/?s=0
+BAL=${DPB_BALANCE:-random}; FE=18000; SV=18100; URL=http://127.0.0.1:$FE/?s=0
 
 parse() { python3 -I "$(dirname "$0")/dpbench_parse.py" "$@"; }
 
@@ -37,7 +38,7 @@ done
 sleep 1
 for p in "${pids[@]}"; do kill -0 $p 2>/dev/null || { echo "an httpterm exited at startup"; kill "${pids[@]}" 2>/dev/null; exit 1; }; done
 
-cfg() { printf 'global\n   strict-limits\n   nbthread %s\n   maxconn 10000\ndefaults\n   mode http\n   balance random\n   timeout client 60s\n   timeout server 60s\n   timeout connect 1s\nlisten p\n   bind 127.0.0.1:%s\n' $1 $FE
+cfg() { printf 'global\n   strict-limits\n   nbthread %s\n   maxconn 10000\ndefaults\n   mode http\n   balance %s\n   timeout client 60s\n   timeout server 60s\n   timeout connect 1s\nlisten p\n   bind 127.0.0.1:%s\n' $1 $BAL $FE
   for i in 0 1 2 3 4 5 6 7; do printf '   server s%s 127.0.0.1:%s\n' $i $((SV+i)); done; }
 cpus() { [ $1 = 1 ] && echo $C0 || echo $C0-$((C0+$1-1)); }
 ticks() { awk '{print $14+$15}' /proc/$1/stat; }

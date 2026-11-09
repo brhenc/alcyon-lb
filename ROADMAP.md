@@ -70,8 +70,9 @@ so each comparison is between builds made the same way.
   the kernel counted. Look at what runs per request outside the rules themselves.
 - **Plain proxying** is level or ahead in every pairing, and PGO is worth 30-45% of cycles to
   both proxies. Releases should ship the PGO build (`tools/pgo-build.sh`).
-- **dpbench** (a server connection per request, 1 and 4 threads): Alcyon 1-5% below HAProxy's
-  maximum, same latency. The connect path is the next place to look.
+- **dpbench** (400 connections, 8 servers, 1 and 4 threads): Alcyon 1-5% below HAProxy's
+  maximum and about 1% more CPU at the same rate, same latency, although it is 4% ahead in the
+  one-core counts. Profile that load on both proxies.
 - **Not measured yet:** more than 4 threads against HAProxy's thread groups, and large bodies.
 
 ## 4. The research questions
