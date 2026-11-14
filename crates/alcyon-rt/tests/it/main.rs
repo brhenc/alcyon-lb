@@ -149,6 +149,7 @@ mod fc_stream_info;
 mod fd_hygiene;
 mod fetch_arg_refusals;
 mod fetch_availability_by_rule;
+mod fetch_be_conn;
 mod fetch_counters;
 mod fetch_edge_cases;
 mod forwardfor_no_room;

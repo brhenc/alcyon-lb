@@ -57,6 +57,12 @@ pub struct Config {
     pub global: Option<GlobalSection>,
     /// Optional defaults settings.
     pub defaults: Option<DefaultsSection>,
+    /// Every named `defaults` section, in the order they were written: `defaults_list` in
+    /// `HAProxy`. Inheritance aside they hold nothing the proxies use, but `HAProxy` keeps
+    /// them and checks the rules written in each as rules of that very section
+    /// (`check_config_validity`), which is where a `track-sc` of a `defaults` is refused
+    /// for want of the table it names -- a `defaults` can hold no `stick-table`.
+    pub defaults_sections: Vec<DefaultsSection>,
     /// List of proxy listen sections in order of definition (`HAProxy` 1.0 style).
     pub listens: Vec<ListenSection>,
     /// List of frontend sections (`HAProxy` 1.1+ style).
@@ -154,7 +160,7 @@ impl Config {
         } else {
             self.proxy_order.clone()
         };
-        crate::parser::refs::validate_references(&order, &self.listens, &self.frontends, &self.backends)
+        crate::parser::refs::validate_references(&order, &self.listens, &self.frontends, &self.backends, &self.defaults_sections)
     }
 
     /// What `HAProxy` warns about once the whole configuration is read, in proxy order

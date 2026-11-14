@@ -15,8 +15,8 @@
 //!   `ACCEPTED` rule exits 0. `src_trackers` and `src_in_table` are not `HAProxy` fetches
 //!   ("unknown fetch method").
 //! * **Alcyon has not implemented it.** `HAProxy` accepts every `NOT_IMPLEMENTED` rule (exit
-//!   0, same measurement). Alcyon has no server queues, does not count a backend's streams,
-//!   keeps no tracker count on a stick-table entry, and has only the `table_*` converters that read a counter. These
+//!   0, same measurement). Alcyon has no server queues, keeps no tracker count on a
+//!   stick-table entry, and has only the `table_*` converters that read a counter. These
 //!   used to load and evaluate to a constant 0 or 1. They are refused now, naming what is
 //!   missing, wherever the expression appears: an ACL, an inline condition, a log-format,
 //!   a rule action, `http-check send`.
@@ -89,6 +89,10 @@ const ACCEPTED: &[(&str, &str)] = &[
     ("http-request set-header x %[src,table_expire(be)]", ""),
     ("http-request set-header x %[src,table_inc_gpc0(be)]", ""),
     ("http-request set-header x %[src,table_bytes_in_rate(be)]", ""),
+    // `be_conn` reads the backend's `beconn`, which the engine keeps for `%bc` too: it used
+    // to be refused as "Alcyon does not count the streams on a backend".
+    ("http-request set-var(txn.x) be_conn(be)", ""),
+    ("", "http-request set-header x %[be_conn]"),
 ];
 
 /// `(frontend rule, backend rule, the keyword the error must name)`.
@@ -97,9 +101,7 @@ const NOT_IMPLEMENTED: &[(&str, &str, &str)] = &[
     ("acl q avg_queue(be) gt 1\n  use_backend be if q", "", "avg_queue"),
     ("http-request set-header x %[srv_queue(be/s1)]", "", "srv_queue"),
     ("http-request set-header x %[str(be/s1),srv_queue]", "", "srv_queue"),
-    ("http-request set-var(txn.x) be_conn(be)", "", "be_conn"),
     ("http-request set-var(txn.x) str(be/s1),srv_queue", "", "srv_queue"),
-    ("", "http-request set-header x %[be_conn]", "be_conn"),
     ("", "option httpchk\n  http-check send hdr x %[queue]", "queue"),
 ];
 

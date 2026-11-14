@@ -881,6 +881,9 @@ pub trait ProxyState: std::fmt::Debug {
     fn frontend_counter(&self, frontend: &str, counter: FrontendCounter) -> Option<i64>;
     /// The streams assigned to backend `backend` over the last second (`be_sess_rate`).
     fn backend_sess_rate(&self, backend: &str) -> Option<i64>;
+    /// The streams backend `backend` has been given and not finished with (`be_conn`,
+    /// `px->beconn`): what `be_sess_rate` counts per second, taken as it stands.
+    fn backend_streams(&self, backend: &str) -> Option<i64>;
     /// The `default_backend` of frontend `frontend`, if it has one.
     fn default_backend(&self, frontend: &str) -> Option<String>;
     /// The connections open on all the frontends (`actconn`).
@@ -938,7 +941,6 @@ pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("queue", "Alcyon has no server queues"),
     ("avg_queue", "Alcyon has no server queues"),
     ("srv_queue", "Alcyon has no server queues"),
-    ("be_conn", "Alcyon does not count the streams on a backend"),
     // T331: `HAProxy` asks the front mux; an HTTP/2 stream's entry does not see its connection's.
     ("fc_nb_streams", "a stream does not see its HTTP/2 connection's stream count"),
     ("fc_settings_streams_limit", "a stream does not see its HTTP/2 connection's advertised SETTINGS_MAX_CONCURRENT_STREAMS"),
@@ -3166,8 +3168,8 @@ impl Registry {
             },
         });
         // The server and backend state fetches (`src/backend.c`). Their arguments are
-        // resolved when the configuration loads; `queue`, `avg_queue`, `srv_queue` and
-        // `be_conn` are refused there instead (see [`NOT_IMPLEMENTED`]).
+        // resolved when the configuration loads; `queue`, `avg_queue` and `srv_queue` are
+        // refused there instead (see [`NOT_IMPLEMENTED`]).
         self.register_fetch(FetchDesc {
             name: "srv_is_up",
             out_type: SampleType::Bool,
@@ -3284,6 +3286,11 @@ impl Registry {
             name: "be_sess_rate",
             out_type: SampleType::Sint,
             func: |ctx, args| ctx.proxies?.backend_sess_rate(backend_arg(ctx, args)?).map(Sample::Sint),
+        });
+        self.register_fetch(FetchDesc {
+            name: "be_conn",
+            out_type: SampleType::Sint,
+            func: |ctx, args| ctx.proxies?.backend_streams(backend_arg(ctx, args)?).map(Sample::Sint),
         });
         self.register_fetch(FetchDesc {
             name: "srv_sess_rate",

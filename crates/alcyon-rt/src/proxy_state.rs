@@ -142,6 +142,11 @@ impl ProxyState for ProxiesView<'_> {
         Some(p.stats.iter().map(|s| to_i64(s.be_sess_rate.rate())).sum())
     }
 
+    fn backend_streams(&self, backend: &str) -> Option<i64> {
+        let p = self.backend(backend)?;
+        Some(p.stats.iter().map(|s| i64::from(s.be_streams.load(Ordering::Relaxed))).sum())
+    }
+
     fn active_connections(&self) -> i64 {
         self.0
             .iter()

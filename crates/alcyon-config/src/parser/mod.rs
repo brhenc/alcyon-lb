@@ -165,6 +165,8 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     let mut proxy_warnings: Vec<crate::ast::global::LoadWarning> = Vec::new();
     let mut defaults: Option<DefaultsSection> = None;
     let mut named_defaults: std::collections::HashMap<String, DefaultsSection> = std::collections::HashMap::new();
+    // Every named `defaults` section in the order written, for `Config::defaults_sections`.
+    let mut defaults_sections: Vec<DefaultsSection> = Vec::new();
     let mut listens = Vec::new();
     let mut frontends = Vec::new();
     let mut backends = Vec::new();
@@ -200,6 +202,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut global,
                     &mut defaults,
                     &mut named_defaults,
+                    &mut defaults_sections,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -217,6 +220,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut global,
                     &mut defaults,
                     &mut named_defaults,
+                    &mut defaults_sections,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -272,6 +276,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut global,
                     &mut defaults,
                     &mut named_defaults,
+                    &mut defaults_sections,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -294,6 +299,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut global,
                     &mut defaults,
                     &mut named_defaults,
+                    &mut defaults_sections,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -316,6 +322,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut global,
                     &mut defaults,
                     &mut named_defaults,
+                    &mut defaults_sections,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -343,6 +350,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut global,
                     &mut defaults,
                     &mut named_defaults,
+                    &mut defaults_sections,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -358,6 +366,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut global,
                     &mut defaults,
                     &mut named_defaults,
+                    &mut defaults_sections,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -373,6 +382,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut global,
                     &mut defaults,
                     &mut named_defaults,
+                    &mut defaults_sections,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -388,6 +398,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut global,
                     &mut defaults,
                     &mut named_defaults,
+                    &mut defaults_sections,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -406,6 +417,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut global,
                     &mut defaults,
                     &mut named_defaults,
+                    &mut defaults_sections,
                     &mut listens,
                     &mut frontends,
                     &mut backends,
@@ -482,6 +494,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         &mut global,
         &mut defaults,
         &mut named_defaults,
+        &mut defaults_sections,
         &mut listens,
         &mut frontends,
         &mut backends,
@@ -547,6 +560,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     let config = Config {
         global,
         defaults,
+        defaults_sections,
         listens,
         frontends,
         backends,
@@ -938,6 +952,7 @@ pub(crate) fn flush_current_section(
     global: &mut Option<GlobalSection>,
     defaults: &mut Option<DefaultsSection>,
     named_defaults: &mut std::collections::HashMap<String, DefaultsSection>,
+    defaults_sections: &mut Vec<DefaultsSection>,
     listens: &mut Vec<ListenSection>,
     frontends: &mut Vec<FrontendSection>,
     backends: &mut Vec<BackendSection>,
@@ -951,6 +966,9 @@ pub(crate) fn flush_current_section(
             CurrentSection::Defaults(d) => {
                 if let Some(ref name) = d.name {
                     named_defaults.insert(name.clone(), d.clone());
+                    // `HAProxy` keeps every `defaults` it reads in `defaults_list`, named
+                    // ones included, and checks the rules of each of them there.
+                    defaults_sections.push(d.clone());
                 }
                 *defaults = Some(d);
             }
