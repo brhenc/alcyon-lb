@@ -23,6 +23,7 @@ fn hash_options_are_read_in_listen_and_inherited_from_defaults() {
 #[test]
 fn malformed_or_unimplemented_forms_are_refused() {
     for (line, why) in [
+        ("balance unknown", "an unknown balance algorithm"),
         ("balance random(x)", "a non-numeric draw count"),
         ("hash-type", "no hashing method"),
         // A hash function or `avalanche` modifier: HAProxy takes them, Alcyon does not hash
@@ -64,12 +65,44 @@ fn balance_uri_refuses_what_haproxy_refuses_in_its_words() {
     }
 }
 
-/// What `haproxy -c` accepts stays accepted: every `balance uri` option, and words after
-/// an algorithm that takes none (`backend_parse_balance` does not look at them; measured
-/// `rc=0` for each line on 3.5-dev8).
+/// `balance random(...)` errors, as `backend_parse_balance` (`src/backend.c`) refuses them; the
+/// messages are `haproxy -c`'s (3.5-dev8, 2026-11-15), after its `parsing [file:line] : `.
+#[test]
+fn balance_random_refuses_what_haproxy_refuses_in_its_words() {
+    for (line, message) in [
+        ("balance random(x)", "balance random : unexpected character 'x' after argument."),
+        ("balance random(5x)", "balance random : unexpected character 'x' after argument."),
+        ("balance random(x", "balance random : unexpected character 'x' after argument."),
+        ("balance random(-x)", "balance random : unexpected character '-' after argument."),
+        ("balance random(08)", "balance random : unexpected character '8' after argument."),
+        ("balance random(5", "balance random : missing closing parenthesis."),
+        ("balance random(", "balance random : missing closing parenthesis."),
+        ("balance random(0)", "balance random : number of draws must be at least 1."),
+        ("balance random(-1)", "balance random : number of draws must be at least 1."),
+        ("balance random(2147483648)", "balance random : number of draws must be at least 1."),
+    ] {
+        let cfg = format!("backend b\n  {line}\n  server s 127.0.0.1:8001\n");
+        match parse_str(&cfg) {
+            Ok(_) => panic!("{line}: accepted"),
+            Err(e) => assert!(e.to_string().ends_with(message), "{line}: {e}"),
+        }
+    }
+}
+
+/// What `haproxy -c` accepts stays accepted: bare `balance`, `random()`, every `balance uri`
+/// option, and words after an algorithm that takes none (`backend_parse_balance` does not look
+/// at them; measured `rc=0` for each line on 3.5-dev8).
 #[test]
 fn balance_lines_haproxy_accepts() {
     for line in [
+        "balance",
+        "balance random()",
+        "balance random() junk",
+        "balance random(3)junk",
+        "balance random(0x3)",
+        "balance random(+3)",
+        "balance random(010)",
+        "balance random(4294967297)",
         "balance uri whole",
         "balance uri len 4",
         "balance uri depth 2",
@@ -89,6 +122,30 @@ fn balance_lines_haproxy_accepts() {
         let cfg = format!("backend b\n  {line}\n  server s 127.0.0.1:8001\n");
         assert!(parse_str(&cfg).is_ok(), "{line}: {:?}", parse_str(&cfg).err());
     }
+}
+
+/// Bare `balance`, `balance random()`, and `strtol(..., 0)` draw counts match `HAProxy`'s
+/// `backend_parse_balance`.
+#[test]
+fn bare_balance_and_random_draws_match_haproxy() {
+    let algo = |line: &str| {
+        let cfg = parse_str(&format!("backend b\n  {line}\n  server s 127.0.0.1:8001\n")).expect(line);
+        cfg.backends[0].balance
+    };
+    assert_eq!(algo("balance"), BalanceAlgorithm::Random(1));
+    assert_eq!(algo("balance random"), BalanceAlgorithm::Random(2));
+    assert_eq!(algo("balance random()"), BalanceAlgorithm::Random(2));
+    assert_eq!(algo("balance random(0x3)"), BalanceAlgorithm::Random(3));
+    assert_eq!(algo("balance random(010)"), BalanceAlgorithm::Random(8));
+    assert_eq!(algo("balance random(4294967297)"), BalanceAlgorithm::Random(1));
+
+    let cfg = parse_str(
+        "defaults\n  balance uri len 5\n\
+         backend b\n  balance\n  server s 127.0.0.1:8001\n",
+    )
+    .expect("bare balance after defaults uri");
+    assert_eq!(cfg.backends[0].balance, BalanceAlgorithm::Random(1));
+    assert_eq!(cfg.backends[0].balance_uri, UriHash::default());
 }
 
 /// What the parser keeps of the `balance uri` options (read by `lb::uri_hash_key`).

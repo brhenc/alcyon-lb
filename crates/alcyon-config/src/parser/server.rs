@@ -924,17 +924,16 @@ pub(crate) fn parse_balance(
     balance: &mut BalanceAlgorithm,
     uri: &mut UriHash,
     tokens: &[Token],
-    kw: &Token,
+    _kw: &Token,
 ) -> Result<(), ConfigError> {
-    if tokens.len() < 2 || tokens[1].text.is_empty() {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "<balance> expects an algorithm as argument.",
-        ));
-    }
     // HAProxy clears the algorithm's arguments on every `balance` line.
     *uri = UriHash::default();
+    if tokens.len() < 2 || tokens[1].text.is_empty() {
+        // Bare `balance` selects `BE_LB_ALGO_RND` without setting `arg_opt1` (`backend_parse_balance`),
+        // so `get_server_rnd` performs 1 draw.
+        *balance = BalanceAlgorithm::Random(1);
+        return Ok(());
+    }
     *balance = match tokens[1].text.as_str() {
         "roundrobin" => BalanceAlgorithm::RoundRobin,
         "source" => BalanceAlgorithm::Source,
@@ -945,31 +944,7 @@ pub(crate) fn parse_balance(
         "leastconn" => BalanceAlgorithm::Leastconn,
         "static-rr" => BalanceAlgorithm::StaticRr,
         "first" => BalanceAlgorithm::First,
-        "random" => BalanceAlgorithm::Random(2),
-        other if other.starts_with("random(") => {
-            let Some(inner) = other.strip_prefix("random(").and_then(|s| s.strip_suffix(')')) else {
-                return Err(ConfigError::new(
-                    tokens[1].line,
-                    tokens[1].col,
-                    "random : missing closing parenthesis.",
-                ));
-            };
-            let draws: u32 = inner.parse().map_err(|_| {
-                ConfigError::new(
-                    tokens[1].line,
-                    tokens[1].col,
-                    format!("random : unexpected argument '{inner}'."),
-                )
-            })?;
-            if draws < 1 {
-                return Err(ConfigError::new(
-                    tokens[1].line,
-                    tokens[1].col,
-                    "random : number of draws must be at least 1.",
-                ));
-            }
-            BalanceAlgorithm::Random(draws)
-        }
+        other if other.starts_with("random") => BalanceAlgorithm::Random(parse_random_draws(&tokens[1])?),
         other => {
             return Err(ConfigError::new(
                 tokens[1].line,
@@ -979,6 +954,92 @@ pub(crate) fn parse_balance(
         }
     };
     Ok(())
+}
+
+/// Parses `random` / `random(<draws>)` as `backend_parse_balance` (`src/backend.c`) does:
+/// `random` or `random()` defaults to 2 draws; otherwise `strtol(beg, &end, 0)` into an `int`.
+fn parse_random_draws(tok: &Token) -> Result<u32, ConfigError> {
+    let rest = &tok.text["random".len()..];
+    let Some(beg) = rest.strip_prefix('(').filter(|b| !b.starts_with(')')) else {
+        return Ok(2);
+    };
+    let (draws, end) = c_strtol0(beg);
+    let tail = &beg[end..];
+    match tail.chars().next() {
+        None => {
+            return Err(ConfigError::new(
+                tok.line,
+                tok.col,
+                "balance random : missing closing parenthesis.",
+            ));
+        }
+        Some(ch) if ch != ')' => {
+            return Err(ConfigError::new(
+                tok.line,
+                tok.col,
+                format!("balance random : unexpected character '{ch}' after argument."),
+            ));
+        }
+        Some(_) => {}
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let draws_i32 = draws as i32;
+    if draws_i32 < 1 {
+        return Err(ConfigError::new(
+            tok.line,
+            tok.col,
+            "balance random : number of draws must be at least 1.",
+        ));
+    }
+    Ok(draws_i32.cast_unsigned())
+}
+
+/// C's `strtol(s, &end, 0)`: optional blanks and sign, `0x` hex, leading-`0` octal or decimal,
+/// returning `(value, end_byte_offset)` (`end == 0` when no digits were read).
+fn c_strtol0(s: &str) -> (i64, usize) {
+    let b = s.as_bytes();
+    let mut j = b
+        .iter()
+        .position(|c| !matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+        .unwrap_or(b.len());
+    let neg = match b.get(j) {
+        Some(b'-') => {
+            j += 1;
+            true
+        }
+        Some(b'+') => {
+            j += 1;
+            false
+        }
+        _ => false,
+    };
+    let (radix, digits_at) = if b.get(j) == Some(&b'0')
+        && matches!(b.get(j + 1), Some(b'x' | b'X'))
+        && b.get(j + 2).is_some_and(u8::is_ascii_hexdigit)
+    {
+        (16, j + 2)
+    } else if b.get(j) == Some(&b'0') {
+        (8, j)
+    } else {
+        (10, j)
+    };
+    let mut k = digits_at;
+    while b.get(k).is_some_and(|c| char::from(*c).is_digit(radix)) {
+        k += 1;
+    }
+    if k == digits_at {
+        return (0, 0);
+    }
+    let digits = &s[digits_at..k];
+    let val = if neg {
+        u64::from_str_radix(digits, radix)
+            .ok()
+            .and_then(|u| i64::try_from(u).ok().map(i64::wrapping_neg))
+            .unwrap_or(i64::MIN)
+    } else {
+        i64::from_str_radix(digits, radix).unwrap_or(i64::MAX)
+    };
+    (val, k)
 }
 
 /// The options after `balance uri`, read and refused as `backend_parse_balance` does

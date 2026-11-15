@@ -1973,10 +1973,10 @@ backend b3
         assert_eq!(config.backends[2].balance, BalanceAlgorithm::Random(5));
 
         let bad_draws = parse_str("backend b\n balance random(0)\n server s1 127.0.0.1:8001\n").unwrap_err();
-        assert_eq!(bad_draws.message, "random : number of draws must be at least 1.");
+        assert_eq!(bad_draws.message, "balance random : number of draws must be at least 1.");
 
         let no_paren = parse_str("backend b\n balance random(5\n server s1 127.0.0.1:8001\n").unwrap_err();
-        assert_eq!(no_paren.message, "random : missing closing parenthesis.");
+        assert_eq!(no_paren.message, "balance random : missing closing parenthesis.");
     }
 
     #[test]
