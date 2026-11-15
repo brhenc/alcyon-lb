@@ -262,10 +262,12 @@ fn start_adopted(sess: &mut TcpSession, rx: RxHead, facts: HeadFacts, abs_len: u
             .flatten()
             .or_else(|| htx.req_line())
             .unwrap_or(alcyon_proto::htx::RequestLineView { method: "", uri: "", version: "" });
+        // Text: the writer checked the scheme and the authority.
+        let abs = (abs_len > 0).then(|| String::from_utf8_lossy(&rx.bytes()[facts.tail..facts.tail + abs_len]));
+        sess.set_req_abs(abs.as_deref());
         if sess.keep_request_line {
-            // Text: the writer checked the scheme and the authority.
-            let abs = String::from_utf8_lossy(&rx.bytes()[facts.tail..facts.tail + abs_len]);
-            sess.strm.log.request_line.set_parts(&[line.method, " ", &abs, line.uri, " ", version]);
+            let abs = abs.as_deref().unwrap_or("");
+            sess.strm.log.request_line.set_parts(&[line.method, " ", abs, line.uri, " ", version]);
         }
         sess.req_method.set(line.method);
         sess.req_uri.set(line.uri);
@@ -329,6 +331,7 @@ fn start_text(sess: &mut TcpSession, head: &TextHead, request_line: Option<&str>
     sess.req_ws = head.facts.ext_connect.then(|| head_ws(head.text_headers(), head.facts.key_written)).flatten();
     sess.req_method.set(head.method());
     sess.req_uri.set(head.uri());
+    sess.set_req_abs((!head.abs.is_empty()).then_some(head.abs.as_str()));
     // `%U` counts the digits the head goes with.
     let mut req_htx = d_req_htx;
     if let Some(n) = head.add_len {

@@ -61,17 +61,27 @@ fn strip_port<'a>(host: &'a str, port: Option<&str>) -> &'a str {
 }
 
 /// `http_is_default_port`. An empty port is a default one. Without a scheme (CONNECT)
-/// both 80 and 443 are; with one, 80 for `http://` and 443 for `https://`.
+/// both 80 and 443 are; with one (with or without `://`), 80 for `http` and 443 for `https`.
 fn is_default_port(scheme: Option<&str>, port: &str) -> bool {
     if port.is_empty() {
         return true;
     }
-    match scheme {
+    match scheme.map(|s| s.strip_suffix("://").unwrap_or(s)) {
         None => port == "443" || port == "80",
         Some(s) => {
-            (port == "443" && s.eq_ignore_ascii_case("https://"))
-                || (port == "80" && s.eq_ignore_ascii_case("http://"))
+            (port == "443" && s.eq_ignore_ascii_case("https"))
+                || (port == "80" && s.eq_ignore_ascii_case("http"))
         }
+    }
+}
+
+/// Drops `:port` when `port` is empty or the default port for `scheme` (with or without `://`).
+pub(crate) fn strip_default_port<'a>(scheme: &str, authority: &'a str) -> &'a str {
+    let port = host_port(authority);
+    if port.is_some_and(|p| is_default_port(Some(scheme), p)) {
+        strip_port(authority, port)
+    } else {
+        authority
     }
 }
 
@@ -279,11 +289,8 @@ pub fn check_and_normalize_with(htx: &mut HtxSlice<'_>, accept_unsafe: bool, kno
     }
 
     // 3. Scheme-based normalisation.
-    let port = host_port(authority);
-    let (norm_host, mut normalize) = match port {
-        Some(p) if is_default_port(Some(scheme), p) => (strip_port(authority, port), true),
-        _ => (authority, false),
-    };
+    let norm_host = strip_default_port(scheme, authority);
+    let mut normalize = norm_host.len() != authority.len();
     let path = if path.is_empty() && !method.eq_ignore_ascii_case("OPTIONS") {
         normalize = true;
         "/"

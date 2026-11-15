@@ -579,24 +579,30 @@ pub fn static_rr(proxy: &Proxy) -> Option<usize> {
 ///
 /// HAProxy's `get_server_uh` (`src/backend.c`) hashes the URI with `sdbm` -- the default
 /// hash function, and no avalanche unless `hash-type` asks for one -- over the slice
-/// its options select, by default the part before the `?` ([`uri_hash_key`]), and `map_get_server_hash` takes that modulo the
+/// its options select, by default the part before the `?` ([`uri_hash_parts`]), and `map_get_server_hash` takes that modulo the
 /// backend's `tot_weight` into the interleaved weighted map ([`WeightMap`]). Both the hash
 /// and the map matter: hashing the query string, or laying the weights out in contiguous
 /// blocks, sends the same URI to another server than HAProxy does.
 ///
-/// Known difference, measured on 3.5-dev8 and not fixed here: for an HTTP/2 request `HAProxy`
-/// hashes the absolute URI it rebuilds from `:scheme` and `:authority`, Alcyon the path it
-/// keeps. With `path-only` both hash the path and agree; without it an HTTP/2 request lands
-/// on another server than `HAProxy`'s (HTTP/1 requests agree either way).
+/// For HTTP/2 and HTTP/3 requests whose `:authority` was present, `req_uri` keeps `:path`
+/// while `H2Child::req_abs` holds `scheme://authority`; [`balance_uri_with_abs`] hashes the
+/// two parts sequentially without joining unless `path-only` is set (`OPTIONS *` with
+/// `req_abs` hashes `req_abs` alone without `*`).
 #[must_use]
 pub fn balance_uri(proxy: &Proxy, uri: &str) -> Option<usize> {
+    balance_uri_with_abs(proxy, uri, None)
+}
+
+/// [`balance_uri`] with an optional `scheme://authority` prefix (`H2Child::req_abs`).
+#[must_use]
+pub fn balance_uri_with_abs(proxy: &Proxy, uri: &str, abs: Option<&str>) -> Option<usize> {
     // `hash-preserve-affinity` only has an effect
     // on a consistent-hash ring (HAProxy gates
     // it the same way: the option is read only from `chash_get_server_hash`).
     if proxy.hash_type == HashType::Consistent {
-        return balance_uri_consistent(proxy, uri);
+        return balance_uri_consistent(proxy, uri, abs);
     }
-    let hash = hash_sdbm(uri_hash_key(uri, proxy.chash.2));
+    let hash = hash_uri(uri, abs, proxy.chash.2);
     if let Some(idx) = proxy.chash.map_pick(proxy, hash) {
         return Some(idx);
     }
@@ -605,29 +611,46 @@ pub fn balance_uri(proxy: &Proxy, uri: &str) -> Option<usize> {
     first_backup(proxy)
 }
 
-/// The slice of `uri` `balance uri` hashes, as `get_server_uh` (`src/backend.c`) and its
-/// caller cut it: with `path-only` the scheme and authority of an absolute URI are dropped
-/// first; `len` keeps the first bytes of what is left; then the walk stops before the `?`
-/// unless `whole` is set, and before the slash that ends `depth` directories (that slash
-/// is the `depth + 1`-th, which is what `depth_end` holds).
-fn uri_hash_key(uri: &str, opts: UriHash) -> &[u8] {
-    let mut key = uri.as_bytes();
-    if opts.path_only {
-        key = uri_path(key);
-    }
+fn hash_uri(uri: &str, abs: Option<&str>, opts: UriHash) -> u32 {
+    let (head, tail) = uri_hash_parts(uri, abs, opts);
+    hash_sdbm_step(hash_sdbm_step(0, head), tail)
+}
+
+/// The slices of `uri` (and `abs`, when `Some`) that `balance uri` hashes, as `get_server_uh`
+/// (`src/backend.c`) and its caller cut them: with `path-only` the scheme and authority are
+/// dropped first; `len` keeps the first bytes across the remaining parts; then the walk
+/// stops before the `?` unless `whole` is set, and before the slash that ends `depth`
+/// directories (that slash is the `depth + 1`-th, which is what `depth_end` holds). `OPTIONS *`
+/// with `abs` has an empty path (`""`, not `*`).
+fn uri_hash_parts<'a>(uri: &'a str, abs: Option<&'a str>, opts: UriHash) -> (&'a [u8], &'a [u8]) {
+    let (mut head, mut tail) = match abs.filter(|a| !a.is_empty()) {
+        Some(_) if opts.path_only => (uri_path(uri.as_bytes()), &[][..]),
+        Some(abs) => (abs.as_bytes(), if uri == "*" { &[][..] } else { uri.as_bytes() }),
+        None => (if opts.path_only { uri_path(uri.as_bytes()) } else { uri.as_bytes() }, &[][..]),
+    };
     if opts.len > 0 {
-        key = &key[..key.len().min(opts.len as usize)];
+        let cap = opts.len as usize;
+        head = &head[..head.len().min(cap)];
+        tail = &tail[..tail.len().min(cap - head.len())];
     }
     let mut slashes = 0i32;
-    let end = key.iter().position(|&c| {
-        if c == b'/' {
-            slashes += 1;
-            slashes == opts.depth_end
-        } else {
-            c == b'?' && !opts.whole
-        }
-    });
-    &key[..end.unwrap_or(key.len())]
+    let mut cut = |bytes: &'a [u8]| -> Option<usize> {
+        bytes.iter().position(|&c| {
+            if c == b'/' {
+                slashes += 1;
+                slashes == opts.depth_end
+            } else {
+                c == b'?' && !opts.whole
+            }
+        })
+    };
+    if let Some(end) = cut(head) {
+        return (&head[..end], &[]);
+    }
+    match cut(tail) {
+        Some(end) => (head, &tail[..end]),
+        None => (head, tail),
+    }
 }
 
 /// `http_parse_path` (`src/http.c`) for `path-only`: an absolute path as it is, what
@@ -745,9 +768,8 @@ fn gcd2(mut a: u32, mut b: u32) -> u32 {
 /// would instead queue the request on the full server; Alcyon has no server queue and never
 /// sends a server more than its `maxconn`, so `always` walks the same way once the server
 /// is full. `None` when no server is up, or every candidate is full.
-fn balance_uri_consistent(proxy: &Proxy, uri: &str) -> Option<usize> {
-    let key = uri_hash_key(uri, proxy.chash.2);
-    chash_lookup(proxy, |_| full_hash(hash_sdbm(key)))
+fn balance_uri_consistent(proxy: &Proxy, uri: &str, abs: Option<&str>) -> Option<usize> {
+    chash_lookup(proxy, |_| full_hash(hash_uri(uri, abs, proxy.chash.2)))
 }
 
 /// `balance source` with `hash-type consistent` (`get_server_sh`, `src/backend.c`): the
@@ -793,8 +815,10 @@ fn chash_lookup(proxy: &Proxy, hash: impl FnOnce(usize) -> u32) -> Option<usize>
 }
 
 /// `hash_sdbm` (`src/hash.c`), `HAProxy`'s default hash function for `balance uri`.
-fn hash_sdbm(bytes: &[u8]) -> u32 {
-    bytes.iter().fold(0u32, |h, &c| {
+/// `hash_sdbm` (`src/hash.c`), `HAProxy`'s default hash function for `balance uri`, folded
+/// from `init` so two slices hash identically to their concatenation.
+fn hash_sdbm_step(init: u32, bytes: &[u8]) -> u32 {
+    bytes.iter().fold(init, |h, &c| {
         u32::from(c).wrapping_add(h << 6).wrapping_add(h << 16).wrapping_sub(h)
     })
 }
@@ -1036,5 +1060,38 @@ mod fwrr_tests {
         assert_eq!(st.pick(|_| false), None);
         let got: Vec<usize> = (0..6).filter_map(|_| st.pick(|_| true)).collect();
         assert_eq!(got.iter().filter(|&&i| i == 0).count(), 4, "{got:?}");
+    }
+}
+
+#[cfg(test)]
+mod uri_tests {
+    use super::hash_uri;
+    use alcyon_config::UriHash;
+
+    #[test]
+    fn split_abs_and_path_hashes_match_joined_uri() {
+        let cases = [
+            ("http://h", "/"),
+            ("http://h", "/a/b/c?x=1"),
+            ("https://example.test:8443", "//a//b?q=1&r=2"),
+            ("http://h", "*"),
+        ];
+        for (abs, path) in cases {
+            let joined = if path == "*" { abs.to_string() } else { format!("{abs}{path}") };
+            for whole in [false, true] {
+                for path_only in [false, true] {
+                    for len in [0, 1, 4, 8, 10, 15, 64] {
+                        for depth_end in [0, 2, 3, 4, 5, i32::MAX] {
+                            let opts = UriHash { len, depth_end, whole, path_only };
+                            assert_eq!(
+                                hash_uri(path, Some(abs), opts),
+                                hash_uri(&joined, None, opts),
+                                "abs={abs:?} path={path:?} opts={opts:?}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

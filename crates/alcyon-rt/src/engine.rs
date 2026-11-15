@@ -2368,13 +2368,26 @@ impl Proxy {
     /// respecting backup failover and connection limits.
     #[must_use]
     pub fn select_server_with_key(&self, source_ip: Option<IpAddr>, uri: Option<&str>) -> Option<SocketAddr> {
-        self.select_server_with_key_idx(source_ip, uri).map(|(_, a)| a)
+        self.select_server_with_key_abs(source_ip, uri, None)
+    }
+
+    /// [`Proxy::select_server_with_key`] with an optional `scheme://authority` prefix
+    /// (`H2Child::req_abs`) for HTTP/2 and HTTP/3 `balance uri`.
+    #[must_use]
+    pub fn select_server_with_key_abs(&self, source_ip: Option<IpAddr>, uri: Option<&str>, abs: Option<&str>) -> Option<SocketAddr> {
+        self.select_server_with_key_abs_idx(source_ip, uri, abs).map(|(_, a)| a)
     }
 
     /// [`Proxy::select_server_with_key`], with the index of the server picked (`None`: the
     /// dispatch address), so that the caller does not look the address up again.
     #[must_use]
     pub fn select_server_with_key_idx(&self, source_ip: Option<IpAddr>, uri: Option<&str>) -> Option<(Option<usize>, SocketAddr)> {
+        self.select_server_with_key_abs_idx(source_ip, uri, None)
+    }
+
+    /// [`Proxy::select_server_with_key_abs`], with the picked server index.
+    #[must_use]
+    pub fn select_server_with_key_abs_idx(&self, source_ip: Option<IpAddr>, uri: Option<&str>, abs: Option<&str>) -> Option<(Option<usize>, SocketAddr)> {
         if self.servers.is_empty() {
             return self.dispatch.map(|a| (None, a));
         }
@@ -2396,7 +2409,7 @@ impl Proxy {
             }
             BalanceAlgorithm::Uri => {
                 let u = uri.unwrap_or("/");
-                if let Some(idx) = crate::lb::balance_uri(self, u) {
+                if let Some(idx) = crate::lb::balance_uri_with_abs(self, u, abs) {
                     Some((Some(idx), self.servers.at(idx)))
                 } else {
                     self.select_server_idx()
@@ -9995,13 +10008,13 @@ fn retry_server_connect(
         let others = proxies[be_idx].eligible_server_indices().len() > 1;
         let be = &proxies[be_idx];
         crate::lb::with_avoided(be, if hash || !others { None } else { old_idx }, || {
-            be.select_server_with_key(source_ip, entry.sess.req_uri.as_deref())
+            be.select_server_with_key_abs(source_ip, entry.sess.req_uri.as_deref(), entry.sess.req_abs())
         })
     } else {
         entry
             .sess
             .target_addr
-            .or_else(|| proxies[be_idx].select_server_with_key(source_ip, entry.sess.req_uri.as_deref()))
+            .or_else(|| proxies[be_idx].select_server_with_key_abs(source_ip, entry.sess.req_uri.as_deref(), entry.sess.req_abs()))
     };
     // A different server is a redispatch (`wredis`), the same one a retry (`wretr`); the
     // client's persistence cookie no longer holds (`SF_DIRECT` cleared, `TX_CK_DOWN`).
@@ -15060,7 +15073,7 @@ impl EngineDispatcher<'_> {
         // Only a server with a `maxconn` is counted here; the others are counted once their
         // connection is in use, below (T224). `counted`: the slot is counted already.
         let be = &proxies[be_idx];
-        let pick = || be.pick_and_take(false, || be.select_server_with_key_idx(source_ip, entry.sess.req_uri.as_deref()));
+        let pick = || be.pick_and_take(false, || be.select_server_with_key_abs_idx(source_ip, entry.sess.req_uri.as_deref(), entry.sess.req_abs()));
         let mut full;
         let target = if let Some(idx) = cookie_server {
             let t = be.take_server_slot(idx, false).map(|counted| ((Some(idx), be.servers.at(idx)), counted));

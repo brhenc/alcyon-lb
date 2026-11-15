@@ -52,9 +52,7 @@ fn answers(weights: &[u32], s2_down: bool) -> String {
     answers_of("balance uri", weights, s2_down, &uris.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
-/// The answering server's number for each of `uris`, behind the backend lines `balance`
-/// (the `balance` line, and a `hash-type` one if any) and servers with `weights`.
-fn answers_of(balance: &str, weights: &[u32], s2_down: bool, uris: &[&str]) -> String {
+fn with_alcyon(bind_opts: &str, balance: &str, weights: &[u32], s2_down: bool, run: impl FnOnce(u16) -> String) -> String {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RUN: AtomicUsize = AtomicUsize::new(0);
     let mut servers = String::new();
@@ -65,7 +63,7 @@ fn answers_of(balance: &str, weights: &[u32], s2_down: bool, uris: &[&str]) -> S
     let port = common::reserve_port();
     let cfg = format!(
         "defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
-         frontend f\n  bind 127.0.0.1:{port}\n  default_backend be\n\
+         frontend f\n  bind 127.0.0.1:{port}{bind_opts}\n  default_backend be\n\
          backend be\n  {balance}\n{servers}"
     );
     let path = std::env::temp_dir().join(format!("alcyon_baluri_{}_{}", std::process::id(), RUN.fetch_add(1, Ordering::Relaxed)));
@@ -83,9 +81,81 @@ fn answers_of(balance: &str, weights: &[u32], s2_down: bool, uris: &[&str]) -> S
         assert!(Instant::now() < deadline, "the daemon never listened on {port}: {balance}");
         thread::sleep(Duration::from_millis(25));
     }
-    let got = uris.iter().map(|u| get(port, u)).collect();
+    let got = run(port);
     let _ = std::fs::remove_file(&path);
     got
+}
+
+/// The answering server's number for each of `uris`, behind the backend lines `balance`
+/// (the `balance` line, and a `hash-type` one if any) and servers with `weights`.
+fn answers_of(balance: &str, weights: &[u32], s2_down: bool, uris: &[&str]) -> String {
+    with_alcyon("", balance, weights, s2_down, |port| uris.iter().map(|u| get(port, u)).collect())
+}
+
+fn h2_frame(ftype: u8, flags: u8, sid: u32, payload: &[u8]) -> Vec<u8> {
+    let len = payload.len();
+    let mut out = Vec::with_capacity(9 + len);
+    let len_bytes = u32::try_from(len).expect("frame fits u24").to_be_bytes();
+    out.extend_from_slice(&[len_bytes[1], len_bytes[2], len_bytes[3], ftype, flags]);
+    out.extend_from_slice(&(sid & 0x7fff_ffff).to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+fn h2_read_frame(s: &mut TcpStream) -> Option<(u8, u8, u32, Vec<u8>)> {
+    let mut hdr = [0u8; 9];
+    s.read_exact(&mut hdr).ok()?;
+    let len = (usize::from(hdr[0]) << 16) | (usize::from(hdr[1]) << 8) | usize::from(hdr[2]);
+    let sid = u32::from_be_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]) & 0x7fff_ffff;
+    let mut pay = vec![0u8; len];
+    s.read_exact(&mut pay).ok()?;
+    Some((hdr[3], hdr[4], sid, pay))
+}
+
+fn h2_get_all(port: u16, reqs: &[Vec<(&'static str, &'static str)>]) -> String {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut init = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    init.extend_from_slice(&h2_frame(4, 0, 0, &[]));
+    s.write_all(&init).expect("preface");
+
+    let mut out = String::with_capacity(reqs.len());
+    for (idx, hdrs) in reqs.iter().enumerate() {
+        let sid = u32::try_from(idx).expect("idx") * 2 + 1;
+        let mut blk = Vec::new();
+        for (k, v) in hdrs {
+            blk.push(0x00);
+            blk.push(u8::try_from(k.len()).expect("header name < 127"));
+            blk.extend_from_slice(k.as_bytes());
+            blk.push(u8::try_from(v.len()).expect("header value < 127"));
+            blk.extend_from_slice(v.as_bytes());
+        }
+        s.write_all(&h2_frame(1, 0x05, sid, &blk)).expect("headers");
+        let mut body = Vec::new();
+        while let Some((ft, fl, rsid, pay)) = h2_read_frame(&mut s) {
+            if ft == 4 && (fl & 1) == 0 {
+                let _ = s.write_all(&h2_frame(4, 1, 0, &[]));
+            } else if ft == 6 && (fl & 1) == 0 && pay.len() == 8 {
+                let _ = s.write_all(&h2_frame(6, 1, 0, &pay));
+            } else if ft == 0 && rsid == sid {
+                body.extend_from_slice(&pay);
+                if (fl & 1) != 0 {
+                    break;
+                }
+            } else if ft == 1 && rsid == sid && (fl & 1) != 0 {
+                break;
+            } else if ft == 3 && rsid == sid || ft == 7 {
+                body.clear();
+                break;
+            }
+        }
+        let ans = match body.as_slice() {
+            [b] if b.is_ascii_digit() => char::from(*b),
+            _ => 'x',
+        };
+        out.push(ans);
+    }
+    out
 }
 
 #[test]
@@ -183,16 +253,20 @@ const OPTIONS_W123_CONSISTENT: [(&str, &str); 6] = [
     ("path-only whole len 9 depth 2", "1221123133332222332222122332222122"),
 ];
 
-fn check_rows(rows: &[(&str, &str)], hash_type: &str, weights: &[u32]) {
+fn check_rows_with(rows: &[(&str, &str)], hash_type: &str, weights: &[u32], runner: impl Fn(&str, &[u32]) -> String) {
     let mut wrong = Vec::new();
     for (opt, want) in rows {
         let balance = format!("balance uri {opt}{hash_type}");
-        let got = answers_of(&balance, weights, false, &OPTION_URIS);
+        let got = runner(&balance, weights);
         if got != *want {
             wrong.push(format!("{balance:?} {weights:?}\n   got {got}\n  want {want}"));
         }
     }
     assert!(wrong.is_empty(), "{} of {} rows differ from HAProxy:\n{}", wrong.len(), rows.len(), wrong.join("\n"));
+}
+
+fn check_rows(rows: &[(&str, &str)], hash_type: &str, weights: &[u32]) {
+    check_rows_with(rows, hash_type, weights, |b, w| answers_of(b, w, false, &OPTION_URIS));
 }
 
 #[test]
@@ -222,4 +296,103 @@ fn a_target_without_a_path_hashes_as_haproxys() {
     ] {
         assert_eq!(answers_of(balance, &[1, 1, 1, 1], false, &["OPTIONS *"]), want, "{balance}");
     }
+}
+
+/// HTTP/2 `balance uri` requests: `HAProxy` hashes `scheme://authority/path` when `:scheme`
+/// and `:authority` are both present (default ports `:80`/`:443` stripped; `OPTIONS *` hashes
+/// `scheme://authority` without `*`, non-`OPTIONS *` hashes `scheme://authority/`) unless
+/// `path-only` is set; requests without `:authority` hash only `:path`.
+///
+/// Measured on `HAProxy` 3.5-dev8 (`/home/bhenc/ibex-worktrees/agy-eval/oracle/haproxy`,
+/// `bind ... proto h2`). Reaches `lb::balance_uri_with_abs` via `H2Child::req_abs`.
+fn h2_requests() -> Vec<Vec<(&'static str, &'static str)>> {
+    let mut out: Vec<Vec<(&'static str, &'static str)>> = OPTION_URIS[..24]
+        .iter()
+        .map(|&p| vec![(":method", "GET"), (":scheme", "http"), (":authority", "h"), (":path", p)])
+        .collect();
+    for p in ["/a/b/c/d1", "/a/b?x=1", "/a/b?x=2", "/a/b"] {
+        out.push(vec![(":method", "GET"), (":scheme", "http"), (":authority", "h"), (":path", p)]);
+    }
+    out.push(vec![(":method", "GET"), (":scheme", "http"), (":authority", "g"), (":path", "/a/b")]);
+    out.push(vec![(":method", "GET"), (":scheme", "https"), (":authority", "h"), (":path", "/a/b")]);
+    for &p in &OPTION_URIS[29..34] {
+        out.push(vec![(":method", "GET"), (":scheme", "http"), (":authority", "h"), (":path", p)]);
+    }
+    out.extend([
+        vec![(":method", "GET"), (":scheme", "http"), (":path", "/a/b")],
+        vec![(":method", "GET"), (":scheme", "http"), (":path", "/a/b"), ("host", "h")],
+        vec![(":method", "OPTIONS"), (":scheme", "http"), (":authority", "h"), (":path", "*")],
+        vec![(":method", "OPTIONS"), (":scheme", "http"), (":path", "*")],
+        vec![(":method", "GET"), (":scheme", "http"), (":authority", "h"), (":path", "*")],
+        vec![(":method", "GET"), (":scheme", "http"), (":authority", "h:80"), (":path", "/a/b")],
+        vec![(":method", "GET"), (":scheme", "http"), (":authority", "h:81"), (":path", "/a/b")],
+        vec![(":method", "GET"), (":scheme", "https"), (":authority", "h:443"), (":path", "/a/b")],
+        vec![(":method", "GET"), (":scheme", "https"), (":authority", "h:80"), (":path", "/a/b")],
+    ]);
+    out
+}
+
+const H2_4EQ_MAP: [(&str, &str); 17] = [
+    ("", "23412341233423134441242224443322411223324333"),
+    ("whole", "23412341233423131241243421243324411223324333"),
+    ("len 4", "11111111111111111111111111111111111221311111"),
+    ("len 10", "44444444444411111111111111114322311223321132"),
+    ("len 12", "23412341233444434442222244443122144223324312"),
+    ("depth 1", "22222222222222222222222222222122222332322211"),
+    ("depth 2", "33333333333333333333333333332233333223333222"),
+    ("depth 3", "23412341233411111111242211114422211223321444"),
+    ("depth 4", "23412341233444434441242244443322444223324333"),
+    ("path-only", "41234123411241312223424442222244233221142222"),
+    ("whole path-only", "41234123411241313423421243422242233221142222"),
+    ("path-only depth 1", "41234123411233333333424433333344433331143333"),
+    ("path-only len 4", "41234123411222212224444422222244322221142222"),
+    ("len 12 depth 3", "23412341233411111112222211114422211223321342"),
+    ("whole len 15", "23412341233411132241144312243324411223324331"),
+    ("whole depth 3", "23412341233411111111243411114424211223321444"),
+    ("path-only whole len 9 depth 2", "41234123411222213424421223422242222221142222"),
+];
+
+const H2_4EQ_CONSISTENT: [(&str, &str); 6] = [
+    ("", "13422144434224131114314421111122122221321111"),
+    ("whole", "13422144434224133314314123311122122221321111"),
+    ("len 10", "33333333333322222222222222223122422221322113"),
+    ("depth 3", "13422144434222222224314422223322222221322134"),
+    ("path-only", "14411231434413322222124412222222313223322222"),
+    ("path-only whole len 9 depth 2", "14411231434422224222221224222224122223322222"),
+];
+
+const H2_W123_MAP: [(&str, &str); 6] = [
+    ("", "32323132322332223332333333331233321332133221"),
+    ("whole", "32323132322332222332332332331233321332133221"),
+    ("len 10", "33333333333322222222222222223133222332132213"),
+    ("depth 3", "32323132322322222222333322223333322332132333"),
+    ("path-only", "32323132322331223331333333333333322331133333"),
+    ("path-only whole len 9 depth 2", "32323132322333322333331332333333333331133333"),
+];
+
+const H2_W123_CONSISTENT: [(&str, &str); 6] = [
+    ("", "33323123332233132223311132223122123222322111"),
+    ("whole", "33323123332233133323312133323122123222322111"),
+    ("len 10", "33333333333322222222222222223122222222322113"),
+    ("depth 3", "33323123332222222223311122223322222222322333"),
+    ("path-only", "12211231333312222222123312222222213223322222"),
+    ("path-only whole len 9 depth 2", "12211231333322223322221223322222122223322222"),
+];
+
+fn answers_of_h2(balance: &str, weights: &[u32], reqs: &[Vec<(&'static str, &'static str)>]) -> String {
+    with_alcyon(" proto h2", balance, weights, false, |port| h2_get_all(port, reqs))
+}
+
+#[test]
+fn h2_uri_options_pick_haproxys_server_map_based() {
+    let reqs = h2_requests();
+    check_rows_with(&H2_4EQ_MAP, "", &[1, 1, 1, 1], |b, w| answers_of_h2(b, w, &reqs));
+    check_rows_with(&H2_W123_MAP, "", &[1, 2, 3], |b, w| answers_of_h2(b, w, &reqs));
+}
+
+#[test]
+fn h2_uri_options_pick_haproxys_server_consistent() {
+    let reqs = h2_requests();
+    check_rows_with(&H2_4EQ_CONSISTENT, "\n  hash-type consistent", &[1, 1, 1, 1], |b, w| answers_of_h2(b, w, &reqs));
+    check_rows_with(&H2_W123_CONSISTENT, "\n  hash-type consistent", &[1, 2, 3], |b, w| answers_of_h2(b, w, &reqs));
 }

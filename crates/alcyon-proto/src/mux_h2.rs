@@ -226,6 +226,9 @@ pub(crate) fn put_abs(rx: &mut RxHead, facts: &crate::h2::HeadFacts, fields: &De
             _ => {}
         }
     }
+    if let (Ok(sc), Ok(au)) = (std::str::from_utf8(scheme), std::str::from_utf8(authority)) {
+        authority = crate::authority::strip_default_port(sc, au).as_bytes();
+    }
     let len = scheme.len() + 3 + authority.len();
     if facts.tail + len > rx.len() - facts.blocks * crate::htx::HTX_DESC_SIZE {
         return None;

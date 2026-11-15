@@ -498,6 +498,10 @@ pub struct H2Child {
     /// T569: the QUIC connection of an HTTP/3 stream and how its peer acknowledged (kept fresh
     /// by the engine at the response head): what the `alcyon_fc_quic_ack_*` fetches read.
     pub quic_ack: Option<QuicAckSrc>,
+    /// `scheme://authority` of an HTTP/2 or HTTP/3 request when `:authority` was present
+    /// (`req_uri` keeps only `:path`; `balance uri` hashes them together unless `path-only`
+    /// is set). Kept here so `SessionEntry` does not grow.
+    pub req_abs: ReqText,
     /// The connection's session variables as the stream got them: what it changed of them
     /// goes back to the connection, and only that, as other streams may have set others.
     pub sess_vars_at_start: alcyon_sample::VarStore,
@@ -1114,6 +1118,19 @@ impl TcpSession {
         }
     }
 
+    /// `scheme://authority` of an HTTP/2 or HTTP/3 request when `:authority` was present.
+    #[must_use]
+    pub fn req_abs(&self) -> Option<&str> {
+        self.h2_child().and_then(|c| c.req_abs.as_deref())
+    }
+
+    /// Sets or clears [`Self::req_abs`] when this session is an HTTP/2 or HTTP/3 child.
+    pub fn set_req_abs(&mut self, abs: Option<&str>) {
+        if let Some(c) = self.h2_child_mut() {
+            c.req_abs.set_opt(abs);
+        }
+    }
+
     /// The owner of an HTTP/3 connection (T509), in its role.
     #[must_use]
     pub fn h3_owner(&self) -> Option<&H3Owner> {
@@ -1321,13 +1338,14 @@ impl TcpSession {
         c.is_first_req = owner.is_first_req;
         // A session that served a stream before has its role and its strings still.
         if let Some(H2Role::Child(ch)) = c.h2_role.as_deref_mut() {
-            let H2Child { owner: o, stream: st, late_trailers, rsp_head, reset, finished, conn_end, owner_tx_pending, rst, goaway, tls: _, quic_ack, sess_vars_at_start } = ch;
+            let H2Child { owner: o, stream: st, late_trailers, rsp_head, reset, finished, conn_end, owner_tx_pending, rst, goaway, tls: _, quic_ack, req_abs, sess_vars_at_start } = ch;
             *o = Some(owner_ref);
             *st = stream;
             *late_trailers = None;
             *rsp_head = None;
             (*reset, *finished, *owner_tx_pending) = (false, false, false);
             (*conn_end, *rst, *goaway, *quic_ack) = (None, None, None, None);
+            req_abs.reset();
             sess_vars_at_start.copy_scope_from(&owner.strm.vars, alcyon_sample::VarScope::Sess);
             return;
         }
@@ -1364,6 +1382,7 @@ impl TcpSession {
             goaway: None,
             tls,
             quic_ack: None,
+            req_abs: ReqText::default(),
             sess_vars_at_start: {
                 let mut v = alcyon_sample::VarStore::new();
                 v.copy_scope_from(&owner.strm.vars, alcyon_sample::VarScope::Sess);

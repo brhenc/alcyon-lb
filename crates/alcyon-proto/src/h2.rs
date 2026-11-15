@@ -2041,7 +2041,11 @@ pub fn write_request_text(fields: &DecodedFields, relaxed: bool, key: Option<&st
         _ => false,
     };
     let abs = match (has_abs, fields.iter().find(|(n, _)| *n == b":scheme"), authority) {
-        (true, Some((_, sc)), Some(a)) => format!("{}://{a}", String::from_utf8_lossy(sc)),
+        (true, Some((_, sc)), Some(a)) => {
+            let sc = String::from_utf8_lossy(sc);
+            let a = crate::authority::strip_default_port(&sc, a);
+            format!("{sc}://{a}")
+        }
         _ => String::new(),
     };
     Ok(TextHead {
