@@ -51,7 +51,7 @@ pub(crate) fn parse_defaults_directive(
         }
         "balance" => {
             let mut b = defaults.balance.unwrap_or(BalanceAlgorithm::RoundRobin);
-            parse_balance(&mut b, tokens, kw)?;
+            parse_balance(&mut b, &mut defaults.balance_uri, tokens, kw)?;
             defaults.balance = Some(b);
             Ok(())
         }

@@ -235,6 +235,22 @@ pub enum Mode {
     Health,
 }
 
+/// The options of `balance uri` (`lbprm.arg_opt1` to `arg_opt3`, `backend_parse_balance`):
+/// which part of the request URI is hashed. Kept beside the section's `balance`, not in
+/// [`BalanceAlgorithm`], which every runtime proxy holds and which they would grow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UriHash {
+    /// `len <n>`: only the first `n` bytes of the URI; 0 without the option.
+    pub len: u32,
+    /// `depth <n>`: the slash that ends the hashed part, the `n + 1`-th, as `HAProxy` stores
+    /// it (as an `int`: a depth of `INT_MAX` wraps to a count never reached); 0 without.
+    pub depth_end: i32,
+    /// `whole`: the query string is hashed too.
+    pub whole: bool,
+    /// `path-only`: the scheme and authority of an absolute URI are left out.
+    pub path_only: bool,
+}
+
 /// Load balancing algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BalanceAlgorithm {
@@ -243,7 +259,7 @@ pub enum BalanceAlgorithm {
     RoundRobin,
     /// Source IP hash.
     Source,
-    /// URI hash.
+    /// URI hash, over the part of the URI the section's [`UriHash`] selects.
     Uri,
     /// Least connections.
     Leastconn,

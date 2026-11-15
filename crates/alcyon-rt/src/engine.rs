@@ -4844,7 +4844,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         log_cursors: Arc::default(),
         hash_type: listen.hash_type.unwrap_or_default(),
         hash_preserve_affinity: listen.hash_preserve_affinity.unwrap_or_default(),
-        chash: Arc::default(),
+        chash: Arc::new(crate::lb::ChashRing::new(listen.balance_uri)),
         fwrr: Arc::default(),
     }
 }
@@ -5148,7 +5148,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         log_cursors: Arc::default(),
         hash_type: be.hash_type.unwrap_or_default(),
         hash_preserve_affinity: be.hash_preserve_affinity.unwrap_or_default(),
-        chash: Arc::default(),
+        chash: Arc::new(crate::lb::ChashRing::new(be.balance_uri)),
         fwrr: Arc::default(),
     }
 }

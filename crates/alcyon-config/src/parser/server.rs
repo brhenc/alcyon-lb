@@ -922,6 +922,7 @@ pub(crate) fn parse_default_server(
 
 pub(crate) fn parse_balance(
     balance: &mut BalanceAlgorithm,
+    uri: &mut UriHash,
     tokens: &[Token],
     kw: &Token,
 ) -> Result<(), ConfigError> {
@@ -932,10 +933,15 @@ pub(crate) fn parse_balance(
             "<balance> expects an algorithm as argument.",
         ));
     }
+    // HAProxy clears the algorithm's arguments on every `balance` line.
+    *uri = UriHash::default();
     *balance = match tokens[1].text.as_str() {
         "roundrobin" => BalanceAlgorithm::RoundRobin,
         "source" => BalanceAlgorithm::Source,
-        "uri" => BalanceAlgorithm::Uri,
+        "uri" => {
+            *uri = parse_balance_uri(tokens)?;
+            BalanceAlgorithm::Uri
+        }
         "leastconn" => BalanceAlgorithm::Leastconn,
         "static-rr" => BalanceAlgorithm::StaticRr,
         "first" => BalanceAlgorithm::First,
@@ -973,6 +979,73 @@ pub(crate) fn parse_balance(
         }
     };
     Ok(())
+}
+
+/// The options after `balance uri`, read and refused as `backend_parse_balance` does
+/// (`src/backend.c`): `whole`, `path-only`, `len <n>` and `depth <n>` in any order, a
+/// repeated one keeping its last value, anything else an error. The other algorithms take
+/// no option and `HAProxy` does not look at what follows them, so neither does Alcyon.
+fn parse_balance_uri(tokens: &[Token]) -> Result<UriHash, ConfigError> {
+    let mut opts = UriHash::default();
+    let mut i = 2;
+    while let Some(tok) = tokens.get(i).filter(|t| !t.text.is_empty()) {
+        let name = tok.text.as_str();
+        match name {
+            "len" | "depth" => {
+                let arg = tokens.get(i + 1).map_or("", |t| t.text.as_str());
+                let n = c_atoi(arg);
+                if n <= 0 {
+                    return Err(ConfigError::new(
+                        tok.line,
+                        tok.col,
+                        format!("balance uri : '{name}' expects a positive integer (got '{arg}')."),
+                    ));
+                }
+                if name == "len" {
+                    opts.len = n.unsigned_abs();
+                } else {
+                    opts.depth_end = n.wrapping_add(1);
+                }
+                i += 2;
+            }
+            "whole" => {
+                opts.whole = true;
+                i += 1;
+            }
+            "path-only" => {
+                opts.path_only = true;
+                i += 1;
+            }
+            other => {
+                return Err(ConfigError::new(
+                    tok.line,
+                    tok.col,
+                    format!("balance uri only accepts parameters 'len', 'depth', 'path-only', and 'whole' (got '{other}')."),
+                ));
+            }
+        }
+    }
+    Ok(opts)
+}
+
+/// C's `atoi` as glibc runs it, which is how `HAProxy` reads these numbers: blanks, a sign,
+/// then digits up to the first other byte (`3x` is 3, `x` is 0), the `long` cut to an
+/// `int` (2^31 is negative, 2^32 + 1 is 1).
+fn c_atoi(text: &str) -> i32 {
+    let t = text.trim_start_matches([' ', '\t', '\n', '\r', '\x0b', '\x0c']);
+    let (neg, digits) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let mut v: i64 = 0;
+    for d in digits.bytes().take_while(u8::is_ascii_digit) {
+        v = v.saturating_mul(10).saturating_add(i64::from(d - b'0'));
+    }
+    // Truncation is the point: `(int) strtol(..)`.
+    #[allow(clippy::cast_possible_truncation)]
+    let n = if neg { v.saturating_neg() } else { v } as i32;
+    n
 }
 
 pub(crate) fn parse_hash_type(

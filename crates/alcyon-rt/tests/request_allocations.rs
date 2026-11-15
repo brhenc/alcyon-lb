@@ -962,6 +962,66 @@ fn balance_uri_allocates_nothing_per_request() {
     assert_eq!(many, few, "1000 more balance-uri requests made {} more allocations", many as i64 - few as i64);
 }
 
+/// The allocations of 100 and of 1100 keep-alive requests through a backend that balances
+/// with `be_lines` over a disabled server and the live one: a pick per request.
+fn balance_allocations(be_lines: &str) -> (usize, usize) {
+    let be = format!("{be_lines}  server s2 127.0.0.1:1 weight 3 disabled\n");
+    let run = |n| keepalive_run_be("", &be, BENCH_RSP, n, b"HTTP/1.1 200", b"\r\n\r\nok").0;
+    (run(100), run(1100))
+}
+
+/// `balance random` picks without allocating. Before: `lb::weighted_eligible` collected the
+/// usable servers and their weights into a `Vec` on every pick.
+#[test]
+fn balance_random_allocates_nothing_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (few, many) = balance_allocations("  balance random\n");
+    println!("[MEASUREMENT LB random] keep-alive allocations: 100 requests {few}, 1100 requests {many}");
+    assert_eq!(many, few, "1000 more balance-random requests made {} more allocations", many as i64 - few as i64);
+}
+
+/// `balance static-rr` picks without allocating. Before: a `Vec` of the usable servers per pick.
+#[test]
+fn balance_static_rr_allocates_nothing_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (few, many) = balance_allocations("  balance static-rr\n");
+    println!("[MEASUREMENT LB static-rr] keep-alive allocations: 100 requests {few}, 1100 requests {many}");
+    assert_eq!(many, few, "1000 more balance-static-rr requests made {} more allocations", many as i64 - few as i64);
+}
+
+/// `balance source` with `hash-type consistent` picks without allocating. Before: a `Vec` of
+/// the address words, and in `lb::chash_lookup` a sorted `Vec` of every ring point's server
+/// to count the servers on the ring; the count is now taken when the ring is built.
+#[test]
+fn balance_source_consistent_allocates_nothing_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (few, many) = balance_allocations("  balance source\n  hash-type consistent\n");
+    println!("[MEASUREMENT LB source consistent] keep-alive allocations: 100 requests {few}, 1100 requests {many}");
+    assert_eq!(many, few, "1000 more consistent balance-source requests made {} more allocations", many as i64 - few as i64);
+}
+
+/// `balance uri` with `hash-type consistent` picks without allocating (`lb::chash_lookup`, as
+/// above).
+#[test]
+fn balance_uri_consistent_allocates_nothing_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (few, many) = balance_allocations("  balance uri whole depth 3\n  hash-type consistent\n");
+    println!("[MEASUREMENT LB uri consistent] keep-alive allocations: 100 requests {few}, 1100 requests {many}");
+    assert_eq!(many, few, "1000 more consistent balance-uri requests made {} more allocations", many as i64 - few as i64);
+}
+
+/// The algorithms that already allocated nothing per pick stay that way: `roundrobin`,
+/// `leastconn`, `first`, and `source` on the default map.
+#[test]
+fn the_other_balance_algorithms_allocate_nothing_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for algo in ["roundrobin", "leastconn", "first", "source"] {
+        let (few, many) = balance_allocations(&format!("  balance {algo}\n"));
+        println!("[MEASUREMENT LB {algo}] keep-alive allocations: 100 requests {few}, 1100 requests {many}");
+        assert_eq!(many, few, "1000 more balance-{algo} requests made {} more allocations", many as i64 - few as i64);
+    }
+}
+
 /// The ten request and response rules of the 2026-10-19 allocation survey (`rules.body` in
 /// `review/alloc-survey-2026-10-19`): header set/del/add, a `%[rand]` format, set-var, a
 /// `path_reg` and a `hdr` ACL, a deny that does not fire.

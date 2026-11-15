@@ -5,7 +5,7 @@
 
 use crate::engine::Proxy;
 use crate::check::ServerStatus;
-use alcyon_config::{HashPreserveAffinity, HashType};
+use alcyon_config::{HashPreserveAffinity, HashType, UriHash};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard};
 
@@ -461,30 +461,29 @@ pub(crate) fn next_random_u64() -> u64 {
     new_state
 }
 
-/// Builds the weighted candidate set for a random draw: primary (non-backup) servers
-/// under their `maxconn` if any are eligible, otherwise the first eligible backup alone.
-/// Returns `(candidates, total_weight)` where `candidates` is `(server_idx, weight)`.
-fn weighted_eligible(proxy: &Proxy) -> (Vec<(usize, u32)>, u32) {
-    let mut total_weight = 0u32;
-    let mut eligible_primaries = Vec::new();
-    for idx in 0..proxy.servers.len() {
-        let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
-        if !is_backup && is_selectable(proxy, idx) {
-            let w = proxy.server_weights.get(idx).unwrap_or(1).max(1);
-            total_weight = total_weight.saturating_add(w);
-            eligible_primaries.push((idx, w));
+/// The usable active servers and their weights (at least 1), in declaration order: what
+/// `random` and `static-rr` draw from. Walked in place on each pick, never collected: a
+/// pick allocates nothing.
+fn usable_primaries(proxy: &Proxy) -> impl Iterator<Item = (usize, u32)> + '_ {
+    (0..proxy.servers.len())
+        .filter(|&idx| !proxy.server_backups.get(idx).copied().unwrap_or(false) && is_selectable(proxy, idx))
+        .map(|idx| (idx, proxy.server_weights.get(idx).unwrap_or(1).max(1)))
+}
+
+/// The server holding position `pos` when the usable active servers are laid end to end,
+/// each as wide as its weight. A server can leave between the pass that summed the weights
+/// and this one; the position then falls past the end and the last usable server takes it.
+fn primary_at(proxy: &Proxy, pos: u32) -> Option<usize> {
+    let mut acc = 0u32;
+    let mut at = None;
+    for (idx, w) in usable_primaries(proxy) {
+        acc = acc.saturating_add(w);
+        at = Some(idx);
+        if pos < acc {
+            break;
         }
     }
-    if !eligible_primaries.is_empty() {
-        return (eligible_primaries, total_weight);
-    }
-
-    // No active server: the first usable backup alone (`lbprm.fbck`; Alcyon has no
-    // `option allbackups`). `HAProxy` 3.5 sent 30 of 30 requests to it under `random`.
-    match first_backup(proxy) {
-        Some(idx) => (vec![(idx, 1)], 1),
-        None => (Vec::new(), 0),
-    }
+    at
 }
 
 /// Random draw over the weighted server set (`balance random`, `balance random(N)`).
@@ -493,28 +492,17 @@ fn weighted_eligible(proxy: &Proxy) -> (Vec<(usize, u32)>, u32) {
 /// is not a candidate, so the queue is never picked for a request it cannot serve.
 #[must_use]
 pub fn random(proxy: &Proxy, draws: u32) -> Option<usize> {
-    let (candidates, total_weight) = weighted_eligible(proxy);
-    if candidates.is_empty() || total_weight == 0 {
-        return None;
+    let total_weight = usable_primaries(proxy).fold(0u32, |t, (_, w)| t.saturating_add(w));
+    if total_weight == 0 {
+        // No active server: the first usable backup alone (`lbprm.fbck`; Alcyon has no
+        // `option allbackups`). `HAProxy` 3.5 sent 30 of 30 requests to it under `random`.
+        return first_backup(proxy);
     }
+    let draw_one = || primary_at(proxy, (next_random_u64() % u64::from(total_weight)) as u32);
 
-    let draw_one = |candidates: &[(usize, u32)], total_weight: u32| -> usize {
-        let pos = (next_random_u64() % u64::from(total_weight)) as u32;
-        let mut acc = 0u32;
-        let mut picked = candidates[0].0;
-        for &(idx, w) in candidates {
-            acc = acc.saturating_add(w);
-            if pos < acc {
-                picked = idx;
-                break;
-            }
-        }
-        picked
-    };
-
-    let mut best = draw_one(&candidates, total_weight);
+    let mut best = draw_one()?;
     for _ in 1..draws.max(1) {
-        let candidate = draw_one(&candidates, total_weight);
+        let candidate = draw_one().unwrap_or(best);
         if candidate == best {
             continue;
         }
@@ -578,44 +566,28 @@ pub fn leastconn(proxy: &Proxy) -> Option<usize> {
 /// Produces an interleaved distribution matching HAProxy map-based round-robin.
 #[must_use]
 pub fn static_rr(proxy: &Proxy) -> Option<usize> {
-    let mut total_weight = 0u32;
-    let mut eligible_primaries = Vec::new();
-
-    for idx in 0..proxy.servers.len() {
-        let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
-        if !is_backup && is_selectable(proxy, idx) {
-            let w = proxy.server_weights.get(idx).unwrap_or(1).max(1);
-            total_weight = total_weight.saturating_add(w);
-            eligible_primaries.push((idx, w));
-        }
+    let total_weight = usable_primaries(proxy).fold(0u32, |t, (_, w)| t.saturating_add(w));
+    if total_weight == 0 {
+        // Backup failover: the first usable backup alone.
+        return first_backup(proxy);
     }
-
-    if !eligible_primaries.is_empty() {
-        let counter = proxy.next_server_idx.fetch_add(1, Ordering::Relaxed);
-        let pos = (counter % (total_weight as usize)) as u32;
-
-        let mut acc = 0u32;
-        for (idx, w) in eligible_primaries {
-            acc = acc.saturating_add(w);
-            if pos < acc {
-                return Some(idx);
-            }
-        }
-        return None;
-    }
-
-    // Backup failover: the first usable backup alone.
-    first_backup(proxy)
+    let counter = proxy.next_server_idx.fetch_add(1, Ordering::Relaxed);
+    primary_at(proxy, (counter % (total_weight as usize)) as u32)
 }
 
 /// Deterministic URI Hash (`balance uri`), `map-based` as HAProxy defaults it.
 ///
 /// HAProxy's `get_server_uh` (`src/backend.c`) hashes the URI with `sdbm` -- the default
 /// hash function, and no avalanche unless `hash-type` asks for one -- over the slice
-/// before the `?` ([`uri_hash_key`]), and `map_get_server_hash` takes that modulo the
+/// its options select, by default the part before the `?` ([`uri_hash_key`]), and `map_get_server_hash` takes that modulo the
 /// backend's `tot_weight` into the interleaved weighted map ([`WeightMap`]). Both the hash
 /// and the map matter: hashing the query string, or laying the weights out in contiguous
 /// blocks, sends the same URI to another server than HAProxy does.
+///
+/// Known difference, measured on 3.5-dev8 and not fixed here: for an HTTP/2 request `HAProxy`
+/// hashes the absolute URI it rebuilds from `:scheme` and `:authority`, Alcyon the path it
+/// keeps. With `path-only` both hash the path and agree; without it an HTTP/2 request lands
+/// on another server than `HAProxy`'s (HTTP/1 requests agree either way).
 #[must_use]
 pub fn balance_uri(proxy: &Proxy, uri: &str) -> Option<usize> {
     // `hash-preserve-affinity` only has an effect
@@ -624,7 +596,7 @@ pub fn balance_uri(proxy: &Proxy, uri: &str) -> Option<usize> {
     if proxy.hash_type == HashType::Consistent {
         return balance_uri_consistent(proxy, uri);
     }
-    let hash = hash_sdbm(uri_hash_key(uri).as_bytes());
+    let hash = hash_sdbm(uri_hash_key(uri, proxy.chash.2));
     if let Some(idx) = proxy.chash.map_pick(proxy, hash) {
         return Some(idx);
     }
@@ -633,16 +605,42 @@ pub fn balance_uri(proxy: &Proxy, uri: &str) -> Option<usize> {
     first_backup(proxy)
 }
 
-/// The slice of `uri` `balance uri` hashes: everything before the `?`, so the query string
-/// does not break cache affinity (`get_server_uh`, `src/backend.c`, which stops at `'?'`
-/// unless the `whole` option asks for the whole request URI). `len` and `depth` narrow it
-/// further in HAProxy; Alcyon's parser accepts those keywords and stores neither, so the
-/// default slice applies to all of them.
-fn uri_hash_key(uri: &str) -> &str {
-    match uri.find('?') {
-        Some(at) => &uri[..at],
-        None => uri,
+/// The slice of `uri` `balance uri` hashes, as `get_server_uh` (`src/backend.c`) and its
+/// caller cut it: with `path-only` the scheme and authority of an absolute URI are dropped
+/// first; `len` keeps the first bytes of what is left; then the walk stops before the `?`
+/// unless `whole` is set, and before the slash that ends `depth` directories (that slash
+/// is the `depth + 1`-th, which is what `depth_end` holds).
+fn uri_hash_key(uri: &str, opts: UriHash) -> &[u8] {
+    let mut key = uri.as_bytes();
+    if opts.path_only {
+        key = uri_path(key);
     }
+    if opts.len > 0 {
+        key = &key[..key.len().min(opts.len as usize)];
+    }
+    let mut slashes = 0i32;
+    let end = key.iter().position(|&c| {
+        if c == b'/' {
+            slashes += 1;
+            slashes == opts.depth_end
+        } else {
+            c == b'?' && !opts.whole
+        }
+    });
+    &key[..end.unwrap_or(key.len())]
+}
+
+/// `http_parse_path` (`src/http.c`) for `path-only`: an absolute path as it is, what
+/// follows the authority of an absolute URI, and nothing for `*` or an authority alone.
+fn uri_path(uri: &[u8]) -> &[u8] {
+    if uri.first() == Some(&b'/') {
+        return uri;
+    }
+    let Some(scheme_end) = uri.windows(3).position(|w| w == b"://") else {
+        return &[];
+    };
+    let rest = &uri[scheme_end + 3..];
+    rest.iter().position(|&c| c == b'/').map_or(&[], |at| &rest[at..])
 }
 
 /// HAProxy's weighted server map (`recalc_server_map` with `init_server_map`,
@@ -740,7 +738,7 @@ fn gcd2(mut a: u32, mut b: u32) -> u32 {
 /// `balance uri` with `hash-type consistent` (`get_server_uh` + `chash_get_server_hash`,
 /// `src/backend.c` and `src/lb_chash.c`).
 ///
-/// The key is `sdbm` of the URI up to its `?`, avalanched by `full_hash` -- `hash-type
+/// The key is `sdbm` of the same slice of the URI ([`uri_hash_key`]), avalanched by `full_hash` -- `hash-type
 /// consistent` alone means `sdbm avalanche` (`cfgparse-listen.c`) -- and the server is the one owning the
 /// ring point nearest to it. A server at `maxconn` is passed over for the next point
 /// round the ring: that is `hash-preserve-affinity maxconn`. `HAProxy`'s default, `always`,
@@ -748,8 +746,8 @@ fn gcd2(mut a: u32, mut b: u32) -> u32 {
 /// sends a server more than its `maxconn`, so `always` walks the same way once the server
 /// is full. `None` when no server is up, or every candidate is full.
 fn balance_uri_consistent(proxy: &Proxy, uri: &str) -> Option<usize> {
-    let key = uri.split('?').next().unwrap_or("");
-    chash_lookup(proxy, |_| full_hash(hash_sdbm(key.as_bytes())))
+    let key = uri_hash_key(uri, proxy.chash.2);
+    chash_lookup(proxy, |_| full_hash(hash_sdbm(key)))
 }
 
 /// `balance source` with `hash-type consistent` (`get_server_sh`, `src/backend.c`): the
@@ -757,13 +755,13 @@ fn balance_uri_consistent(proxy: &Proxy, uri: &str) -> Option<usize> {
 /// and 0 when only one server is left to choose from, then the ring as for `balance uri`.
 #[must_use]
 pub fn balance_source_consistent(proxy: &Proxy, ip: std::net::IpAddr) -> Option<usize> {
-    let words = match ip {
-        std::net::IpAddr::V4(a) => vec![u32::from(a)],
-        std::net::IpAddr::V6(a) => a.octets().chunks(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect(),
+    let key = match ip {
+        std::net::IpAddr::V4(a) => u32::from(a),
+        std::net::IpAddr::V6(a) => {
+            a.octets().chunks_exact(4).fold(0, |h, c| h ^ u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
+        }
     };
-    chash_lookup(proxy, |servers_in_ring| {
-        if servers_in_ring <= 1 { 0 } else { full_hash(words.iter().fold(0, |h, w| h ^ w)) }
-    })
+    chash_lookup(proxy, |servers_in_ring| if servers_in_ring <= 1 { 0 } else { full_hash(key) })
 }
 
 /// The server owning the ring point nearest to the key `hash(n)`, `n` being how many
@@ -780,10 +778,7 @@ fn chash_lookup(proxy: &Proxy, hash: impl FnOnce(usize) -> u32) -> Option<usize>
 
     // The point at or after the key, or the first one past the end of the ring; then
     // whichever of it and the point before is closer, the earlier one on a tie.
-    let mut in_ring: Vec<u32> = points.iter().map(|p| p.1).collect();
-    in_ring.sort_unstable();
-    in_ring.dedup();
-    let hash = hash(in_ring.len());
+    let hash = hash(ring.servers);
     let next = points.partition_point(|&(k, _)| k < hash) % points.len();
     let prev = (next + points.len() - 1) % points.len();
     let dp = hash.wrapping_sub(points[prev].0);
@@ -840,6 +835,9 @@ struct Ring {
     members: RingMembers,
     /// `(key, server index)`, sorted by key.
     points: Vec<(u32, u32)>,
+    /// How many servers hold points (`tot_used`), counted when the ring is built so that
+    /// a request does not count them.
+    servers: usize,
 }
 
 /// The consistent-hash ring of one proxy, shared by its workers (the `Proxy` clones).
@@ -848,10 +846,21 @@ struct Ring {
 /// rebuilt from scratch whenever the set of up servers differs from the one it was built
 /// from. A server's points depend only on its id and weight, so the rebuilt ring is the
 /// one `HAProxy` holds, and keys move only to and from the server that changed.
+///
+/// The third field is the proxy's `balance uri` options, set when the proxy is built and
+/// never written again: they sit here, with the rest of what a hash pick reads, because
+/// `Proxy` is paid for by every proxy and must not grow (`struct_sizes`).
 #[derive(Debug, Default)]
-pub struct ChashRing(RwLock<Ring>, RwLock<WeightMap>);
+pub struct ChashRing(RwLock<Ring>, RwLock<WeightMap>, UriHash);
 
 impl ChashRing {
+    /// The balancing state of a proxy whose `balance uri` line had the options `uri`.
+    #[must_use]
+    pub fn new(uri: UriHash) -> Self {
+        ChashRing(RwLock::default(), RwLock::default(), uri)
+    }
+
+
     /// The server `balance uri` (map-based) picks for `hash`, from the [`WeightMap`] of the
     /// usable primary servers; `None` when none is usable. Per request: one read lock and
     /// one pass over the servers comparing state and weight to what the map was built
@@ -896,9 +905,13 @@ impl ChashRing {
         }
         {
             let mut ring = self.0.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let built_from: Vec<bool> = (0..proxy.servers.len()).map(in_ring).collect();
+            let ring = &mut *ring;
+            // Into the buffers of the previous build: a rebuild allocates only to grow.
+            ring.built_from.clear();
+            ring.built_from.extend((0..proxy.servers.len()).map(in_ring));
             ring.points.clear();
-            for idx in (0..proxy.servers.len()).filter(|&i| built_from[i]) {
+            ring.servers = 0;
+            for idx in (0..proxy.servers.len()).filter(|&i| ring.built_from[i]) {
                 // `puid`: the server's id, from 1 in declaration order around the ones
                 // with an `id`; `hash-key id` is the default.
                 let puid = proxy.server_puid(idx);
@@ -906,10 +919,10 @@ impl ChashRing {
                 let nodes = proxy.server_weights.get(idx).unwrap_or(1) * BE_WEIGHT_SCALE;
                 let server = u32::try_from(idx).unwrap_or(u32::MAX);
                 ring.points.extend((0..nodes).map(|j| (full_hash(base.wrapping_add(j)), server)));
+                ring.servers += usize::from(nodes > 0);
             }
             // Stable, so equal keys keep HAProxy's insertion order.
             ring.points.sort_by_key(|&(k, _)| k);
-            ring.built_from = built_from;
             ring.members = if !ring.points.is_empty() {
                 RingMembers::Active
             } else if let Some(b) = (0..proxy.servers.len()).find(|&i| {

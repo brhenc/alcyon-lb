@@ -121,6 +121,7 @@ pub(crate) fn parse_listen_header(
         monitor_uri: None,
         default_backend: defaults.and_then(|d| d.default_backend.clone()),
         balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
+        balance_uri: defaults.map(|d| d.balance_uri).unwrap_or_default(),
         balance_set: defaults.is_some_and(|d| d.balance.is_some()),
         stick_table: None,
         stick_rules: Vec::new(),
@@ -299,6 +300,7 @@ pub(crate) fn parse_backend_header(
         id: None,
         description: None,
         balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
+        balance_uri: defaults.map(|d| d.balance_uri).unwrap_or_default(),
         balance_set: defaults.is_some_and(|d| d.balance.is_some()),
         cookie: defaults.and_then(|d| d.cookie.clone()),
         contimeout: timeouts.connect,
@@ -416,7 +418,7 @@ pub(crate) fn parse_listen_directive(
         "srvexp" => parse_srvexp(kw),
         "balance" => {
             proxy.balance_set = true;
-            parse_balance(&mut proxy.balance, tokens, kw)
+            parse_balance(&mut proxy.balance, &mut proxy.balance_uri, tokens, kw)
         }
         "http-reuse" => parse_http_reuse(&mut proxy.http_reuse, tokens, kw),
         "hash-type" => {
@@ -686,7 +688,7 @@ pub(crate) fn parse_backend_directive(
         "use-server" => parse_use_server(&mut be.use_servers, tokens, kw),
         "balance" => {
             be.balance_set = true;
-            parse_balance(&mut be.balance, tokens, kw)
+            parse_balance(&mut be.balance, &mut be.balance_uri, tokens, kw)
         }
         "http-reuse" => parse_http_reuse(&mut be.http_reuse, tokens, kw),
         "hash-type" => {
