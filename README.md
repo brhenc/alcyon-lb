@@ -155,6 +155,16 @@ Build and report directories default to `${XDG_CACHE_HOME:-~/.cache}/alcyon/` (`
 `ALCYON_GATE_TARGET_BASE`, `ALCYON_PERFBASE_DIR`, `ALCYON_PERFBASE_BOARDS`, `DIFFFUZZ_TARGET`,
 `DIFFFUZZ_OUT`, `ALCYON_WORKTREES`.
 
+## Who wrote the code
+
+Alcyon is written by Claude models (Anthropic) under one maintainer. Some code was written by
+other models, run locally while they were being evaluated: Qwen3.6-35B-A3B, Qwen3.8-Flash-Next and
+Muse Glimmer 30B. Every such commit, and how much of it is still in the tree, is listed in
+[docs/provenance/LOCAL-MODELS.md](docs/provenance/LOCAL-MODELS.md), generated from git by
+`tools/model_provenance.py`. A model's output is committed unmodified as its own commit, with a
+`Model-Authored-By:` trailer, so `git show` on it is exactly what the model wrote. Review fixes and
+tests are separate commits on top.
+
 ## Licence
 
 Alcyon is a derivative of HAProxy and carries its licence: GPL-2.0-or-later
