@@ -679,7 +679,7 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                         return true;
                     };
                     self.s += 1;
-                    let srv_id = proxy.server_ids.get(s_idx).map_or("srv", String::as_str);
+                    let srv_id = proxy.server_ids.get(s_idx).map_or("srv", |s| s);
                     let srv_status = proxy
                         .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
                     let is_backup = proxy.server_backups.get(s_idx).copied().unwrap_or(false);
@@ -1258,7 +1258,7 @@ impl JsonCursor {
                 if s_idx > 0 {
                     out.push(',');
                 }
-                let srv_id = proxy.server_ids.get(s_idx).map_or("srv", String::as_str);
+                let srv_id = proxy.server_ids.get(s_idx).map_or("srv", |s| s);
                 let srv_status = proxy.server_statuses.get(s_idx).map_or(ServerStatus::Up, |s| ServerStatus::from(s.load(Relaxed)));
                 let weight = proxy.server_weights.get(s_idx).unwrap_or(1);
                 let srv_maxconn = proxy.server_maxconn.get(s_idx).unwrap_or(0);

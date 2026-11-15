@@ -59,7 +59,7 @@ fn pick(engine: &mut Engine, uri: &str) -> Option<String> {
     let proxy = &engine.proxies[0];
     let addr = proxy.select_server_with_key(None, Some(uri))?;
     let idx = proxy.servers.position(addr).expect("a configured server");
-    Some(proxy.server_ids[idx].clone())
+    Some(proxy.server_ids[idx].to_string())
 }
 
 fn assert_choices(engine: &mut Engine, expected: &[(&str, &str)]) {

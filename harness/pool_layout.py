@@ -35,6 +35,7 @@ NOT_CACHES: dict[tuple[str, str], str] = {
     ("crates/alcyon-rt/src/proxy.rs", "QUEUED"): "the requests waiting on this thread, oldest first (live queue state)",
     ("crates/alcyon-config/src/ast/userlist.rs", "USERLISTS"): "the userlist sections of the parse in progress, handed to the config by `take_userlists` (configuration, built once at start-up; no spare memory is kept for a later owner)",
     ("crates/alcyon-sample/src/registry.rs", "DEBUG_DESTS"): "the `debug()` destinations named while a config was checked, handed to the runtime once by `take_debug_destinations` (configuration)",
+    ("crates/alcyon-rt/src/proxy_state.rs", "SERVER_REFS"): "the servers a fetch argument names, gathered while a config is checked and taken once by `referenced_servers` (configuration, built once at start-up; None outside that call)",
 }
 
 SKIP_CRATES = {"alcyon-alloc"}

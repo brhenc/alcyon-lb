@@ -819,3 +819,13 @@ row is here because the behaviour is surprising or measurable, not because it di
 | **Gap** | With prealloc on, a TLS response can still reach the allocator on a cold thread, so prealloc does not yet mean "no allocation after start" for TLS. Plain-text traffic is unaffected. |
 | **Decision** | Postponed (user 2026-11-01). Revisit with the memory-budget work; until then prealloc's documentation says TLS send buffers are not prefilled. |
 
+### 6.35 `set server <b>/<s> name` leaks the replaced name and one slot per rename (T631) — **deliberate; bounded by an operator's action**
+
+| | |
+|---|---|
+| **What** | A server's names are a chain (`ServerNames`, `crates/alcyon-rt/src/srv_rt.rs`): the configured name is a slot inside the proxy's shared array, and each `set server <b>/<s> name <new>` appends one leaked slot (32 bytes) and the new name's bytes (at most 63). Nothing is ever freed or changed in place: the old name stays allocated and the old slot stays in the chain. |
+| **Why** | The name is read on the request path (the response context's `srv_name`, the log line, the `use-server` scan), by every worker. A lock, even a read lock, writes the lock word (rule 8, AGENTS.md); freeing the old name needs a reader count or an epoch, which is also a write per read; `alcyon-rt` forbids `unsafe`, which rules out an atomic pointer. An append-only chain is read with `OnceLock::get`, one Acquire load per hop and no write, and a `&'static str` a reader holds never dangles. |
+| **Cost** | Memory: at most 95 bytes per rename plus the allocator's overhead, for the life of the process; a reload starts from the configuration again. 10,000 renames are about 1 MB. Time: a read of a server's name walks one hop per rename that server has had since start (0 for a server never renamed), so a script that renames one server in a loop slows every read of that name linearly; a rename walks the same chain. Unrenamed servers pay nothing: the slot is as large as the lock it replaces (32 bytes; the 60,000-server figures are unchanged, 19,972,112 and 36,288,368 bytes). |
+| **HAProxy** | Frees the old name (`server.c`, `srv_update_server_name` under thread isolation); no growth. |
+| **Revisit if** | An operator renames servers continuously (an orchestrator that uses names as slots' labels). Then: compact the chain at a point where no worker reads (a reload, or the thread-isolation equivalent once there is one). |
+| **V&V probe** | Rename one server 100,000 times under load: RSS grows by about 10 MB and no more, no crash, no stale or torn name in the log; request latency on that backend rises with the chain. |

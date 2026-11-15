@@ -561,3 +561,9 @@ mod tests {
         drop(lines(&proxies));
     }
 }
+
+/// Whether another server's `track` names server `s` of proxy `p` (`SRV_F_NAME_REFD`).
+#[must_use]
+pub fn is_tracked(proxies: &[Proxy], p: usize, s: usize) -> bool {
+    proxies.iter().any(|px| px.server_track.as_ref().is_some_and(|t| t.iter().flatten().any(|t| t.target == (p, s))))
+}

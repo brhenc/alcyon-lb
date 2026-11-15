@@ -785,7 +785,7 @@ fn with_check_ctx<R>(
     f: impl FnOnce(&LogData, &alcyon_sample::SampleContext) -> R,
 ) -> R {
     let reg = crate::engine::sample_registry();
-    let srv = px.server_ids.get(check.server()).map(String::as_str);
+    let srv = px.server_ids.get(check.server());
     let view = ProxiesView(proxies);
     let mut ctx = alcyon_sample::PhaseCtx {
         fe_name: Some(&px.name),
@@ -942,7 +942,7 @@ fn server_state_header(check: &ServerCheckState, proxies: &[Proxy]) -> String {
         addr.ip(),
         addr.port(),
         px.name,
-        px.server_ids.get(i).map_or("", String::as_str),
+        px.server_ids.get(i).map_or("", |s| s),
         crate::engine::log_hostname(),
         px.server_weights.get(i).unwrap_or(1),
         total_weight(px),

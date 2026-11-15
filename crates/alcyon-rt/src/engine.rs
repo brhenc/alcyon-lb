@@ -1971,7 +1971,7 @@ pub struct Proxy {
     /// Each server's address, shared by every worker: `set server ... addr` changes it
     /// in place (T177).
     pub servers: crate::srv_rt::ServerAddrs,
-    pub server_ids: Vec<String>,
+    pub server_ids: crate::srv_rt::ServerNames,
     /// Each server's persistence cookie value (`server ... cookie <value>`). A server
     /// without one is never chosen by a cookie, not even by its name.
     pub server_cookies: Vec<Option<Box<str>>>,
@@ -2015,6 +2015,10 @@ pub struct Proxy {
     /// `proxy-v2-options unique-id`, per server.
     pub server_pp_unique_id: Vec<bool>,
     pub server_backups: Vec<bool>,
+    /// The servers whose name a sample fetch's argument holds (`srv_is_up(be/s)` and the
+    /// other `srv_*`), which `set server <b>/<s> name` refuses to rename: the fetches look the
+    /// server up by name. Empty when no fetch names a server of this proxy.
+    pub server_name_refd: Box<[bool]>,
     /// Each server's `maxconn`, shared by every worker: `set maxconn server` changes it in
     /// place (T177).
     pub server_maxconn: crate::srv_rt::ServerMaxconns,
@@ -3567,8 +3571,7 @@ fn stream_log_data<'a>(entry: &'a SessionEntry, proxies: &'a [Proxy], proxy_idx:
         server: entry
             .target_server_idx
             .or_else(|| entry.sess.strm.log.server.map(|i| i.get() as usize - 1))
-            .and_then(|i| proxies.get(entry.srv_backend_idx)?.server_ids.get(i))
-            .map(String::as_str),
+            .and_then(|i| proxies.get(entry.srv_backend_idx)?.server_ids.get(i)),
         term_state: term_state(entry),
         // The stream has let go of its backend when the line is made: only the others count.
         beconn: {
@@ -4802,6 +4805,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         server_send_proxy_v2: listen.servers.iter().map(|s| s.send_proxy_v2).collect(),
         server_pp_unique_id: listen.servers.iter().map(|s| s.proxy_v2_unique_id).collect(),
         server_backups: listen.servers.iter().map(|s| s.backup).collect(),
+        server_name_refd: Box::default(),
         server_maxconn: listen.servers.iter().map(|s| s.maxconn).collect(),
         server_actconn: Arc::new((0..server_count).map(|_| AtomicU32::new(0)).collect()),
         server_retr: Arc::default(),
@@ -4918,7 +4922,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         cliexp,
         srvexp: Vec::new(),
         servers: Vec::new().into(),
-        server_ids: Vec::new(),
+        server_ids: crate::srv_rt::ServerNames::default(),
         server_cookies: Vec::new(),
         server_statuses: std::sync::Arc::new(Vec::new()),
         server_track: None,
@@ -4948,6 +4952,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         server_send_proxy_v2: Vec::new(),
         server_pp_unique_id: Vec::new(),
         server_backups: Vec::new(),
+        server_name_refd: Box::default(),
         server_maxconn: std::iter::empty().collect(),
         server_actconn: std::sync::Arc::new(Vec::new()),
         server_retr: Arc::default(),
@@ -5104,6 +5109,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         server_send_proxy_v2: be.servers.iter().map(|s| s.send_proxy_v2).collect(),
         server_pp_unique_id: be.servers.iter().map(|s| s.proxy_v2_unique_id).collect(),
         server_backups: be.servers.iter().map(|s| s.backup).collect(),
+        server_name_refd: Box::default(),
         server_maxconn: be.servers.iter().map(|s| s.maxconn).collect(),
         server_actconn: Arc::new((0..server_count).map(|_| AtomicU32::new(0)).collect()),
         server_retr: Arc::default(),
@@ -5386,8 +5392,9 @@ impl Engine {
     crate::crash::set_fault(config.global.as_ref().and_then(|g| g.debug_panic.clone()));
     // An action naming a fetch or converter the registry lacks would load and then do
     // nothing on every request; `HAProxy` refuses the configuration instead.
-    crate::rule_exprs::validate_config(config)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // The resolution of every fetch argument also tells which servers a fetch names.
+    let (valid, server_refs) = crate::proxy_state::referenced_servers(|| crate::rule_exprs::validate_config(config));
+    valid.map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     // Exactly the proxies built below: a doubling Vec of 1.6 KB proxies left up to half of
     // it unused, 2.7 KB a backend at 10,000 (T175).
     let mut proxies = Vec::with_capacity(
@@ -5451,6 +5458,14 @@ impl Engine {
         for p in &mut proxies {
             p.ids.rows = Some(Arc::clone(&table));
         }
+    }
+    for (px, srv) in &server_refs {
+        let Some(p) = proxies.iter_mut().find(|p| p.has_backend && p.name == *px) else { continue };
+        let Some(i) = p.server_ids.iter().position(|s| s == srv) else { continue };
+        if p.server_name_refd.is_empty() {
+            p.server_name_refd = vec![false; p.server_ids.len()].into_boxed_slice();
+        }
+        p.server_name_refd[i] = true;
     }
     crate::track::attach(&mut proxies, config);
     link_declaration_order(&mut proxies);
@@ -11943,7 +11958,7 @@ impl EngineDispatcher<'_> {
             // before the stream's own line (rare: the message is built here, not on the path).
             let checkcache_alert = std::mem::take(&mut entry.sess.strm.log.checkcache_blocked).then(|| {
                 let srv_idx = entry.target_server_idx.or_else(|| entry.sess.strm.log.server.map(|i| i.get() as usize - 1));
-                let srv = srv_idx.and_then(|i| self.proxies.get(entry.srv_backend_idx)?.server_ids.get(i)).map_or("<dispatch>", String::as_str);
+                let srv = srv_idx.and_then(|i| self.proxies.get(entry.srv_backend_idx)?.server_ids.get(i)).map_or("<dispatch>", |s| s);
                 let be = self.proxies.get(entry.backend_idx).map_or("", |p| p.name.as_str());
                 (entry.backend_idx, format!("Blocking cacheable cookie in response from instance {be}, server {srv}."))
             });
@@ -12986,8 +13001,7 @@ impl EngineDispatcher<'_> {
             srv_id: entry.target_server_idx.and_then(|i| u32::try_from(i + 1).ok()),
             srv_name: entry
                 .target_server_idx
-                .and_then(|i| proxies.get(entry.srv_backend_idx)?.server_ids.get(i))
-                .map(String::as_str),
+                .and_then(|i| proxies.get(entry.srv_backend_idx)?.server_ids.get(i)),
             ..Default::default()
         };
         let rh = RepHead {
@@ -13813,7 +13827,7 @@ impl EngineDispatcher<'_> {
                         if target_backend.is_none() || target_backend == Some(proxy.name.as_str()) {
                             let mut weight_changes = Vec::new();
                             for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
-                                if target_server.is_none() || target_server == Some(sid.as_str()) {
+                                if target_server.is_none() || target_server == Some(sid) {
                                     let new_status = match cmd.action.as_str() {
                                         "ready" | "up" | "enable" => Some(ServerStatus::Up),
                                         "drain" => Some(ServerStatus::Drain),
@@ -15475,7 +15489,7 @@ impl EngineDispatcher<'_> {
                 let server = proxy
                     .server_ids
                     .get(server_idx)
-                    .map_or("?", String::as_str);
+                    .map_or("?", |s| s);
                 Some(check.log_line(&proxy.name, server, event))
             });
 

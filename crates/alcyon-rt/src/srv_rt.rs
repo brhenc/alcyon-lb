@@ -9,7 +9,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// A frontend's connection limit and the connections it holds, shared by every worker and
 /// listener of the proxy: `maxconn N` is a total over all threads (`feconn` against
@@ -395,5 +395,189 @@ mod tests {
             w.join().expect("writer");
         }
         assert_eq!(addrs.0[0].seq.load(Ordering::Relaxed), 800_000, "every write took the sequence twice");
+    }
+}
+
+/// One name of a server. `next` is empty while this is the server's current name; a rename
+/// fills it, once, with the slot that holds the name after this one.
+#[derive(Debug)]
+struct NameSlot {
+    name: &'static str,
+    next: OnceLock<&'static NameSlot>,
+}
+
+impl NameSlot {
+    fn new(name: String) -> Self {
+        Self { name: Box::leak(name.into_boxed_str()), next: OnceLock::new() }
+    }
+
+    /// The slot that holds the current name: the end of the chain that starts here.
+    /// `OnceLock::get` is one Acquire load and writes nothing, so a reader on the request
+    /// path touches no memory another thread has to read back (AGENTS.md rule 8). It must
+    /// stay that way: no lock, no counter, no "last read" here.
+    fn tail(&self) -> &NameSlot {
+        let mut slot = self;
+        while let Some(next) = slot.next.get() {
+            slot = next;
+        }
+        slot
+    }
+}
+
+/// Each server's name, shared by every worker: `set server ... name` renames in place.
+///
+/// A server's first name is a slot inside the shared array (no allocation per server beyond
+/// the name itself: 60,000 servers are counted, `request_allocations.rs`). A rename appends
+/// a leaked slot to that server's chain and never changes or frees an older one, so a reader
+/// needs no lock and a `&str` it holds never dangles. The leak is one slot and one name per
+/// rename, an operator's action (tradeoff.md 6.35); a read walks one hop per rename the
+/// server has had since startup.
+#[derive(Debug, Clone, Default)]
+pub struct ServerNames(Arc<[NameSlot]>);
+
+impl ServerNames {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub fn get(&self, i: usize) -> Option<&'static str> {
+        self.0.get(i).map(|first| first.tail().name)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.0.iter().map(|first| first.tail().name)
+    }
+
+    /// The server at `i` is called `name` from now on. Allocates and leaks: for the CLI, not
+    /// for a request.
+    pub fn set(&self, i: usize, name: &str) {
+        let Some(first) = self.0.get(i) else { return };
+        let new: &'static NameSlot = Box::leak(Box::new(NameSlot::new(name.to_owned())));
+        let mut tail = first.tail();
+        // Another rename of the same server got there first: ours goes after it.
+        while tail.next.set(new).is_err() {
+            tail = tail.tail();
+        }
+    }
+}
+
+impl std::ops::Index<usize> for ServerNames {
+    type Output = str;
+    fn index(&self, i: usize) -> &str {
+        self.get(i).expect("server index in range")
+    }
+}
+
+impl FromIterator<String> for ServerNames {
+    fn from_iter<I: IntoIterator<Item = String>>(it: I) -> Self {
+        Self(it.into_iter().map(NameSlot::new).collect())
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    fn names(v: &[&str]) -> ServerNames {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn names_read_back_as_configured() {
+        let n = names(&["a", "b", "c"]);
+        assert_eq!(n.len(), 3);
+        assert_eq!(n.get(0), Some("a"));
+        assert_eq!(n.get(2), Some("c"));
+        assert_eq!(n.get(3), None);
+        assert_eq!(&n[1], "b");
+        assert_eq!(n.iter().collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert_eq!(ServerNames::default().len(), 0);
+        assert_eq!(ServerNames::default().get(0), None);
+    }
+
+    #[test]
+    fn a_rename_is_seen_by_every_clone_and_leaves_the_others_alone() {
+        let n = names(&["a", "b", "c"]);
+        let other = n.clone();
+        n.set(1, "bee");
+        assert_eq!(other.get(1), Some("bee"));
+        assert_eq!(other.iter().collect::<Vec<_>>(), ["a", "bee", "c"]);
+        // Out of range: nothing to rename, nothing changes.
+        n.set(3, "nobody");
+        assert_eq!(n.iter().collect::<Vec<_>>(), ["a", "bee", "c"]);
+    }
+
+    #[test]
+    fn a_chain_of_renames_reads_the_last_one() {
+        let n = names(&["s0", "s1"]);
+        let first = n.get(0).expect("name");
+        for i in 0..50 {
+            n.set(0, &format!("renamed{i}"));
+            assert_eq!(n.get(0), Some(format!("renamed{i}").as_str()));
+        }
+        // Back to a name it had before: the latest still wins.
+        n.set(0, "s0");
+        assert_eq!(n.get(0), Some("s0"));
+        assert_eq!(n.get(1), Some("s1"));
+        // A name read before the renames is still the old name, not freed memory.
+        assert_eq!(first, "s0");
+    }
+
+    /// The 60,000-server memory bound (`request_allocations.rs`) has 0.4 MB of headroom: a
+    /// slot is two words of name and two of link, and a third field would not fit.
+    #[test]
+    fn a_slot_is_four_words() {
+        assert_eq!(std::mem::size_of::<NameSlot>(), 32);
+    }
+
+    /// Readers against renamers, as `readers_never_see_a_torn_address` does for addresses:
+    /// every read is a name that was set, whole, and one reader never goes back to an older
+    /// name of a single renamer.
+    #[test]
+    fn readers_never_see_a_name_that_was_not_set() {
+        const RENAMES: usize = 2_000;
+        let n = names(&["w0-0", "other"]);
+        let writers: Vec<_> = (0..4)
+            .map(|w| {
+                let n = n.clone();
+                std::thread::spawn(move || {
+                    for i in 1..=RENAMES {
+                        n.set(0, &format!("w{w}-{i}"));
+                    }
+                })
+            })
+            .collect();
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let n = n.clone();
+                std::thread::spawn(move || {
+                    let mut last = [0usize; 4];
+                    for _ in 0..20_000 {
+                        let got = n.get(0).expect("name");
+                        let (w, i) = got.strip_prefix('w').and_then(|r| r.split_once('-')).expect(got);
+                        let (w, i): (usize, usize) = (w.parse().expect(got), i.parse().expect(got));
+                        assert!(w < 4 && i <= RENAMES, "a name nobody set: {got}");
+                        assert!(i >= last[w], "went back from w{w}-{} to {got}", last[w]);
+                        last[w] = i;
+                        assert_eq!(n.get(1), Some("other"));
+                    }
+                })
+            })
+            .collect();
+        for t in writers.into_iter().chain(readers) {
+            t.join().expect("thread");
+        }
+        let last = n.get(0).expect("name");
+        assert!(last.ends_with(&format!("-{RENAMES}")), "the last rename of some writer wins: {last}");
+        // No rename was lost to another: the chain holds every one of them.
+        let mut renames = 0;
+        let mut slot = &n.0[0];
+        while let Some(next) = slot.next.get() {
+            renames += 1;
+            slot = next;
+        }
+        assert_eq!(renames, 4 * RENAMES);
     }
 }

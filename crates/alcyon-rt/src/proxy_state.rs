@@ -580,6 +580,21 @@ fn has_table(config: &Config, name: &str) -> bool {
         || config.frontends.iter().any(|f| f.name == name && f.stick_table.is_some())
 }
 
+std::thread_local! {
+    /// The servers [`resolve`] found named by a fetch argument, while [`referenced_servers`]
+    /// gathers them: `HAProxy`'s resolver sets `SRV_F_NAME_REFD` on each (`sample.c`), and a
+    /// server so named cannot be renamed (`set server <b>/<s> name`).
+    static SERVER_REFS: std::cell::RefCell<Option<Vec<(String, String)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `check` (the load-time validation, which resolves every fetch argument) and returns
+/// what it returned, with the `(proxy, server)` of every server a fetch argument names.
+pub(crate) fn referenced_servers<T>(check: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
+    SERVER_REFS.with_borrow_mut(|refs| *refs = Some(Vec::new()));
+    let out = check();
+    (out, SERVER_REFS.with_borrow_mut(Option::take).unwrap_or_default())
+}
+
 /// Resolves one argument as `smp_resolve_args` does, with its messages.
 fn resolve(config: &Config, at: Where<'_>, spec: ArgSpec, arg: Option<&str>, what: &str) -> Result<(), String> {
     let ArgSpec { kind, pos, optional } = spec;
@@ -632,6 +647,11 @@ fn resolve(config: &Config, at: Where<'_>, spec: ArgSpec, arg: Option<&str>, wha
                 },
             };
             if has_server(config, px, srv) {
+                SERVER_REFS.with_borrow_mut(|refs| {
+                    if let Some(refs) = refs {
+                        refs.push((px.to_owned(), srv.to_owned()));
+                    }
+                });
                 Ok(())
             } else {
                 Err(format!("unable to find server '{srv}' in proxy '{px}', referenced in arg {n} of {what}"))

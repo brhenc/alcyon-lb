@@ -1334,7 +1334,7 @@ impl CliApplet {
                         None if name == "server_key" => {
                             // The name of the server `server_id` stands for.
                             let sname = v.server_id.and_then(|id| (0..proxy.servers.len()).find(|&i| proxy.server_puid(i) == id)).and_then(|i| proxy.server_ids.get(i));
-                            let _ = write!(out, " server_key={}", sname.map_or("", String::as_str));
+                            let _ = write!(out, " server_key={}", sname.map_or("", |s| s));
                         }
                         None => {
                             let _ = write!(out, " {name}={val}");
@@ -1696,7 +1696,7 @@ impl CliApplet {
         let srv = s
             .srv
             .and_then(|sv| s.be.and_then(|b| ctx.proxies.get(b)).and_then(|p| p.server_ids.get(sv)))
-            .map_or("<none>", String::as_str);
+            .map_or("<none>", |s| s);
         let src = s.src.map_or_else(|| "unix:1".to_string(), |a| a.to_string());
         let age = i64::try_from(now.saturating_duration_since(s.since).as_secs()).unwrap_or(i64::MAX);
         let scb_state = if s.srv_fd >= 0 || s.src.is_none() { 8 } else { 0 };
@@ -1842,7 +1842,7 @@ impl CliApplet {
                     match Self::find_server(target, ctx) {
                         Ok((p_idx, s_idx)) => {
                             px_name = ctx.proxies[p_idx].name.clone();
-                            sv = Some(ctx.proxies[p_idx].server_ids[s_idx].clone());
+                            sv = Some(ctx.proxies[p_idx].server_ids[s_idx].to_string());
                         }
                         Err(msg) => {
                             self.finish_msg(msg);
@@ -2189,8 +2189,46 @@ impl CliApplet {
                 }
                 self.finish_msg(&format!("{target} changed its FQDN from {} to {name}{BY}", cur.as_deref().unwrap_or("(null)")));
             }
+            Some("name") => {
+                let Some(&new) = parts.get(2) else {
+                    self.finish_msg("set server <b>/<s> name requires a new name.");
+                    return;
+                };
+                self.finish_msg(Self::rename_server(ctx, p_idx, s_idx, new));
+            }
             _ => self.finish_msg(USAGE),
         }
+    }
+
+    /// `srv_update_server_name` (`server.c`): the refusals in HAProxy's order, or "" once done.
+    fn rename_server(ctx: &AppletContext, p_idx: usize, s_idx: usize, new: &str) -> &'static str {
+        let px = &ctx.proxies[p_idx];
+        if new.chars().any(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '-'))) {
+            return "Server name contains invalid characters.";
+        }
+        if new.len() >= 64 {
+            return "Server name too long.";
+        }
+        let cur_status = px.server_statuses.get(s_idx).map_or(0, |a| a.load(std::sync::atomic::Ordering::Relaxed));
+        if ServerStatus::from(cur_status) != ServerStatus::Maint {
+            return "Server must be in maintenance mode to be renamed (set server <b>/<s> state maint).";
+        }
+        let old = &px.server_ids[s_idx];
+        if px.use_servers.iter().any(|r| r.server == *old)
+            || crate::track::is_tracked(ctx.proxies, p_idx, s_idx)
+            || px.server_name_refd.get(s_idx).copied().unwrap_or(false)
+        {
+            return "Cannot rename: server's name is statically referenced (use-server, track, or sample argument).";
+        }
+        if old == new {
+            return "Server name updated.";
+        }
+        if px.server_ids.iter().any(|n| n == new) {
+            return "A server with the same name already exists in this backend.";
+        }
+        crate::stderr_line!("[NOTICE]   ({}) : Server {}/{new} renamed from '{old}'.", std::process::id(), px.name);
+        px.server_ids.set(s_idx, new);
+        "Server name updated."
     }
 
     fn handle_get_weight(&mut self, target: &str, ctx: &mut AppletContext) {
