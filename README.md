@@ -157,13 +157,19 @@ Build and report directories default to `${XDG_CACHE_HOME:-~/.cache}/alcyon/` (`
 
 ## Who wrote the code
 
-Alcyon is written by Claude models (Anthropic) under one maintainer. Some code was written by
+Most of Alcyon is written by Claude models (Anthropic) under one maintainer. Some code was written by
 other models, run locally while they were being evaluated: Qwen3.6-35B-A3B, Qwen3.8-Flash-Next and
 Muse Glimmer 30B. Every such commit, and how much of it is still in the tree, is listed in
 [docs/provenance/LOCAL-MODELS.md](docs/provenance/LOCAL-MODELS.md), generated from git by
 `tools/model_provenance.py`. A model's output is committed unmodified as its own commit, with a
 `Model-Authored-By:` trailer, so `git show` on it is exactly what the model wrote. Review fixes and
 tests are separate commits on top.
+
+The early work (2026-09-21 to 2026-10-12) was done with Google's Antigravity agent, running Gemini
+models (Gemini 3.1 Pro among them). It wrote the first versions of much of the tree, including the
+TLS, HTTP/1 and HTTP/2, HPACK, stats, health-check and stick-table code, and many of the `agy/T*`
+tasks merged in that period. That code came in mixed with the maintainers' review fixes, so it is
+credited here rather than itemised in the ledger.
 
 ## Licence
 
