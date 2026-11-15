@@ -481,9 +481,9 @@ const TLV_NAMES: &[&str] = &[
 /// `when_cond_kw[]`, in `HAProxy`'s order.
 const WHEN_KEYWORDS: &[&str] = &["stopping", "normal", "error", "forwarded", "toapplet", "processed", "acl"];
 
-/// A fetch's `val_args`, by `HAProxy`'s function name. Functions not ported accept, and so do
-/// those of fetches Alcyon does not register, whose names are refused first (`val_distcc`,
-/// `val_blk_arg`).
+/// A fetch's `val_args`, by `HAProxy`'s function name. Functions not listed here
+/// accept, and so do those of fetches Alcyon does not register, whose names are
+/// refused first (`val_blk_arg`).
 #[allow(clippy::too_many_lines)]
 fn val_fetch(val: &str, args: &mut [Arg]) -> Result<(), String> {
     match val {
@@ -493,6 +493,15 @@ fn val_fetch(val: &str, args: &mut [Arg]) -> Result<(), String> {
         },
         "smp_check_date_unit" => date_unit(args.get(1)),
         "smp_check_accept_date_unit" => date_unit(args.first()),
+        "val_distcc" => {
+            // `val_distcc`: `HAProxy` folds the token into a big-endian integer; Alcyon
+            // keeps the token as its own 4 bytes, so only the length is checked.
+            if args.first().is_some_and(|a| a.str().len() == 4) {
+                Ok(())
+            } else {
+                Err("token name must be exactly 4 characters".to_string())
+            }
+        }
         "val_payload_lv" => {
             if args.first().map_or(0, Arg::sint) < 0 {
                 return Err("payload offset1 must be positive".to_string());

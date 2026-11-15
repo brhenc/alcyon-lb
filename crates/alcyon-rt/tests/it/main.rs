@@ -463,6 +463,7 @@ mod tarpit;
 mod tcp_frontend_backend;
 mod tcp_options;
 mod tcp_raw_fetches;
+mod fetch_distcc;
 mod tcp_request_rules;
 mod tcp_request_tracking;
 mod tcp_converters;

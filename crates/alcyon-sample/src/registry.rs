@@ -2961,6 +2961,79 @@ impl Registry {
             out_type: SampleType::Bin,
             func: request_payload_fetch,
         });
+
+        // The DISTCC fetches (`smp_fetch_distcc_param` and `smp_fetch_distcc_body` in
+        // `src/payload.c`): a stream of 12-byte headers, each a 4-character token followed
+        // by an 8-digit hexadecimal parameter, most tokens being followed by a body of that
+        // many bytes. One walker finds the requested header; the fetches differ only in what
+        // they make of it.
+        fn distcc_args(args: &[String]) -> Option<(&[u8], i64)> {
+            let token = args.first()?;
+            if token.len() != 4 {
+                return None;
+            }
+            Some((token.as_bytes(), args.get(1).and_then(|s| s.trim().parse::<i64>().ok()).unwrap_or(0)))
+        }
+
+        /// The buffer of a `SMP_USE_L6REQ|SMP_USE_L6RES` fetch: the request's in a request
+        /// rule set, the response's otherwise. Only a TCP stream has one, an HTTP stream
+        /// being HTX, where these fetches have no value.
+        fn distcc_buf<'a>(ctx: &SampleContext<'a>) -> Option<&'a [u8]> {
+            if ctx.raw_res.is_some() && ctx.raw_req.is_none() { ctx.raw_res } else { ctx.raw_req }
+        }
+
+        /// The `occ`th header of `buf` whose token is `token` (`occ` 0 takes the first): its
+        /// parameter and the bytes of its body. A header that does not fit in what was
+        /// received, a non-hex digit in the parameter or a body running past the end of the
+        /// buffer end the walk with no match.
+        fn distcc_find<'b>(buf: &'b [u8], token: &[u8], occ: i64) -> Option<(u32, &'b [u8])> {
+            // The tokens whose parameter is a value and not the length of a body.
+            const NO_BODY: [&[u8]; 5] = [b"ARGC", b"DIST", b"NFIL", b"STAT", b"DONE"];
+            let mut ofs = 0usize;
+            let mut seen = 0i64;
+            loop {
+                if ofs + 12 > buf.len() {
+                    return None;
+                }
+                let mut param = 0u32;
+                for &c in &buf[ofs + 4.. ofs + 12] {
+                    param = (param << 4) + char::from(c).to_digit(16)?;
+                }
+                let here = &buf[ofs..ofs + 4];
+                ofs += 12;
+                let body = if NO_BODY.contains(&here) { 0 } else { param as usize };
+                if here == token {
+                    seen += 1;
+                    if occ == 0 || occ == seen {
+                        // A body longer than what arrived gives only the bytes present:
+                        // `HAProxy` truncates to the receive limit instead and hands back
+                        // whatever the pool buffer held past the data.
+                        return Some((param, &buf[ofs..ofs.saturating_add(body).min(buf.len())]));
+                    }
+                }
+                if body > buf.len() - ofs {
+                    return None;
+                }
+                ofs += body;
+            }
+        }
+
+        self.register_fetch(FetchDesc {
+            name: "distcc_param",
+            out_type: SampleType::Sint,
+            func: |ctx, args| {
+                let (token, occ) = distcc_args(args)?;
+                Some(Sample::Sint(i64::from(distcc_find(distcc_buf(ctx)?, token, occ)?.0)))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "distcc_body",
+            out_type: SampleType::Bin,
+            func: |ctx, args| {
+                let (token, occ) = distcc_args(args)?;
+                Some(Sample::Bin(distcc_find(distcc_buf(ctx)?, token, occ)?.1.to_vec()))
+            },
+        });
         let response_payload_fetch_early: FetchFn = |ctx, args| {
             // `payload` takes the direction of the rule set that runs it.
             if ctx.raw_res.is_some() && ctx.raw_req.is_none() {
