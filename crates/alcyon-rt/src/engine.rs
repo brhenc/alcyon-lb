@@ -2392,20 +2392,9 @@ impl Proxy {
             return self.dispatch.map(|a| (None, a));
         }
         match self.balance {
-            BalanceAlgorithm::Source if self.hash_type == alcyon_config::HashType::Consistent && source_ip.is_some() => {
+            BalanceAlgorithm::Source if source_ip.is_some() => {
                 let ip = source_ip?;
-                crate::lb::balance_source_consistent(self, ip).map(|idx| (Some(idx), self.servers.at(idx))).or(self.dispatch.map(|a| (None, a)))
-            }
-            BalanceAlgorithm::Source => {
-                let n = self.eligible_count();
-                let slot = match source_ip {
-                    // The sum of the address bytes (v6) or the address (v4), modulo the servers.
-                    Some(IpAddr::V4(v4)) => u32::from(v4) as usize,
-                    Some(IpAddr::V6(v6)) => v6.octets().iter().fold(0usize, |acc, &b| acc.wrapping_add(b as usize)),
-                    None => self.next_server_idx.fetch_add(1, Ordering::Relaxed),
-                };
-                let picked = n.checked_sub(1).and_then(|last| self.eligible_nth(slot % (last + 1)));
-                picked.map(|idx| (Some(idx), self.servers.at(idx))).or(self.dispatch.map(|a| (None, a)))
+                crate::lb::balance_source(self, ip).map(|idx| (Some(idx), self.servers.at(idx))).or(self.dispatch.map(|a| (None, a)))
             }
             BalanceAlgorithm::Uri => {
                 let u = uri.unwrap_or("/");

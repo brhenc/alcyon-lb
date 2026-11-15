@@ -772,17 +772,42 @@ fn balance_uri_consistent(proxy: &Proxy, uri: &str, abs: Option<&str>) -> Option
     chash_lookup(proxy, |_| full_hash(hash_uri(uri, abs, proxy.chash.2)))
 }
 
+/// Source IP hash (`balance source`), `map-based` as `HAProxy` defaults it (`get_server_sh`
+/// and `map_get_server_hash`, `src/backend.c` and `src/lb_map.c`), or `hash-type consistent`
+/// ([`balance_source_consistent`]).
+///
+/// The key is the XOR of the address' 32-bit big-endian words (`ntohl`, no avalanche in
+/// `map-based` mode), and `map_get_server_hash` indexes the interleaved [`WeightMap`]
+/// modulo `tot_weight`.
+#[must_use]
+pub fn balance_source(proxy: &Proxy, ip: std::net::IpAddr) -> Option<usize> {
+    if proxy.hash_type == HashType::Consistent {
+        return balance_source_consistent(proxy, ip);
+    }
+    let hash = source_hash_key(ip);
+    if let Some(idx) = proxy.chash.map_pick(proxy, hash) {
+        return Some(idx);
+    }
+
+    // Backup failover: the first usable backup alone.
+    first_backup(proxy)
+}
+
+fn source_hash_key(ip: std::net::IpAddr) -> u32 {
+    match ip {
+        std::net::IpAddr::V4(a) => u32::from(a),
+        std::net::IpAddr::V6(a) => {
+            a.octets().as_chunks::<4>().0.iter().fold(0, |h, &c| h ^ u32::from_be_bytes(c))
+        }
+    }
+}
+
 /// `balance source` with `hash-type consistent` (`get_server_sh`, `src/backend.c`): the
 /// key is the XOR of the address' 32-bit words (host order), avalanched by `full_hash`,
 /// and 0 when only one server is left to choose from, then the ring as for `balance uri`.
 #[must_use]
 pub fn balance_source_consistent(proxy: &Proxy, ip: std::net::IpAddr) -> Option<usize> {
-    let key = match ip {
-        std::net::IpAddr::V4(a) => u32::from(a),
-        std::net::IpAddr::V6(a) => {
-            a.octets().chunks_exact(4).fold(0, |h, c| h ^ u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
-        }
-    };
+    let key = source_hash_key(ip);
     chash_lookup(proxy, |servers_in_ring| if servers_in_ring <= 1 { 0 } else { full_hash(key) })
 }
 
@@ -885,10 +910,10 @@ impl ChashRing {
     }
 
 
-    /// The server `balance uri` (map-based) picks for `hash`, from the [`WeightMap`] of the
-    /// usable primary servers; `None` when none is usable. Per request: one read lock and
-    /// one pass over the servers comparing state and weight to what the map was built
-    /// from. The map is rebuilt, under the write lock, only when that differs.
+    /// The server `balance uri` or `balance source` (map-based) picks for `hash`, from the
+    /// [`WeightMap`] of the usable primary servers; `None` when none is usable. Per request:
+    /// one read lock and one pass over the servers comparing state and weight to what the map
+    /// was built from. The map is rebuilt, under the write lock, only when that differs.
     fn map_pick(&self, proxy: &Proxy, hash: u32) -> Option<usize> {
         let in_map = |idx: usize| -> u32 {
             if proxy.server_backups.get(idx).copied().unwrap_or(false) || !is_selectable(proxy, idx) {
