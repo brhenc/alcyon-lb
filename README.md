@@ -177,3 +177,36 @@ Alcyon is a derivative of HAProxy and carries its licence: GPL-2.0-or-later
 ([LICENSE](LICENSE), [LICENSE.GPL-2.0](LICENSE.GPL-2.0)). `crates/ebtree` is LGPL-2.1-only
 ([LICENSE.LGPL-2.1](LICENSE.LGPL-2.1)), as Willy Tarreau's ebtree is, and `crates/slz` is MIT, as
 libslz is. The vendored crates keep their own licences.
+
+## Thanks to the HAProxy developers
+
+Alcyon would not exist without HAProxy, and almost everything good in it is theirs.
+
+**Willy Tarreau** started HAProxy in 2000 and has led it ever since. **Everyone who has contributed
+to it** made it what it is today: the maintainers, the patch authors, the reviewers, the people who
+report bugs and test the development branches, and the people at HAProxy Technologies who fund
+and do much of the work. Their names are in HAProxy's history and in its `CONTRIBUTING` and
+`MAINTAINERS` files, and they deserve the credit for the ideas this project reimplements.
+
+What Alcyon takes from their work:
+
+- **The design.** The configuration language, the stream and connection model, the muxes, the
+  HTX representation, the schedulers, the load-balancing algorithms, stick tables, the sample
+  fetch and converter system, the CLI, the stats page and the logging formats were all
+  designed by the HAProxy developers. Alcyon follows their design rather than inventing its own,
+  and the source comments point to the HAProxy file and line each piece follows.
+- **The code.** Alcyon is a derivative work: much of it is a Rust translation of HAProxy's C,
+  which is why every file carries HAProxy's licence and copyright line.
+- **The oracle.** The HAProxy binary is the specification Alcyon is tested against. Most tests
+  here run the same configuration and traffic through both and compare the results. That is
+  only possible because HAProxy behaves so precisely and consistently.
+- **The tests and the documentation.** HAProxy's reg-tests (run with VTest, which descends from
+  Varnish's varnishtest) and its `configuration.txt` and `management.txt` are the best
+  specification a reimplementation could ask for. Many of Alcyon's tests are ports of them.
+- **The libraries.** Willy Tarreau's ebtree and libslz are ported here as `crates/ebtree` and
+  `crates/slz`.
+- **The engineering.** Where Alcyon is fast, it is usually because it copied a decision HAProxy
+  made first: buffer and memory pools, zero-copy forwarding, and careful attention to the cost of
+  each request.
+
+Any mistakes in Alcyon are its own, not HAProxy's.
