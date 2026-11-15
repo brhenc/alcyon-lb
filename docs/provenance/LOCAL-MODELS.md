@@ -28,6 +28,8 @@ How the code came in:
 | Qwen (version not recorded; the 10-15 queue ran Qwen3.6-35B-A3B) | 2 | 364 | 290 |
 | Muse Glimmer 30B | 18 | 3242 | 1174 |
 | Gemini 4 Hydrogen (high), via Antigravity | 1 | 156 | 156 |
+| Gemini 4 Argon (high), via Antigravity | 1 | 216 | 216 |
+| Gemini 4 Hydrogen (xhigh), via Antigravity | 1 | 337 | 337 |
 
 ## Commits
 
@@ -76,6 +78,8 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-10-17 | t331s-process-ids | Muse Glimmer 30B | `1cdfee11d1` | 148 | 52 | `crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/process_ids.rs` +129/37<br>`crates/alcyon-sample/src/registry.rs` +18/14 | unmodified model output |
 | 2026-10-18 | t363l | Muse Glimmer 30B | `cd5612b260` | 15 | 15 | `harness/vtc_runner.py` +15/15 | Muse's `vtc_runner.py` hex fix, corrected by the maintainer in the same commit, together with unrelated docs; only `harness/vtc_runner.py` is counted |
 | 2026-11-15 | BALPARSE | Gemini 4 Hydrogen (high), via Antigravity | `09dee6b203` | 156 | 156 | `crates/alcyon-config/src/parser/mod.rs` +2/2<br>`crates/alcyon-config/src/parser/server.rs` +94/94<br>`crates/alcyon-config/tests/it/balance_options.rs` +60/60 | unmodified model output |
+| 2026-11-15 | BALSOURCE | Gemini 4 Argon (high), via Antigravity | `0bfb1d2ff0` | 216 | 216 | `crates/alcyon-rt/src/engine.rs` +2/2<br>`crates/alcyon-rt/src/lb.rs` +35/35<br>`crates/alcyon-rt/tests/it/balance_source_map.rs` +178/178<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
+| 2026-11-15 | H2URI | Gemini 4 Hydrogen (xhigh), via Antigravity | `1cd3399122` | 337 | 337 | `crates/alcyon-proto/src/authority.rs` +16/16<br>`crates/alcyon-proto/src/h2.rs` +5/5<br>`crates/alcyon-proto/src/mux_h2.rs` +3/3<br>`crates/alcyon-rt/src/engine.rs` +18/18<br>`crates/alcyon-rt/src/h2_bridge.rs` +6/6<br>`crates/alcyon-rt/src/lb.rs` +89/89<br>`crates/alcyon-rt/src/proxy.rs` +20/20<br>`crates/alcyon-rt/tests/it/balance_uri_map.rs` +180/180 | unmodified model output |
 
 ## Squashed in this history
 
