@@ -40,7 +40,7 @@ pub(crate) fn clear_avoided() {
 /// Whether a lock of the balancing state of a backend was poisoned: a panic unwound
 /// through a change of it (T447).
 pub(crate) fn lb_poisoned(fwrr: &Fwrr, chash: &ChashRing) -> bool {
-    fwrr.0.is_poisoned() || chash.0.is_poisoned()
+    fwrr.0.is_poisoned() || chash.0.is_poisoned() || chash.1.is_poisoned()
 }
 
 /// Determines whether a server at `idx` in `proxy` is eligible to receive traffic.
@@ -608,56 +608,133 @@ pub fn static_rr(proxy: &Proxy) -> Option<usize> {
     first_backup(proxy)
 }
 
-/// 64-bit FNV-1a deterministic hash function for URI path/query mapping.
-#[inline]
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for &b in bytes {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3_u64);
-    }
-    hash
-}
-
-/// Deterministic Consistent URI Hash (`balance uri`).
-/// Hashes the request URI and consistently selects the backend server.
+/// Deterministic URI Hash (`balance uri`), `map-based` as HAProxy defaults it.
+///
+/// HAProxy's `get_server_uh` (`src/backend.c`) hashes the URI with `sdbm` -- the default
+/// hash function, and no avalanche unless `hash-type` asks for one -- over the slice
+/// before the `?` ([`uri_hash_key`]), and `map_get_server_hash` takes that modulo the
+/// backend's `tot_weight` into the interleaved weighted map ([`WeightMap`]). Both the hash
+/// and the map matter: hashing the query string, or laying the weights out in contiguous
+/// blocks, sends the same URI to another server than HAProxy does.
 #[must_use]
 pub fn balance_uri(proxy: &Proxy, uri: &str) -> Option<usize> {
-    // `hash-preserve-affinity` only has an effect on a consistent-hash ring (HAProxy gates
-    // it the same way: the option is read only from `chash_get_server_hash`). Map-based
-    // hashing (the default) keeps the pre-existing weighted-modulo-over-eligible-servers
-    // behaviour below untouched.
+    // `hash-preserve-affinity` only has an effect
+    // on a consistent-hash ring (HAProxy gates
+    // it the same way: the option is read only from `chash_get_server_hash`).
     if proxy.hash_type == HashType::Consistent {
         return balance_uri_consistent(proxy, uri);
     }
-    let hash = fnv1a_64(uri.as_bytes()) as usize;
-
-    let mut total_weight = 0u32;
-    let mut eligible_primaries = Vec::new();
-
-    for idx in 0..proxy.servers.len() {
-        let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
-        if !is_backup && is_selectable(proxy, idx) {
-            let w = proxy.server_weights.get(idx).unwrap_or(1).max(1);
-            total_weight = total_weight.saturating_add(w);
-            eligible_primaries.push((idx, w));
-        }
-    }
-
-    if !eligible_primaries.is_empty() {
-        let pos = (hash % (total_weight as usize)) as u32;
-        let mut acc = 0u32;
-        for (idx, w) in eligible_primaries {
-            acc = acc.saturating_add(w);
-            if pos < acc {
-                return Some(idx);
-            }
-        }
-        return None;
+    let hash = hash_sdbm(uri_hash_key(uri).as_bytes());
+    if let Some(idx) = proxy.chash.map_pick(proxy, hash) {
+        return Some(idx);
     }
 
     // Backup failover: the first usable backup alone.
     first_backup(proxy)
+}
+
+/// The slice of `uri` `balance uri` hashes: everything before the `?`, so the query string
+/// does not break cache affinity (`get_server_uh`, `src/backend.c`, which stops at `'?'`
+/// unless the `whole` option asks for the whole request URI). `len` and `depth` narrow it
+/// further in HAProxy; Alcyon's parser accepts those keywords and stores neither, so the
+/// default slice applies to all of them.
+fn uri_hash_key(uri: &str) -> &str {
+    match uri.find('?') {
+        Some(at) => &uri[..at],
+        None => uri,
+    }
+}
+
+/// HAProxy's weighted server map (`recalc_server_map` with `init_server_map`,
+/// `src/lb_map.c`) over the usable primary servers: `tot_weight` slots, the sum of the
+/// usable servers' reduced weights, and a hash picks slot `hash % tot_weight`.
+///
+/// Each server holds `next_eweight` slots -- its user weight divided by the greatest
+/// common divisor of every configured weight, rounded up -- handed out one at a time to
+/// whoever leads on the weighted counter `wscore`. That is what spreads a heavy server
+/// over the whole range instead of in one block, and it keeps the declaration order on
+/// ties, so the first declared server holds slot 0. A server a health check takes out
+/// holds no slot at all: the map is rebuilt over the rest and every hash re-lands
+/// somewhere else, which is what HAProxy does too.
+///
+/// It is built when the usable servers or their weights change, not per request
+/// ([`ChashRing::map_pick`]), and rebuilt into the buffers of the previous build, so a
+/// rebuild allocates only when the map grows.
+#[derive(Debug, Default)]
+struct WeightMap {
+    /// Per server, the user weight it was built with, 0 when it held no slot (a backup,
+    /// unusable, or weight 0). A request compares the servers against this, and nothing else.
+    built_from: Vec<u32>,
+    /// `tot_weight` slots, each a server index.
+    slots: Vec<u32>,
+    /// `wscore` per server, kept only to reuse its buffer.
+    score: Vec<i64>,
+}
+
+impl WeightMap {
+    fn rebuild(&mut self, proxy: &Proxy, in_map: impl Fn(usize) -> u32) {
+        let n = proxy.servers.len();
+        self.built_from.clear();
+        self.built_from.extend((0..n).map(&in_map));
+        let gcd = weight_gcd(proxy);
+        // HAProxy's `(uweight * wdiv + wmult - 1) / wmult`, `wdiv` being 1 for the map.
+        let eweight = |w: u32| -> u32 { if w == 0 { 0 } else { w.saturating_add(gcd - 1) / gcd } };
+        let tot_weight: u32 = self.built_from.iter().map(|&w| eweight(w)).fold(0, u32::saturating_add);
+        self.slots.clear();
+        self.score.clear();
+        self.score.resize(n, 0);
+        let tot = i64::from(tot_weight);
+        for _ in 0..tot_weight {
+            let mut best = 0usize;
+            let mut max = i64::MIN;
+            for (idx, &w) in self.built_from.iter().enumerate() {
+                let w = eweight(w);
+                if w == 0 {
+                    continue;
+                }
+                self.score[idx] += i64::from(w);
+                // `(wscore + tot) / tot`, the integer lead HAProxy compares.
+                let v = (self.score[idx] + tot) / tot;
+                if v > max {
+                    max = v;
+                    best = idx;
+                }
+            }
+            self.score[best] -= tot;
+            self.slots.push(u32::try_from(best).unwrap_or(u32::MAX));
+        }
+    }
+
+    fn pick(&self, hash: u32) -> Option<usize> {
+        let len = u32::try_from(self.slots.len()).ok().filter(|&l| l > 0)?;
+        self.slots.get((hash % len) as usize).map(|&i| i as usize)
+    }
+}
+
+/// The greatest common divisor of every configured server weight -- `init_server_map`'s
+/// `wmult`, taken over all servers including backups and checked-down ones because it is
+/// computed from the user weights once at config time. Zero-weight servers are skipped,
+/// as HAProxy skips them looking for the first non-zero one.
+fn weight_gcd(proxy: &Proxy) -> u32 {
+    let mut g = 0u32;
+    for idx in 0..proxy.servers.len() {
+        let w = proxy.server_weights.get(idx).unwrap_or(0);
+        if w == 0 {
+            continue;
+        }
+        g = if g == 0 { w } else { gcd2(g, w) };
+    }
+    g.max(1)
+}
+
+/// Euclid's algorithm, as `init_server_map` runs it in place.
+fn gcd2(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
 }
 
 /// `balance uri` with `hash-type consistent` (`get_server_uh` + `chash_get_server_hash`,
@@ -772,9 +849,37 @@ struct Ring {
 /// from. A server's points depend only on its id and weight, so the rebuilt ring is the
 /// one `HAProxy` holds, and keys move only to and from the server that changed.
 #[derive(Debug, Default)]
-pub struct ChashRing(RwLock<Ring>);
+pub struct ChashRing(RwLock<Ring>, RwLock<WeightMap>);
 
 impl ChashRing {
+    /// The server `balance uri` (map-based) picks for `hash`, from the [`WeightMap`] of the
+    /// usable primary servers; `None` when none is usable. Per request: one read lock and
+    /// one pass over the servers comparing state and weight to what the map was built
+    /// from. The map is rebuilt, under the write lock, only when that differs.
+    fn map_pick(&self, proxy: &Proxy, hash: u32) -> Option<usize> {
+        let in_map = |idx: usize| -> u32 {
+            if proxy.server_backups.get(idx).copied().unwrap_or(false) || !is_selectable(proxy, idx) {
+                0
+            } else {
+                proxy.server_weights.get(idx).unwrap_or(1)
+            }
+        };
+        let current = |m: &WeightMap| {
+            m.built_from.len() == proxy.servers.len() && m.built_from.iter().enumerate().all(|(i, &w)| w == in_map(i))
+        };
+        {
+            let map = self.1.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if current(&map) {
+                return map.pick(hash);
+            }
+        }
+        let mut map = self.1.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !current(&map) {
+            map.rebuild(proxy, in_map);
+        }
+        map.pick(hash)
+    }
+
     fn ring<'a>(&'a self, proxy: &Proxy) -> RwLockReadGuard<'a, Ring> {
         let in_ring = |idx: usize| {
             !proxy.server_backups.get(idx).copied().unwrap_or(false)

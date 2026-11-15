@@ -870,13 +870,19 @@ fn keepalive_allocations_with(fe_lines: &str, rsp: &'static [u8], n: usize, stat
 /// [`keepalive_allocations_with`], and the by-name variable lookups the `n` requests made on
 /// this thread (the engine runs on it: `Engine::run_once`).
 fn keepalive_run(fe_lines: &str, rsp: &'static [u8], n: usize, status: &[u8], tail: &[u8]) -> (usize, usize, u64) {
+    keepalive_run_be(fe_lines, "", rsp, n, status, tail)
+}
+
+/// [`keepalive_run`] with `be_lines` (each indented, newline-terminated) in the backend, before
+/// its one server.
+fn keepalive_run_be(fe_lines: &str, be_lines: &str, rsp: &'static [u8], n: usize, status: &[u8], tail: &[u8]) -> (usize, usize, u64) {
     let (srv, srv_addr) = loopback0();
     let addr = common::reserve_addr();
     let running = Arc::new(AtomicBool::new(true));
     let be = start_keepalive_backend(srv, Arc::clone(&running), rsp);
     let cfg = format!(
         "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
-         frontend f\n  bind {addr}\n{fe_lines}  default_backend b\nbackend b\n  server s1 {srv_addr}\n"
+         frontend f\n  bind {addr}\n{fe_lines}  default_backend b\nbackend b\n{be_lines}  server s1 {srv_addr}\n"
     );
     let mut engine = Engine::new(&alcyon_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
     let mut client = TcpStream::connect(addr).expect("connect to frontend");
@@ -938,6 +944,22 @@ fn a_proxied_keep_alive_request_allocates_nothing() {
     let many = keepalive_proxied_allocations(1100);
     println!("[MEASUREMENT T436 A] proxied keep-alive allocations: 100 requests {few}, 1100 requests {many}");
     assert_eq!(many, few, "1000 more keep-alive requests made {} more allocations", many as i64 - few as i64);
+}
+
+/// BALURI: `balance uri` (map-based, the default `hash-type`) picks from HAProxy's weighted map
+/// of the servers, which is built when the servers or their weights change, not per request. The
+/// count for 1100 requests must equal the count for 100. Before: Qwen's port built the map, a
+/// `Vec` of `tot_weight` slots, on every request, and the code before it a `Vec` of the usable
+/// servers.
+#[test]
+fn balance_uri_allocates_nothing_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let be = "  balance uri\n  server s2 127.0.0.1:1 weight 3 disabled\n";
+    let run = |n| keepalive_run_be("", be, BENCH_RSP, n, b"HTTP/1.1 200", b"\r\n\r\nok");
+    let (few, _, _) = run(100);
+    let (many, _, _) = run(1100);
+    println!("[MEASUREMENT BALURI] balance uri keep-alive allocations: 100 requests {few}, 1100 requests {many}");
+    assert_eq!(many, few, "1000 more balance-uri requests made {} more allocations", many as i64 - few as i64);
 }
 
 /// The ten request and response rules of the 2026-10-19 allocation survey (`rules.body` in
