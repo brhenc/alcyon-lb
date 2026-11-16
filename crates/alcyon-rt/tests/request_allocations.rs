@@ -949,17 +949,20 @@ fn use_server_with_a_configured_name_looks_up_no_name_per_request() {
          backend b\n  balance roundrobin\n  use-server s1 if TRUE\n  \
          server s1 {srv_addr}\n  server s2 127.0.0.1:1 disabled\n  server s3 127.0.0.1:1 disabled\n"
     );
+    let before_load = alcyon_rt::rule_compiled::server_name_lookups_on_this_thread();
     let mut engine = Engine::new(&alcyon_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let load_lookups = alcyon_rt::rule_compiled::server_name_lookups_on_this_thread() - before_load;
+    assert_eq!(load_lookups, 1, "expected 1 by-name server lookup at load, got {load_lookups}");
     let mut client = TcpStream::connect(addr).expect("connect to frontend");
     client.set_nonblocking(true).expect("set_nonblocking");
     for _ in 0..3 {
         drive_request_expecting(&mut client, &mut engine, b"HTTP/1.1 200", b"\r\n\r\nok");
     }
-    let lookups = alcyon_rt::engine::server_name_lookups_on_this_thread();
+    let lookups = alcyon_rt::rule_compiled::server_name_lookups_on_this_thread();
     for _ in 0..50 {
         drive_request_expecting(&mut client, &mut engine, b"HTTP/1.1 200", b"\r\n\r\nok");
     }
-    let lookups = alcyon_rt::engine::server_name_lookups_on_this_thread() - lookups;
+    let lookups = alcyon_rt::rule_compiled::server_name_lookups_on_this_thread() - lookups;
     drop(client);
     for _ in 0..5 {
         let _ = engine.run_once();
@@ -967,6 +970,42 @@ fn use_server_with_a_configured_name_looks_up_no_name_per_request() {
     running.store(false, Ordering::Relaxed);
     let _ = be.join();
     assert_eq!(lookups, 0, "{lookups} by-name server lookups in 50 requests through use-server");
+}
+
+/// T632 item 1: an unresolved `use-server` rule is a configuration error at load (`Engine::new`),
+/// with HAProxy's wording.
+#[test]
+fn unresolved_use_server_fails_engine_load_as_haproxy() {
+    let mut cfg = alcyon_config::parse_str(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         backend b\n  server s1 127.0.0.1:8080\n",
+    )
+    .expect("parse");
+    let cond = alcyon_config::AclCondition { is_if: true, terms: Vec::new() };
+    cfg.backends[0].use_servers.push(alcyon_config::UseServerRule { server: "missing".into(), cond: cond.clone() });
+    let err = match Engine::new(&cfg, 64) {
+        Ok(_) => panic!("expected Engine::new to fail for unresolved backend use-server"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("backend 'b' : unable to find server 'missing' referenced in a 'use-server' rule."),
+        "unexpected error: {err}"
+    );
+
+    let mut lcfg = alcyon_config::parse_str(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         listen l\n  bind 127.0.0.1:0\n  server s1 127.0.0.1:8080\n",
+    )
+    .expect("parse");
+    lcfg.listens[0].use_servers.push(alcyon_config::UseServerRule { server: "missing".into(), cond });
+    let err = match Engine::new(&lcfg, 64) {
+        Ok(_) => panic!("expected Engine::new to fail for unresolved listen use-server"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("proxy 'l' : unable to find server 'missing' referenced in a 'use-server' rule."),
+        "unexpected error: {err}"
+    );
 }
 
 /// T436 A: a steady-state keep-alive request proxied to a server allocates nothing. Measured

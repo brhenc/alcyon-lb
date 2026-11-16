@@ -493,19 +493,37 @@ pub fn use_backend(rules: &[alcyon_config::UseBackendRule], acls: &Acls) -> Vec<
     rules.iter().map(|r| Rule::new(r.cond.as_ref(), acls, None, None)).collect()
 }
 
-/// The `use-server` rules', in their order: the condition and resolved server index.
+thread_local! {
+    static SERVER_NAME_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many by-name server lookups this thread has made (debug builds only; always 0 in
+/// release): a test reads it around requests to show that `use-server` names are resolved at
+/// load (T632).
 #[must_use]
+pub fn server_name_lookups_on_this_thread() -> u64 {
+    SERVER_NAME_LOOKUPS.with(std::cell::Cell::get)
+}
+
+/// The `use-server` rules', in their order: the condition and resolved server index.
 pub fn use_server(
     rules: &[alcyon_config::UseServerRule],
     acls: &Acls,
     servers: &[alcyon_config::ast::Server],
-) -> Vec<Rule> {
+    section: &str,
+    name: &str,
+) -> Result<Vec<Rule>, String> {
     rules
         .iter()
         .map(|r| {
+            #[cfg(debug_assertions)]
+            SERVER_NAME_LOOKUPS.with(|n| n.set(n.get() + 1));
+            let idx = servers.iter().position(|s| s.id == r.server).ok_or_else(|| {
+                format!("{section} '{name}' : unable to find server '{}' referenced in a 'use-server' rule.", r.server)
+            })?;
             let mut rule = Rule::new(Some(&r.cond), acls, None, None);
-            rule.server = servers.iter().position(|s| s.id == r.server);
-            rule
+            rule.server = Some(idx);
+            Ok(rule)
         })
         .collect()
 }
