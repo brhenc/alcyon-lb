@@ -102,6 +102,7 @@ fuzz/libfuzzer/Cargo.lock
 # exports (2026-09-27; their work is on main or in the agy/T* branches).
 # ---------------------------------------------------------------------------
 /agy-resume.sh
+/newagy-resume.sh
 /mythos-resume.sh
 /claude-vv-resume.sh
 /claude-mythos-resume.sh
