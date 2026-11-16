@@ -32,6 +32,7 @@ How the code came in:
 | Gemini 4 Hydrogen (xhigh), via Antigravity | 1 | 337 | 337 |
 | Qwen3.8-Flash-Next | 1 | 201 | 201 |
 | gemini-4-hydrogen-medium | 2 | 169 | 91 |
+| Qwen3.8-27B | 1 | 77 | 54 |
 
 ## Commits
 
@@ -85,16 +86,4 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-16 | REQBUF | Qwen3.8-Flash-Next | `7c6190bed5` | 201 | 201 | `crates/alcyon-rt/src/engine.rs` +31/31<br>`crates/alcyon-rt/tests/it/chunked_body_abort.rs` +169/169<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-16 | T632 | gemini-4-hydrogen-medium | `b754147a59` | 79 | 43 | `crates/alcyon-rt/src/engine.rs` +16/16<br>`crates/alcyon-rt/src/rule_compiled.rs` +22/22<br>`crates/alcyon-rt/tests/request_allocations.rs` +41/5 | unmodified model output |
 | 2026-11-16 | T632 | gemini-4-hydrogen-medium | `f14870b983` | 90 | 48 | `crates/alcyon-rt/src/engine.rs` +36/0<br>`crates/alcyon-rt/src/rule_compiled.rs` +18/14<br>`crates/alcyon-rt/tests/request_allocations.rs` +36/34 | unmodified model output |
-
-## Squashed in this history
-
-In this repository these merges arrived as one commit each, so the model's commit is not
-separate here and is not counted above. The model's unmodified commit is in the full
-history (the maintainer's repository) under the ID given; the squashed commit also
-contains the review fixes and tests.
-
-| Date | Case | Model | Squashed commit here | Model's commit in the full history |
-|---|---|---|---|---|
-| 2026-11-15 | BALURI | Qwen3.8-Flash-Next | `2b110a360b` | `eda5e450` |
-| 2026-11-15 | DISTCC | Qwen3.8-Flash-Next | `a901c3fbdc` | `9a1c3e22` |
-| 2026-11-14 | TRACKSC | Qwen3.8-Flash-Next | `4ecc49a8df` | `f9de3955` |
+| 2026-11-17 | BADCHUNK | Qwen3.8-27B | `c0337e4598` | 77 | 54 | `crates/alcyon-rt/src/proxy.rs` +6/6<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +71/48 | unmodified model output |
