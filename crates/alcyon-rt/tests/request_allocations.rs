@@ -933,6 +933,42 @@ fn set_var_with_a_configured_name_looks_up_no_name_per_request() {
     assert_eq!(c, 0, "{c} by-name variable lookups in 50 requests (conditions, sess, unset-var)");
 }
 
+/// T632 item 1: a `use-server` rule's server is resolved to its index at load: the requests look
+/// up no server name. Debug builds count the by-name lookups.
+#[cfg(debug_assertions)]
+#[test]
+fn use_server_with_a_configured_name_looks_up_no_name_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (srv, srv_addr) = loopback0();
+    let addr = common::reserve_addr();
+    let running = Arc::new(AtomicBool::new(true));
+    let be = start_keepalive_backend(srv, Arc::clone(&running), BENCH_RSP);
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend f\n  bind {addr}\n  default_backend b\n\
+         backend b\n  balance roundrobin\n  use-server s1 if TRUE\n  \
+         server s1 {srv_addr}\n  server s2 127.0.0.1:1 disabled\n  server s3 127.0.0.1:1 disabled\n"
+    );
+    let mut engine = Engine::new(&alcyon_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut client = TcpStream::connect(addr).expect("connect to frontend");
+    client.set_nonblocking(true).expect("set_nonblocking");
+    for _ in 0..3 {
+        drive_request_expecting(&mut client, &mut engine, b"HTTP/1.1 200", b"\r\n\r\nok");
+    }
+    let lookups = alcyon_rt::engine::server_name_lookups_on_this_thread();
+    for _ in 0..50 {
+        drive_request_expecting(&mut client, &mut engine, b"HTTP/1.1 200", b"\r\n\r\nok");
+    }
+    let lookups = alcyon_rt::engine::server_name_lookups_on_this_thread() - lookups;
+    drop(client);
+    for _ in 0..5 {
+        let _ = engine.run_once();
+    }
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+    assert_eq!(lookups, 0, "{lookups} by-name server lookups in 50 requests through use-server");
+}
+
 /// T436 A: a steady-state keep-alive request proxied to a server allocates nothing. Measured
 /// before (2026-10-19, uprobe on malloc under the pstat load): 2 per request, the method and the
 /// URI copied into `TcpSession::req_method` / `req_uri` as owned `String`s. The count for 1100

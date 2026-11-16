@@ -320,6 +320,9 @@ pub struct Rule {
     /// The variable of a `set-var`, `set-var-fmt` or `unset-var`, resolved to its number at
     /// load (T595): the request path looks up no name.
     pub var: Option<alcyon_sample::vars::VarRef>,
+    /// The target server index of a `use-server` rule, resolved at load (T632): the request path
+    /// looks up no server name.
+    pub server: Option<usize>,
 }
 
 impl Rule {
@@ -348,6 +351,7 @@ impl Rule {
             reply: None,
             page: None,
             var: None,
+            server: None,
         }
     }
 
@@ -489,10 +493,21 @@ pub fn use_backend(rules: &[alcyon_config::UseBackendRule], acls: &Acls) -> Vec<
     rules.iter().map(|r| Rule::new(r.cond.as_ref(), acls, None, None)).collect()
 }
 
-/// The `use-server` rules', in their order: the condition.
+/// The `use-server` rules', in their order: the condition and resolved server index.
 #[must_use]
-pub fn use_server(rules: &[alcyon_config::UseServerRule], acls: &Acls) -> Vec<Rule> {
-    rules.iter().map(|r| Rule::new(Some(&r.cond), acls, None, None)).collect()
+pub fn use_server(
+    rules: &[alcyon_config::UseServerRule],
+    acls: &Acls,
+    servers: &[alcyon_config::ast::Server],
+) -> Vec<Rule> {
+    rules
+        .iter()
+        .map(|r| {
+            let mut rule = Rule::new(Some(&r.cond), acls, None, None);
+            rule.server = servers.iter().position(|s| s.id == r.server);
+            rule
+        })
+        .collect()
 }
 
 /// The `force-be-switch` conditions, compiled.

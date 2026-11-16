@@ -4723,7 +4723,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         tcp_res_content: crate::rule_compiled::tcp_res_content(&listen.tcp_res_content_rules, &acls),
         stick: crate::rule_compiled::stick(&listen.stick_rules, &acls),
         use_backend: crate::rule_compiled::use_backend(&listen.use_backends, &acls),
-        use_server: crate::rule_compiled::use_server(&listen.use_servers, &acls),
+        use_server: crate::rule_compiled::use_server(&listen.use_servers, &acls, &listen.servers),
         force_be: crate::rule_compiled::force_be(&listen.force_be_switch, &acls),
         reply_pages: crate::rule_compiled::reply_pages(&listen.error_replies),
         res_stream: false,
@@ -4881,7 +4881,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         tcp_res_content: crate::rule_compiled::tcp_res_content(&[], &acls),
         stick: crate::rule_compiled::stick(&fe.stick_rules, &acls),
         use_backend: crate::rule_compiled::use_backend(&fe.use_backends, &acls),
-        use_server: crate::rule_compiled::use_server(&[], &acls),
+        use_server: crate::rule_compiled::use_server(&[], &acls, &[]),
         force_be: crate::rule_compiled::force_be(&fe.force_be_switch, &acls),
         reply_pages: crate::rule_compiled::reply_pages(&fe.error_replies),
         res_stream: false,
@@ -5031,7 +5031,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         tcp_res_content: crate::rule_compiled::tcp_res_content(&be.tcp_res_content_rules, &acls),
         stick: crate::rule_compiled::stick(&be.stick_rules, &acls),
         use_backend: crate::rule_compiled::use_backend(&[], &acls),
-        use_server: crate::rule_compiled::use_server(&be.use_servers, &acls),
+        use_server: crate::rule_compiled::use_server(&be.use_servers, &acls, &be.servers),
         force_be: crate::rule_compiled::force_be(&[], &acls),
         reply_pages: crate::rule_compiled::reply_pages(&be.error_replies),
         res_stream: false,
@@ -10345,6 +10345,24 @@ fn inject_connection_token_zero_alloc(buf: &mut crate::buf::Buf, token: &str, ca
     }
 }
 
+thread_local! {
+    static SERVER_NAME_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many by-name server lookups this thread has made (debug builds only; always 0 in
+/// release): a test reads it around requests to show that `use-server` names are resolved at
+/// load (T632).
+#[must_use]
+pub fn server_name_lookups_on_this_thread() -> u64 {
+    SERVER_NAME_LOOKUPS.with(std::cell::Cell::get)
+}
+
+fn find_server_by_name(be: &Proxy, name: &str) -> Option<usize> {
+    #[cfg(debug_assertions)]
+    SERVER_NAME_LOOKUPS.with(|n| n.set(n.get() + 1));
+    be.server_ids.iter().position(|s| s == name)
+}
+
 impl EngineDispatcher<'_> {
     /// What the sample fetches of a request rule see: the session, the proxy whose rules
     /// run (for its counters), and the proxies' state.
@@ -10451,7 +10469,7 @@ impl EngineDispatcher<'_> {
             if !rc.cond.as_ref().is_some_and(|cond| cond.eval(&ctx.as_ctx(), &be.acls, registry)) {
                 continue;
             }
-            let Some(i) = be.server_ids.iter().position(|s| *s == rule.server) else { continue };
+            let Some(i) = rc.server.or_else(|| find_server_by_name(be, &rule.server)) else { continue };
             let st = be.server_statuses.get(i).map_or(ServerStatus::Down, |s| ServerStatus::from(s.load(Ordering::Relaxed)));
             if !matches!(st, ServerStatus::Down | ServerStatus::Maint) {
                 return Some(i);
@@ -19504,6 +19522,20 @@ mod stats_req_headers_tests {
         assert!(EngineDispatcher::stats_req_headers(&s).is_empty());
         s.req_headers = Some(vec![("Origin".to_string(), "http://evil".to_string())]);
         assert_eq!(EngineDispatcher::stats_req_headers(&s), [("Origin", "http://evil")]);
+    }
+
+    #[test]
+    fn find_server_by_name_counts_by_name_lookups() {
+        let cfg = alcyon_config::parse_str("backend b\n  server s1 127.0.0.1:1\n  server s2 127.0.0.1:2\n").expect("parse");
+        let ids = alcyon_config::ast::ProxyId { iid: 1, decl: 1, forced: false };
+        let px = init_proxy_from_backend(0, ids, &cfg.backends[0]);
+        let before = server_name_lookups_on_this_thread();
+        assert_eq!(find_server_by_name(&px, "s2"), Some(1));
+        assert_eq!(find_server_by_name(&px, "missing"), None);
+        #[cfg(debug_assertions)]
+        assert_eq!(server_name_lookups_on_this_thread() - before, 2);
+        #[cfg(not(debug_assertions))]
+        assert_eq!(server_name_lookups_on_this_thread() - before, 0);
     }
 }
 
