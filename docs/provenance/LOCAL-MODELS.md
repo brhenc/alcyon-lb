@@ -30,6 +30,7 @@ How the code came in:
 | Gemini 4 Hydrogen (high), via Antigravity | 1 | 156 | 156 |
 | Gemini 4 Argon (high), via Antigravity | 1 | 216 | 216 |
 | Gemini 4 Hydrogen (xhigh), via Antigravity | 1 | 337 | 337 |
+| Qwen3.8-Flash-Next | 1 | 201 | 201 |
 | gemini-4-hydrogen-medium | 2 | 169 | 91 |
 
 ## Commits
@@ -81,6 +82,7 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-15 | BALPARSE | Gemini 4 Hydrogen (high), via Antigravity | `09dee6b203` | 156 | 156 | `crates/alcyon-config/src/parser/mod.rs` +2/2<br>`crates/alcyon-config/src/parser/server.rs` +94/94<br>`crates/alcyon-config/tests/it/balance_options.rs` +60/60 | unmodified model output |
 | 2026-11-15 | BALSOURCE | Gemini 4 Argon (high), via Antigravity | `0bfb1d2ff0` | 216 | 216 | `crates/alcyon-rt/src/engine.rs` +2/2<br>`crates/alcyon-rt/src/lb.rs` +35/35<br>`crates/alcyon-rt/tests/it/balance_source_map.rs` +178/178<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-15 | H2URI | Gemini 4 Hydrogen (xhigh), via Antigravity | `1cd3399122` | 337 | 337 | `crates/alcyon-proto/src/authority.rs` +16/16<br>`crates/alcyon-proto/src/h2.rs` +5/5<br>`crates/alcyon-proto/src/mux_h2.rs` +3/3<br>`crates/alcyon-rt/src/engine.rs` +18/18<br>`crates/alcyon-rt/src/h2_bridge.rs` +6/6<br>`crates/alcyon-rt/src/lb.rs` +89/89<br>`crates/alcyon-rt/src/proxy.rs` +20/20<br>`crates/alcyon-rt/tests/it/balance_uri_map.rs` +180/180 | unmodified model output |
+| 2026-11-16 | REQBUF | Qwen3.8-Flash-Next | `7c6190bed5` | 201 | 201 | `crates/alcyon-rt/src/engine.rs` +31/31<br>`crates/alcyon-rt/tests/it/chunked_body_abort.rs` +169/169<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-16 | T632 | gemini-4-hydrogen-medium | `b754147a59` | 79 | 43 | `crates/alcyon-rt/src/engine.rs` +16/16<br>`crates/alcyon-rt/src/rule_compiled.rs` +22/22<br>`crates/alcyon-rt/tests/request_allocations.rs` +41/5 | unmodified model output |
 | 2026-11-16 | T632 | gemini-4-hydrogen-medium | `f14870b983` | 90 | 48 | `crates/alcyon-rt/src/engine.rs` +36/0<br>`crates/alcyon-rt/src/rule_compiled.rs` +18/14<br>`crates/alcyon-rt/tests/request_allocations.rs` +36/34 | unmodified model output |
 
