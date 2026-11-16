@@ -18,6 +18,7 @@
 mod common;
 
 mod aborted_client_waiting_for_server;
+mod chunked_body_abort;
 mod common_helpers;
 mod abortonclose;
 mod h1_lowercase_headers;

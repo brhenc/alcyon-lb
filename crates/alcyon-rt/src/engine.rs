@@ -14647,8 +14647,16 @@ impl EngineDispatcher<'_> {
                                 return Err(408);
                             }
                             BodyWait::ClientGone => {
+                                // `http_wait_for_msg_body` stops waiting as soon as the client
+                                // side is in error or has shut down (`SC_FL_ERROR`/`SC_FL_EOS`),
+                                // it does not fail the request there. The analysis therefore
+                                // goes on: the request is routed, which is what names the
+                                // backend in the log, and the aborted client then ends the
+                                // stream before a server is picked: the `CR` is what that
+                                // routing test reads, and is the only source of a bare `CR`
+                                // this early (`HAProxy`'s `SC_FL_EOS`/`SC_ABRT`, which its log
+                                // turns into the `C` of `CR--`).
                                 sess.strm.log.term.get_or_insert(*b"CR");
-                                return Err(400);
                             }
                             BodyWait::Malformed => return Err(400),
                         }
@@ -14914,6 +14922,23 @@ impl EngineDispatcher<'_> {
                 Ok(RuleFlow::Suspend) => return None,
                 Ok(RuleFlow::Next) => {}
             }
+        }
+
+        // A client that stopped writing while its body was awaited: `HAProxy` named the
+        // backend on its way past the switching rules and then the aborted client ends the
+        // stream, so no server is picked or connected and nothing is written back to a client
+        // that has gone (`http_wait_for_msg_body` leaves the wait on `SC_FL_EOS`/`SC_FL_ERROR`,
+        // and the request never reaches the server). Measured on the reference for a chunked
+        // body abandoned after `0\r\n`: `fe be/<NOSRV> 0/-1/-1/-1/0 400 0 - - CR--`, no bytes.
+        if entry.sess.strm.log.term == Some(*b"CR") {
+            entry.sess.strm.log.status = Some(400);
+            if let Some(txn) = entry.sess.strm.txn.as_mut() {
+                txn.close_after = true;
+                txn.aborted = true;
+            }
+            entry.sess.cli_state = ScState::Closed;
+            entry.sess.srv_state = ScState::Closed;
+            return None;
         }
 
         // `retry-on <status>`: the request is kept, once it is sent, to be sent again on an
@@ -16656,10 +16681,13 @@ fn wait_for_request_body(
         BodyWait::Pending
     };
     // The request is complete for the log when its body is here (`Tq`), and never was when
-    // the wait ends otherwise.
+    // the wait ends otherwise. A client that stopped writing ends the wait the way a body
+    // that arrived does (`http_wait_for_request_body`, `http_end`): `Tq` is the time spent
+    // reading what the client managed to send.
     match outcome {
         BodyWait::Ready if held.is_some() => sess.strm.log.request = Some(crate::txnlog::loop_now()),
-        BodyWait::TimedOut | BodyWait::ClientGone | BodyWait::Malformed => sess.strm.log.request = None,
+        BodyWait::ClientGone => sess.strm.log.request = Some(crate::txnlog::loop_now()),
+        BodyWait::TimedOut | BodyWait::Malformed => sess.strm.log.request = None,
         _ => {}
     }
     let pending = matches!(outcome, BodyWait::Pending);
