@@ -2707,6 +2707,12 @@ impl TcpSession {
         self.strm.log.term = Some(*b"PR");
         self.req.clear();
         self.req_head_pending = false;
+        // A refused request is refused for the log as well: `HAProxy` keeps no line of it
+        // (`%r` = `<BADREQ>`) and records no time for it (`%TR` = -1), whatever the head
+        // check already wrote of both (T281). The head errors that refuse before either was
+        // written are unchanged: `None` and an empty line are what they already were.
+        self.strm.log.request = None;
+        self.strm.log.request_line.reset();
         self.strm.txn = Some(HttpTxn::failed(status));
         // A stream of an HTTP/2 connection fails alone: its answer goes out as HEADERS and the
         // connection and its other streams go on (T464), so its state is not the connection's.

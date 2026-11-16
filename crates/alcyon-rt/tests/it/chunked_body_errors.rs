@@ -143,6 +143,11 @@ fn server(responses: Arc<Vec<Vec<Part>>>, seen: Arc<Mutex<Vec<u8>>>) -> SocketAd
 }
 
 fn start(responses: Vec<Vec<Part>>, seen: Arc<Mutex<Vec<u8>>>) -> Proxy {
+    start_with("", responses, seen)
+}
+
+/// `start` with `fe_opts` (whole config lines, each ending in a newline) added to frontend `f`.
+fn start_with(fe_opts: &str, responses: Vec<Vec<Part>>, seen: Arc<Mutex<Vec<u8>>>) -> Proxy {
     let (fe, sentinel) = (common::reserve_addr(), common::reserve_addr());
     let be = server(Arc::new(responses), seen);
     let mut cfg = NamedTempFile::new().expect("tmp");
@@ -151,7 +156,7 @@ fn start(responses: Vec<Vec<Part>>, seen: Arc<Mutex<Vec<u8>>>) -> Proxy {
         "global\n  log stdout format raw local0\n\
          defaults\n  mode http\n  log global\n  option httplog\n  timeout connect 2s\n  \
          timeout client 5s\n  timeout server 5s\n  timeout http-request 5s\n\
-         frontend f\n  bind {fe}\n  default_backend b\n\
+         frontend f\n  bind {fe}\n{fe_opts}  default_backend b\n\
          frontend s\n  bind {sentinel}\n  http-request return status 200\n\
          backend b\n  server s {be}\n"
     )
@@ -366,4 +371,81 @@ fn a_request_trailer_section_too_large_or_refused_never_half_reaches_the_server(
         }
     }
     assert!(wrong.is_empty(), "{} of {} cases differ:\n{}", wrong.len(), cases.len(), wrong.join("\n"));
+}
+
+/// A chunked request body that is malformed in the bytes that arrived with its head is
+/// refused whole, with or without `option http-buffer-request`, and logged the way `HAProxy`
+/// logs it:
+/// the request never made it, so its line is not recorded (`<BADREQ>`) and its time is not
+/// either (`%TR` = -1); the answer is a 400 page, terminated `PR--`, on the frontend with
+/// no server (T281).
+#[test]
+fn a_buffered_request_body_parse_error_is_logged_badreq() {
+    let head = |n: usize| format!("POST /{n} HTTP/1.1\r\n").into_bytes();
+    // (name, the chunked body after the head, sent whole with the head)
+    let cases: Vec<(&str, &[u8])> = vec![
+        ("bad_chunk_size", b"zz\r\n"),
+        ("missing_crlf_after_data", b"5\r\nhello0\r\n"),
+    ];
+    let mut wrong = Vec::new();
+    // The body is checked with the head as it is parsed, before any rule runs, so buffering
+    // changes nothing here; both are run (review of the BADCHUNK case).
+    for (mode, opts) in [("unbuffered", ""), ("http-buffer-request", "  option http-buffer-request\n")] {
+        let p = start_with(opts, Vec::new(), Arc::default());
+        for (n, (name, body)) in cases.iter().enumerate() {
+            let name = format!("{mode} {name}");
+            let req = cat(&[&head(n), REQ_HEAD, body]);
+            let (got, port) = exchange_port(&p, &req);
+            let log = log_line_port(&p, port);
+            if log.is_empty() {
+                wrong.push(format!("{name}: no log line for client port {port} (client got {})", esc(&got)));
+                continue;
+            }
+            let f: Vec<&str> = log.split_whitespace().collect();
+            // `%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc ... %{+Q}r`
+            let checks: Vec<(&str, bool)> = vec![
+                ("400 page", got.starts_with(b"HTTP/1.1 400 ")),
+                ("no server, on the frontend", f.get(3).copied() == Some("f/<NOSRV>")),
+                ("%TR not recorded", f.get(4).and_then(|t| t.split('/').next()) == Some("-1")),
+                ("%ST is 400", f.get(5).copied() == Some("400")),
+                ("termination PR--", f.get(9).copied() == Some("PR--")),
+                ("request line <BADREQ>", f.last().copied() == Some("\"<BADREQ>\"")),
+            ];
+            for (what, ok) in checks {
+                if !ok {
+                    wrong.push(format!("{name}: {what} (log: {log}; client got {})", esc(&got)));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{} of {} cases differ:\n{}", wrong.len(), cases.len(), wrong.join("\n"));
+}
+
+/// Sends `req` whole to the proxy and reads until it closes: what came back, and the client
+/// port the connection used, which the log names as `%ci:%cp`.
+fn exchange_port(p: &Proxy, req: &[u8]) -> (Vec<u8>, u16) {
+    let mut c = TcpStream::connect(p.fe).expect("connect");
+    let port = c.local_addr().expect("local_addr").port();
+    c.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+    let _ = c.write_all(req);
+    let mut got = Vec::new();
+    let mut b = [0u8; 65536];
+    loop {
+        match c.read(&mut b) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&b[..n]),
+        }
+    }
+    (got, port)
+}
+
+/// The log line for the connection that used client port `port` (`%ci:%cp` names it).
+fn log_line_port(p: &Proxy, port: u16) -> String {
+    let want = format!("127.0.0.1:{port} ");
+    while let Ok(l) = p.logs.recv_timeout(Duration::from_secs(3)) {
+        if l.starts_with(&want) {
+            return l;
+        }
+    }
+    String::new()
 }
