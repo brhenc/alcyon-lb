@@ -27,6 +27,7 @@ mod idle_h2c_preface;
 mod post_during_connect;
 mod stalled_upload_linger;
 mod absolute_uri;
+mod use_server_unresolved;
 mod access_log;
 mod access_log_states;
 mod acl_bin_patterns;

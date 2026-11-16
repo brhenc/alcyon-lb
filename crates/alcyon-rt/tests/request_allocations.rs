@@ -972,42 +972,6 @@ fn use_server_with_a_configured_name_looks_up_no_name_per_request() {
     assert_eq!(lookups, 0, "{lookups} by-name server lookups in 50 requests through use-server");
 }
 
-/// T632 item 1: an unresolved `use-server` rule is a configuration error at load (`Engine::new`),
-/// with HAProxy's wording.
-#[test]
-fn unresolved_use_server_fails_engine_load_as_haproxy() {
-    let mut cfg = alcyon_config::parse_str(
-        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
-         backend b\n  server s1 127.0.0.1:8080\n",
-    )
-    .expect("parse");
-    let cond = alcyon_config::AclCondition { is_if: true, terms: Vec::new() };
-    cfg.backends[0].use_servers.push(alcyon_config::UseServerRule { server: "missing".into(), cond: cond.clone() });
-    let err = match Engine::new(&cfg, 64) {
-        Ok(_) => panic!("expected Engine::new to fail for unresolved backend use-server"),
-        Err(e) => e,
-    };
-    assert!(
-        err.to_string().contains("backend 'b' : unable to find server 'missing' referenced in a 'use-server' rule."),
-        "unexpected error: {err}"
-    );
-
-    let mut lcfg = alcyon_config::parse_str(
-        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
-         listen l\n  bind 127.0.0.1:0\n  server s1 127.0.0.1:8080\n",
-    )
-    .expect("parse");
-    lcfg.listens[0].use_servers.push(alcyon_config::UseServerRule { server: "missing".into(), cond });
-    let err = match Engine::new(&lcfg, 64) {
-        Ok(_) => panic!("expected Engine::new to fail for unresolved listen use-server"),
-        Err(e) => e,
-    };
-    assert!(
-        err.to_string().contains("proxy 'l' : unable to find server 'missing' referenced in a 'use-server' rule."),
-        "unexpected error: {err}"
-    );
-}
-
 /// T436 A: a steady-state keep-alive request proxied to a server allocates nothing. Measured
 /// before (2026-10-19, uprobe on malloc under the pstat load): 2 per request, the method and the
 /// URI copied into `TcpSession::req_method` / `req_uri` as owned `String`s. The count for 1100
