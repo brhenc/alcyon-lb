@@ -1110,7 +1110,13 @@ pub(crate) fn write_backend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy
     r.set("eresp", n.eresp);
     r.set("wretr", proxy.counters().retries_count.load(Relaxed));
     r.set("wredis", proxy.counters().redispatches.load(Relaxed));
-    r.set("status", if be_down { "DOWN" } else { "UP" });
+    let status = if be_down { "DOWN" } else { "UP" };
+    r.set("status", status);
+    if proxy.ids.cli.unpublished.load(std::sync::atomic::Ordering::Relaxed) {
+        // `stats-proxy.c` appends " (UNPUB)" to the status of a backend `unpublish backend`
+        // took out of traffic. The stats dump is the CLI's own path, so it spells the pair out.
+        r.set("status", &format!("{status} (UNPUB)"));
+    }
     r.set("weight", weight);
     r.set("uweight", weight);
     r.set("act", act);
@@ -1258,7 +1264,10 @@ impl StatCursor {
                     let p = &proxies[j];
                     self.px = crate::engine::usize_to_u32(j);
                     self.s = 0;
-                    let skip = self.iid.is_some_and(|f| f != -1 && u32::try_from(f).ok() != Some(p.ids.iid));
+                    // `del backend` took the proxy out of `main_proxies`: no row of any
+                    // kind is listed for it, whatever else the caller filtered on.
+                    let skip = p.is_deleted()
+                        || self.iid.is_some_and(|f| f != -1 && u32::try_from(f).ok() != Some(p.ids.iid));
                     self.step = if skip { ST_PROXY } else { ST_FRONTEND };
                 }
                 ST_FRONTEND => {
@@ -1272,7 +1281,8 @@ impl StatCursor {
                 ST_SERVERS => {
                     let p = &proxies[i];
                     let s = self.s as usize;
-                    if !self.type_wanted(2) || s >= p.servers.len() {
+                    // A server `del server` retired is off the backend's list (`LIST del`).
+                    if !self.type_wanted(2) || s >= p.servers.len() || p.srv_gone(s) {
                         self.step = ST_BACKEND;
                         continue;
                     }

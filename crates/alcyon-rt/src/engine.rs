@@ -1788,6 +1788,30 @@ pub(crate) fn link_declaration_order(proxies: &mut [Proxy]) {
     }
 }
 
+/// What the runtime CLI commands retire on a proxy: `unpublish backend` and `publish backend`
+/// the first flag (`PR_FL_BE_UNPUBLISHED`, `src/proxy.c`), `del backend` the second
+/// (`PR_FL_DELETED`), `del server <be>/<srv>` one flag per server. An `Arc` because a `Proxy`
+/// is cloned, and the workers, which read the first flag on every switching rule that matches,
+/// must see what the CLI wrote; `server_gone` one entry per configured server, in the order of
+/// [`ProxyIdInfo::server_ids`], sized once here.
+#[derive(Debug, Default)]
+pub struct BackendCliState {
+    /// The switching rules skip this backend and `show stat` spells its status `(UNPUB)`.
+    pub unpublished: std::sync::atomic::AtomicBool,
+    /// The backend is out of every listing and out of every lookup by name.
+    pub deleted: std::sync::atomic::AtomicBool,
+    /// The servers `del server` took out of the backend's list. Nothing reads them on the
+    /// request path: a server cannot be deleted out of maintenance, which no LB picks.
+    pub server_gone: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>>,
+}
+
+impl BackendCliState {
+    /// The state of a proxy with `n` configured servers.
+    pub fn with_servers(n: usize) -> Self {
+        Self { server_gone: std::sync::Arc::new((0..n).map(|_| std::sync::atomic::AtomicBool::new(false)).collect()), ..Self::default() }
+    }
+}
+
 /// What [`Proxy::ids`] holds.
 #[derive(Debug, Clone, Default)]
 pub struct ProxyIdInfo {
@@ -1813,6 +1837,11 @@ pub struct ProxyIdInfo {
     pub next_decl: u32,
     /// The section has an `id` of its own (`bk_f_forced_id`).
     pub forced_id: bool,
+    /// `PR_FL_BE_UNPUBLISHED` (`unpublish backend`, `publish backend`, `src/proxy.c`): the
+    /// switching rules skip a backend so marked and `show stat` spells its status `(UNPUB)`.
+    /// Written only by the CLI, read once per switching rule that matches. Here, in the box,
+    /// because `Proxy` is held to its size.
+    pub cli: std::sync::Arc<BackendCliState>,
     /// Each server's numeric id in this proxy (`puid`), what `srv_id`, the `sid` column of
     /// `show stat` and `show servers state` report, and where the server's points on a
     /// consistent-hash ring come from. Empty when no server has an `id` of its own: they are
@@ -2147,6 +2176,40 @@ impl Proxy {
     #[must_use]
     pub fn server_cmaint(&self, idx: usize) -> bool {
         self.ids.server_cmaint.get(idx).copied().unwrap_or(false)
+    }
+
+    /// `be_is_eligible()` (`include/haproxy/backend.h`): whether a switching rule may still
+    /// aim at this backend. One Acquire load on the rule that matched, and no write.
+    #[must_use]
+    pub fn be_eligible(&self) -> bool {
+        !self.ids.cli.unpublished.load(Ordering::Acquire)
+    }
+
+    /// Whether `del backend` retired this proxy, which is how everything that lists or looks
+    /// up proxies - `show stat`, `show backend`, the CLI's own refusals - loses it.
+    #[must_use]
+    pub fn is_deleted(&self) -> bool {
+        self.ids.cli.deleted.load(Ordering::Acquire)
+    }
+
+    /// Whether `del server <be>/<srv>` retired the server at `idx`.
+    #[must_use]
+    pub fn srv_gone(&self, idx: usize) -> bool {
+        self.ids.cli.server_gone.get(idx).is_some_and(|f| f.load(Ordering::Acquire))
+    }
+
+    /// The servers still attached to the backend: `del backend` refuses one that has any,
+    /// which for HAProxy is a non-empty `be->servers`.
+    #[must_use]
+    pub fn attached_srv_count(&self) -> usize {
+        let gone = self.ids.cli.server_gone.iter().filter(|f| f.load(Ordering::Relaxed)).count();
+        self.server_ids.len().saturating_sub(gone)
+    }
+
+    /// The flag of [`BackendCliState::server_gone`] for the server at `idx`.
+    #[must_use]
+    pub fn server_gone_slot(&self, idx: usize) -> Option<&std::sync::atomic::AtomicBool> {
+        self.ids.cli.server_gone.get(idx)
     }
 
     /// Whether the server at `idx` has no address (`SRV_ADMF_RMAINT`): it stays in
@@ -4738,6 +4801,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
             forced_id: ids.forced,
             server_puids: server_puids(listen.servers.len(), &listen.server_extras),
             server_forced_ids: server_forced_ids(listen.servers.len(), &listen.server_extras),
+            cli: std::sync::Arc::new(BackendCliState::with_servers(listen.servers.len())),
             server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
             server_cmaint: server_cmaint(&listen.servers),
             server_rmaint: server_rmaint(&listen.servers, &listen.server_extras),
@@ -5046,6 +5110,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
             forced_id: ids.forced,
             server_puids: server_puids(be.servers.len(), &be.server_extras),
             server_forced_ids: server_forced_ids(be.servers.len(), &be.server_extras),
+            cli: std::sync::Arc::new(BackendCliState::with_servers(be.servers.len())),
             server_init_health: server_init_health(be.servers.len(), &be.server_extras),
             server_cmaint: server_cmaint(&be.servers),
             server_rmaint: server_rmaint(&be.servers, &be.server_extras),
@@ -10413,7 +10478,9 @@ impl EngineDispatcher<'_> {
         for (rule, rc) in proxy.use_backends.iter().zip(&proxy.rules.use_backend) {
             let matches = rc.cond.as_ref().is_none_or(|cond| cond.eval(&ctx.as_ctx(), &proxy.acls, registry));
             if matches {
-                if let Some(idx) = proxies.iter().position(|p| p.name == rule.backend) {
+                // `be_is_eligible`: a backend `unpublish backend` took out of traffic is
+                // skipped, and the rules carry on to the next one (`src/stream.c`).
+                if let Some(idx) = proxies.iter().position(|p| p.name == rule.backend && p.be_eligible()) {
                     return Some(idx);
                 }
                 if proxy.disabled_backends.contains(&rule.backend) && forced() {
@@ -10423,7 +10490,8 @@ impl EngineDispatcher<'_> {
         }
 
         if let Some(ref def_name) = proxy.default_backend {
-            if let Some(idx) = proxies.iter().position(|p| p.name == *def_name) {
+            // `be_is_eligible` again, for the `default_backend` of `src/stream.c`.
+            if let Some(idx) = proxies.iter().position(|p| p.name == *def_name && p.be_eligible()) {
                 return Some(idx);
             }
             if proxy.disabled_backends.contains(def_name) && forced() {
