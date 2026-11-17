@@ -1037,6 +1037,24 @@ mod tests {
         p.srv_set_mut().set_check_port(1, 9999);
         assert_eq!(p.srv_set().check_config(0).and_then(|c| c.check_port), Some(9999));
         assert!(p.srv_set().check_config(1).is_none());
+        p.srv_set_mut().set_check_port(7, 9999);
+    }
+
+    #[test]
+    fn a_server_without_an_address_keeps_the_admin_state_under_its_maintenance() {
+        let c = "defaults\n    mode http\nbackend b\n    server s1 a.test:80 init-addr none\n    server s2 127.0.0.1:2\n";
+        let config = alcyon_config::parse_str(c).expect("config");
+        let all = crate::engine::Engine::build_shared_state(&config).expect("proxies");
+        let p = backend(&all);
+        assert!(p.server_rmaint(0));
+        assert!(!p.server_rmaint(1));
+        assert_eq!(p.server_rmaint_kept(0), ServerStatus::Up);
+        p.set_server_rmaint(0, Some(ServerStatus::Drain));
+        assert_eq!(p.server_rmaint_kept(0), ServerStatus::Drain);
+        p.set_server_rmaint(0, None);
+        assert!(!p.server_rmaint(0));
+        p.set_server_rmaint(9, Some(ServerStatus::Maint));
+        assert_eq!(p.server_rmaint_kept(9), ServerStatus::Up);
     }
 
     #[test]
