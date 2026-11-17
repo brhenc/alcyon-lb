@@ -69,6 +69,7 @@ mod stats_page_streaming;
 mod cold_start_timers;
 mod body_after_head_rewrite;
 mod buffer_wait;
+mod builtin_error_wire;
 mod tls_tx_idle;
 mod bufsize_h2_alpn;
 mod canonical_haproxy_35_e2e;
