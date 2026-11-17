@@ -34,7 +34,7 @@ pub struct Refusal(pub u16);
 
 /// A [`Refusal`] with what caused it, as the payload of an `io::Error`.
 #[derive(Debug)]
-struct RefusalWhy(u16, &'static str, bool);
+struct RefusalWhy(u16, &'static str);
 
 impl std::fmt::Display for RefusalWhy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -47,21 +47,7 @@ impl std::error::Error for RefusalWhy {}
 impl Refusal {
     #[must_use]
     pub fn error(status: u16, why: &'static str) -> io::Error {
-        io::Error::new(io::ErrorKind::InvalidData, RefusalWhy(status, why, false))
-    }
-
-    /// A [`Refusal::error`] that is not answered: the connection closes with nothing
-    /// written, and the status is only logged (`HAProxy` on Content-Length lines that
-    /// differ, T286).
-    #[must_use]
-    pub fn quiet(status: u16, why: &'static str) -> io::Error {
-        io::Error::new(io::ErrorKind::InvalidData, RefusalWhy(status, why, true))
-    }
-
-    /// Whether the error from a parse is one that is not answered ([`Refusal::quiet`]).
-    #[must_use]
-    pub fn is_quiet(e: &io::Error) -> bool {
-        e.get_ref().and_then(|e| e.downcast_ref::<RefusalWhy>()).is_some_and(|r| r.2)
+        io::Error::new(io::ErrorKind::InvalidData, RefusalWhy(status, why))
     }
 
     /// The status an error from a parse asks for: its own, or 400.
@@ -1028,7 +1014,7 @@ impl H1Parser {
             };
             if seen_cl.is_some_and(|prev| prev != len) {
                 self.phase = H1Phase::Error;
-                return Err(Refusal::quiet(400, "conflicting Content-Length values"));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "conflicting Content-Length values"));
             }
             seen_cl = Some(len);
         }
@@ -1495,18 +1481,16 @@ pub fn header_lines_invalid(buf: &[u8], mut at: usize, accept_unsafe: bool) -> b
 pub enum ClEarly {
     /// Nothing wrong yet: wait for the rest of the head.
     Fine,
-    /// A value that is not a number, or a list of different values in the first line: 400.
+    /// A value that is not a number, a list of different values in the first line, or a value
+    /// that differs from an earlier line's: 400 (dev8 closed with nothing written on the last).
     Bad,
-    /// A value that differs from an earlier line's: the connection closes, nothing written
-    /// (`HAProxy` logs a 400; [`Refusal::quiet`]).
-    Conflict,
 }
 
 /// The `Content-Length` lines of a request head not yet whole, from `at` in `buf`, read as
 /// `HAProxy` reads them as each line completes (`h1_headers_to_hdr_list`,
 /// `h1_parse_cont_len_header`, T315). A line counts once it ends with LF and a byte of the
 /// next is in. A value is a list of decimal numbers that fit 64 bits; the list of the first
-/// line holds one number; a number that differs from an earlier line's is a [`ClEarly::Conflict`].
+/// line holds one number; a number that differs from an earlier line's is [`ClEarly::Bad`] too.
 /// It stops at the end of the head, which the full parse judges. One pass, no allocation.
 #[must_use]
 pub fn content_length_early(buf: &[u8], mut at: usize) -> ClEarly {
@@ -1530,15 +1514,14 @@ pub fn content_length_early(buf: &[u8], mut at: usize) -> ClEarly {
             continue;
         }
         let value = line[colon + 1..].trim_ascii();
-        let first_line = seen.is_none();
-        for (i, item) in value.split(|&b| b == b',').enumerate() {
+        for item in value.split(|&b| b == b',') {
             let item = item.trim_ascii();
             if item.is_empty() || !item.iter().all(u8::is_ascii_digit) {
                 return ClEarly::Bad;
             }
             let Some(n) = std::str::from_utf8(item).ok().and_then(|s| s.parse::<u64>().ok()) else { return ClEarly::Bad };
             match seen {
-                Some(prev) if prev != n => return if first_line && i > 0 { ClEarly::Bad } else { ClEarly::Conflict },
+                Some(prev) if prev != n => return ClEarly::Bad,
                 _ => seen = Some(n),
             }
         }
@@ -2010,8 +1993,8 @@ mod request_target_tests {
     }
 
     /// No prefix of a valid head, repeated equal `Content-Length` lines included, is settled
-    /// early; a bad value or a list of different values is a 400, a later different value a
-    /// quiet close (T315).
+    /// early; a bad value or a list of different values is a 400, a later different value
+    /// too (a quiet close before dev11, T315).
     #[test]
     fn content_length_early_settles_only_bad_lines() {
         use super::{content_length_early, ClEarly};
@@ -2030,8 +2013,8 @@ mod request_target_tests {
             (b"P / HTTP/1.1\r\nContent-Length: 5,\r\nX", ClEarly::Bad),
             (b"P / HTTP/1.1\r\nContent-Length: 5, 6\r\nX", ClEarly::Bad),
             (b"P / HTTP/1.1\r\nContent-Length: 99999999999999999999\r\nX", ClEarly::Bad),
-            (b"P / HTTP/1.1\r\nContent-Length: 5\r\ncontent-length: 10\r\nX", ClEarly::Conflict),
-            (b"P / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5, 6\r\nX", ClEarly::Conflict),
+            (b"P / HTTP/1.1\r\nContent-Length: 5\r\ncontent-length: 10\r\nX", ClEarly::Bad),
+            (b"P / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5, 6\r\nX", ClEarly::Bad),
         ];
         for (buf, want) in cases {
             assert_eq!(content_length_early(buf, 0), want, "{buf:?}");
