@@ -453,7 +453,7 @@ impl CounterTable {
         let mut spans = Vec::with_capacity(proxies.len());
         let mut at = 1u32;
         for p in proxies {
-            let n = u32::try_from(SRV + p.servers.len()).unwrap_or(u32::MAX);
+            let n = u32::try_from(SRV + p.srv_set().len()).unwrap_or(u32::MAX);
             spans.push((at, n));
             at = at.saturating_add(n);
         }

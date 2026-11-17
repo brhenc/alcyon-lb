@@ -88,11 +88,11 @@ fn health_check_detects_down_server_and_routes_to_live_server() {
 
     // Verify server statuses
     assert_eq!(
-        engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Down as u8,
+        engine.proxies[0].srv_set().status_cell(0).expect("status").load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Down as u8,
         "dead server should be DOWN"
     );
     assert_eq!(
-        engine.proxies[0].server_statuses[1].load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Up as u8,
+        engine.proxies[0].srv_set().status_cell(1).expect("status").load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Up as u8,
         "live server should be UP"
     );
 

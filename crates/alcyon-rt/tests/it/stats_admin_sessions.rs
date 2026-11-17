@@ -133,7 +133,7 @@ fn test_kill_sessions_web_admin_and_reclaim_actconn() {
         engine.proxies[0].stats[0].act_conn.load(std::sync::atomic::Ordering::Relaxed)
     );
     assert_eq!(
-        engine.proxies[0].server_actconn[0].load(std::sync::atomic::Ordering::Relaxed), 1,
+        engine.proxies[0].srv_set().actconn_cell(0).expect("actconn").load(std::sync::atomic::Ordering::Relaxed), 1,
         "server_actconn should be 1"
     );
 
@@ -149,7 +149,7 @@ fn test_kill_sessions_web_admin_and_reclaim_actconn() {
 
     // 3. Verify active connection counts immediately reclaimed
     assert_eq!(
-        engine.proxies[0].server_actconn[0].load(std::sync::atomic::Ordering::Relaxed), 0,
+        engine.proxies[0].srv_set().actconn_cell(0).expect("actconn").load(std::sync::atomic::Ordering::Relaxed), 0,
         "server_actconn must be reclaimed to 0"
     );
     assert_eq!(
@@ -197,7 +197,7 @@ listen test_proxy
 
     // Manually increment actconn to simulate active sessions
     engine.proxies[0].stats[0].act_conn.store(5, std::sync::atomic::Ordering::Relaxed);
-    engine.proxies[0].server_actconn[0].store(5, std::sync::atomic::Ordering::Relaxed);
+    engine.proxies[0].srv_set().actconn_cell(0).expect("actconn").store(5, std::sync::atomic::Ordering::Relaxed);
 
     // 1. Test direct engine API
     let killed = engine.shutdown_sessions(Some("test_proxy"), Some("srv1"));
@@ -366,12 +366,12 @@ fn test_health_check_enable_disable_web_and_cli() {
     assert!(!engine.checks[0].enabled, "check should now be disabled");
 
     // Step engine: verify server_status is NOT modified by health checks while disabled
-    engine.proxies[0].server_statuses[0].store(ServerStatus::Maint as u8, std::sync::atomic::Ordering::Relaxed);
+    engine.proxies[0].srv_set().status_cell(0).expect("status").store(ServerStatus::Maint as u8, std::sync::atomic::Ordering::Relaxed);
     for _ in 0..5 {
         let _ = engine.run_once();
     }
     assert_eq!(
-        engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Maint as u8,
+        engine.proxies[0].srv_set().status_cell(0).expect("status").load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Maint as u8,
         "administrative status must be preserved while health check is disabled"
     );
 
@@ -445,13 +445,13 @@ fn test_maxconn_tuning_web_and_cli() {
     let mut engine = Engine::new(&config, 64).expect("engine");
     engine.bind_cli_socket(&socket_path).expect("bind cli");
 
-    assert_eq!(engine.proxies[0].server_maxconn.get(0), Some(10));
+    assert_eq!(engine.proxies[0].srv_set().maxconn_at(0), Some(10));
 
     // 1. Set server maxconn via Web Admin
     let post_req = b"POST /stats HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 52\r\n\r\naction=maxconn&backend=maxconn_proxy&server=srv1&maxconn=42";
     let resp = send_http_request(proxy_addr, &mut engine, post_req);
     assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "Got: {resp}");
-    assert_eq!(engine.proxies[0].server_maxconn.get(0), Some(42));
+    assert_eq!(engine.proxies[0].srv_set().maxconn_at(0), Some(42));
 
     // 2. Set proxy maxconn via Web Admin
     let post_req2 = b"POST /stats HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 43\r\n\r\naction=maxconn&backend=maxconn_proxy&maxconn=999";
@@ -469,10 +469,10 @@ fn test_maxconn_tuning_web_and_cli() {
         .expect("write");
     step_engine_until(
         &mut engine,
-        |eng| eng.proxies[0].server_maxconn.get(0) == Some(75),
+        |eng| eng.proxies[0].srv_set().maxconn_at(0) == Some(75),
         20,
     );
-    assert_eq!(engine.proxies[0].server_maxconn.get(0), Some(75));
+    assert_eq!(engine.proxies[0].srv_set().maxconn_at(0), Some(75));
 
     // 4. Set backend maxconn via CLI socket
     let mut client2 = UnixStream::connect(&socket_path).expect("connect cli 2");
@@ -491,7 +491,7 @@ fn test_maxconn_tuning_web_and_cli() {
 
     // 5. Test direct engine API
     assert!(engine.set_maxconn("maxconn_proxy", Some("srv1"), 88));
-    assert_eq!(engine.proxies[0].server_maxconn.get(0), Some(88));
+    assert_eq!(engine.proxies[0].srv_set().maxconn_at(0), Some(88));
     assert!(engine.set_maxconn("maxconn_proxy", None, 2000));
     assert_eq!(engine.proxies[0].maxconn.get(), 2000);
 }

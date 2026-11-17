@@ -41,7 +41,7 @@ ARRAY_RE = re.compile(r"\.(?:%s)\b(?!\s*\()" % "|".join(ARRAYS))
 # A proxy's `servers` (ServerAddrs); the receivers below are the parsed configuration, and
 # `px.servers` in the stats page's JavaScript is a JSON field.
 SERVERS_RE = re.compile(r"(?<![\w.])(\w+(?:\[[^\]]*\])?(?:\.\w+)*)\.servers\b(?!\s*:|\s*\)|\.forEach)")
-CONFIG_RECV = re.compile(r"^(?:b|l|s|sec|section|self|cfg|config|users\[\w+\]|\w*\.(?:backends|listens)|be|bk)$|^(?:config|cfg)\.")
+CONFIG_RECV = re.compile(r"^(?:b|l|s|sec|section|self|cfg|config|users\[\w+\]|\w*\.(?:backends|listens)|be|bk|listen|backend|pool|ring)$|^(?:config|cfg)\.")
 
 
 def count_line(line):

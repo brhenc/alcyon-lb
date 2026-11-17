@@ -275,7 +275,7 @@ fn a_tcp_backend_retry_with_no_server_left_ends_the_stream() {
     // refusal comes back.
     let accepted = common::drive_until(&mut engine, |e| e.proxies[p].counters().cum_conn.load(Ordering::Relaxed) == 1);
     assert!(accepted, "not accepted");
-    engine.proxies[p].server_statuses[0].store(alcyon_rt::check::ServerStatus::Down as u8, Ordering::Relaxed);
+    engine.proxies[p].srv_set().status_cell(0).expect("status").store(alcyon_rt::check::ServerStatus::Down as u8, Ordering::Relaxed);
     let mut buf = [0u8; 16];
     let closed = common::drive_until(&mut engine, |_| match c.read(&mut buf) {
         Ok(0) => true,

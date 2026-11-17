@@ -92,8 +92,8 @@ fn test_render_stats_html_helper_and_status_badges() {
     };
 
     let mut engine = Engine::new(&config, 64).expect("engine");
-    engine.proxies[0].server_statuses[0].store(ServerStatus::Up as u8, std::sync::atomic::Ordering::Relaxed);
-    engine.proxies[0].server_statuses[1].store(ServerStatus::Drain as u8, std::sync::atomic::Ordering::Relaxed);
+    engine.proxies[0].srv_set().status_cell(0).expect("status").store(ServerStatus::Up as u8, std::sync::atomic::Ordering::Relaxed);
+    engine.proxies[0].srv_set().status_cell(1).expect("status").store(ServerStatus::Drain as u8, std::sync::atomic::Ordering::Relaxed);
 
     let html = render_stats_html(&engine.proxies, &engine.checks, 4242);
 
@@ -222,8 +222,8 @@ fn test_stats_server_state_and_weight_mutations() {
     let mut engine = Engine::new(&config, 64).expect("engine");
 
     // 1. Initial status is UP
-    assert_eq!(engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Up as u8);
-    assert_eq!(engine.proxies[0].server_weights.get(0).unwrap(), 10);
+    assert_eq!(engine.proxies[0].srv_set().status_cell(0).expect("status").load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Up as u8);
+    assert_eq!(engine.proxies[0].srv_set().weight_at(0).unwrap(), 10);
 
     // 2. Mutate state to DRAIN via POST
     let drain_body = "action=drain&backend=cluster_px&server=web1";
@@ -242,7 +242,7 @@ fn test_stats_server_state_and_weight_mutations() {
         drain_resp.starts_with("HTTP/1.1 200 OK\r\n"),
         "Got: {drain_resp}"
     );
-    assert_eq!(engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Drain as u8);
+    assert_eq!(engine.proxies[0].srv_set().status_cell(0).expect("status").load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Drain as u8);
 
     // GET /stats now shows DRAIN badge
     let get_drain = send_http_request(
@@ -278,7 +278,7 @@ fn test_stats_server_state_and_weight_mutations() {
         maint_resp.starts_with("HTTP/1.1 200 OK\r\n"),
         "Got: {maint_resp}"
     );
-    assert_eq!(engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Maint as u8);
+    assert_eq!(engine.proxies[0].srv_set().status_cell(0).expect("status").load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Maint as u8);
 
     // GET /stats shows MAINT badge
     let get_maint = send_http_request(
@@ -292,7 +292,7 @@ fn test_stats_server_state_and_weight_mutations() {
     // 4. A GET never acts (a page that embeds the URL must not alter servers).
     let get_act = b"GET /stats?action=ready&backend=cluster_px&server=web1 HTTP/1.1\r\nHost: localhost\r\n\r\n";
     let _ = send_http_request(proxy_addr, &mut engine, get_act);
-    assert_eq!(engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Maint as u8);
+    assert_eq!(engine.proxies[0].srv_set().status_cell(0).expect("status").load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Maint as u8);
     // Back to READY (UP) via POST.
     let ready_body = "action=ready&backend=cluster_px&server=web1";
     let ready_req = format!("POST /stats HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{ready_body}", ready_body.len());
@@ -302,7 +302,7 @@ fn test_stats_server_state_and_weight_mutations() {
         ready_resp.starts_with("HTTP/1.1 200 OK\r\n"),
         "Got: {ready_resp}"
     );
-    assert_eq!(engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Up as u8);
+    assert_eq!(engine.proxies[0].srv_set().status_cell(0).expect("status").load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Up as u8);
 
     // 5. Adjust server weight
     let weight_body = "action=weight&backend=cluster_px&server=web1&weight=64";
@@ -321,7 +321,7 @@ fn test_stats_server_state_and_weight_mutations() {
         weight_resp.starts_with("HTTP/1.1 200 OK\r\n"),
         "Got: {weight_resp}"
     );
-    assert_eq!(engine.proxies[0].server_weights.get(0).unwrap(), 64);
+    assert_eq!(engine.proxies[0].srv_set().weight_at(0).unwrap(), 64);
 
     // CSV shows new weight
     let csv_w = send_http_request(
@@ -386,5 +386,5 @@ fn test_stats_custom_uri_admin_stats() {
         drain_resp.starts_with("HTTP/1.1 200 OK\r\n"),
         "Got: {drain_resp}"
     );
-    assert_eq!(engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Drain as u8);
+    assert_eq!(engine.proxies[0].srv_set().status_cell(0).expect("status").load(std::sync::atomic::Ordering::Relaxed), ServerStatus::Drain as u8);
 }

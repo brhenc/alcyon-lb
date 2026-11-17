@@ -2101,7 +2101,7 @@ impl CliApplet {
                     self.finish_msg(&format!("Invalid addr '{ip_s}'"));
                     return;
                 };
-                let old = ctx.proxies[p_idx].servers.at(s_idx);
+                let old = ctx.proxies[p_idx].srv_set().addr_at(s_idx);
                 let mut new_port = old.port();
                 if parts.get(3) == Some(&"port") {
                     let p_s = parts.get(4).copied().unwrap_or("");
@@ -2128,8 +2128,8 @@ impl CliApplet {
                     return;
                 }
                 msg.push_str(" by 'stats socket command'");
-                // `proxy.servers` is where every connection to this server takes its address.
-                ctx.proxies[p_idx].servers.set(s_idx, new);
+                // the server's address is where every connection to this server takes its address.
+                ctx.proxies[p_idx].srv_set().set_addr_at(s_idx, new);
                 if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy() == p_idx && c.server() == s_idx) {
                     check.addr = new;
                 }
