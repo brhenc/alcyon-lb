@@ -829,3 +829,14 @@ row is here because the behaviour is surprising or measurable, not because it di
 | **HAProxy** | Frees the old name (`server.c`, `srv_update_server_name` under thread isolation); no growth. |
 | **Revisit if** | An operator renames servers continuously (an orchestrator that uses names as slots' labels). Then: compact the chain at a point where no worker reads (a reload, or the thread-isolation equivalent once there is one). |
 | **V&V probe** | Rename one server 100,000 times under load: RSS grows by about 10 MB and no more, no crash, no stale or torn name in the log; request latency on that backend rises with the chain. |
+
+### 6.36 Features new in HAProxy 3.5's development cycle are not ported before 3.6 LTS — **decided by the user 2026-11-17**
+
+| | |
+|---|---|
+| **What** | Keywords and actions that first appear in a 3.5 development release are refused at load (`unknown keyword`, rule 5) instead of ported. Declined so far: the `http-hardening` global keyword and its profiles (3.5-dev11; reg-tests `http-messaging/http_hardening_{h1,h2,profiles,trailers}.vtc`) and the `curve2name` converter (3.5-dev11; `ssl/curve2name.vtc`, the CURVE2NAME case, held). Bug fixes and stricter parsing that dev11 brings to existing behaviour are followed as usual (CONNECTTGT, CHUNK10). |
+| **Why** | These are HAProxy's own innovations, still in development. They should reach operators first in HAProxy, credited to the people who designed them, not in a reimplementation built from their unreleased tree. Alcyon is a proof of concept for a C-to-Rust translation; its target is HAProxy 3.6 LTS, which becomes the oracle when it is released (expected around May-June 2027). |
+| **Cost** | A configuration that uses one of these keywords does not load in Alcyon; the matching reg-tests stay red on the board and are listed here, not counted as gaps to close. |
+| **HAProxy** | Has them in 3.5-dev11 and, presumably, in 3.6. |
+| **Revisit if** | 3.6 LTS is released and becomes the oracle: then each keyword here is ported against the released behaviour. |
+| **V&V probe** | A configuration with `http-hardening` in `global` or `curve2name` in a sample expression is refused at load with the keyword's name; never accepted and ignored. |
