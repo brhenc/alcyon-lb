@@ -11,7 +11,9 @@
 //! RFC 3986 section 6.3.2): a default or empty port is dropped from the authority and every
 //! `Host` is rewritten to match, and an empty path becomes `/`.
 //!
-//! Every expected value below was measured, not derived: `HAProxy` 3.5-dev8-885761-29
+//! Every expected value below was measured, not derived (c32-c35, the empty-host cases and the
+//! `Host` added to a request without one: 3.5-dev11-ce79f339c, 2026-11-17; the rest on
+//! `HAProxy` 3.5-dev8-885761-29
 //! (2026/10/02, `$ALCYON_REFERENCE/haproxy/haproxy`), on 2026-10-03, with
 //! `defaults mode http` / `frontend fe` / `default_backend be` / `backend be` / `server s1`,
 //! sending each request on its own connection and recording the status the client got and
@@ -225,6 +227,27 @@ fn an_authority_that_disagrees_with_host_is_refused() {
     );
 }
 
+/// An absolute `http://` or `https://` target with an empty host is refused whatever the
+/// port, userinfo or `Host` (HAProxy 3.5-dev11, `4aa4c3d27`; dev8 let it through, the c32-c35
+/// of the vtc were 200 then). `reg-tests/http-messaging/h1_absolute_uri_empty_host.vtc` c1-c3
+/// (no `Host`), c4 as the control, and CONNECT with no host before its port
+/// (`h1_validate_connect_authority`, same commit).
+#[test]
+fn an_absolute_target_with_an_empty_host_is_refused() {
+    check(
+        &[
+            bad("e1", "GET", "http:///admin.internal/x", &[]),
+            bad("e2", "GET", "http://:8080/x", &[]),
+            bad("e3", "GET", "https://@/x", &[]),
+            bad("e4", "GET", "HTTPS:///x", &[]),
+            bad("e5", "GET", "http://u@:81/", &[]),
+            bad("e6", "CONNECT", ":443", &[":443"]),
+            ok("e7", "GET", "http://www.example.com:8080/x", &[], "GET http://www.example.com:8080/x HTTP/1.1", &["www.example.com:8080"]),
+        ],
+        "empty host in the authority",
+    );
+}
+
 /// A default port (80 for `http://`, 443 for `https://`) or an empty port is dropped from
 /// an absolute-form target, every `Host` is rewritten to the authority's host, and an
 /// empty path becomes `/`. Userinfo stays in the target (c1). The scheme is matched
@@ -243,10 +266,10 @@ fn an_absolute_target_is_normalised_by_its_scheme() {
             ok("c29", "GET", "http://hostname:/c29", &["hostname:80"], "GET http://hostname/c29 HTTP/1.1", &["hostname"]),
             ok("c30", "GET", "https://hostname:443/c30", &["hostname:"], "GET https://hostname/c30 HTTP/1.1", &["hostname"]),
             ok("c31", "GET", "https://hostname:/c31", &["hostname:443"], "GET https://hostname/c31 HTTP/1.1", &["hostname"]),
-            ok("c32", "GET", "http://:", &[":80"], "GET http:/// HTTP/1.1", &[""]),
-            ok("c33", "GET", "https://:", &[":443"], "GET https:/// HTTP/1.1", &[""]),
-            ok("c34", "GET", "http://:", &[":"], "GET http:/// HTTP/1.1", &[""]),
-            ok("c35", "GET", "https://:", &[":"], "GET https:/// HTTP/1.1", &[""]),
+            bad("c32", "GET", "http://:", &[":80"]),
+            bad("c33", "GET", "https://:", &[":443"]),
+            bad("c34", "GET", "http://:", &[":"]),
+            bad("c35", "GET", "https://:", &[":"]),
             ok("c36", "GET", "http://hostname", &["hostname"], "GET http://hostname/ HTTP/1.1", &["hostname"]),
             ok("c37", "GET", "http://hostname:80", &["hostname"], "GET http://hostname/ HTTP/1.1", &["hostname"]),
             ok("c38", "GET", "http://hostname:", &["hostname"], "GET http://hostname/ HTTP/1.1", &["hostname"]),
@@ -256,7 +279,7 @@ fn an_absolute_target_is_normalised_by_its_scheme() {
             ok("c42", "GET", "http://hostname:81", &["hostname:81"], "GET http://hostname:81/ HTTP/1.1", &["hostname:81"]),
             ok("c43", "GET", "https://hostname:444", &["hostname:444"], "GET https://hostname:444/ HTTP/1.1", &["hostname:444"]),
             ok("c45", "GET", "http://hostname:80?c=d", &["hostname:80"], "GET http://hostname?c=d HTTP/1.1", &["hostname"]),
-            ok("x1", "GET", "http://hostname:80/x1", &[], "GET http://hostname/x1 HTTP/1.1", &[]),
+            ok("x1", "GET", "http://hostname:80/x1", &[], "GET http://hostname/x1 HTTP/1.1", &["hostname"]),
             ok("x4", "GET", "http://HostName:80/x4", &["hostname"], "GET http://HostName/x4 HTTP/1.1", &["HostName"]),
             ok("x5", "OPTIONS", "http://hostname:80", &["hostname"], "OPTIONS http://hostname HTTP/1.1", &["hostname"]),
             ok("x7", "GET", "HTTP://hostname:80/x7", &["hostname"], "GET HTTP://hostname/x7 HTTP/1.1", &["hostname"]),
@@ -301,7 +324,7 @@ fn connect_keeps_its_authority_and_normalises_host() {
             ok("c6b", "CONNECT", "hostname:443", &["hostname"], "CONNECT hostname:443 HTTP/1.1", &["hostname"]),
             ok("c6c", "CONNECT", "hostname:443", &["hostname:"], "CONNECT hostname:443 HTTP/1.1", &["hostname:"]),
             ok("c7", "CONNECT", "hostname:8443", &["hostname:8443"], "CONNECT hostname:8443 HTTP/1.1", &["hostname:8443"]),
-            ok("x10", "CONNECT", "hostname:80", &[], "CONNECT hostname:80 HTTP/1.1", &[]),
+            ok("x10", "CONNECT", "hostname:80", &[], "CONNECT hostname:80 HTTP/1.1", &["hostname"]),
             ok("x14", "CONNECT", "127.0.0.1:443", &["127.0.0.1:443"], "CONNECT 127.0.0.1:443 HTTP/1.1", &["127.0.0.1"]),
             ok("x15", "CONNECT", "[::1]:443", &["[::1]:443"], "CONNECT [::1]:443 HTTP/1.1", &["[::1]"]),
         ],
