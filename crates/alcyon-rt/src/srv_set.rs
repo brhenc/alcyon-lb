@@ -268,24 +268,6 @@ impl<'a> Srv<'a> {
         self.px.srv_set().check_config(self.i)
     }
 
-    /// What it tracks.
-    #[must_use]
-    pub fn track(&self) -> Option<&'a Track> {
-        self.px.srv_set().track(self.i)
-    }
-
-    /// `(wretr, wredis, econ)`.
-    #[must_use]
-    pub fn retr(&self) -> (u64, u64, u64) {
-        self.px.srv_set().retr(self.i)
-    }
-
-    /// Whether the configuration disabled it.
-    #[must_use]
-    pub fn cmaint(&self) -> bool {
-        self.px.server_cmaint(self.i)
-    }
-
     /// Whether it has no address (`SRV_ADMF_RMAINT`).
     #[must_use]
     pub fn rmaint(&self) -> bool {
@@ -344,6 +326,18 @@ mod tests {
 
     fn backend(proxies: &crate::engine::Proxies) -> &Proxy {
         proxies.iter().find(|p| p.name == "b").expect("b")
+    }
+
+    #[test]
+    fn a_check_port_reaches_the_check_of_a_checked_server_only() {
+        let c = "defaults\n    mode http\nbackend b\n    server s1 127.0.0.1:1 check\n    server s2 127.0.0.1:2\nfrontend f\n    bind 127.0.0.1:0\n";
+        let config = alcyon_config::parse_str(c).expect("config");
+        let mut all = crate::engine::Engine::build_shared_state(&config).expect("proxies").into_vec();
+        let p = all.iter_mut().find(|p| p.name == "b").expect("b");
+        p.srv_set_mut().set_check_port(0, 9999);
+        p.srv_set_mut().set_check_port(1, 9999);
+        assert_eq!(p.srv_set().check_config(0).and_then(|c| c.check_port), Some(9999));
+        assert!(p.srv_set().check_config(1).is_none());
     }
 
     #[test]

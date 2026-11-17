@@ -1908,6 +1908,12 @@ impl Proxies {
     pub fn new(proxies: Vec<Proxy>) -> Self {
         Self(Arc::new(proxies))
     }
+
+    /// The proxies back, for a unit test that writes into them as the load does.
+    #[cfg(test)]
+    pub(crate) fn into_vec(self) -> Vec<Proxy> {
+        Arc::try_unwrap(self.0).unwrap_or_else(|a| panic!("{} other holders", Arc::strong_count(&a) - 1))
+    }
 }
 
 impl std::ops::Deref for Proxies {
