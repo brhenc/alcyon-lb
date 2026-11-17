@@ -39,6 +39,7 @@ mod acl_multivalue_converter_failure;
 mod crypto_provider;
 mod return_header_spaces;
 mod prometheus_exporter;
+mod pp_authority;
 mod acl_keyword_families;
 mod acl_pattern_lists;
 mod acl_pattern_tokens;
