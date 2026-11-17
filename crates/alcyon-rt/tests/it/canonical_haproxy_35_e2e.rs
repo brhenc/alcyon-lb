@@ -616,8 +616,8 @@ fn test_canonical_haproxy_35_backup_server_failover() {
         .iter()
         .position(|p| p.name == "be_default")
         .expect("be_default proxy");
-    harness.engine.proxies[be_idx].server_statuses[0].store(ServerStatus::Down as u8, std::sync::atomic::Ordering::Relaxed);
-    harness.engine.proxies[be_idx].server_statuses[1].store(ServerStatus::Down as u8, std::sync::atomic::Ordering::Relaxed);
+    harness.engine.proxies[be_idx].srv_set().status_cell(0).expect("status").store(ServerStatus::Down as u8, std::sync::atomic::Ordering::Relaxed);
+    harness.engine.proxies[be_idx].srv_set().status_cell(1).expect("status").store(ServerStatus::Down as u8, std::sync::atomic::Ordering::Relaxed);
     harness.app01.stop();
     harness.app02.stop();
 

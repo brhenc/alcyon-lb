@@ -30,20 +30,20 @@ backend test_be
     let eng = get_proxy(cfg);
     let proxy = &eng.proxies[0];
     
-    for s in proxy.server_statuses.iter() {
-        s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
+    for i in 0..proxy.srv_set().len() {
+        proxy.srv_set().status_cell(i).expect("status").store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
     
-    proxy.server_actconn[0].store(5, Ordering::Relaxed);
-    proxy.server_actconn[1].store(10, Ordering::Relaxed);
-    proxy.server_actconn[2].store(5, Ordering::Relaxed);
+    proxy.srv_set().actconn_cell(0).expect("actconn").store(5, Ordering::Relaxed);
+    proxy.srv_set().actconn_cell(1).expect("actconn").store(10, Ordering::Relaxed);
+    proxy.srv_set().actconn_cell(2).expect("actconn").store(5, Ordering::Relaxed);
     
     assert_eq!(lb::leastconn(proxy), Some(1));
     
     proxy.set_weight(2, 2);
     assert_eq!(lb::leastconn(proxy), Some(2));
     
-    proxy.server_actconn[1].store(2, Ordering::Relaxed);
+    proxy.srv_set().actconn_cell(1).expect("actconn").store(2, Ordering::Relaxed);
     assert_eq!(lb::leastconn(proxy), Some(1));
 }
 
@@ -58,8 +58,8 @@ backend test_be
     let eng = get_proxy(cfg);
     let proxy = &eng.proxies[0];
     
-    for s in proxy.server_statuses.iter() {
-        s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
+    for i in 0..proxy.srv_set().len() {
+        proxy.srv_set().status_cell(i).expect("status").store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
     
     let mut counts = vec![0; 2];
@@ -85,8 +85,8 @@ backend test_be
     let eng = get_proxy(cfg);
     let proxy = &eng.proxies[0];
     
-    for s in proxy.server_statuses.iter() {
-        s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
+    for i in 0..proxy.srv_set().len() {
+        proxy.srv_set().status_cell(i).expect("status").store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
     
     let uri1 = "/api/v1/users";
@@ -121,8 +121,8 @@ backend test_be
     let eng = get_proxy(cfg);
     let proxy = &eng.proxies[0];
     
-    for s in proxy.server_statuses.iter() {
-        s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
+    for i in 0..proxy.srv_set().len() {
+        proxy.srv_set().status_cell(i).expect("status").store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
     
     let mut counts = vec![0; 3];
@@ -130,7 +130,7 @@ backend test_be
         let uri = format!("/api/v1/resource/{}", i);
         // Drive the engine's real selection path -- not lb::balance_uri
         let target = proxy.select_server_with_key(None, Some(&uri)).unwrap();
-        let idx = proxy.servers.position(target).unwrap();
+        let idx = proxy.srv_set().slot_of_addr(target).unwrap();
         counts[idx] += 1;
     }
     
@@ -156,13 +156,13 @@ backend test_be
     let eng = get_proxy(cfg);
     let proxy = &eng.proxies[0];
 
-    for s in proxy.server_statuses.iter() {
-        s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
+    for i in 0..proxy.srv_set().len() {
+        proxy.srv_set().status_cell(i).expect("status").store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
 
     for _ in 0..20 {
         let target = proxy.select_server_with_key(None, None).unwrap();
-        assert_eq!(target, proxy.servers.at(0), "balance first must always pick the earliest server with a free slot");
+        assert_eq!(target, proxy.srv_set().addr_at(0), "balance first must always pick the earliest server with a free slot");
     }
 }
 
@@ -181,13 +181,13 @@ backend test_be
     let eng = get_proxy(cfg);
     let proxy = &eng.proxies[0];
 
-    for s in proxy.server_statuses.iter() {
-        s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
+    for i in 0..proxy.srv_set().len() {
+        proxy.srv_set().status_cell(i).expect("status").store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
-    proxy.server_actconn[0].store(1, Ordering::Relaxed); // s1 (index 0) is full
+    proxy.srv_set().actconn_cell(0).expect("actconn").store(1, Ordering::Relaxed); // s1 (index 0) is full
 
     let target = proxy.select_server_with_key(None, None).unwrap();
-    assert_eq!(target, proxy.servers.at(1), "a full earlier server must be skipped in favour of the next one");
+    assert_eq!(target, proxy.srv_set().addr_at(1), "a full earlier server must be skipped in favour of the next one");
 }
 
 /// Verified against the reference binary: three real HTTP servers behind `balance random`,
@@ -207,14 +207,14 @@ backend test_be
     let eng = get_proxy(cfg);
     let proxy = &eng.proxies[0];
 
-    for s in proxy.server_statuses.iter() {
-        s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
+    for i in 0..proxy.srv_set().len() {
+        proxy.srv_set().status_cell(i).expect("status").store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
 
     let mut counts = vec![0; 3];
     for _ in 0..300 {
         let target = proxy.select_server_with_key(None, None).unwrap();
-        let idx = proxy.servers.position(target).unwrap();
+        let idx = proxy.srv_set().slot_of_addr(target).unwrap();
         counts[idx] += 1;
     }
 
@@ -238,14 +238,14 @@ backend test_be
     let eng = get_proxy(cfg);
     let proxy = &eng.proxies[0];
 
-    for s in proxy.server_statuses.iter() {
-        s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
+    for i in 0..proxy.srv_set().len() {
+        proxy.srv_set().status_cell(i).expect("status").store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
-    proxy.server_actconn[0].store(1, Ordering::Relaxed); // s1 is full
+    proxy.srv_set().actconn_cell(0).expect("actconn").store(1, Ordering::Relaxed); // s1 is full
 
     for _ in 0..50 {
         let target = proxy.select_server_with_key(None, None).unwrap();
-        assert_eq!(target, proxy.servers.at(1), "a saturated server must never be drawn");
+        assert_eq!(target, proxy.srv_set().addr_at(1), "a saturated server must never be drawn");
     }
 }
 
@@ -266,24 +266,24 @@ backend test_be
 ";
     let eng = get_proxy(cfg);
     let proxy = &eng.proxies[0];
-    for s in proxy.server_statuses.iter() {
-        s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
+    for i in 0..proxy.srv_set().len() {
+        proxy.srv_set().status_cell(i).expect("status").store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
 
     let uri = "/test-url";
     let natural = proxy.select_server_with_key(None, Some(uri)).unwrap();
-    let natural_idx = proxy.servers.position(natural).unwrap();
+    let natural_idx = proxy.srv_set().slot_of_addr(natural).unwrap();
 
     // Saturate the natural target and confirm the ring moves to the other server.
-    proxy.server_actconn[natural_idx].store(1, Ordering::Relaxed);
+    proxy.srv_set().actconn_cell(natural_idx).expect("actconn").store(1, Ordering::Relaxed);
     let other_idx = 1 - natural_idx;
     let target = proxy.select_server_with_key(None, Some(uri)).unwrap();
-    assert_eq!(target, proxy.servers.at(other_idx), "hash-preserve-affinity maxconn must skip a full natural target");
+    assert_eq!(target, proxy.srv_set().addr_at(other_idx), "hash-preserve-affinity maxconn must skip a full natural target");
 }
 
 fn all_up(proxy: &engine::Proxy) {
-    for s in proxy.server_statuses.iter() {
-        s.store(check::ServerStatus::Up as u8, Ordering::Relaxed);
+    for i in 0..proxy.srv_set().len() {
+        proxy.srv_set().status_cell(i).expect("status").store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
 }
 
@@ -298,13 +298,13 @@ fn random_and_first_fall_back_to_the_first_backup_only() {
         ));
         let proxy = &eng.proxies[0];
         all_up(proxy);
-        proxy.server_statuses[0].store(check::ServerStatus::Down as u8, Ordering::Relaxed);
+        proxy.srv_set().status_cell(0).expect("status").store(check::ServerStatus::Down as u8, Ordering::Relaxed);
         for _ in 0..50 {
-            assert_eq!(proxy.select_server_with_key(None, None), Some(proxy.servers.at(1)), "balance {algo}");
+            assert_eq!(proxy.select_server_with_key(None, None), Some(proxy.srv_set().addr_at(1)), "balance {algo}");
         }
         // And nothing at all once the backups are down too.
-        proxy.server_statuses[1].store(check::ServerStatus::Down as u8, Ordering::Relaxed);
-        proxy.server_statuses[2].store(check::ServerStatus::Down as u8, Ordering::Relaxed);
+        proxy.srv_set().status_cell(1).expect("status").store(check::ServerStatus::Down as u8, Ordering::Relaxed);
+        proxy.srv_set().status_cell(2).expect("status").store(check::ServerStatus::Down as u8, Ordering::Relaxed);
         assert_eq!(proxy.select_server_with_key(None, None), None, "balance {algo}");
     }
 }
@@ -316,8 +316,8 @@ fn random_draws_prefer_the_less_loaded_server() {
     let eng = get_proxy("backend b\n    balance random(10)\n    server s1 127.0.0.1:8001\n    server s2 127.0.0.1:8002\n");
     let proxy = &eng.proxies[0];
     all_up(proxy);
-    proxy.server_actconn[0].store(50, Ordering::Relaxed);
-    let to_s2 = (0..1000).filter(|_| proxy.select_server_with_key(None, None) == Some(proxy.servers.at(1))).count();
+    proxy.srv_set().actconn_cell(0).expect("actconn").store(50, Ordering::Relaxed);
+    let to_s2 = (0..1000).filter(|_| proxy.select_server_with_key(None, None) == Some(proxy.srv_set().addr_at(1))).count();
     assert!(to_s2 > 950, "{to_s2}/1000 to the idle server");
 }
 
@@ -332,17 +332,17 @@ fn runtime_maxconn_and_weight_reach_the_fallback_selections() {
         ));
         let proxy = &eng.proxies[0];
         all_up(proxy);
-        assert!(proxy.server_maxconn.set(0, Some(1)));
-        proxy.server_actconn[0].store(1, Ordering::Relaxed);
+        assert!(proxy.srv_set().set_maxconn(0, Some(1)));
+        proxy.srv_set().actconn_cell(0).expect("actconn").store(1, Ordering::Relaxed);
         for _ in 0..10 {
-            assert_eq!(proxy.select_server_with_key(None, None), Some(proxy.servers.at(1)), "balance {algo}");
-            assert_eq!(proxy.select_server(), Some(proxy.servers.at(1)), "balance {algo}");
+            assert_eq!(proxy.select_server_with_key(None, None), Some(proxy.srv_set().addr_at(1)), "balance {algo}");
+            assert_eq!(proxy.select_server(), Some(proxy.srv_set().addr_at(1)), "balance {algo}");
         }
-        proxy.server_actconn[0].store(0, Ordering::Relaxed);
+        proxy.srv_set().actconn_cell(0).expect("actconn").store(0, Ordering::Relaxed);
         proxy.set_weight(1, 0);
         assert_eq!(proxy.initial_weight(1), 1);
         for _ in 0..10 {
-            assert_eq!(proxy.select_server_with_key(None, None), Some(proxy.servers.at(0)), "balance {algo}");
+            assert_eq!(proxy.select_server_with_key(None, None), Some(proxy.srv_set().addr_at(0)), "balance {algo}");
         }
     }
 }

@@ -70,7 +70,7 @@ backend be_test
     let _ = server_thread.join();
 
     // The backend answering 500 MUST be marked DOWN
-    let status = ServerStatus::from(engine.proxies[0].server_statuses[0].load(Ordering::Relaxed));
+    let status = ServerStatus::from(engine.proxies[0].srv_set().status_cell(0).expect("status").load(Ordering::Relaxed));
     assert_eq!(
         status,
         ServerStatus::Down,

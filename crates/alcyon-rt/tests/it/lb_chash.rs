@@ -49,8 +49,8 @@ const S3_FULL: [(&str, &str); 6] = [
 fn engine(extra: &str, servers: &str) -> Engine {
     let cfg = format!("backend be\n    mode http\n    balance uri\n    hash-type consistent\n{extra}{servers}");
     let mut engine = Engine::new(&alcyon_config::parse_str(&cfg).expect("parse"), 64).expect("engine");
-    for s in engine.proxies[0].server_statuses.iter() {
-        s.store(ServerStatus::Up as u8, Ordering::Relaxed);
+    for i in 0..engine.proxies[0].srv_set().len() {
+        engine.proxies[0].srv_set().status_cell(i).expect("status").store(ServerStatus::Up as u8, Ordering::Relaxed);
     }
     engine
 }
@@ -58,8 +58,8 @@ fn engine(extra: &str, servers: &str) -> Engine {
 fn pick(engine: &mut Engine, uri: &str) -> Option<String> {
     let proxy = &engine.proxies[0];
     let addr = proxy.select_server_with_key(None, Some(uri))?;
-    let idx = proxy.servers.position(addr).expect("a configured server");
-    Some(proxy.server_ids[idx].to_string())
+    let idx = proxy.srv_set().slot_of_addr(addr).expect("a configured server");
+    Some(proxy.srv_set().name_at(idx).expect("name").to_string())
 }
 
 fn assert_choices(engine: &mut Engine, expected: &[(&str, &str)]) {
@@ -77,10 +77,10 @@ fn every_key_lands_where_haproxy_puts_it() {
 #[test]
 fn a_server_going_down_moves_only_its_own_keys() {
     let mut e = engine("", SERVERS);
-    e.proxies[0].server_statuses[2].store(ServerStatus::Down as u8, Ordering::Relaxed);
+    e.proxies[0].srv_set().status_cell(2).expect("status").store(ServerStatus::Down as u8, Ordering::Relaxed);
     assert_choices(&mut e, &S3_DOWN);
     // And back: the ring is rebuilt from who is up, not patched.
-    e.proxies[0].server_statuses[2].store(ServerStatus::Up as u8, Ordering::Relaxed);
+    e.proxies[0].srv_set().status_cell(2).expect("status").store(ServerStatus::Up as u8, Ordering::Relaxed);
     assert_choices(&mut e, &ALL_UP);
 }
 
@@ -89,7 +89,7 @@ fn a_full_server_s_keys_walk_round_the_ring_under_maxconn_affinity() {
     let servers = SERVERS.replace("27101", "27101 maxconn 1").replace("27102 weight 3", "27102 weight 3 maxconn 1")
         .replace("27103", "27103 maxconn 1").replace("27104 weight 2", "27104 weight 2 maxconn 1");
     let mut e = engine("    hash-preserve-affinity maxconn\n", &servers);
-    e.proxies[0].server_actconn[2].store(1, Ordering::Relaxed);
+    e.proxies[0].srv_set().actconn_cell(2).expect("actconn").store(1, Ordering::Relaxed);
     assert_choices(&mut e, &S3_FULL);
 }
 
@@ -102,7 +102,7 @@ fn without_a_server_queue_always_walks_off_a_full_server_rather_than_exceed_maxc
     let servers = SERVERS.replace("27103", "27103 maxconn 1");
     let mut e = engine("", &servers);
     assert_eq!(pick(&mut e, "/test-url").as_deref(), Some("s3"));
-    e.proxies[0].server_actconn[2].store(1, Ordering::Relaxed);
+    e.proxies[0].srv_set().actconn_cell(2).expect("actconn").store(1, Ordering::Relaxed);
     assert_eq!(pick(&mut e, "/test-url").as_deref(), Some("s1"));
 }
 
@@ -113,7 +113,7 @@ fn with_no_active_server_up_the_first_backup_takes_every_key() {
         "",
         "    server a 127.0.0.1:27101\n    server b1 127.0.0.1:27102 backup\n    server b2 127.0.0.1:27103 backup\n",
     );
-    e.proxies[0].server_statuses[0].store(ServerStatus::Down as u8, Ordering::Relaxed);
+    e.proxies[0].srv_set().status_cell(0).expect("status").store(ServerStatus::Down as u8, Ordering::Relaxed);
     for (u, _) in ALL_UP {
         assert_eq!(pick(&mut e, u).as_deref(), Some("b1"), "{u}");
     }
@@ -122,8 +122,8 @@ fn with_no_active_server_up_the_first_backup_takes_every_key() {
 #[test]
 fn with_no_server_up_there_is_no_server() {
     let mut e = engine("", SERVERS);
-    for s in e.proxies[0].server_statuses.iter() {
-        s.store(ServerStatus::Down as u8, Ordering::Relaxed);
+    for i in 0..e.proxies[0].srv_set().len() {
+        e.proxies[0].srv_set().status_cell(i).expect("status").store(ServerStatus::Down as u8, Ordering::Relaxed);
     }
     assert_eq!(pick(&mut e, "/a"), None);
 }

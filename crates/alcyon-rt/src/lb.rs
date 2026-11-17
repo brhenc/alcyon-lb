@@ -48,19 +48,19 @@ pub(crate) fn lb_poisoned(fwrr: &Fwrr, chash: &ChashRing) -> bool {
 #[must_use]
 pub fn is_server_available(proxy: &Proxy, idx: usize) -> bool {
     // The server a retry has just left, while a redispatch looks for another one.
-    if idx >= proxy.servers.len() || avoided(proxy, idx) {
+    if idx >= proxy.srv_set().len() || avoided(proxy, idx) {
         return false;
     }
-    if let Some(status) = proxy.server_statuses.get(idx) {
+    if let Some(status) = proxy.srv_set().status_cell(idx) {
         if status.load(Ordering::Relaxed) != ServerStatus::Up as u8 {
             return false;
         }
     } else {
         return false;
     }
-    if let Some(mc) = proxy.server_maxconn.get(idx) {
+    if let Some(mc) = proxy.srv_set().maxconn_at(idx) {
         if mc > 0 {
-            let act = proxy.server_actconn.get(idx).map_or(0, |a| a.load(Ordering::Relaxed));
+            let act = proxy.srv_set().actconn_at(idx);
             if act >= mc {
                 return false;
             }
@@ -75,7 +75,7 @@ pub fn is_server_available(proxy: &Proxy, idx: usize) -> bool {
 #[inline]
 #[must_use]
 fn is_selectable(proxy: &Proxy, idx: usize) -> bool {
-    is_server_available(proxy, idx) && proxy.server_weights.get(idx).unwrap_or(1) > 0
+    is_server_available(proxy, idx) && proxy.srv_set().weight_at(idx).unwrap_or(1) > 0
 }
 
 /// Determines whether a server at `idx` is UP, ignoring its connection load. Used to build
@@ -84,21 +84,18 @@ fn is_selectable(proxy: &Proxy, idx: usize) -> bool {
 /// skipped afterwards.
 #[inline]
 fn is_server_up(proxy: &Proxy, idx: usize) -> bool {
-    proxy
-        .server_statuses
-        .get(idx)
-        .is_some_and(|status| status.load(Ordering::Relaxed) == ServerStatus::Up as u8)
+    proxy.srv_set().status_at(idx) == Some(ServerStatus::Up as u8)
 }
 
 /// Whether some server is UP, not avoided and taking balanced traffic, but at its `maxconn`.
 #[must_use]
 pub fn any_full(proxy: &Proxy) -> bool {
-    (0..proxy.servers.len()).any(|idx| {
+    (0..proxy.srv_set().len()).any(|idx| {
         is_server_up(proxy, idx)
             && !avoided(proxy, idx)
-            && proxy.server_weights.get(idx).unwrap_or(1) > 0
-            && proxy.server_maxconn.get(idx).is_some_and(|mc| {
-                mc > 0 && proxy.server_actconn.get(idx).map_or(0, |a| a.load(Ordering::Relaxed)) >= mc
+            && proxy.srv_set().weight_at(idx).unwrap_or(1) > 0
+            && proxy.srv_set().maxconn_at(idx).is_some_and(|mc| {
+                mc > 0 && proxy.srv_set().actconn_at(idx) >= mc
             })
     })
 }
@@ -108,7 +105,7 @@ pub fn any_full(proxy: &Proxy) -> bool {
 /// `recount_servers`; Alcyon refuses `option allbackups`, which would use them all).
 #[must_use]
 pub fn first_backup(proxy: &Proxy) -> Option<usize> {
-    (0..proxy.servers.len()).find(|&idx| proxy.server_backups.get(idx).copied().unwrap_or(false) && is_selectable(proxy, idx))
+    (0..proxy.srv_set().len()).find(|&idx| proxy.srv_set().backup_at(idx) && is_selectable(proxy, idx))
 }
 
 /// `balance roundrobin`: HAProxy's fast weighted round-robin (`fwrr_get_next_server`,
@@ -191,9 +188,9 @@ fn tree_insert(tree: &mut Vec<(u32, usize)>, key: u32, idx: usize) {
 impl FwrrState {
     /// The weight server `idx` counts for in the window.
     fn eweight(proxy: &Proxy, idx: usize) -> u32 {
-        let backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
-        let up = proxy.server_statuses.get(idx).is_some_and(|s| s.load(Ordering::Relaxed) == ServerStatus::Up as u8);
-        let w = proxy.server_weights.get(idx).unwrap_or(1).min(256);
+        let backup = proxy.srv_set().backup_at(idx);
+        let up = proxy.srv_set().status_cell(idx).is_some_and(|s| s.load(Ordering::Relaxed) == ServerStatus::Up as u8);
+        let w = proxy.srv_set().weight_at(idx).unwrap_or(1).min(256);
         if backup || !up { 0 } else { w * BE_WEIGHT_SCALE }
     }
 
@@ -201,7 +198,7 @@ impl FwrrState {
     /// (`fwrr_init_server_groups`: every usable server in `init`, in declaration order).
     fn sync(&mut self, proxy: &Proxy) {
         alcyon_sample::work::note(alcyon_sample::work::Op::LbSync, 1);
-        let n = proxy.servers.len();
+        let n = proxy.srv_set().len();
         if self.built_from.len() != n {
             self.rebuild((0..n).map(|i| Self::eweight(proxy, i)));
             return;
@@ -408,7 +405,7 @@ pub fn round_robin(proxy: &Proxy) -> Option<usize> {
     // ones that balance only.
     let st = guard.get_or_insert_with(Box::default);
     let generation = proxy.fwrr.1.load(Ordering::Acquire);
-    if st.generation != generation || st.built_from.len() != proxy.servers.len() {
+    if st.generation != generation || st.built_from.len() != proxy.srv_set().len() {
         st.generation = generation;
         st.sync(proxy);
     }
@@ -420,8 +417,8 @@ pub fn round_robin(proxy: &Proxy) -> Option<usize> {
 /// Falls back to backup servers, in declaration order, if no primary server qualifies.
 #[must_use]
 pub fn first(proxy: &Proxy) -> Option<usize> {
-    for idx in 0..proxy.servers.len() {
-        let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
+    for idx in 0..proxy.srv_set().len() {
+        let is_backup = proxy.srv_set().backup_at(idx);
         if !is_backup && is_selectable(proxy, idx) {
             return Some(idx);
         }
@@ -465,9 +462,9 @@ pub(crate) fn next_random_u64() -> u64 {
 /// `random` and `static-rr` draw from. Walked in place on each pick, never collected: a
 /// pick allocates nothing.
 fn usable_primaries(proxy: &Proxy) -> impl Iterator<Item = (usize, u32)> + '_ {
-    (0..proxy.servers.len())
-        .filter(|&idx| !proxy.server_backups.get(idx).copied().unwrap_or(false) && is_selectable(proxy, idx))
-        .map(|idx| (idx, proxy.server_weights.get(idx).unwrap_or(1).max(1)))
+    (0..proxy.srv_set().len())
+        .filter(|&idx| !proxy.srv_set().backup_at(idx) && is_selectable(proxy, idx))
+        .map(|idx| (idx, proxy.srv_set().weight_at(idx).unwrap_or(1).max(1)))
 }
 
 /// The server holding position `pos` when the usable active servers are laid end to end,
@@ -506,10 +503,10 @@ pub fn random(proxy: &Proxy, draws: u32) -> Option<usize> {
         if candidate == best {
             continue;
         }
-        let best_weight = u64::from(proxy.server_weights.get(best).unwrap_or(1).max(1));
-        let cand_weight = u64::from(proxy.server_weights.get(candidate).unwrap_or(1).max(1));
-        let best_load = u64::from(proxy.server_actconn.get(best).map_or(0, |a| a.load(Ordering::Relaxed)));
-        let cand_load = u64::from(proxy.server_actconn.get(candidate).map_or(0, |a| a.load(Ordering::Relaxed)));
+        let best_weight = u64::from(proxy.srv_set().weight_at(best).unwrap_or(1).max(1));
+        let cand_weight = u64::from(proxy.srv_set().weight_at(candidate).unwrap_or(1).max(1));
+        let best_load = u64::from(proxy.srv_set().actconn_at(best));
+        let cand_load = u64::from(proxy.srv_set().actconn_at(candidate));
         // Cross-multiplied comparison of (load / weight): keep whichever is less loaded
         // relative to its own capacity.
         if cand_load.saturating_mul(best_weight) > best_load.saturating_mul(cand_weight) {
@@ -530,11 +527,11 @@ pub fn leastconn(proxy: &Proxy) -> Option<usize> {
     let mut best_load_metric = (u64::MAX, 1u64); // (load * other_weight, weight)
 
     // First pass: try primary (non-backup) servers
-    for idx in 0..proxy.servers.len() {
-        let is_backup = proxy.server_backups.get(idx).copied().unwrap_or(false);
+    for idx in 0..proxy.srv_set().len() {
+        let is_backup = proxy.srv_set().backup_at(idx);
         if !is_backup && is_selectable(proxy, idx) {
-            let conn = u64::from(proxy.server_actconn.get(idx).map_or(0, |a| a.load(Ordering::Relaxed)));
-            let weight = u64::from(proxy.server_weights.get(idx).unwrap_or(1).max(1));
+            let conn = u64::from(proxy.srv_set().actconn_at(idx));
+            let weight = u64::from(proxy.srv_set().weight_at(idx).unwrap_or(1).max(1));
 
             // Load metric comparison: (conn + 1) / weight vs (best_conn + 1) / best_weight
             // Cross-multiplied: (conn + 1) * best_weight vs (best_conn + 1) * weight
@@ -694,7 +691,7 @@ struct WeightMap {
 
 impl WeightMap {
     fn rebuild(&mut self, proxy: &Proxy, in_map: impl Fn(usize) -> u32) {
-        let n = proxy.servers.len();
+        let n = proxy.srv_set().len();
         self.built_from.clear();
         self.built_from.extend((0..n).map(&in_map));
         let gcd = weight_gcd(proxy);
@@ -738,8 +735,8 @@ impl WeightMap {
 /// as HAProxy skips them looking for the first non-zero one.
 fn weight_gcd(proxy: &Proxy) -> u32 {
     let mut g = 0u32;
-    for idx in 0..proxy.servers.len() {
-        let w = proxy.server_weights.get(idx).unwrap_or(0);
+    for idx in 0..proxy.srv_set().len() {
+        let w = proxy.srv_set().weight_at(idx).unwrap_or(0);
         if w == 0 {
             continue;
         }
@@ -916,14 +913,14 @@ impl ChashRing {
     /// was built from. The map is rebuilt, under the write lock, only when that differs.
     fn map_pick(&self, proxy: &Proxy, hash: u32) -> Option<usize> {
         let in_map = |idx: usize| -> u32 {
-            if proxy.server_backups.get(idx).copied().unwrap_or(false) || !is_selectable(proxy, idx) {
+            if proxy.srv_set().backup_at(idx) || !is_selectable(proxy, idx) {
                 0
             } else {
-                proxy.server_weights.get(idx).unwrap_or(1)
+                proxy.srv_set().weight_at(idx).unwrap_or(1)
             }
         };
         let current = |m: &WeightMap| {
-            m.built_from.len() == proxy.servers.len() && m.built_from.iter().enumerate().all(|(i, &w)| w == in_map(i))
+            m.built_from.len() == proxy.srv_set().len() && m.built_from.iter().enumerate().all(|(i, &w)| w == in_map(i))
         };
         {
             let map = self.1.read().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -940,13 +937,13 @@ impl ChashRing {
 
     fn ring<'a>(&'a self, proxy: &Proxy) -> RwLockReadGuard<'a, Ring> {
         let in_ring = |idx: usize| {
-            !proxy.server_backups.get(idx).copied().unwrap_or(false)
+            !proxy.srv_set().backup_at(idx)
                 && is_server_up(proxy, idx)
-                && proxy.server_weights.get(idx).unwrap_or(1) > 0
+                && proxy.srv_set().weight_at(idx).unwrap_or(1) > 0
         };
         {
             let ring = self.0.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if ring.built_from.len() == proxy.servers.len()
+            if ring.built_from.len() == proxy.srv_set().len()
                 && ring.built_from.iter().enumerate().all(|(i, &b)| b == in_ring(i))
             {
                 return ring;
@@ -957,15 +954,15 @@ impl ChashRing {
             let ring = &mut *ring;
             // Into the buffers of the previous build: a rebuild allocates only to grow.
             ring.built_from.clear();
-            ring.built_from.extend((0..proxy.servers.len()).map(in_ring));
+            ring.built_from.extend((0..proxy.srv_set().len()).map(in_ring));
             ring.points.clear();
             ring.servers = 0;
-            for idx in (0..proxy.servers.len()).filter(|&i| ring.built_from[i]) {
+            for idx in (0..proxy.srv_set().len()).filter(|&i| ring.built_from[i]) {
                 // `puid`: the server's id, from 1 in declaration order around the ones
                 // with an `id`; `hash-key id` is the default.
                 let puid = proxy.server_puid(idx);
                 let base = puid.wrapping_mul(SRV_EWGHT_RANGE);
-                let nodes = proxy.server_weights.get(idx).unwrap_or(1) * BE_WEIGHT_SCALE;
+                let nodes = proxy.srv_set().weight_at(idx).unwrap_or(1) * BE_WEIGHT_SCALE;
                 let server = u32::try_from(idx).unwrap_or(u32::MAX);
                 ring.points.extend((0..nodes).map(|j| (full_hash(base.wrapping_add(j)), server)));
                 ring.servers += usize::from(nodes > 0);
@@ -974,8 +971,8 @@ impl ChashRing {
             ring.points.sort_by_key(|&(k, _)| k);
             ring.members = if !ring.points.is_empty() {
                 RingMembers::Active
-            } else if let Some(b) = (0..proxy.servers.len()).find(|&i| {
-                proxy.server_backups.get(i).copied().unwrap_or(false) && is_server_up(proxy, i)
+            } else if let Some(b) = (0..proxy.srv_set().len()).find(|&i| {
+                proxy.srv_set().backup_at(i) && is_server_up(proxy, i)
             }) {
                 RingMembers::FirstBackup(b)
             } else {

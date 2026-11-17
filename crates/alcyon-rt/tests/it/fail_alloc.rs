@@ -211,3 +211,94 @@ fn a_header_name_too_long_for_the_htx_is_400_not_500() {
     let got = String::from_utf8_lossy(&got);
     assert!(got.starts_with("HTTP/1.1 400"), "{}", &got[..got.len().min(80)]);
 }
+
+/// A `mode tcp` proxy picks its server when the connection is accepted, so a session refused
+/// then gives the pick back (`init_client_session`). With `tune.fail-alloc 100` every session is
+/// refused: the connection closes and the process stays up.
+#[test]
+fn a_refused_session_gives_back_the_server_slot_it_was_picked_with() {
+    let be = backend();
+    let dir = tempfile::TempDir::new().expect("dir");
+    let cfg = dir.path().join("c.cfg");
+    let port = common::reserve_port();
+    std::fs::write(
+        &cfg,
+        format!(
+            "global\n\tnbthread 1\n\ttune.fail-alloc 100\n\
+             defaults\n\tmode tcp\n\ttimeout connect 3s\n\ttimeout client 5s\n\ttimeout server 5s\n\n\
+             listen l\n\tbind 127.0.0.1:{port}\n\tserver s1 127.0.0.1:{be} maxconn 1\n"
+        ),
+    )
+    .expect("write config");
+    let mut child = Command::new(binary()).args(["-dMfail"]).arg("-f").arg(&cfg).arg("-db").stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    assert!(common::wait_listening(([127, 0, 0, 1], port).into()), "the proxy never listened on {port}");
+    for _ in 0..20 {
+        let _ = get(port);
+    }
+    let alive = child.try_wait().expect("try_wait").is_none();
+    common::stop(&mut child);
+    assert!(alive, "the process died under refused sessions");
+}
+
+/// A server answering every head `200` with `ok` and keeping the connection.
+fn keepalive_backend() -> u16 {
+    let l = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+    let port = l.local_addr().expect("addr").port();
+    thread::spawn(move || {
+        for c in l.incoming() {
+            let Ok(mut c) = c else { continue };
+            thread::spawn(move || {
+                c.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match c.read(&mut tmp) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                        }
+                    }
+                    buf.clear();
+                    if c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// A second request on a client connection whose server connection is kept (`http-reuse never`),
+/// to a server with a `maxconn`, picks (and counts) its server again while the stream already
+/// holds its own count: the pick's goes back (`else if counted`, T592). Observable: both requests
+/// are answered `200` by a server whose `maxconn` is 1, so the pick's slot did not leak.
+#[test]
+fn the_second_request_of_a_client_connection_to_a_maxconn_server_is_served() {
+    let be = keepalive_backend();
+    let dir = tempfile::TempDir::new().expect("dir");
+    let cfg = dir.path().join("c.cfg");
+    let port = common::reserve_port();
+    std::fs::write(
+        &cfg,
+        format!(
+            "global\n\tnbthread 1\n\
+             defaults\n\tmode http\n\thttp-reuse never\n\ttimeout connect 3s\n\ttimeout client 5s\n\ttimeout server 5s\n\n\
+             listen l\n\tbind 127.0.0.1:{port}\n\tserver s1 127.0.0.1:{be} maxconn 1\n"
+        ),
+    )
+    .expect("write config");
+    let mut child = Command::new(binary()).arg("-f").arg(&cfg).arg("-db").stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn");
+    assert!(common::wait_listening(([127, 0, 0, 1], port).into()), "the proxy never listened on {port}");
+    let mut c = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut answers = 0;
+    for _ in 0..3 {
+        c.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("write");
+        let mut got = [0u8; 256];
+        let n = c.read(&mut got).unwrap_or(0);
+        answers += usize::from(String::from_utf8_lossy(&got[..n]).starts_with("HTTP/1.1 200"));
+    }
+    common::stop(&mut child);
+    assert_eq!(answers, 3);
+}

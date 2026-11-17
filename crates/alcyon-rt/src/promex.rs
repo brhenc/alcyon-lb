@@ -341,7 +341,7 @@ fn produce(cur: &mut Cursor, c: &Ctx<'_>, q: &Query<'_>, info: &crate::stats::In
                             }
                         }
                         Kind::Server => {
-                            if (cur.s as usize) < px.servers.len() {
+                            if (cur.s as usize) < px.srv_set().len() {
                                 found = Some((p_idx, cur.s as usize));
                                 cur.s += 1;
                                 break;

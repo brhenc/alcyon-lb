@@ -209,7 +209,7 @@ fn cli_applet_show_stat_and_admin_server_state_mutations() {
     );
 
     assert_eq!(
-        engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), alcyon_rt::ServerStatus::Maint as u8,
+        engine.proxies[0].srv_set().status_cell(0).expect("status").load(std::sync::atomic::Ordering::Relaxed), alcyon_rt::ServerStatus::Maint as u8,
         "srv1 should be in maintenance after disable server (HAProxy: MAINT)"
     );
 
@@ -227,7 +227,7 @@ fn cli_applet_show_stat_and_admin_server_state_mutations() {
     );
 
     assert_eq!(
-        engine.proxies[0].server_statuses[0].load(std::sync::atomic::Ordering::Relaxed), alcyon_rt::ServerStatus::Up as u8,
+        engine.proxies[0].srv_set().status_cell(0).expect("status").load(std::sync::atomic::Ordering::Relaxed), alcyon_rt::ServerStatus::Up as u8,
         "srv1 should be marked Up after enable server"
     );
 
@@ -245,7 +245,7 @@ fn cli_applet_show_stat_and_admin_server_state_mutations() {
     );
 
     assert_eq!(
-        engine.proxies[0].server_statuses[1].load(std::sync::atomic::Ordering::Relaxed), alcyon_rt::ServerStatus::Drain as u8,
+        engine.proxies[0].srv_set().status_cell(1).expect("status").load(std::sync::atomic::Ordering::Relaxed), alcyon_rt::ServerStatus::Drain as u8,
         "srv2 should be draining (HAProxy: DRAIN) after set server state drain"
     );
 }

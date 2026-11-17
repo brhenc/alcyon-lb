@@ -98,9 +98,9 @@ fn states_engine() -> Engine {
     };
     let engine = Engine::new(&config, 64).expect("Engine::new");
     let be = engine.proxies.iter().find(|p| p.name == "be").expect("be");
-    be.server_statuses[0].store(alcyon_rt::check::ServerStatus::Up as u8, std::sync::atomic::Ordering::Relaxed);
-    be.server_statuses[1].store(alcyon_rt::check::ServerStatus::Maint as u8, std::sync::atomic::Ordering::Relaxed);
-    be.server_statuses[2].store(alcyon_rt::check::ServerStatus::Drain as u8, std::sync::atomic::Ordering::Relaxed);
+    be.srv_set().status_cell(0).expect("status").store(alcyon_rt::check::ServerStatus::Up as u8, std::sync::atomic::Ordering::Relaxed);
+    be.srv_set().status_cell(1).expect("status").store(alcyon_rt::check::ServerStatus::Maint as u8, std::sync::atomic::Ordering::Relaxed);
+    be.srv_set().status_cell(2).expect("status").store(alcyon_rt::check::ServerStatus::Drain as u8, std::sync::atomic::Ordering::Relaxed);
     engine
 }
 

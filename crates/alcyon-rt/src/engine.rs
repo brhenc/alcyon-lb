@@ -15,12 +15,13 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 
 use crate::applet::{AppletArena, AppletContext, CliApplet};
-use crate::check::{self, ServerCheckConfig, ServerCheckState, ServerStatus};
+use crate::check::{self, ServerCheckState, ServerStatus};
 use crate::fdtab::{FdState, FdTab, Interest};
 use crate::listener::Listener;
 use crate::poller::Poller;
 use crate::proxy_state::{ProxiesView, StickView};
 use crate::syslog::SyslogTarget;
+use crate::srv_set::{ServerArrays, ServerIdArrays};
 use alcyon_config::LogLevel;
 use crate::txn::MsgState;
 use crate::proxy::{TcpSession, Timeouts};
@@ -40,7 +41,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use std::time::{Duration, Instant};
 
@@ -661,7 +662,7 @@ impl IdlePool {
     fn ensure_sized(&mut self, proxies: &[Proxy]) {
         if !self.sized {
             self.sized = true;
-            let counts: Vec<usize> = proxies.iter().map(|p| p.servers.len()).collect();
+            let counts: Vec<usize> = proxies.iter().map(|p| p.srv_set().len()).collect();
             self.size(&counts);
         }
     }
@@ -1308,20 +1309,6 @@ mod pool_tests {
     }
 }
 
-/// The idle connection settings of each server of a proxy, and its `proto h2` in `mode http`
-/// (`mode_http`); empty when all are the defaults.
-fn pool_cfgs(servers: &[alcyon_config::Server], mode_http: bool) -> Vec<SrvPoolCfg> {
-    let cfg = |s: &alcyon_config::Server| {
-        let p = s.pool.as_deref().copied().unwrap_or_default();
-        SrvPoolCfg { max_conn: p.max_conn, low_conn: p.low_conn, purge_delay_ms: p.purge_delay, h2: mode_http && s.proto_h2, max_reuse: p.max_reuse }
-    };
-    if servers.iter().all(|s| cfg(s) == SrvPoolCfg::DEFAULT) {
-        Vec::new()
-    } else {
-        servers.iter().map(cfg).collect()
-    }
-}
-
 /// Attaches the freshly connected `srv_fd` to `sess` with the transport the server line
 /// `proxies[be_idx].servers.at(s_idx)` asks for: plaintext, or TLS with the SNI its
 /// expression gives over this stream. This is where `server ... ssl` reaches the data
@@ -1335,7 +1322,7 @@ fn attach_server_to(
     srv_fd: OwnedFd,
     now: Tick,
 ) {
-    let tls = s_idx.and_then(|i| proxies.get(be_idx).and_then(|p| p.server_tls.get(i)).and_then(Option::as_ref));
+    let tls = s_idx.and_then(|i| proxies.get(be_idx).and_then(|p| p.srv_set().tls_at(i)));
     // `proto h2`: h2 from the first byte, over TLS whatever ALPN selects (T540).
     let h2 = s_idx.is_some_and(|i| proxies.get(be_idx).is_some_and(|p| p.ids.server_pool(i).h2));
     let Some(tls) = tls else {
@@ -1348,7 +1335,7 @@ fn attach_server_to(
     };
     let (fe, be) = (&proxies[fe_idx], &proxies[be_idx]);
     let stick = StickView::new(proxies, &sess.tracked_sc);
-    let ip = s_idx.and_then(|i| be.servers.get(i)).map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |a| a.ip());
+    let ip = s_idx.and_then(|i| be.srv_set().addr_get(i)).map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |a| a.ip());
     let mut xprt = tls.with_sni(sample_registry(), &stream_sample_ctx(sess, fe, be, &ProxiesView(proxies), &stick).as_ctx(), |sni| {
         tls.connect(&srv_fd, sni, ip)
     });
@@ -1447,7 +1434,7 @@ fn with_server_sni<R>(
     s_idx: Option<usize>,
     f: impl FnOnce(Option<&str>) -> R,
 ) -> R {
-    let Some(tls) = s_idx.and_then(|i| proxies.get(be_idx).and_then(|p| p.server_tls.get(i)).and_then(Option::as_ref)) else {
+    let Some(tls) = s_idx.and_then(|i| proxies.get(be_idx).and_then(|p| p.srv_set().tls_at(i))) else {
         return f(None);
     };
     let stick = StickView::new(proxies, &sess.tracked_sc);
@@ -1458,31 +1445,6 @@ fn with_server_sni<R>(
 /// with `sni` (a plaintext connection has none); none without a server.
 fn idle_key(addr: SocketAddr, be_idx: usize, s_idx: Option<usize>, sni: Option<String>) -> Option<IdleKey> {
     Some(IdleKey { srv: (be_idx, s_idx?), addr, name: sni })
-}
-
-/// Builds the TLS of every server of `proxy` from its section (`servers`). Done once per
-/// proxy at load, as `ssl_sock_prepare_srv_ctx` is, so a missing `ca-file` or `crt` is
-/// a load error and `alcyon -c` reports it.
-fn attach_server_tls(proxy: &mut Proxy, servers: &[alcyon_config::Server], mode_http: bool, section: &str) -> io::Result<()> {
-    proxy.server_tls.clear();
-    proxy.server_check_tls.clear();
-    // A backend with no TLS server anywhere keeps both maps empty; indexing is by
-    // `.get(i)`, which reads an empty map as "all plaintext". So 60,000 plaintext
-    // servers cost nothing here -- the memory-bound tests stay where they were.
-    if !servers.iter().any(|s| s.ssl.as_deref().is_some_and(|x| x.ssl || x.check_uses_tls(s.check_port))) {
-        return Ok(());
-    }
-    proxy.server_tls.resize_with(servers.len(), || None);
-    proxy.server_check_tls.resize_with(servers.len(), || None);
-    for (i, s) in servers.iter().enumerate() {
-        if !s.ssl.as_deref().is_some_and(|x| x.ssl || x.check_uses_tls(s.check_port)) {
-            continue;
-        }
-        let who = format!("'server {}/{}'", section, s.id);
-        proxy.server_tls[i] = crate::srv_tls::ServerTls::from_server(s, mode_http, &who)?.map(Arc::new);
-        proxy.server_check_tls[i] = crate::srv_tls::CheckTls::from_server(s, &who)?.map(Arc::new);
-    }
-    Ok(())
 }
 
 #[inline]
@@ -1739,7 +1701,7 @@ pub struct ProxyStats {
 impl Proxy {
     /// The proxy's transaction counters, made when first needed.
     pub fn txn_counters(&self) -> &crate::statcnt::ProxyCounters {
-        self.ids.tc.get_or_init(|| Arc::new(crate::statcnt::ProxyCounters::new(self.servers.len())))
+        self.ids.tc.get_or_init(|| Arc::new(crate::statcnt::ProxyCounters::new(self.srv_set().len())))
     }
 }
 
@@ -1791,6 +1753,8 @@ pub(crate) fn link_declaration_order(proxies: &mut [Proxy]) {
 /// What [`Proxy::ids`] holds.
 #[derive(Debug, Clone, Default)]
 pub struct ProxyIdInfo {
+    /// The per-server arrays that are rarely read ([`crate::srv_set`]).
+    pub srv: crate::srv_set::ServerIdArrays,
     /// The proxy's `timeout client`, `server`, `connect`, `queue`, `tunnel`, `tarpit` in ms
     /// (0 unset), as the `*_timeout` fetches report them: converted once, not a stream run
     /// (L3, [`stream_timeouts`]). Here, in the box, because `Proxy` is held to its size.
@@ -1813,47 +1777,8 @@ pub struct ProxyIdInfo {
     pub next_decl: u32,
     /// The section has an `id` of its own (`bk_f_forced_id`).
     pub forced_id: bool,
-    /// Each server's numeric id in this proxy (`puid`), what `srv_id`, the `sid` column of
-    /// `show stat` and `show servers state` report, and where the server's points on a
-    /// consistent-hash ring come from. Empty when no server has an `id` of its own: they are
-    /// then 1, 2, 3...; read it with [`Proxy::server_puid`].
-    pub server_puids: Vec<u32>,
-    /// Whether each server has an `id` of its own (`srv_f_forced_id`); empty when none does
-    /// (see [`Proxy::server_forced_id`]).
-    pub server_forced_ids: Vec<bool>,
-    /// What `show servers state` reports as each server's `srv_check_health` while no check
-    /// runs on it; empty when that is 0 for all (see [`Proxy::server_init_health`]).
-    pub server_init_health: Vec<u32>,
-    /// Which servers the configuration disabled (`SRV_ADMF_CMAINT`, 4 in `show servers state`
-    /// whatever the CLI does afterwards); empty when none (see [`Proxy::server_cmaint`]).
-    pub server_cmaint: Vec<bool>,
-    /// Which servers have no address (`init-addr none` after a name did not resolve, or a
-    /// resolver took it: `SRV_ADMF_RMAINT`, 32 in `show servers state`, `MAINT
-    /// (resolution)`), and the operator's admin state kept under it (`SRV_ADMF_FMAINT`,
-    /// `SRV_ADMF_FDRAIN`): 0 none, else 1 + that [`ServerStatus`]; empty when no server's
-    /// address is a name (see [`Proxy::server_rmaint`], [`Proxy::server_rmaint_kept`]).
-    pub server_rmaint: Arc<Vec<std::sync::atomic::AtomicU8>>,
-    /// The name each server's address was written as (`srv_fqdn`); empty when no server's
-    /// was (see [`Proxy::server_fqdn`]).
-    pub server_fqdns: Vec<Option<Box<str>>>,
-    /// Which servers' `srv_fqdn` the server-state file had changed from the CLI
-    /// (`SRV_ADMF_FQDN_CHANGED`, 64 in `srv_admin_state`; T490); empty when none.
-    pub server_fqdn_changed: Vec<bool>,
-    /// The slots of the servers whose name is an SRV record (`srvrecord`, T487): the target
-    /// each took and `SRV_ADMF_FQDN_CHANGED`; `None` when no server's name is one.
-    pub server_srv: Option<Arc<crate::resolvers::SrvSlots>>,
-    /// Each server's `port` (`check port`, `default-server port`): `srv_agent_port`, and
-    /// `srv_check_port` of a server with no check; empty when no server has one.
-    pub server_check_ports: Vec<u16>,
-    /// Each server's `econ`: the requests whose connection attempts all failed, the last
-    /// attempt having been to that server (see [`count_connect_failure`]).
     /// Each listener's numeric id (`luid`) by `bind` line, as `so_id` reads it.
     pub listener_ids: Vec<u32>,
-    /// `pool-max-conn`, `pool-low-conn` and `pool-purge-delay` per server; empty when every
-    /// server has the defaults (read it with [`ProxyIdInfo::server_pool`]). Read when a
-    /// server connection is released, so it lives here, off `Proxy`'s inline size
-    /// (`struct_sizes.rs`).
-    pub server_pool: Vec<SrvPoolCfg>,
     /// `option http-server-close`: the server connection carries one request. Read when a
     /// request goes to a server and when its response ends.
     pub http_mode: alcyon_config::ast::HttpMode,
@@ -1864,31 +1789,6 @@ pub struct ProxyIdInfo {
     pub checkcache: bool,
     /// `retry-on`, as the `alcyon_config::RE_*` bits: what a failed attempt is retried on.
     pub retry_on: u32,
-    /// What the server-state file gave each server (T490, [`crate::server_state`]): read
-    /// by `init_checks` and by the `lastchg` columns; empty when no file was applied.
-    pub server_restored: Vec<Option<crate::server_state::Restored>>,
-}
-
-impl ProxyIdInfo {
-    /// What the server-state file gave server `i`, if anything.
-    #[must_use]
-    pub fn restored(&self, i: usize) -> Option<&crate::server_state::Restored> {
-        self.server_restored.get(i).and_then(Option::as_ref)
-    }
-
-    /// Seconds since server `i` last changed state (`lastchg`, `srv_time_since_last_change`):
-    /// from its last change, or else from the start plus the age the server-state file gave.
-    #[must_use]
-    pub fn server_lastchg(&self, i: usize, last_chg: u64) -> u64 {
-        crate::statcnt::TxnCounters::since_secs(last_chg)
-            .unwrap_or_else(|| crate::statcnt::now_ms() / 1000 + self.restored(i).map_or(0, |r| r.age_s))
-    }
-
-    /// The idle connection settings of server `i`.
-    #[must_use]
-    pub fn server_pool(&self, i: usize) -> SrvPoolCfg {
-        self.server_pool.get(i).copied().unwrap_or(SrvPoolCfg::DEFAULT)
-    }
 }
 
 /// The proxies, built once by [`Engine::build_shared_state`] and shared by every worker,
@@ -1907,6 +1807,12 @@ impl Proxies {
     #[must_use]
     pub fn new(proxies: Vec<Proxy>) -> Self {
         Self(Arc::new(proxies))
+    }
+
+    /// The proxies back, for a unit test that writes into them as the load does.
+    #[cfg(test)]
+    pub(crate) fn into_vec(self) -> Vec<Proxy> {
+        Arc::try_unwrap(self.0).unwrap_or_else(|a| panic!("{} other holders", Arc::strong_count(&a) - 1))
     }
 }
 
@@ -1938,6 +1844,8 @@ impl Monitor {
 // them into an enum would model a relationship that does not exist.
 #[allow(clippy::struct_excessive_bools)]
 pub struct Proxy {
+    /// The per-server arrays, private to [`crate::srv_set`]: read them through [`Proxy::srv_set`].
+    pub srv: crate::srv_set::ServerArrays,
     /// The proxy's index in the engine's list, which the engine addresses it by. Not the
     /// number `HAProxy` shows for it: that is [`Proxy::iid`].
     pub id: u32,
@@ -1968,20 +1876,6 @@ pub struct Proxy {
     pub cookie: Option<alcyon_config::CookieConfig>,
     pub cliexp: Vec<alcyon_proto::CompiledExp>,
     pub srvexp: Vec<alcyon_proto::CompiledExp>,
-    /// Each server's address, shared by every worker: `set server ... addr` changes it
-    /// in place (T177).
-    pub servers: crate::srv_rt::ServerAddrs,
-    pub server_ids: crate::srv_rt::ServerNames,
-    /// Each server's persistence cookie value (`server ... cookie <value>`). A server
-    /// without one is never chosen by a cookie, not even by its name.
-    pub server_cookies: Vec<Option<Box<str>>>,
-    pub server_statuses: Arc<Vec<AtomicU8>>,
-    /// `track` of each server (`None` for one that tracks nothing; empty when none does).
-    pub server_track: Option<Arc<Vec<Option<crate::track::Track>>>>,
-    /// Each server's current weight and its configured one (`iweight`: what `set server
-    /// ... weight <n>%` is a share of, and the `initial` of `get weight`), shared by every
-    /// worker: `set weight` changes it in place (T177).
-    pub server_weights: crate::srv_rt::ServerWeights,
     pub next_server_idx: Arc<AtomicUsize>,
     /// The proxy's counters: one set, which every worker counts into, as `HAProxy`'s
     /// threads count into their thread group's (`fe_counters_shared.tg[]`; one group by
@@ -2008,34 +1902,6 @@ pub struct Proxy {
     pub acls: alcyon_sample::Acls,
     pub stick_table: Option<Arc<StickTable>>,
     pub stick_rules: Vec<StickRule>,
-    pub server_send_proxy: Vec<bool>,
-    /// `tfo` per server, in `servers` order.
-    pub server_tfo: Vec<bool>,
-    pub server_send_proxy_v2: Vec<bool>,
-    /// `proxy-v2-options unique-id`, per server.
-    pub server_pp_unique_id: Vec<bool>,
-    pub server_backups: Vec<bool>,
-    /// The servers whose name a sample fetch's argument holds (`srv_is_up(be/s)` and the
-    /// other `srv_*`), which `set server <b>/<s> name` refuses to rename: the fetches look the
-    /// server up by name. Empty when no fetch names a server of this proxy.
-    pub server_name_refd: Box<[bool]>,
-    /// Each server's `maxconn`, shared by every worker: `set maxconn server` changes it in
-    /// place (T177).
-    pub server_maxconn: crate::srv_rt::ServerMaxconns,
-    pub server_actconn: Arc<Vec<AtomicU32>>,
-    /// Per server `(wretr, wredis, econ)`: retries on it, redispatches away from it, and
-    /// streams whose last connect attempt, out of retries, failed on it.
-    pub server_retr: Arc<std::sync::Mutex<std::collections::HashMap<usize, (u64, u64, u64)>>>,
-    /// Streams assigned to each server per second (`srv_sess_rate`).
-    pub server_sess_rates: Arc<Vec<RateCtr>>,
-    /// Each server's check parameters, `None` for a server without `check`. The servers
-    /// whose parameters are the same share one (T304: 60,000 servers of a backend hold one).
-    pub server_check_configs: Vec<Option<Arc<ServerCheckConfig>>>,
-    /// Each server's TLS (`server ... ssl`), `None` for a plaintext one (T113).
-    pub server_tls: Vec<Option<Arc<crate::srv_tls::ServerTls>>>,
-    /// Each server's health-check TLS (`check-ssl`, or `ssl` inherited), `None` for
-    /// plaintext checks.
-    pub server_check_tls: Vec<Option<Arc<crate::srv_tls::CheckTls>>>,
     pub tcp_req_conn_rules: Vec<alcyon_config::TcpReqConnRule>,
     pub tcp_req_session_rules: Vec<alcyon_config::TcpReqSessionRule>,
     pub tcp_req_content_rules: Vec<alcyon_config::TcpReqContentRule>,
@@ -2119,132 +1985,11 @@ pub struct Proxy {
 }
 
 impl Proxy {
-    /// Whether server `tfo` applies to the server at `addr`.
-    fn server_tfo_of(&self, addr: SocketAddr) -> bool {
-        self.servers.iter().position(|s| s == addr).and_then(|i| self.server_tfo.get(i).copied()).unwrap_or(false)
-    }
-
     /// The counters this worker counts into (see [`Proxy::stats`]).
     #[inline]
     #[must_use]
     pub fn counters(&self) -> &ProxyStats {
         &self.stats[0]
-    }
-
-    /// `srv_check_health` of the server at `idx` while no check runs on it.
-    #[must_use]
-    pub fn server_init_health(&self, idx: usize) -> u32 {
-        self.ids.server_init_health.get(idx).copied().unwrap_or(0)
-    }
-
-    /// The numeric id of the server at `idx` (`puid`).
-    #[must_use]
-    pub fn server_puid(&self, idx: usize) -> u32 {
-        self.ids.server_puids.get(idx).copied().unwrap_or_else(|| u32::try_from(idx + 1).unwrap_or(u32::MAX))
-    }
-
-    /// Whether the configuration disabled the server at `idx` (`SRV_ADMF_CMAINT`).
-    #[must_use]
-    pub fn server_cmaint(&self, idx: usize) -> bool {
-        self.ids.server_cmaint.get(idx).copied().unwrap_or(false)
-    }
-
-    /// Whether the server at `idx` has no address (`SRV_ADMF_RMAINT`): it stays in
-    /// maintenance whatever the CLI asks, until its resolver gives it one (`crate::resolvers`).
-    #[must_use]
-    pub fn server_rmaint(&self, idx: usize) -> bool {
-        self.ids.server_rmaint.get(idx).is_some_and(|f| f.load(Ordering::Relaxed) != 0)
-    }
-
-    /// The admin state the operator (or `disabled`) gave the server at `idx` while it is in
-    /// `SRV_ADMF_RMAINT`: `Maint`, `Drain` or `Up`, the one it takes back when its name
-    /// resolves again. `Up` when it is not in `RMAINT`.
-    #[must_use]
-    pub fn server_rmaint_kept(&self, idx: usize) -> ServerStatus {
-        match self.ids.server_rmaint.get(idx).map_or(0, |f| f.load(Ordering::Relaxed)) {
-            0 => ServerStatus::Up,
-            v => ServerStatus::from(v - 1),
-        }
-    }
-
-    /// Puts the server at `idx` in `SRV_ADMF_RMAINT`, keeping the admin state `kept`, or takes
-    /// it out with `None` (a server whose address is a name: the others have no flag).
-    pub fn set_server_rmaint(&self, idx: usize, kept: Option<ServerStatus>) {
-        if let Some(f) = self.ids.server_rmaint.get(idx) {
-            f.store(kept.map_or(0, |k| k as u8 + 1), Ordering::Relaxed);
-        }
-    }
-
-    /// The name the address of the server at `idx` was written as, if it was one.
-    #[must_use]
-    pub fn server_fqdn(&self, idx: usize) -> Option<&str> {
-        self.ids.server_fqdns.get(idx).and_then(Option::as_deref)
-    }
-
-    /// Whether the server-state file kept `SRV_ADMF_FQDN_CHANGED` for the server at `idx`.
-    #[must_use]
-    pub fn server_fqdn_changed(&self, idx: usize) -> bool {
-        self.ids.server_fqdn_changed.get(idx).copied().unwrap_or(false)
-            || self.ids.server_srv.as_ref().is_some_and(|v| v.changed.get(idx).is_some_and(|c| c.load(Ordering::Relaxed)))
-    }
-
-    /// The SRV record the server at `idx` is a slot of (`srvrecord`), if any.
-    #[must_use]
-    pub fn server_srv_record(&self, idx: usize) -> Option<&str> {
-        self.ids.server_srv.as_ref().and_then(|v| v.record.get(idx)).and_then(Option::as_deref)
-    }
-
-    /// The target the SRV slot at `idx` took (`srv->hostname`), if it took one.
-    #[must_use]
-    pub fn server_srv_fqdn(&self, idx: usize) -> Option<Box<str>> {
-        self.ids.server_srv.as_ref().and_then(|v| v.fqdn(idx))
-    }
-
-    /// Sets (or clears) the target of the SRV slot at `idx`; setting one raises
-    /// `SRV_ADMF_FQDN_CHANGED`. A server that is no slot has no target to set.
-    pub fn set_server_srv_fqdn(&self, idx: usize, v: Option<&str>) {
-        if let Some(slots) = &self.ids.server_srv {
-            slots.set_fqdn(idx, v);
-        }
-    }
-
-    /// The `resolvers` section the server at `idx` names, if any (`srv->resolvers`).
-    #[must_use]
-    pub fn server_resolvers(&self, idx: usize) -> Option<&str> {
-        self.ids.server_srv.as_ref().and_then(|v| v.section.get(idx)).and_then(Option::as_deref)
-    }
-
-    /// The name the server at `idx` resolves now (`srv->hostname`): the one `set server fqdn`
-    /// or an SRV record gave it, else the configuration's.
-    #[must_use]
-    pub fn server_hostname(&self, idx: usize) -> Option<Box<str>> {
-        self.server_srv_fqdn(idx).or_else(|| self.server_fqdn(idx).map(Box::from))
-    }
-
-    /// `set server fqdn`: the name `srv_fqdn` shows from now on (no flag yet).
-    pub fn set_server_hostname(&self, idx: usize, v: &str) {
-        if let Some(slots) = &self.ids.server_srv {
-            slots.set_name(idx, Some(v));
-        }
-    }
-
-    /// Raises `SRV_ADMF_FQDN_CHANGED` for the server at `idx`.
-    pub fn mark_server_fqdn_changed(&self, idx: usize) {
-        if let Some(c) = self.ids.server_srv.as_ref().and_then(|v| v.changed.get(idx)) {
-            c.store(true, Ordering::Relaxed);
-        }
-    }
-
-    /// The `port` keyword of the server at `idx`, 0 without one (`srv_agent_port`).
-    #[must_use]
-    pub fn server_check_port(&self, idx: usize) -> u16 {
-        self.ids.server_check_ports.get(idx).copied().unwrap_or(0)
-    }
-
-    /// Whether the server at `idx` has an `id` of its own (`SRV_F_FORCED_ID`).
-    #[must_use]
-    pub fn server_forced_id(&self, idx: usize) -> bool {
-        self.ids.server_forced_ids.get(idx).copied().unwrap_or(false)
     }
 
     /// Returns the indices of eligible servers for request routing.
@@ -2261,20 +2006,20 @@ impl Proxy {
 
     /// Whether server `idx` is an active server that takes balanced traffic.
     fn is_eligible_active(&self, idx: usize) -> bool {
-        let is_backup = self.server_backups.get(idx).copied().unwrap_or(false);
+        let is_backup = self.srv_set().backup_at(idx);
         // A weight of 0 (`set server ... weight 0`) takes no balanced traffic.
-        !is_backup && crate::lb::is_server_available(self, idx) && self.server_weights.get(idx).unwrap_or(1) > 0
+        !is_backup && crate::lb::is_server_available(self, idx) && self.srv_set().weight_at(idx).unwrap_or(1) > 0
     }
 
     /// How many servers [`Proxy::eligible_server_indices`] lists, without listing them.
     fn eligible_count(&self) -> usize {
-        let active = (0..self.servers.len()).filter(|&i| self.is_eligible_active(i)).count();
+        let active = (0..self.srv_set().len()).filter(|&i| self.is_eligible_active(i)).count();
         if active > 0 { active } else { usize::from(crate::lb::first_backup(self).is_some()) }
     }
 
     /// The `k`th of [`Proxy::eligible_server_indices`], without listing them.
     fn eligible_nth(&self, k: usize) -> Option<usize> {
-        let mut it = (0..self.servers.len()).filter(|&i| self.is_eligible_active(i));
+        let mut it = (0..self.srv_set().len()).filter(|&i| self.is_eligible_active(i));
         it.nth(k).or_else(|| crate::lb::first_backup(self).filter(|_| k == 0))
     }
 
@@ -2296,8 +2041,8 @@ impl Proxy {
     /// How many queued requests assigned server `idx` can take now (`usize::MAX`: no limit).
     #[must_use]
     pub fn server_headroom(&self, idx: usize) -> usize {
-        self.server_maxconn.get(idx).filter(|&mc| mc > 0).map_or(usize::MAX, |mc| {
-            mc.saturating_sub(self.server_actconn.get(idx).map_or(0, |a| a.load(Ordering::Relaxed))) as usize
+        self.srv_set().maxconn_at(idx).filter(|&mc| mc > 0).map_or(usize::MAX, |mc| {
+            mc.saturating_sub(self.srv_set().actconn_at(idx)) as usize
         })
     }
 
@@ -2309,8 +2054,8 @@ impl Proxy {
     /// (`Some(false)`: the caller counts it when the connection is in use, T224).
     #[must_use]
     pub fn take_server_slot(&self, idx: usize, count_unlimited: bool) -> Option<bool> {
-        let Some(cur) = self.server_actconn.get(idx) else { return Some(false) };
-        match self.server_maxconn.get(idx).filter(|&mc| mc > 0) {
+        let Some(cur) = self.srv_set().actconn_cell(idx) else { return Some(false) };
+        match self.srv_set().maxconn_at(idx).filter(|&mc| mc > 0) {
             None => {
                 if count_unlimited {
                     cur.fetch_add(1, Ordering::Relaxed);
@@ -2331,7 +2076,7 @@ impl Proxy {
         count_unlimited: bool,
         mut pick: impl FnMut() -> Option<(Option<usize>, SocketAddr)>,
     ) -> Option<((Option<usize>, SocketAddr), bool)> {
-        (0..=self.servers.len())
+        (0..=self.srv_set().len())
             .find_map(|_| match pick() {
                 Some((Some(i), addr)) => self.take_server_slot(i, count_unlimited).map(|counted| Some(((Some(i), addr), counted))),
                 other => Some(other.map(|t| (t, false))),
@@ -2350,7 +2095,7 @@ impl Proxy {
     /// [`Proxy::select_server`], with the index of the server picked.
     #[must_use]
     pub fn select_server_idx(&self) -> Option<(Option<usize>, SocketAddr)> {
-        if self.servers.is_empty() {
+        if self.srv_set().is_empty() {
             return self.dispatch.map(|a| (None, a));
         }
         let picked = match self.balance {
@@ -2361,7 +2106,7 @@ impl Proxy {
             BalanceAlgorithm::RoundRobin => crate::lb::round_robin(self),
             _ => self.eligible_count().checked_sub(1).and_then(|last| self.eligible_nth(self.next_server_idx.fetch_add(1, Ordering::Relaxed) % (last + 1))),
         };
-        picked.map(|idx| (Some(idx), self.servers.at(idx))).or(self.dispatch.map(|a| (None, a)))
+        picked.map(|idx| (Some(idx), self.srv_set().addr_at(idx))).or(self.dispatch.map(|a| (None, a)))
     }
 
     /// Selects the target backend server with load balancing algorithm (Source IP hash or round-robin),
@@ -2388,18 +2133,18 @@ impl Proxy {
     /// [`Proxy::select_server_with_key_abs`], with the picked server index.
     #[must_use]
     pub fn select_server_with_key_abs_idx(&self, source_ip: Option<IpAddr>, uri: Option<&str>, abs: Option<&str>) -> Option<(Option<usize>, SocketAddr)> {
-        if self.servers.is_empty() {
+        if self.srv_set().is_empty() {
             return self.dispatch.map(|a| (None, a));
         }
         match self.balance {
             BalanceAlgorithm::Source if source_ip.is_some() => {
                 let ip = source_ip?;
-                crate::lb::balance_source(self, ip).map(|idx| (Some(idx), self.servers.at(idx))).or(self.dispatch.map(|a| (None, a)))
+                crate::lb::balance_source(self, ip).map(|idx| (Some(idx), self.srv_set().addr_at(idx))).or(self.dispatch.map(|a| (None, a)))
             }
             BalanceAlgorithm::Uri => {
                 let u = uri.unwrap_or("/");
                 if let Some(idx) = crate::lb::balance_uri_with_abs(self, u, abs) {
-                    Some((Some(idx), self.servers.at(idx)))
+                    Some((Some(idx), self.srv_set().addr_at(idx)))
                 } else {
                     self.select_server_idx()
                 }
@@ -3573,7 +3318,7 @@ fn stream_log_data<'a>(entry: &'a SessionEntry, proxies: &'a [Proxy], proxy_idx:
         server: entry
             .target_server_idx
             .or_else(|| entry.sess.strm.log.server.map(|i| i.get() as usize - 1))
-            .and_then(|i| proxies.get(entry.srv_backend_idx)?.server_ids.get(i)),
+            .and_then(|i| proxies.get(entry.srv_backend_idx)?.srv_set().name_at(i)),
         term_state: term_state(entry),
         // The stream has let go of its backend when the line is made: only the others count.
         beconn: {
@@ -3582,7 +3327,7 @@ fn stream_log_data<'a>(entry: &'a SessionEntry, proxies: &'a [Proxy], proxy_idx:
         },
         srvconn: entry
             .target_server_idx
-            .and_then(|i| proxies.get(entry.srv_backend_idx)?.server_actconn.get(i))
+            .and_then(|i| proxies.get(entry.srv_backend_idx)?.srv_set().actconn_cell(i))
             .map_or(0, |a| u64::from(a.load(Ordering::Relaxed))),
         ..session_log_data(&entry.sess, fe, be, pid)
     }
@@ -3920,7 +3665,7 @@ fn account_rows<'a, R: crate::statcnt::Rows<'a>>(entry: &SessionEntry, proxies: 
             w.add(&c.lbtot, 1);
         }
         one(c, cold, true);
-        let now_on = sbe.server_actconn.get(i).map_or(0, |a| a.load(Ordering::Relaxed));
+        let now_on = sbe.srv_set().actconn_at(i);
         crate::statcnt::max(&cold.smax, now_on);
     }
 }
@@ -4495,14 +4240,6 @@ fn section_timeouts(
     }
 }
 
-#[allow(clippy::too_many_lines)] // a field-by-field mirror of the section
-/// The state a server starts in: `disabled` is maintenance, which the CLI's `enable
-/// server` ends.
-fn initial_status(s: &alcyon_config::Server, unresolved: bool) -> u8 {
-    // A server whose name did not resolve (`init-addr none`) has no address to send to.
-    if s.disabled || unresolved { ServerStatus::Maint as u8 } else { ServerStatus::Up as u8 }
-}
-
 /// The `bind` lines of a frontend, as the engine opens them: the `bind` shorthand of a
 /// section built in code first, when no line has its address.
 /// Binds the QUIC sockets of all `workers` for every enabled frontend's `quic` bind, before any
@@ -4610,78 +4347,6 @@ fn frontend_binds(frontend: &alcyon_config::FrontendSection) -> Vec<alcyon_confi
     all_binds
 }
 
-/// The ids of the servers for [`Proxy::server_puids`]: empty when none asked for one.
-fn server_puids(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Vec<u32> {
-    if extras.puid.is_empty() { Vec::new() } else { alcyon_config::ast::server_puids(count, &extras.puid) }
-}
-
-/// The values for [`Proxy::server_init_health`]: empty when all are 0.
-fn server_init_health(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Vec<u32> {
-    let mut health = Vec::new();
-    for &(i, h) in &extras.init_health {
-        health.resize(count, 0);
-        if let Some(slot) = health.get_mut(i as usize) {
-            *slot = h;
-        }
-    }
-    health
-}
-
-/// The flags for [`Proxy::server_cmaint`]: empty when no server is `disabled` in the file.
-fn server_cmaint(servers: &[alcyon_config::Server]) -> Vec<bool> {
-    if servers.iter().any(|s| s.disabled) { servers.iter().map(|s| s.disabled).collect() } else { Vec::new() }
-}
-
-/// The flags for [`Proxy::server_rmaint`]: one per server when an address was written as a
-/// name (a resolver may take it away at run time), else empty. A `disabled` server keeps
-/// `Maint` under it.
-fn server_rmaint(servers: &[alcyon_config::Server], extras: &alcyon_config::ast::ServerExtras) -> Arc<Vec<std::sync::atomic::AtomicU8>> {
-    if extras.names.is_empty() {
-        Arc::default()
-    } else {
-        let kept = |i: usize| if servers.get(i).is_some_and(|s| s.disabled) { ServerStatus::Maint } else { ServerStatus::Up };
-        Arc::new((0..servers.len()).map(|i| std::sync::atomic::AtomicU8::new(if extras.unresolved(i) { kept(i) as u8 + 1 } else { 0 })).collect())
-    }
-}
-
-/// The names for [`Proxy::server_fqdn`]: empty when no address was written as one.
-/// An SRV record's name is no `srv_fqdn`: the slot's target is (see [`Proxy::server_srv_fqdn`]).
-fn server_fqdns(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Vec<Option<Box<str>>> {
-    if extras.names.is_empty() { Vec::new() } else { (0..count).map(|i| extras.fqdn(i).filter(|f| !f.starts_with('_')).map(Box::from)).collect() }
-}
-
-/// [`ProxyIdInfo::server_fqdn_changed`].
-fn server_fqdn_changed(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Vec<bool> {
-    let mut out = Vec::new();
-    for n in extras.names.iter().filter(|n| n.fqdn_changed) {
-        out.resize(count, false);
-        if let Some(slot) = out.get_mut(n.index as usize) {
-            *slot = true;
-        }
-    }
-    out
-}
-
-/// [`ProxyIdInfo::server_check_ports`].
-fn server_check_ports(servers: &[alcyon_config::ast::Server]) -> Vec<u16> {
-    if servers.iter().all(|s| s.check_port.is_none()) {
-        return Vec::new();
-    }
-    servers.iter().map(|s| s.check_port.unwrap_or(0)).collect()
-}
-
-/// The flags for [`Proxy::server_forced_ids`]: empty when none asked for an id.
-fn server_forced_ids(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Vec<bool> {
-    let mut forced = Vec::new();
-    for &(i, _) in &extras.puid {
-        forced.resize(count, false);
-        if let Some(slot) = forced.get_mut(i as usize) {
-            *slot = true;
-        }
-    }
-    forced
-}
-
 fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, listen: &alcyon_config::ListenSection) -> io::Result<Proxy> {
     let mut http_req_rules = listen.http_req_rules.clone();
     with_buffered_request(&mut http_req_rules, listen.buffer_request);
@@ -4709,8 +4374,6 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         .as_ref()
         .map(|ast| Arc::new(init_stick_table(ast, &listen.name)));
 
-    let server_count = listen.servers.len();
-    let server_check_configs = server_check_configs(&listen.servers, listen.timeouts.check);
 
     let acls = compile_acls(&listen.acls);
     let rules = Box::new(crate::rule_compiled::Rules {
@@ -4737,17 +4400,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
             decl: ids.decl,
             next_decl: 0,
             forced_id: ids.forced,
-            server_puids: server_puids(listen.servers.len(), &listen.server_extras),
-            server_forced_ids: server_forced_ids(listen.servers.len(), &listen.server_extras),
-            server_init_health: server_init_health(listen.servers.len(), &listen.server_extras),
-            server_cmaint: server_cmaint(&listen.servers),
-            server_rmaint: server_rmaint(&listen.servers, &listen.server_extras),
-            server_fqdns: server_fqdns(listen.servers.len(), &listen.server_extras),
-            server_fqdn_changed: server_fqdn_changed(listen.servers.len(), &listen.server_extras),
-            server_srv: crate::resolvers::SrvSlots::new(listen.servers.len(), &listen.server_extras),
-            server_check_ports: server_check_ports(&listen.servers),
+            srv: ServerIdArrays::build(&listen.servers, &listen.server_extras, listen.mode == Mode::Http),
             listener_ids: alcyon_config::ast::listener_ids(&listen.binds),
-            server_pool: pool_cfgs(&listen.servers, listen.mode == Mode::Http),
             http_mode: listen.http_mode,
             persist: listen.persist,
             checkcache: listen.checkcache,
@@ -4772,16 +4426,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         cookie: listen.cookie.clone(),
         cliexp,
         srvexp,
-        servers: listen.servers.iter().map(|s| s.addr).collect(),
-        server_ids: listen.servers.iter().map(|s| s.id.clone()).collect(),
-        server_cookies: listen.servers.iter().map(|s| s.cookie.as_deref().map(Box::from)).collect(),
-        server_statuses: Arc::new(listen.servers.iter().enumerate().map(|(i, s)| AtomicU8::new(initial_status(s, listen.server_extras.unresolved(i)))).collect()),
-        server_track: None,
-        server_weights: listen
-            .servers
-            .iter()
-            .map(|s| s.weight.unwrap_or(1))
-            .collect(),
+        srv: ServerArrays::build(&listen.servers, &listen.server_extras, listen.timeouts.check),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
         stats: Arc::new(vec![ProxyStats::default()]),
         desc: listen.description.as_deref().map(Box::from),
@@ -4803,19 +4448,6 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         acls,
         stick_table,
         stick_rules: listen.stick_rules.clone(),
-        server_send_proxy: listen.servers.iter().map(|s| s.send_proxy).collect(),
-        server_tfo: listen.servers.iter().map(|s| s.tfo).collect(),
-        server_send_proxy_v2: listen.servers.iter().map(|s| s.send_proxy_v2).collect(),
-        server_pp_unique_id: listen.servers.iter().map(|s| s.proxy_v2_unique_id).collect(),
-        server_backups: listen.servers.iter().map(|s| s.backup).collect(),
-        server_name_refd: Box::default(),
-        server_maxconn: listen.servers.iter().map(|s| s.maxconn).collect(),
-        server_actconn: Arc::new((0..server_count).map(|_| AtomicU32::new(0)).collect()),
-        server_retr: Arc::default(),
-        server_sess_rates: Arc::new((0..server_count).map(|_| RateCtr::default()).collect()),
-        server_check_configs,
-        server_tls: Vec::new(),
-        server_check_tls: Vec::new(),
         tcp_req_conn_rules: listen.tcp_req_conn_rules.clone(),
         tcp_req_session_rules: listen.tcp_req_session_rules.clone(),
         tcp_req_content_rules,
@@ -4895,9 +4527,6 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
             decl: ids.decl,
             next_decl: 0,
             forced_id: ids.forced,
-            server_puids: Vec::new(),
-            server_forced_ids: Vec::new(),
-            server_init_health: Vec::new(),
             listener_ids: alcyon_config::ast::listener_ids(&frontend_binds(fe)),
             http_mode: fe.http_mode,
             retry_on: alcyon_config::RE_CONN_FAILED,
@@ -4924,12 +4553,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         cookie: None,
         cliexp,
         srvexp: Vec::new(),
-        servers: Vec::new().into(),
-        server_ids: crate::srv_rt::ServerNames::default(),
-        server_cookies: Vec::new(),
-        server_statuses: std::sync::Arc::new(Vec::new()),
-        server_track: None,
-        server_weights: std::iter::empty().collect(),
+        srv: ServerArrays::default(),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
         stats: Arc::new(vec![ProxyStats::default()]),
         desc: fe.description.as_deref().map(Box::from),
@@ -4950,19 +4574,6 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         acls,
         stick_table,
         stick_rules: fe.stick_rules.clone(),
-        server_send_proxy: Vec::new(),
-        server_tfo: Vec::new(),
-        server_send_proxy_v2: Vec::new(),
-        server_pp_unique_id: Vec::new(),
-        server_backups: Vec::new(),
-        server_name_refd: Box::default(),
-        server_maxconn: std::iter::empty().collect(),
-        server_actconn: std::sync::Arc::new(Vec::new()),
-        server_retr: Arc::default(),
-        server_sess_rates: std::sync::Arc::new(Vec::new()),
-        server_check_configs: Vec::new(),
-        server_tls: Vec::new(),
-        server_check_tls: Vec::new(),
         tcp_req_conn_rules: fe.tcp_req_conn_rules.clone(),
         tcp_req_session_rules: fe.tcp_req_session_rules.clone(),
         tcp_req_content_rules,
@@ -5018,8 +4629,6 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         .as_ref()
         .map(|ast| Arc::new(init_stick_table(ast, &be.name)));
 
-    let server_count = be.servers.len();
-    let server_check_configs = server_check_configs(&be.servers, be.timeouts.check);
 
     let acls = compile_acls(&be.acls);
     let rules = Box::new(crate::rule_compiled::Rules {
@@ -5046,17 +4655,8 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
             decl: ids.decl,
             next_decl: 0,
             forced_id: ids.forced,
-            server_puids: server_puids(be.servers.len(), &be.server_extras),
-            server_forced_ids: server_forced_ids(be.servers.len(), &be.server_extras),
-            server_init_health: server_init_health(be.servers.len(), &be.server_extras),
-            server_cmaint: server_cmaint(&be.servers),
-            server_rmaint: server_rmaint(&be.servers, &be.server_extras),
-            server_fqdns: server_fqdns(be.servers.len(), &be.server_extras),
-            server_fqdn_changed: server_fqdn_changed(be.servers.len(), &be.server_extras),
-            server_srv: crate::resolvers::SrvSlots::new(be.servers.len(), &be.server_extras),
-            server_check_ports: server_check_ports(&be.servers),
+            srv: ServerIdArrays::build(&be.servers, &be.server_extras, be.mode == Mode::Http),
             listener_ids: Vec::new(),
-            server_pool: pool_cfgs(&be.servers, be.mode == Mode::Http),
             http_mode: be.http_mode,
             persist: be.persist,
             checkcache: be.checkcache,
@@ -5081,12 +4681,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         cookie: be.cookie.clone(),
         cliexp: Vec::new(),
         srvexp,
-        servers: be.servers.iter().map(|s| s.addr).collect(),
-        server_ids: be.servers.iter().map(|s| s.id.clone()).collect(),
-        server_cookies: be.servers.iter().map(|s| s.cookie.as_deref().map(Box::from)).collect(),
-        server_statuses: Arc::new(be.servers.iter().enumerate().map(|(i, s)| AtomicU8::new(initial_status(s, be.server_extras.unresolved(i)))).collect()),
-        server_track: None,
-        server_weights: be.servers.iter().map(|s| s.weight.unwrap_or(1)).collect(),
+        srv: ServerArrays::build(&be.servers, &be.server_extras, be.timeouts.check),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
         stats: Arc::new(vec![ProxyStats::default()]),
         desc: be.description.as_deref().map(Box::from),
@@ -5108,19 +4703,6 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         acls,
         stick_table,
         stick_rules: be.stick_rules.clone(),
-        server_send_proxy: be.servers.iter().map(|s| s.send_proxy).collect(),
-        server_tfo: be.servers.iter().map(|s| s.tfo).collect(),
-        server_send_proxy_v2: be.servers.iter().map(|s| s.send_proxy_v2).collect(),
-        server_pp_unique_id: be.servers.iter().map(|s| s.proxy_v2_unique_id).collect(),
-        server_backups: be.servers.iter().map(|s| s.backup).collect(),
-        server_name_refd: Box::default(),
-        server_maxconn: be.servers.iter().map(|s| s.maxconn).collect(),
-        server_actconn: Arc::new((0..server_count).map(|_| AtomicU32::new(0)).collect()),
-        server_retr: Arc::default(),
-        server_sess_rates: Arc::new((0..server_count).map(|_| RateCtr::default()).collect()),
-        server_check_configs,
-        server_tls: Vec::new(),
-        server_check_tls: Vec::new(),
         tcp_req_conn_rules: Vec::new(),
         tcp_req_session_rules: Vec::new(),
         tcp_req_content_rules: be.tcp_req_content_rules.clone(),
@@ -5157,61 +4739,20 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
     })
 }
 
-/// The check parameters of each server of a section (`inter`, `fastinter`, `downinter`,
-/// `rise`, `fall`, and `timeout check` or else `inter`): one shared copy for each run of
-/// servers that have the same, which is every server of a backend whose `server` lines
-/// differ only by name and address.
-fn server_check_configs(servers: &[alcyon_config::ast::Server], check_timeout: Option<Duration>) -> Vec<Option<Arc<ServerCheckConfig>>> {
-    let mut last: Option<Arc<ServerCheckConfig>> = None;
-    servers
-        .iter()
-        .map(|s| {
-            if !s.check {
-                return None;
-            }
-            let mut cfg = ServerCheckConfig::default();
-            if let Some(inter) = s.inter {
-                cfg.inter = inter;
-            }
-            cfg.check_port = s.check_port;
-            cfg.h2 = s.check_proto.map_or(s.proto_h2, |p| p == "h2");
-            cfg.fastinter_ms = s.fastinter_ms();
-            cfg.downinter_ms = s.downinter_ms();
-            if let Some(fall) = s.fall {
-                cfg.fall = fall;
-            }
-            if let Some(rise) = s.rise {
-                cfg.rise = rise;
-            }
-            if let Some(chk_timeout) = check_timeout {
-                cfg.timeout = chk_timeout;
-            } else if let Some(inter) = s.inter {
-                cfg.timeout = inter;
-            }
-            let shared = match last.take() {
-                Some(prev) if *prev == cfg => prev,
-                _ => Arc::new(cfg),
-            };
-            last = Some(Arc::clone(&shared));
-            Some(shared)
-        })
-        .collect()
-}
-
 fn init_checks(proxies: &[Proxy], scheduler: &mut Scheduler, now: Tick) -> Vec<ServerCheckState> {
-    let mut checks = Vec::with_capacity(proxies.iter().map(|p| p.server_check_configs.iter().flatten().count()).sum());
+    let mut checks = Vec::with_capacity(proxies.iter().map(|p| p.srv_set().checked_count()).sum());
     // One task and one timer per check.
     scheduler.reserve(checks.capacity());
     for (proxy_idx, proxy) in proxies.iter().enumerate() {
-        for (server_idx, srv_addr) in proxy.servers.iter().enumerate() {
-            let Some(check_cfg) = proxy.server_check_configs.get(server_idx).and_then(Clone::clone) else {
+        for (server_idx, srv_addr) in proxy.srv_set().addrs().enumerate() {
+            let Some(check_cfg) = proxy.srv_set().check_config(server_idx).cloned() else {
                 continue;
             };
             let mut check = ServerCheckState::new(proxy_idx, server_idx, srv_addr, check_cfg, now);
-            check.tls = proxy.server_check_tls.get(server_idx).cloned().flatten();
+            check.tls = proxy.srv_set().check_tls_at(server_idx).cloned();
             if let Some(r) = proxy.ids.restored(server_idx) {
                 // What the server-state file said (T490), already in `server_statuses`.
-                let published = proxy.server_statuses.get(server_idx).map_or(0, |s| s.load(Ordering::Relaxed));
+                let published = proxy.srv_set().status_cell(server_idx).map_or(0, |s| s.load(Ordering::Relaxed));
                 check.status = if published == crate::check::DRAIN_DOWN { ServerStatus::Down } else { ServerStatus::from(published) };
                 check.admin = r.admin;
                 check.health = r.health;
@@ -5220,7 +4761,7 @@ fn init_checks(proxies: &[Proxy], scheduler: &mut Scheduler, now: Tick) -> Vec<S
                     check.last_status_code = code;
                     check.last_status_desc = desc;
                 }
-            } else if proxy.server_statuses.get(server_idx).is_some_and(|s| s.load(Ordering::Relaxed) == ServerStatus::Maint as u8) {
+            } else if proxy.srv_set().status_cell(server_idx).is_some_and(|s| s.load(Ordering::Relaxed) == ServerStatus::Maint as u8) {
                 // A `disabled` server stays in maintenance whatever its checks find.
                 check.set_admin_status(ServerStatus::Maint);
             }
@@ -5409,13 +4950,13 @@ impl Engine {
     let ids = config.proxy_ids();
     for (i, listen) in config.listens.iter().enumerate().filter(|(_, l)| !l.disabled) {
         let mut p = init_proxy_from_listen(proxies.len(), ids.listens[i], listen)?;
-        attach_server_tls(&mut p, &listen.servers, listen.mode == Mode::Http, &listen.name)?;
+        p.srv_set_mut().attach_tls(&listen.servers, listen.mode == Mode::Http, &listen.name)?;
         proxies.push(p);
     }
     for (i, backend) in config.backends.iter().enumerate() {
         if !backend.disabled {
             let mut p = init_proxy_from_backend(proxies.len(), ids.backends[i], backend)?;
-            attach_server_tls(&mut p, &backend.servers, backend.mode == Mode::Http, &backend.name)?;
+            p.srv_set_mut().attach_tls(&backend.servers, backend.mode == Mode::Http, &backend.name)?;
             proxies.push(p);
         }
     }
@@ -5465,11 +5006,8 @@ impl Engine {
     }
     for (px, srv) in &server_refs {
         let Some(p) = proxies.iter_mut().find(|p| p.has_backend && p.name == *px) else { continue };
-        let Some(i) = p.server_ids.iter().position(|s| s == srv) else { continue };
-        if p.server_name_refd.is_empty() {
-            p.server_name_refd = vec![false; p.server_ids.len()].into_boxed_slice();
-        }
-        p.server_name_refd[i] = true;
+        let Some(i) = p.srv_set().find(srv).map(|s| s.index()) else { continue };
+        p.srv_set_mut().mark_name_refd(i);
     }
     crate::track::attach(&mut proxies, config);
     link_declaration_order(&mut proxies);
@@ -6482,7 +6020,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     // keyword acts.
                     let proxies = &self.proxies;
                     self.idle_backend_pool.purge(inst, |(be, s)| {
-                        proxies.get(be).and_then(|p| p.server_actconn.get(s)).map_or(0, |a| a.load(Ordering::Relaxed))
+                        proxies.get(be).and_then(|p| p.srv_set().actconn_cell(s)).map_or(0, |a| a.load(Ordering::Relaxed))
                     });
                     self.housekeeping.purge_at = None;
                     continue;
@@ -8627,15 +8165,13 @@ fn register_new_session(
 
     let proxy = &engine.proxies[proxy_idx];
 
-    let target_server_idx = target_addr.and_then(|t| proxy.servers.iter().position(|s| s == t));
+    let target_server_idx = target_addr.and_then(|t| proxy.srv_set().slot_of_addr(t));
     if target_addr.is_some() {
         count_connect(&engine.proxies, proxy_idx, target_server_idx, false);
     }
     // A balanced pick counted its server when it took the slot (`init_client_session`).
     if let Some(idx) = target_server_idx.filter(|_| !sess.lb_picked) {
-        if idx < proxy.server_actconn.len() {
-            proxy.server_actconn[idx].fetch_add(1, Ordering::Relaxed);
-        }
+        proxy.srv_set().actconn_inc(idx);
     }
 
     sess.strm.log.server = target_server_idx.and_then(crate::txnlog::server_slot);
@@ -8675,9 +8211,7 @@ fn register_new_session(
         parked: false,
     })) else {
         if let Some(idx) = target_server_idx {
-            if idx < proxy.server_actconn.len() {
-                proxy.server_actconn[idx].fetch_sub(1, Ordering::Relaxed);
-            }
+            proxy.srv_set().actconn_dec(idx);
         }
         return;
     };
@@ -8687,9 +8221,7 @@ fn register_new_session(
         .create(WorkKind::new(Kind::Stream, session_idx))
     else {
         if let Some(idx) = target_server_idx {
-            if idx < proxy.server_actconn.len() {
-                proxy.server_actconn[idx].fetch_sub(1, Ordering::Relaxed);
-            }
+            proxy.srv_set().actconn_dec(idx);
         }
         engine.sessions.free(session_idx);
         return;
@@ -8816,19 +8348,15 @@ fn prepend_send_proxy(fe: &Proxy, proxy: &Proxy, proxies: &[Proxy], sess: &mut T
 /// The PROXY header this stream sends ahead of its request to `target_addr`, if that
 /// server line asks for one.
 fn proxy_header(fe: &Proxy, proxy: &Proxy, proxies: &[Proxy], sess: &mut TcpSession, target_addr: SocketAddr) -> Option<Vec<u8>> {
-    let idx = proxy.servers.iter().position(|s| s == target_addr)?;
-    let send_v2 = proxy
-        .server_send_proxy_v2
-        .get(idx)
-        .copied()
-        .unwrap_or(false);
-    let send_v1 = proxy.server_send_proxy.get(idx).copied().unwrap_or(false);
+    let idx = proxy.srv_set().slot_of_addr(target_addr)?;
+    let send_v2 = proxy.srv_set().send_proxy_v2_at(idx);
+    let send_v1 = proxy.srv_set().send_proxy_at(idx);
 
     if send_v2 {
         let src = sess.client_addr;
         let dst = sess.server_addr.or(Some(proxy.addr));
         let mut tlv_data = sess.proxy_info.as_ref().map_or_else(Vec::new, |p| p.tlv_data.clone());
-        if proxy.server_pp_unique_id.get(idx).copied().unwrap_or(false) {
+        if proxy.srv_set().pp_unique_id_at(idx) {
             // `PP2_TYPE_UNIQUE_ID`: the stream's ID, built now if nothing has yet (a TCP
             // stream), from the frontend's format; without one, an empty TLV
             // (`stream_generate_unique_id`, `make_proxy_line_v2`).
@@ -9012,11 +8540,11 @@ fn init_client_session(
         // A balanced pick takes its server's slot with it (T590), on the index the session
         // is counted on (`register_new_session`); `use-server` is counted there.
         target_addr = match use_server {
-            Some(i) => Some(proxy.servers.at(i)),
+            Some(i) => Some(proxy.srv_set().addr_at(i)),
             None => proxy
                 .pick_and_take(true, || {
                     let a = proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()), sess.req_uri.as_deref())?;
-                    Some((proxy.servers.iter().position(|s| s == a), a))
+                    Some((proxy.srv_set().slot_of_addr(a), a))
                 })
                 .map(|((_, a), _)| a),
         };
@@ -9028,11 +8556,11 @@ fn init_client_session(
             sess.set_backend_timeouts(proxy);
 
             sess.target_addr = Some(target);
-            let connected = raw::connect_opts(connect_addr(target, sess.server_addr), proxy.server_tfo_of(target))
+            let connected = raw::connect_opts(connect_addr(target, sess.server_addr), proxy.srv_set().tfo_of(target))
                 .inspect_err(|e| sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)));
             if let Ok((srv_fd, immediate)) = connected {
                 let sfd = srv_fd.as_raw_fd();
-                let s_idx = proxy.servers.iter().position(|s| s == target);
+                let s_idx = proxy.srv_set().slot_of_addr(target);
                 attach_server_to(&mut sess, proxies, proxy_idx, proxy_idx, s_idx, srv_fd, now);
                 srv_raw_fd = Some(sfd);
                 if immediate {
@@ -9042,8 +8570,8 @@ fn init_client_session(
                 // Out of retries already: `econ` counts this one (`server_connect_failed`
                 // counts the failures of the retries).
                 proxy.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
-                if let Some(i) = proxy.servers.iter().position(|s| s == target) {
-                    proxy.server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(i).or_default().2 += 1;
+                if let Some(i) = proxy.srv_set().slot_of_addr(target) {
+                    proxy.srv_set().bump_retr(i, (0, 0, 1));
                 }
                 sess.srv_state = ScState::Error;
             }
@@ -9080,8 +8608,8 @@ pub fn shutdown_session_entry(
         }
         if let Some(s_idx) = entry.target_server_idx.filter(|_| !entry.sess.srv_uncounted()) {
             let be_idx = entry.srv_backend_idx;
-            if be_idx < proxies.len() && s_idx < proxies[be_idx].server_actconn.len() {
-                proxies[be_idx].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
+            if proxies.len() > be_idx {
+                proxies[be_idx].srv_set().actconn_dec(s_idx);
             }
         }
     }
@@ -9110,7 +8638,7 @@ pub fn shutdown_matching_sessions<'a>(
         if let Some(s_id) = server_id {
             let matches_server = entry
                 .target_server_idx
-                .and_then(|idx| proxies[be_idx].server_ids.get(idx))
+                .and_then(|idx| proxies[be_idx].srv_set().name_at(idx))
                 .is_some_and(|sid| sid == s_id);
             if !matches_server {
                 continue;
@@ -9133,12 +8661,12 @@ fn clear_one(p: &Proxy) {
     if let Some(t) = p.ids.rows.as_deref() {
         t.clear(p.id as usize, true);
     }
-    p.server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+    p.srv_set().retr_clear();
 }
 
 /// `clear counters server`: the counters of server `idx` of `p`, and no other.
 pub fn clear_server_counters(p: &Proxy, idx: usize) {
-    p.server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&idx);
+    p.srv_set().retr_remove(idx);
 }
 
 /// `clear counters` without `all`: the maxima of every proxy, nothing else.
@@ -9179,10 +8707,7 @@ pub fn set_health_check_enabled(
     let Some(proxy_idx) = proxies.iter().position(|p| p.name == px_name) else {
         return false;
     };
-    let Some(server_idx) = proxies[proxy_idx]
-        .server_ids
-        .iter()
-        .position(|sid| sid == sv_name)
+    let Some(server_idx) = proxies[proxy_idx].srv_set().find(sv_name).map(|s| s.index())
     else {
         return false;
     };
@@ -9206,10 +8731,10 @@ pub fn set_proxy_maxconn(
         return false;
     };
     if let Some(sv) = sv_name {
-        let Some(s_idx) = proxy.server_ids.iter().position(|sid| sid == sv) else {
+        let Some(s_idx) = proxy.srv_set().find(sv).map(|s| s.index()) else {
             return false;
         };
-        proxy.server_maxconn.set(s_idx, Some(val))
+        proxy.srv_set().set_maxconn(s_idx, Some(val))
     } else {
         // The listeners of the frontend read the same value (`Listener::is_full`).
         proxy.maxconn.set(val);
@@ -9339,7 +8864,7 @@ fn server_actconn_add(entry: &SessionEntry, proxies: &[Proxy], add: bool) {
     if entry.actconn_reclaimed {
         return;
     }
-    if let Some(a) = entry.target_server_idx.and_then(|i| proxies.get(entry.srv_backend_idx)?.server_actconn.get(i)) {
+    if let Some(a) = entry.target_server_idx.and_then(|i| proxies.get(entry.srv_backend_idx)?.srv_set().actconn_cell(i)) {
         if add {
             a.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -9394,7 +8919,7 @@ fn release_server(
             .and_then(|addr| idle_key(addr, entry.srv_backend_idx, entry.target_server_idx, xprt.sni().map(str::to_string)));
         if let (Some(key), Some(be)) = (key, proxies.get(entry.srv_backend_idx)) {
             let cfg = be.ids.server_pool(key.srv.1);
-            let used = be.server_actconn.get(key.srv.1).map_or(0, |a| a.load(Ordering::Relaxed)) + u32::from(parked);
+            let used = be.srv_set().actconn_at(key.srv.1) + u32::from(parked);
             // Out of use before it counts as idle (`srv_add_to_idle_list` moves it from one
             // count to the other at once): in use and idle at the same time, another worker
             // weighing a release saw one connection more than there were and closed one the
@@ -9453,8 +8978,8 @@ fn release_server(
 fn release_server_actconn(entry: &SessionEntry, proxies: &[Proxy], parked: bool) {
     let be = entry.srv_backend_idx;
     if let Some(s_idx) = entry.target_server_idx {
-        if !entry.actconn_reclaimed && !parked && be < proxies.len() && s_idx < proxies[be].server_actconn.len() {
-            proxies[be].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
+        if !entry.actconn_reclaimed && !parked && proxies.len() > be {
+            proxies[be].srv_set().actconn_dec(s_idx);
         }
     }
 }
@@ -9776,7 +9301,7 @@ fn close_http_session(
 /// whether it then reuses a connection to it or opens one (`srv_sess_rate`).
 fn count_server_session(proxies: &[Proxy], be_idx: usize, idx: Option<usize>) {
     let px = &proxies[be_idx];
-    idx.and_then(|idx| px.server_sess_rates.get(idx)).inspect(|rate| rate.tick());
+    idx.and_then(|idx| px.srv_set().sess_rate_at(idx)).inspect(|rate| rate.tick());
 }
 
 /// `SessionEntry::be_counted` of a stream no backend counts.
@@ -9890,7 +9415,7 @@ fn server_connect_failed(
             let be = &proxies[entry.srv_backend_idx];
             be.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
             if let Some(i) = entry.target_server_idx {
-                be.server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(i).or_default().2 += 1;
+                be.srv_set().bump_retr(i, (0, 0, 1));
             }
             entry.sess.srv_state = ScState::Error;
             if entry.sess.mode == Mode::Http {
@@ -9945,7 +9470,7 @@ fn retry_server_connect(
     let old_idx = entry.target_server_idx.take();
     let old_be = entry.srv_backend_idx;
     let give_back_old = || {
-        if let Some(a) = old_idx.and_then(|i| proxies.get(old_be)?.server_actconn.get(i)) {
+        if let Some(a) = old_idx.and_then(|i| proxies.get(old_be)?.srv_set().actconn_cell(i)) {
             a.fetch_sub(1, Ordering::Relaxed);
         }
     };
@@ -9967,12 +9492,12 @@ fn retry_server_connect(
         }
     }
     let redispatch = !resuming && be.redisp && {
-        let status_of = |i: usize| be.server_statuses.get(i).map(|s| s.load(Ordering::Relaxed));
+        let status_of = |i: usize| be.srv_set().status_cell(i).map(|s| s.load(Ordering::Relaxed));
         let running = old_idx.is_none_or(|i| {
             status_of(i).is_some_and(|s| s == ServerStatus::Up as u8 || s == ServerStatus::Drain as u8)
         });
-        let active = (0..be.servers.len())
-            .filter(|&i| !be.server_backups.get(i).copied().unwrap_or(false) && status_of(i) == Some(ServerStatus::Up as u8))
+        let active = (0..be.srv_set().len())
+            .filter(|&i| !be.srv_set().backup_at(i) && status_of(i) == Some(ServerStatus::Up as u8))
             .count();
         let hash = matches!(be.balance, BalanceAlgorithm::Source | BalanceAlgorithm::Uri);
         let direct = entry.sess.strm.txn.as_ref().is_some_and(|t| t.ck.direct);
@@ -10012,11 +9537,8 @@ fn retry_server_connect(
     let moved = target.is_some() && entry.sess.target_addr.is_some() && target != entry.sess.target_addr;
     let stats = &proxies[be_idx].counters();
     let count_on_server = |redispatch: bool| {
-        let mut m = proxies[be_idx].server_retr.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         old_idx.into_iter().for_each(|i| {
-            let c = m.entry(i).or_default();
-            c.0 += u64::from(!redispatch);
-            c.1 += u64::from(redispatch);
+            proxies[be_idx].srv_set().bump_retr(i, (u64::from(!redispatch), u64::from(redispatch), 0));
         });
     };
     // `SF_REDISP` is set when the server changed, not when a redispatch was due and the
@@ -10045,7 +9567,7 @@ fn retry_server_connect(
     // The stream leaves the server it held a slot on only for another one (or none); the
     // other one's slot is taken as a pick's (T590). One that another worker filled since the
     // balancer offered it is no server for this attempt, as if none had been offered.
-    let s_idx = target.and_then(|a| proxies[be_idx].servers.iter().position(|s| s == a));
+    let s_idx = target.and_then(|a| proxies[be_idx].srv_set().slot_of_addr(a));
     let moves = target.is_none() || s_idx.is_none() || s_idx != old_idx || be_idx != old_be;
     if moves {
         give_back_old();
@@ -10075,7 +9597,7 @@ fn retry_server_connect(
     maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
     set_target(entry, target_addr);
-    if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].server_tfo_of(target_addr))
+    if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].srv_set().tfo_of(target_addr))
         .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
     {
         let sfd = srv_fd.as_raw_fd();
@@ -10259,8 +9781,8 @@ fn cleanup_done(
         }
         if let Some(s_idx) = entry.target_server_idx.filter(|_| !entry.actconn_reclaimed && !entry.sess.srv_uncounted()) {
             let be_idx = entry.srv_backend_idx;
-            if be_idx < proxies.len() && s_idx < proxies[be_idx].server_actconn.len() {
-                proxies[be_idx].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
+            if proxies.len() > be_idx {
+                proxies[be_idx].srv_set().actconn_dec(s_idx);
             }
         }
         return;
@@ -10276,8 +9798,8 @@ fn cleanup_done(
 
         if let Some(s_idx) = entry.target_server_idx.filter(|_| !entry.sess.srv_uncounted()) {
             let be_idx = entry.srv_backend_idx;
-            if be_idx < proxies.len() && s_idx < proxies[be_idx].server_actconn.len() {
-                proxies[be_idx].server_actconn[s_idx].fetch_sub(1, Ordering::Relaxed);
+            if proxies.len() > be_idx {
+                proxies[be_idx].srv_set().actconn_dec(s_idx);
             }
         }
     }
@@ -10454,7 +9976,7 @@ impl EngineDispatcher<'_> {
                 continue;
             }
             let Some(i) = rc.server else { continue };
-            let st = be.server_statuses.get(i).map_or(ServerStatus::Down, |s| ServerStatus::from(s.load(Ordering::Relaxed)));
+            let st = be.srv_set().status_cell(i).map_or(ServerStatus::Down, |s| ServerStatus::from(s.load(Ordering::Relaxed)));
             if !matches!(st, ServerStatus::Down | ServerStatus::Maint) {
                 return Some(i);
             }
@@ -10506,8 +10028,8 @@ impl EngineDispatcher<'_> {
                 if let Ok(Some(entry)) = tbl.get_entry(&key) {
                     if !assigned {
                         // The server stored by its id, if it is still there and not stopped.
-                        let i = entry.server_id.and_then(|id| (0..be.servers.len()).find(|&i| be.server_puid(i) == id));
-                        let up = |i: usize| be.server_statuses.get(i).is_none_or(|s| !matches!(ServerStatus::from(s.load(Ordering::Relaxed)), ServerStatus::Down | ServerStatus::Maint));
+                        let i = entry.server_id.and_then(|id| (0..be.srv_set().len()).find(|&i| be.server_puid(i) == id));
+                        let up = |i: usize| be.srv_set().status_cell(i).is_none_or(|s| !matches!(ServerStatus::from(s.load(Ordering::Relaxed)), ServerStatus::Down | ServerStatus::Maint));
                         if let Some(i) = i.filter(|&i| be.ids.persist || up(i)) {
                             found = Some(i);
                             assigned = true;
@@ -11359,7 +10881,7 @@ impl EngineDispatcher<'_> {
                 // lists would have (`srv_add_to_idle_list` raising `max_used_conns`).
                 // (`keeps` above holds only with a server, so there is one.)
                 let i = entry.target_server_idx.unwrap_or_default();
-                let used = proxies.get(entry.srv_backend_idx).and_then(|p| p.server_actconn.get(i)).map_or(0, |a| a.load(Ordering::Relaxed));
+                let used = proxies.get(entry.srv_backend_idx).and_then(|p| p.srv_set().actconn_cell(i)).map_or(0, |a| a.load(Ordering::Relaxed));
                 idle_pool.ensure_sized(proxies);
                 idle_pool.note_used((entry.srv_backend_idx, i), used);
                 server_actconn_add(entry, proxies, false);
@@ -12041,7 +11563,7 @@ impl EngineDispatcher<'_> {
             // before the stream's own line (rare: the message is built here, not on the path).
             let checkcache_alert = std::mem::take(&mut entry.sess.strm.log.checkcache_blocked).then(|| {
                 let srv_idx = entry.target_server_idx.or_else(|| entry.sess.strm.log.server.map(|i| i.get() as usize - 1));
-                let srv = srv_idx.and_then(|i| self.proxies.get(entry.srv_backend_idx)?.server_ids.get(i)).map_or("<dispatch>", |s| s);
+                let srv = srv_idx.and_then(|i| self.proxies.get(entry.srv_backend_idx)?.srv_set().name_at(i)).map_or("<dispatch>", |s| s);
                 let be = self.proxies.get(entry.backend_idx).map_or("", |p| p.name.as_str());
                 (entry.backend_idx, format!("Blocking cacheable cookie in response from instance {be}, server {srv}."))
             });
@@ -12379,7 +11901,7 @@ impl EngineDispatcher<'_> {
         let per_proxy = self.proxies.iter().find_map(|p| {
             p.stick_table.as_ref().is_some_and(|t| t.is_poisoned()).then_some("a stick table")
                 .or_else(|| crate::lb::lb_poisoned(&p.fwrr, &p.chash).then_some("a load balancer"))
-                .or_else(|| p.server_retr.is_poisoned().then_some("server retry counters"))
+                .or_else(|| p.srv_set().retr_poisoned().then_some("server retry counters"))
         });
         per_proxy
             .or_else(|| self.idle_backend_pool.poisoned().then_some("the idle server connections"))
@@ -13084,7 +12606,7 @@ impl EngineDispatcher<'_> {
             srv_id: entry.target_server_idx.and_then(|i| u32::try_from(i + 1).ok()),
             srv_name: entry
                 .target_server_idx
-                .and_then(|i| proxies.get(entry.srv_backend_idx)?.server_ids.get(i)),
+                .and_then(|i| proxies.get(entry.srv_backend_idx)?.srv_set().name_at(i)),
             ..Default::default()
         };
         let rh = RepHead {
@@ -13288,7 +12810,7 @@ impl EngineDispatcher<'_> {
             if let Some(cfg) = &proxies[be_idx].cookie {
                 let be = &proxies[be_idx];
                 let target = entry.target_server_idx.filter(|_| entry.srv_backend_idx == be_idx).map(|i| crate::cookie::Target {
-                    value: be.server_cookies.get(i).and_then(Option::as_deref).map(str::as_bytes),
+                    value: be.srv_set().cookie_at(i).map(str::as_bytes),
                 });
                 let method = entry.sess.req_method.as_deref().unwrap_or("");
                 let req = crate::cookie::ReqKind {
@@ -13702,8 +13224,8 @@ impl EngineDispatcher<'_> {
         }
         let mut backend = |name: &str| proxies.iter().position(|p| p.has_backend && p.name == name);
         let mut apply = |p: usize, verb: Verb, name: &str| -> Option<bool> {
-            let s = proxies[p].server_ids.iter().position(|id| id == name)?;
-            let cur = proxies[p].server_statuses.get(s).map_or(0, |a| a.load(Ordering::Relaxed));
+            let s = proxies[p].srv_set().find(name).map(|s| s.index())?;
+            let cur = proxies[p].srv_set().status_cell(s).map_or(0, |a| a.load(Ordering::Relaxed));
             let maint = ServerStatus::from(cur) == ServerStatus::Maint;
             let drain = cur == check::DRAIN_DOWN || cur == ServerStatus::Drain as u8;
             let set = |to: ServerStatus, cause: crate::srvlog::Cause<'_>, checks: &mut [ServerCheckState]| {
@@ -13909,7 +13431,7 @@ impl EngineDispatcher<'_> {
                     for (p_idx, proxy) in proxies.iter().enumerate() {
                         if target_backend.is_none() || target_backend == Some(proxy.name.as_str()) {
                             let mut weight_changes = Vec::new();
-                            for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
+                            for (s_idx, sid) in proxy.srv_set().live().map(|s| (s.index(), s.name())) {
                                 if target_server.is_none() || target_server == Some(sid) {
                                     let new_status = match cmd.action.as_str() {
                                         "ready" | "up" | "enable" => Some(ServerStatus::Up),
@@ -13924,7 +13446,7 @@ impl EngineDispatcher<'_> {
                                         weight_changes.push((s_idx, w));
                                     }
                                     if let Some(mc) = cmd.maxconn {
-                                        proxy.server_maxconn.set(s_idx, Some(mc));
+                                        proxy.srv_set().set_maxconn(s_idx, Some(mc));
                                     }
                                 }
                             }
@@ -15176,7 +14698,7 @@ impl EngineDispatcher<'_> {
         let pick = || be.pick_and_take(false, || be.select_server_with_key_abs_idx(source_ip, entry.sess.req_uri.as_deref(), entry.sess.req_abs()));
         let mut full;
         let target = if let Some(idx) = cookie_server {
-            let t = be.take_server_slot(idx, false).map(|counted| ((Some(idx), be.servers.at(idx)), counted));
+            let t = be.take_server_slot(idx, false).map(|counted| ((Some(idx), be.srv_set().addr_at(idx)), counted));
             full = t.is_none();
             t
         } else {
@@ -15184,7 +14706,7 @@ impl EngineDispatcher<'_> {
             // another worker freed in between: asked again rather than refused (`SRV_STATUS_FULL`
             // is decided under the lock in `HAProxy`). The verdict that queues is the one seen
             // here, not one read again later.
-            let limited = || (0..be.servers.len()).any(|i| be.server_maxconn.get(i).is_some_and(|m| m > 0));
+            let limited = || (0..be.srv_set().len()).any(|i| be.srv_set().maxconn_at(i).is_some_and(|m| m > 0));
             let mut tries = 0..3;
             loop {
                 let t = pick();
@@ -15257,10 +14779,12 @@ impl EngineDispatcher<'_> {
                     if !counted {
                         server_actconn_add(entry, proxies, true);
                     }
-                } else if counted {
-                    if let Some(a) = picked_idx.and_then(|i| proxies[be_idx].server_actconn.get(i)) {
-                        a.fetch_sub(1, Ordering::Relaxed);
-                    }
+                } else {
+                    // Since T592 a connection left attached at a transaction's end is kept
+                    // (`srv_kept`) or parked, so it is uncounted here: a counted pick never
+                    // meets a counted connection. No test reached the old give-back arm
+                    // (probe, 2026-11-17, the whole `it` suite).
+                    debug_assert!(!counted, "a counted pick on a connection that holds its own slot");
                 }
                 entry.sess.server_connected(now);
                 entry.sess.bc_idle = false;
@@ -15316,9 +14840,7 @@ impl EngineDispatcher<'_> {
         // a connection the next burst needed (T224: 9 server connections where 8 serve).
         // A server with a `maxconn` was counted with the pick (T590).
         if let Some(idx) = s_idx.filter(|_| !counted) {
-            if idx < proxies[be_idx].server_actconn.len() {
-                proxies[be_idx].server_actconn[idx].fetch_add(1, Ordering::Relaxed);
-            }
+            proxies[be_idx].srv_set().actconn_inc(idx);
         }
 
         count_connect(proxies, be_idx, s_idx, reused.is_some());
@@ -15360,7 +14882,7 @@ impl EngineDispatcher<'_> {
                     new_interest.writable,
                 );
             }
-        } else if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].server_tfo_of(target_addr))
+        } else if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].srv_set().tfo_of(target_addr))
         .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
     {
             let sfd = srv_fd.as_raw_fd();
@@ -15513,7 +15035,7 @@ impl EngineDispatcher<'_> {
         // whether or not it is full, as before.
         let be = &proxies[be_idx];
         let target = match direct {
-            Some(i) => Some(((Some(i), be.servers.at(i)), false)),
+            Some(i) => Some(((Some(i), be.srv_set().addr_at(i)), false)),
             None => be.pick_and_take(true, || be.select_server_with_key_idx(source_ip, entry.sess.req_uri.as_deref())),
         };
 
@@ -15525,9 +15047,7 @@ impl EngineDispatcher<'_> {
         count_server_session(proxies, be_idx, s_idx);
 
         if let Some(idx) = s_idx.filter(|_| !counted) {
-            if idx < proxies[be_idx].server_actconn.len() {
-                proxies[be_idx].server_actconn[idx].fetch_add(1, Ordering::Relaxed);
-            }
+            proxies[be_idx].srv_set().actconn_inc(idx);
         }
         count_connect(proxies, be_idx, s_idx, false);
         entry.target_server_idx = s_idx;
@@ -15541,7 +15061,7 @@ impl EngineDispatcher<'_> {
         // socket is reported writable on the next poll and completes there. Only INET
         // servers exist (`unix@` is refused at parse time), so no test could reach a
         // separate branch for it.
-        if let Ok((srv_fd, _immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].server_tfo_of(target_addr))
+        if let Ok((srv_fd, _immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].srv_set().tfo_of(target_addr))
         .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
     {
             let sfd = srv_fd.as_raw_fd();
@@ -15599,10 +15119,7 @@ impl EngineDispatcher<'_> {
                 if !proxy.log_health_checks {
                     return None;
                 }
-                let server = proxy
-                    .server_ids
-                    .get(server_idx)
-                    .map_or("?", |s| s);
+                let server = proxy.srv_set().name_at(server_idx).unwrap_or("?");
                 Some(check.log_line(&proxy.name, server, event))
             });
 
@@ -17128,14 +16645,13 @@ fn unix_now() -> i64 {
 fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
     let cfg = be.cookie.as_ref()?;
     // `cur_state != SRV_ST_STOPPED`: a draining server still takes its clients.
-    let servers: Vec<crate::cookie::SrvCookie<'_>> = (0..be.servers.len())
+    let servers: Vec<crate::cookie::SrvCookie<'_>> = (0..be.srv_set().len())
         .map(|i| crate::cookie::SrvCookie {
-            value: be.server_cookies.get(i).and_then(Option::as_deref).map(str::as_bytes),
+            value: be.srv_set().cookie_at(i).map(str::as_bytes),
             persistent: be.ids.persist,
             usable: be
-                .server_statuses
-                .get(i)
-                .map(|s| s.load(Ordering::Relaxed))
+                .srv_set()
+                .status_at(i)
                 .is_some_and(|s| s == ServerStatus::Up as u8 || s == ServerStatus::Drain as u8),
         })
         .collect();
@@ -19138,7 +18654,7 @@ mod actconn_tests {
             }
         }
         let proxies = &engine.proxies;
-        let in_use = |p: &[Proxy]| p.iter().map(|p| p.server_actconn.iter().map(|a| a.load(Ordering::Relaxed)).sum::<u32>()).sum::<u32>();
+        let in_use = |p: &[Proxy]| p.iter().map(|p| (0..p.srv_set().len()).map(|i| p.srv_set().actconn_at(i)).sum::<u32>()).sum::<u32>();
         let (_, entry) = engine.sessions.iter_mut().find(|(_, e)| e.sess.srv_park_exp.is_set()).expect("a parked connection");
         assert_eq!(in_use(proxies), 0, "parked: out of the connections in use");
         server_actconn_add(entry, proxies, true);

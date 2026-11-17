@@ -139,7 +139,7 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &alcyon_config::Server, f: &[&str;
     } else if !fmaint_in_file && cfg_cmaint {
         to_ready(&mut cur);
     }
-    let cfg_iweight = p.server_weights.initial(i).unwrap_or(1);
+    let cfg_iweight = p.initial_weight(i);
     let mut admin = if cur == ServerStatus::Maint as u8 { ServerStatus::Maint } else { ServerStatus::Up };
     // A drain that came from an initial weight of 0 ends once the weight is no longer 0.
     if admin != ServerStatus::Maint && v.admin & 8 != 0 && (v.iweight > 0 || cfg_iweight == 0) {
@@ -157,7 +157,7 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &alcyon_config::Server, f: &[&str;
         cur = ServerStatus::Maint as u8;
         admin = ServerStatus::Maint;
     }
-    let before = p.server_statuses.get(i).map_or(cur, |slot| slot.swap(cur, Ordering::Relaxed));
+    let before = p.srv_set().at(i).and_then(|s| s.swap_status(cur)).unwrap_or(cur);
     p.fwrr.changed();
     // `srv_set_stopped` from the file: written on stderr only, the log is not up yet.
     // (The administrative changes are not: `_srv_update_status_adm` keeps quiet while
@@ -184,20 +184,16 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &alcyon_config::Server, f: &[&str;
     }
     // The CLI's weight is kept unless the configuration's changed.
     if v.iweight == cfg_iweight {
-        p.server_weights.set(i, v.uweight);
+        p.srv_set().at(i).expect("server of the file").set_weight(v.uweight);
         p.fwrr.changed();
     }
     // `i` is a server of the configuration, so of `p.servers`.
-    let addr = p.servers.at(i);
-    p.servers.set(i, std::net::SocketAddr::new(addr.ip(), v.port));
+    let me = p.srv_set().at(i).expect("server of the file");
+    let addr = me.addr().expect("address of a configured server");
+    me.set_addr(std::net::SocketAddr::new(addr.ip(), v.port));
     if !has_check {
         // What `show servers state` prints as the health of a server with no check.
-        let n = p.servers.len();
-        let h = &mut p.ids.server_init_health;
-        if h.len() < n {
-            h.resize(n, 0);
-        }
-        h[i] = health;
+        p.srv_set_mut().set_init_health(i, health);
     }
     let restored = Restored {
         health,
@@ -206,15 +202,10 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &alcyon_config::Server, f: &[&str;
         check_code: if has_check { crate::check::check_status_of(v.check_status) } else { None },
         age_s: u64::try_from(v.age.max(0)).unwrap_or(0),
     };
-    let n = p.servers.len();
-    let slots = &mut p.ids.server_restored;
-    if slots.len() < n {
-        slots.resize(n, None);
-    }
-    slots[i] = Some(restored);
+    p.srv_set_mut().set_restored(i, restored);
     // What Alcyon cannot apply, said rather than dropped. HAProxy turns TLS off when the file
     // says 0 for a server with TLS (a server without has nothing to turn on: no message).
-    let ssl = p.server_tls.get(i).is_some_and(Option::is_some);
+    let ssl = p.srv_set().at(i).is_some_and(|s| s.has_tls());
     if ssl && v.use_ssl == Some(false) {
         partial.push_str(", srv_use_ssl 0 is not applied: Alcyon has no 'set server ssl'");
     }
@@ -233,10 +224,8 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &alcyon_config::Server, f: &[&str;
                 Ok(port) => {
                     // The checks connect there (`srv_update_check_addr_port`); their TLS is
                     // what the configuration made it, as `HAProxy`'s `check.use_ssl`.
-                    if let (Some(port), Some(slot)) = (port, p.server_check_configs.get_mut(i)) {
-                        if let Some(cfg) = slot.as_deref() {
-                            *slot = Some(std::sync::Arc::new(crate::check::ServerCheckConfig { check_port: Some(port), ..cfg.clone() }));
-                        }
+                    if let Some(port) = port {
+                        p.srv_set_mut().set_check_port(i, port);
                     }
                     if v.check_addr.is_some() {
                         partial.push_str(", srv_check_addr is not applied: Alcyon refuses the server keyword 'addr'");

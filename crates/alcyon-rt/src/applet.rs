@@ -18,7 +18,7 @@
 //! - `quit`: closes the session
 
 use crate::check::{ServerCheckState, ServerStatus};
-use crate::engine::{Proxy, SessionArena};
+use crate::engine::SessionArena;
 use crate::fdtab::Interest;
 use crate::mailbox::{Gather, Mailboxes, Msg, QuicSnap, SessFilter, SessSnap};
 use alcyon_sched::task::TaskRef;
@@ -215,22 +215,6 @@ impl CliLevel {
             return Self::Operator;
         }
         Self::Admin
-    }
-}
-
-impl Proxy {
-    /// Server `idx`'s configured weight, whatever it is now.
-    #[must_use]
-    pub fn initial_weight(&self, idx: usize) -> u32 {
-        self.server_weights.initial(idx).unwrap_or(1)
-    }
-
-    /// Changes server `idx`'s current weight, keeping the configured one for
-    /// [`Self::initial_weight`]. The weights are shared: every worker's next balancing
-    /// decision sees it.
-    pub fn set_weight(&self, idx: usize, weight: u32) {
-        self.server_weights.set(idx, weight);
-        self.fwrr.changed();
     }
 }
 
@@ -640,11 +624,12 @@ impl CliApplet {
                 if let Some(target) = be_filter {
                     if p.name != target && p.ids.iid.to_string() != target { continue; }
                 }
-                for (s_idx, s) in p.server_ids.iter().enumerate() {
-                    let rmaint = p.server_rmaint(s_idx);
-                    let addr = p.servers.get(s_idx).filter(|_| !rmaint).map_or_else(|| "-".to_string(), |a| a.ip().to_string());
-                    let port = p.servers.get(s_idx).map_or_else(|| "-".to_string(), |a| a.port().to_string());
-                    let raw = p.server_statuses.get(s_idx).map(|s| s.load(std::sync::atomic::Ordering::Relaxed));
+                for srv in p.srv_set().live() {
+                    let (s_idx, s) = (srv.index(), srv.name());
+                    let rmaint = srv.rmaint();
+                    let addr = srv.addr().filter(|_| !rmaint).map_or_else(|| "-".to_string(), |a| a.ip().to_string());
+                    let port = srv.addr().map_or_else(|| "-".to_string(), |a| a.port().to_string());
+                    let raw = srv.raw_status();
                     let status = raw.map(ServerStatus::from);
                     // srv_op_state: 2 running, 0 stopped (a draining server still runs).
                     let op_state = match status {
@@ -682,7 +667,7 @@ impl CliApplet {
                     // `port` keyword sets too.
                     let agent_port = p.server_check_port(s_idx);
                     let mut check_port = agent_port;
-                    let uweight = p.server_weights.get(s_idx).unwrap_or(1);
+                    let uweight = srv.weight().unwrap_or(1);
                     let iweight = p.initial_weight(s_idx);
                     
                     let mut check_status = 1;
@@ -716,7 +701,7 @@ impl CliApplet {
                         s_idx,
                         p.ids.tc.get().and_then(|c| c.srv.get(s_idx)).map_or(0, |c| c.last_chg.load(std::sync::atomic::Ordering::Relaxed)),
                     );
-                    let use_ssl = u8::from(p.server_tls.get(s_idx).is_some_and(Option::is_some));
+                    let use_ssl = u8::from(srv.has_tls());
 
                     let puid = p.server_puid(s_idx);
                     let bk_forced = u8::from(p.ids.forced_id);
@@ -1333,7 +1318,7 @@ impl CliApplet {
                         }
                         None if name == "server_key" => {
                             // The name of the server `server_id` stands for.
-                            let sname = v.server_id.and_then(|id| (0..proxy.servers.len()).find(|&i| proxy.server_puid(i) == id)).and_then(|i| proxy.server_ids.get(i));
+                            let sname = v.server_id.and_then(|id| proxy.srv_set().by_puid(id)).map(|s| s.name());
                             let _ = write!(out, " server_key={}", sname.map_or("", |s| s));
                         }
                         None => {
@@ -1695,8 +1680,8 @@ impl CliApplet {
         };
         let srv = s
             .srv
-            .and_then(|sv| s.be.and_then(|b| ctx.proxies.get(b)).and_then(|p| p.server_ids.get(sv)))
-            .map_or("<none>", |s| s);
+            .and_then(|sv| s.be.and_then(|b| ctx.proxies.get(b)).and_then(|p| p.srv_set().at(sv)))
+            .map_or("<none>", |s| s.name());
         let src = s.src.map_or_else(|| "unix:1".to_string(), |a| a.to_string());
         let age = i64::try_from(now.saturating_duration_since(s.since).as_secs()).unwrap_or(i64::MAX);
         let scb_state = if s.srv_fd >= 0 || s.src.is_none() { 8 } else { 0 };
@@ -1747,7 +1732,7 @@ impl CliApplet {
             for (p_idx, p) in ctx.proxies.iter().enumerate() {
                 if p.name == px_name {
                     found_px = true;
-                    if let Some(s_idx) = p.server_ids.iter().position(|sid| sid == sv_name) {
+                    if let Some(s_idx) = p.srv_set().find(sv_name).map(|s| s.index()) {
                         found = Some((p_idx, s_idx));
                         break;
                     }
@@ -1842,7 +1827,7 @@ impl CliApplet {
                     match Self::find_server(target, ctx) {
                         Ok((p_idx, s_idx)) => {
                             px_name = ctx.proxies[p_idx].name.clone();
-                            sv = Some(ctx.proxies[p_idx].server_ids[s_idx].to_string());
+                            sv = Some(ctx.proxies[p_idx].srv_set().at(s_idx).expect("server of find_server").name().to_string());
                         }
                         Err(msg) => {
                             self.finish_msg(msg);
@@ -1895,7 +1880,8 @@ impl CliApplet {
         for (p_idx, proxy) in ctx.proxies.iter().enumerate() {
             if proxy.name == px_name {
                 found_px = true;
-                for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
+                for srv in proxy.srv_set().live() {
+                    let (s_idx, sid) = (srv.index(), srv.name());
                     if sid == sv_name {
                         track_changes.push((p_idx, s_idx, ServerStatus::Up));
                         found_sv = true;
@@ -1927,7 +1913,8 @@ impl CliApplet {
         for (p_idx, proxy) in ctx.proxies.iter().enumerate() {
             if proxy.name == px_name {
                 found_px = true;
-                for (s_idx, sid) in proxy.server_ids.iter().enumerate() {
+                for srv in proxy.srv_set().live() {
+                    let (s_idx, sid) = (srv.index(), srv.name());
                     if sid == sv_name {
                         track_changes.push((p_idx, s_idx, ServerStatus::Maint));
                         found_sv = true;
@@ -1991,7 +1978,7 @@ impl CliApplet {
         for (p_idx, proxy) in ctx.proxies.iter().enumerate() {
             if proxy.name == px_name {
                 found_px = true;
-                if let Some(s_idx) = proxy.server_ids.iter().position(|sid| sid == sv_name) {
+                if let Some(s_idx) = proxy.srv_set().find(sv_name).map(|s| s.index()) {
                     return Ok((p_idx, s_idx));
                 }
             }
@@ -2114,7 +2101,7 @@ impl CliApplet {
                     self.finish_msg(&format!("Invalid addr '{ip_s}'"));
                     return;
                 };
-                let old = ctx.proxies[p_idx].servers.at(s_idx);
+                let old = ctx.proxies[p_idx].srv_set().addr_at(s_idx);
                 let mut new_port = old.port();
                 if parts.get(3) == Some(&"port") {
                     let p_s = parts.get(4).copied().unwrap_or("");
@@ -2141,8 +2128,8 @@ impl CliApplet {
                     return;
                 }
                 msg.push_str(" by 'stats socket command'");
-                // `proxy.servers` is where every connection to this server takes its address.
-                ctx.proxies[p_idx].servers.set(s_idx, new);
+                // the server's address is where every connection to this server takes its address.
+                ctx.proxies[p_idx].srv_set().set_addr_at(s_idx, new);
                 if let Some(check) = ctx.checks.iter_mut().find(|c| c.proxy() == p_idx && c.server() == s_idx) {
                     check.addr = new;
                 }
@@ -2209,25 +2196,26 @@ impl CliApplet {
         if new.len() >= 64 {
             return "Server name too long.";
         }
-        let cur_status = px.server_statuses.get(s_idx).map_or(0, |a| a.load(std::sync::atomic::Ordering::Relaxed));
+        let srv = px.srv_set().at(s_idx).expect("server of find_server");
+        let cur_status = srv.raw_status().unwrap_or(0);
         if ServerStatus::from(cur_status) != ServerStatus::Maint {
             return "Server must be in maintenance mode to be renamed (set server <b>/<s> state maint).";
         }
-        let old = &px.server_ids[s_idx];
+        let old = srv.name();
         if px.use_servers.iter().any(|r| r.server == *old)
             || crate::track::is_tracked(ctx.proxies, p_idx, s_idx)
-            || px.server_name_refd.get(s_idx).copied().unwrap_or(false)
+            || srv.name_refd()
         {
             return "Cannot rename: server's name is statically referenced (use-server, track, or sample argument).";
         }
         if old == new {
             return "Server name updated.";
         }
-        if px.server_ids.iter().any(|n| n == new) {
+        if px.srv_set().find(new).is_some() {
             return "A server with the same name already exists in this backend.";
         }
         crate::stderr_line!("[NOTICE]   ({}) : Server {}/{new} renamed from '{old}'.", std::process::id(), px.name);
-        px.server_ids.set(s_idx, new);
+        srv.rename(new);
         "Server name updated."
     }
 
@@ -2236,7 +2224,7 @@ impl CliApplet {
         match Self::find_server(target, ctx) {
             Ok((p_idx, s_idx)) => {
                 let px = &ctx.proxies[p_idx];
-                let w = px.server_weights.get(s_idx).unwrap_or(1);
+                let w = px.srv_set().at(s_idx).and_then(|s| s.weight()).unwrap_or(1);
                 let iw = px.initial_weight(s_idx);
                 self.finish_msg(&format!("{w} (initial {iw})"));
             }

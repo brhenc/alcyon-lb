@@ -416,7 +416,7 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                     let mut total_maint = 0;
 
                     for proxy in proxies {
-                        for status_atomic in proxy.server_statuses.iter() { let status = ServerStatus::from(status_atomic.load(std::sync::atomic::Ordering::Relaxed));
+                        for raw in proxy.srv_set().raw_statuses() { let status = ServerStatus::from(raw);
                             total_servers += 1;
                             match status {
                                 ServerStatus::Up => total_up += 1,
@@ -607,7 +607,7 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                         self.step = H_BE_END;
                         continue;
                     };
-                    if proxy.servers.is_empty() {
+                    if proxy.srv_set().is_empty() {
                         self.p += 1;
                         continue;
                     }
@@ -667,7 +667,8 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                     let p_idx = self.p as usize;
                     let proxy = &proxies[p_idx];
                     let s_idx = self.s as usize;
-                    let Some(srv_addr) = proxy.servers.get(s_idx) else {
+                    let srv = proxy.srv_set().at(s_idx);
+                    let Some(srv_addr) = srv.and_then(|s| s.addr()) else {
                         self.p += 1;
                         self.step = H_BE;
                         out.push_str(
@@ -679,13 +680,12 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                         return true;
                     };
                     self.s += 1;
-                    let srv_id = proxy.server_ids.get(s_idx).map_or("srv", |s| s);
-                    let srv_status = proxy
-                        .server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
-                    let is_backup = proxy.server_backups.get(s_idx).copied().unwrap_or(false);
-                    let weight = proxy.server_weights.get(s_idx).unwrap_or(1);
-                    let srv_maxconn = proxy.server_maxconn.get(s_idx).unwrap_or(0);
-                    let actconn = proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
+                    let srv_id = srv.map_or("srv", |s| s.name());
+                    let srv_status = srv.and_then(|s| s.raw_status()).map_or(ServerStatus::Up, ServerStatus::from);
+                    let is_backup = srv.is_some_and(|s| s.backup());
+                    let weight = srv.and_then(|s| s.weight()).unwrap_or(1);
+                    let srv_maxconn = srv.and_then(|s| s.maxconn()).unwrap_or(0);
+                    let actconn = srv.map_or(0, |s| s.actconn());
 
                     let check_state = check_of(proxy, checks, p_idx, s_idx);
 
@@ -1208,8 +1208,8 @@ impl JsonCursor {
                 let total_bytes_out: u64 = proxies.iter().map(|p| p.stats.iter().map(|s| s.bytes_out.load(Relaxed)).sum::<u64>()).sum();
                 let (mut count_up, mut count_down, mut count_drain, mut count_maint) = (0, 0, 0, 0);
                 for proxy in proxies {
-                    for status_atomic in proxy.server_statuses.iter() {
-                        match ServerStatus::from(status_atomic.load(Relaxed)) {
+                    for raw in proxy.srv_set().raw_statuses() {
+                        match ServerStatus::from(raw) {
                             ServerStatus::Up => count_up += 1,
                             ServerStatus::Down => count_down += 1,
                             ServerStatus::Drain => count_drain += 1,
@@ -1248,7 +1248,7 @@ impl JsonCursor {
             J_SRV => {
                 let p_idx = self.p as usize;
                 let s_idx = self.s as usize;
-                let Some(proxy) = proxies.get(p_idx).filter(|p| s_idx < p.servers.len()) else {
+                let Some(proxy) = proxies.get(p_idx).filter(|p| s_idx < p.srv_set().len()) else {
                     out.push_str("]}");
                     self.p += 1;
                     self.step = J_PX;
@@ -1258,11 +1258,12 @@ impl JsonCursor {
                 if s_idx > 0 {
                     out.push(',');
                 }
-                let srv_id = proxy.server_ids.get(s_idx).map_or("srv", |s| s);
-                let srv_status = proxy.server_statuses.get(s_idx).map_or(ServerStatus::Up, |s| ServerStatus::from(s.load(Relaxed)));
-                let weight = proxy.server_weights.get(s_idx).unwrap_or(1);
-                let srv_maxconn = proxy.server_maxconn.get(s_idx).unwrap_or(0);
-                let actconn = proxy.server_actconn.get(s_idx).map_or(0, |a| a.load(Relaxed));
+                let srv = proxy.srv_set().at(s_idx);
+                let srv_id = srv.map_or("srv", |s| s.name());
+                let srv_status = srv.and_then(|s| s.raw_status()).map_or(ServerStatus::Up, ServerStatus::from);
+                let weight = srv.and_then(|s| s.weight()).unwrap_or(1);
+                let srv_maxconn = srv.and_then(|s| s.maxconn()).unwrap_or(0);
+                let actconn = srv.map_or(0, |s| s.actconn());
                 let check_state = check_of(proxy, checks, p_idx, s_idx);
                 let check_info = if let Some(c) = &check_state {
                     if !c.enabled {
