@@ -29,7 +29,7 @@ use std::sync::atomic::Ordering;
 
 /// The [`ProxyState`] of a worker's proxies.
 #[derive(Debug, Clone, Copy)]
-pub struct ProxiesView<'a>(pub &'a [Proxy]);
+pub struct ProxiesView<'a>(pub &'a crate::table::Table);
 
 fn status(p: &Proxy, i: usize) -> ServerStatus {
     p.srv_set().at(i).and_then(|s| s.raw_status()).map_or(ServerStatus::Down, ServerStatus::from)
@@ -205,13 +205,13 @@ fn to_i64(v: u64) -> i64 {
 /// context does not borrow the stream's own slots, which those rules assign.
 #[derive(Debug)]
 pub struct StickView<'a> {
-    proxies: &'a [Proxy],
+    proxies: &'a crate::table::Table,
     tracked: std::cell::RefCell<[Option<(usize, StickKey)>; 3]>,
 }
 
 impl<'a> StickView<'a> {
     #[must_use]
-    pub fn new(proxies: &'a [Proxy], tracked: &[Option<(usize, StickKey)>; 3]) -> Self {
+    pub fn new(proxies: &'a crate::table::Table, tracked: &[Option<(usize, StickKey)>; 3]) -> Self {
         // Nothing tracked (the usual case): no key to clone.
         let tracked = if tracked.iter().all(Option::is_none) { [None, None, None] } else { tracked.clone() };
         Self { proxies, tracked: std::cell::RefCell::new(tracked) }

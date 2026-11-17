@@ -43,17 +43,17 @@ pub fn combine(own: ServerStatus, target: ServerStatus) -> ServerStatus {
     }
 }
 
-fn track_of(proxies: &[Proxy], p: usize, s: usize) -> Option<&Track> {
+fn track_of(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize, s: usize) -> Option<&Track> {
     proxies.get(p)?.srv_set().track(s)
 }
 
-fn load(proxies: &[Proxy], p: usize, s: usize) -> ServerStatus {
+fn load(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize, s: usize) -> ServerStatus {
     proxies.get(p).and_then(|px| px.srv_set().at(s)).and_then(|v| v.raw_status()).map_or(ServerStatus::Up, ServerStatus::from)
 }
 
 /// Recomputes every server that tracks `(p, s)`, and those that track them. A chain cannot
 /// loop: the load refuses it.
-fn propagate(proxies: &[Proxy], p: usize, s: usize) {
+fn propagate(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize, s: usize) {
     let state = load(proxies, p, s);
     for (q, px) in proxies.iter().enumerate() {
         let Some(tracks) = px.srv_set().tracks() else { continue };
@@ -73,7 +73,7 @@ fn propagate(proxies: &[Proxy], p: usize, s: usize) {
 /// Sets the state of server `s` of proxy `p`: a check's verdict, or what an operator asked.
 /// For a tracker, the state is what the operator forced on it (`Up` for nothing), and the
 /// server's own is that combined with its target's.
-pub fn set_status(proxies: &[Proxy], p: usize, s: usize, st: ServerStatus, kind: Kind, cause: Cause<'_>) {
+pub fn set_status(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize, s: usize, st: ServerStatus, kind: Kind, cause: Cause<'_>) {
     set_raw(proxies, p, s, st as u8, kind, cause);
 }
 
@@ -81,7 +81,7 @@ pub fn set_status(proxies: &[Proxy], p: usize, s: usize, st: ServerStatus, kind:
 /// included.
 ///
 /// `kind` and `cause` say what `HAProxy` would write about the change ([`crate::srvlog`]).
-pub fn set_raw(proxies: &[Proxy], p: usize, s: usize, raw: u8, kind: Kind, cause: Cause<'_>) {
+pub fn set_raw(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize, s: usize, raw: u8, kind: Kind, cause: Cause<'_>) {
     let status_of = || proxies.get(p).and_then(|px| px.srv_set().at(s)).and_then(|v| v.raw_status()).unwrap_or(0);
     let before = status_of();
     set_status_inner(proxies, p, s, raw);
@@ -107,7 +107,7 @@ pub fn set_raw(proxies: &[Proxy], p: usize, s: usize, raw: u8, kind: Kind, cause
     }
 }
 
-fn set_status_inner(proxies: &[Proxy], p: usize, s: usize, raw: u8) {
+fn set_status_inner(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize, s: usize, raw: u8) {
     if let Some(tr) = track_of(proxies, p, s) {
         let st = ServerStatus::from(raw);
         tr.own.store(st as u8, Ordering::Relaxed);
@@ -202,7 +202,7 @@ pub fn inherited(proxy: &Proxy, s: usize) -> bool {
 /// `Drain` or `Maint`): `enable`/`disable server`, `set server state`, the stats page's
 /// admin form. It moves the admin state only: what the checks found (`cur_state`) is kept,
 /// so `ready` does not send traffic to a server they found dead (T274 E1).
-pub fn apply_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, to: ServerStatus, cause: Cause<'_>) {
+pub fn apply_admin(proxies: &(impl crate::table::ProxyList + ?Sized), checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, to: ServerStatus, cause: Cause<'_>) {
     // A server with no address stays in maintenance (`SRV_ADMF_RMAINT` outlives `enable
     // server` and `set server state ready`: "leaving forced maintenance but remains in
     // maintenance").
@@ -221,7 +221,7 @@ pub fn apply_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckSta
 
 /// [`apply_admin`] without the `SRV_ADMF_RMAINT` guard: the resolver taking a server into
 /// maintenance, or giving it back the admin state it had (`crate::resolvers`).
-pub fn set_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, to: ServerStatus, cause: Cause<'_>) {
+pub fn set_admin(proxies: &(impl crate::table::ProxyList + ?Sized), checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, to: ServerStatus, cause: Cause<'_>) {
     if track_of(proxies, p, s).is_some() {
         set_status(proxies, p, s, to, Kind::Admin, cause);
         return;
@@ -335,7 +335,7 @@ fn adopt(ops: &mut Vec<(u32, CheckOp)>, p: usize, checks: &mut [crate::check::Se
 /// The owner of `check` takes the changes made elsewhere before the check runs a step, so
 /// that its verdict lands on top of them, as `HAProxy`'s does (measured: a check passing
 /// after `hdown` brings a `rise 1` server back up).
-pub fn adopt_for(proxies: &[Proxy], check: &mut crate::check::ServerCheckState) {
+pub fn adopt_for(proxies: &(impl crate::table::ProxyList + ?Sized), check: &mut crate::check::ServerCheckState) {
     if OPS_PENDING.load(Ordering::Acquire) == 0 {
         return;
     }
@@ -346,7 +346,7 @@ pub fn adopt_for(proxies: &[Proxy], check: &mut crate::check::ServerCheckState) 
 
 /// The owner of the checks takes the changes the other workers made (once per loop pass,
 /// only when some wait), so `show stat` on its CLI reads them before the next check step.
-pub fn adopt_pending(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState]) {
+pub fn adopt_pending(proxies: &(impl crate::table::ProxyList + ?Sized), checks: &mut [crate::check::ServerCheckState]) {
     if checks.is_empty() || OPS_PENDING.load(Ordering::Acquire) == 0 {
         return;
     }
@@ -370,7 +370,7 @@ pub fn adopt_pending(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckS
 
 /// `enable health`/`disable health` (CLI) and the stats page's `ehlth`/`dhlth` on server
 /// `s` of proxy `p`; false when it has no check.
-pub fn set_check_enabled(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, enabled: bool, now: alcyon_sched::Tick) -> bool {
+pub fn set_check_enabled(proxies: &(impl crate::table::ProxyList + ?Sized), checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, enabled: bool, now: alcyon_sched::Tick) -> bool {
     let Some(px) = proxies.get(p) else { return false };
     let mut ops = lock_ops(px);
     adopt(&mut ops, p, checks);
@@ -391,7 +391,7 @@ pub fn set_check_enabled(proxies: &[Proxy], checks: &mut [crate::check::ServerCh
 
 /// A check's verdict reaches `Proxy::server_statuses`: the owner of the check (worker 0)
 /// after each step of it.
-pub fn publish_check(proxies: &[Proxy], check: &mut crate::check::ServerCheckState) {
+pub fn publish_check(proxies: &(impl crate::table::ProxyList + ?Sized), check: &mut crate::check::ServerCheckState) {
     let (p, s) = (check.proxy(), check.server());
     let Some(px) = proxies.get(p) else { return };
     // Under the lock: a change another worker makes is either taken in first, or made
@@ -405,13 +405,13 @@ pub fn publish_check(proxies: &[Proxy], check: &mut crate::check::ServerCheckSta
 }
 
 /// Whether server `s` of proxy `p` tracks another one.
-pub fn is_tracking(proxies: &[Proxy], p: usize, s: usize) -> bool {
+pub fn is_tracking(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize, s: usize) -> bool {
     track_of(proxies, p, s).is_some()
 }
 
 /// `set server health up|down` on server `s` of proxy `p` (not a tracker: refused before):
 /// the operational state moves, the admin state stays.
-pub fn apply_health(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, up: bool, cause: Cause<'_>) {
+pub fn apply_health(proxies: &(impl crate::table::ProxyList + ?Sized), checks: &mut [crate::check::ServerCheckState], p: usize, s: usize, up: bool, cause: Cause<'_>) {
     let Some(px) = proxies.get(p) else { return };
     let mut ops = lock_ops(px);
     adopt(&mut ops, p, checks);
@@ -442,13 +442,13 @@ mod tests {
         (proxies, check)
     }
 
-    fn lines(proxies: &[Proxy]) -> Vec<String> {
+    fn lines(proxies: &(impl crate::table::ProxyList + ?Sized)) -> Vec<String> {
         let mut out = Vec::new();
         crate::srvlog::drain(proxies, |_, _, l| out.push(l.to_owned()));
         out
     }
 
-    fn status(proxies: &[Proxy], p: usize) -> u8 {
+    fn status(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize) -> u8 {
         proxies[p].srv_set().at(0).and_then(|v| v.raw_status()).expect("s1")
     }
 
@@ -561,6 +561,6 @@ mod tests {
 
 /// Whether another server's `track` names server `s` of proxy `p` (`SRV_F_NAME_REFD`).
 #[must_use]
-pub fn is_tracked(proxies: &[Proxy], p: usize, s: usize) -> bool {
+pub fn is_tracked(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize, s: usize) -> bool {
     proxies.iter().any(|px| px.srv_set().tracks().is_some_and(|t| t.iter().flatten().any(|t| t.target == (p, s))))
 }

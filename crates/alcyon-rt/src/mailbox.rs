@@ -31,6 +31,8 @@ pub enum Msg {
     Shutdown(Arc<SessFilter>, Arc<Gather<usize>>),
     /// A gather a task of this worker waits on is complete: wake the task.
     Wake(TaskRef),
+    /// A new table of backends (T637 S2): swap to it between two events and reply with its epoch.
+    Table(Arc<crate::table::Table>, Arc<Gather<u64>>),
     /// To worker 0: a `do-resolve` question its sections answer (T489).
     DoResolve(alcyon_alloc::PoolBox<Box<crate::resolvers::DrMsg>>),
     /// Back to the worker that asked: the answer, for its cache and the waiting stream.
@@ -44,6 +46,7 @@ impl Msg {
             Msg::ShowSess(g) => g.reply(wid, Vec::new()),
             Msg::ShowQuic(g) => g.reply(wid, Vec::new()),
             Msg::Shutdown(_, g) => g.reply(wid, 0),
+            Msg::Table(t, g) => g.reply(wid, t.epoch()),
             // The stream that asked gives up at its deadline.
             Msg::Wake(_) | Msg::DoResolve(_) | Msg::DoResolved(_) => {}
         }
@@ -412,5 +415,20 @@ mod tests {
             }
         }
         assert_eq!(g.take().map(|v| v.len()), Some(2));
+    }
+
+    #[test]
+    fn a_table_posted_to_a_stopped_worker_is_answered_with_its_epoch() {
+        let boxes = Mailboxes::new(2).expect("eventfd");
+        boxes.close(1);
+        let table = Arc::new(crate::table::Table::new(Vec::new()));
+        let g = crate::table::publish(&boxes, &table, 0, TaskRef::NONE);
+        assert!(g.take().is_none(), "worker 0 has not answered");
+        for m in boxes.take(0) {
+            if let Msg::Table(t, g) = m {
+                g.reply(0, t.epoch());
+            }
+        }
+        assert_eq!(g.take(), Some(vec![1, 1]), "worker 1 stopped: its answer is the epoch, as it would read it");
     }
 }

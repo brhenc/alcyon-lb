@@ -15,7 +15,6 @@
 //! loop runs the other streams between two buffers.
 
 use crate::check::ServerCheckState;
-use crate::engine::Proxy;
 use crate::stats::StatCursor;
 use crate::stats_html::{HtmlCursor, JsonCursor};
 
@@ -51,7 +50,7 @@ pub struct Dump {
 
 /// What [`fill`] reads besides the cursor.
 pub struct Ctx<'a> {
-    pub proxies: &'a [Proxy],
+    pub proxies: &'a crate::table::Table,
     pub checks: &'a [ServerCheckState],
     pub pid: u32,
     /// The `stats` section of the proxy that serves the page.

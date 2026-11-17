@@ -593,7 +593,7 @@ fn first_type(fam: Families, prefer_ipv4: bool) -> u16 {
 /// Never: a resolution is made by its pool's `init`, which always gives one.
 pub fn build(
     config: &alcyon_config::Config,
-    proxies: &[Proxy],
+    proxies: &crate::table::Table,
     scheduler: &mut alcyon_sched::Scheduler,
     fdtab: &mut crate::fdtab::FdTab,
     poller: &crate::poller::Poller,
@@ -813,7 +813,7 @@ impl Section {
     /// and applies every result to its servers. Returns when it wants to run again.
     pub fn step(
         &mut self,
-        proxies: &[Proxy],
+        proxies: &crate::table::Table,
         checks: &mut [ServerCheckState],
         log: &mut LogFn<'_>,
         fdtab: &mut crate::fdtab::FdTab,
@@ -940,7 +940,7 @@ impl Section {
         &mut self,
         i: usize,
         now: Instant,
-        proxies: &[Proxy],
+        proxies: &crate::table::Table,
         checks: &mut [ServerCheckState],
         log: &mut LogFn<'_>,
         fdtab: &mut crate::fdtab::FdTab,
@@ -1075,7 +1075,7 @@ impl Section {
         }
     }
 
-    fn drain_results(&mut self, now: Instant, ns: Option<usize>, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) {
+    fn drain_results(&mut self, now: Instant, ns: Option<usize>, proxies: &crate::table::Table, checks: &mut [ServerCheckState], log: &mut LogFn<'_>) {
         while let Some((qid, res)) = self.dns.poll_result() {
             if !self.dr_pending.is_empty() && self.dr_result(qid, &res, now) {
                 continue;
@@ -1151,7 +1151,7 @@ impl Section {
     /// Applies the `set server fqdn` requests for this section's servers (`srv_set_fqdn`):
     /// the server leaves its resolution and joins the new name's, asked at once. A server
     /// written as an address had no resolution: it takes the default `resolve-*` options.
-    fn take_fqdn_requests(&mut self, proxies: &[Proxy], now: Instant) {
+    fn take_fqdn_requests(&mut self, proxies: &crate::table::Table, now: Instant) {
         let mine: Vec<(u32, u32, Box<str>)> = {
             let mut all = FQDN_SETS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let (mine, rest): (Vec<_>, Vec<_>) = all.drain(..).partition(|(p, s, _)| {
@@ -1184,7 +1184,7 @@ impl Section {
 /// additional records onto the first record of their name without one, then in key order the
 /// obsolete records go (their slots with them) and each record fills a slot of each proxy.
 #[allow(clippy::too_many_arguments)]
-fn srv_answer(r: &mut Resolution, answers: &[Answer], holds: &Holds, now: Instant, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>) {
+fn srv_answer(r: &mut Resolution, answers: &[Answer], holds: &Holds, now: Instant, proxies: &crate::table::Table, checks: &mut [ServerCheckState], log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>) {
     r.status = Status::Valid;
     r.last_valid = Some(now);
     let fam = active_families(now);
@@ -1256,7 +1256,7 @@ fn srv_answer(r: &mut Resolution, answers: &[Answer], holds: &Holds, now: Instan
 /// target and weight, and the address of its additional record if it has one (its own
 /// resolution is then dropped), else resolves the target.
 #[allow(clippy::too_many_arguments)]
-fn srv_fill(it: &SrvItem, p: u32, s: u32, opts: &ResolveOpts, proxies: &[Proxy], log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>, leave: &mut Vec<(u32, u32)>) {
+fn srv_fill(it: &SrvItem, p: u32, s: u32, opts: &ResolveOpts, proxies: &crate::table::Table, log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>, leave: &mut Vec<(u32, u32)>) {
     let (pi, si) = (p as usize, s as usize);
     let Some(px) = proxies.get(pi) else { return };
     let Some((me, old)) = px.srv_set().at(si).and_then(|m| Some((m, m.addr()?))) else { return };
@@ -1310,7 +1310,7 @@ fn srv_fill(it: &SrvItem, p: u32, s: u32, opts: &ResolveOpts, proxies: &[Proxy],
 /// removed from SRV record"), loses its target, address and port, leaves its target's
 /// resolution, and is free again (at the end of the list).
 #[allow(clippy::too_many_arguments)]
-fn srv_cleanup(rqs: &mut [SrvRq], p: u32, s: u32, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>) {
+fn srv_cleanup(rqs: &mut [SrvRq], p: u32, s: u32, proxies: &crate::table::Table, checks: &mut [ServerCheckState], log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>) {
     acts.push(SrvAct::Unlink(p, s));
     let Some(px) = proxies.get(p as usize) else { return };
     if !px.server_rmaint(s as usize) {
@@ -1327,7 +1327,7 @@ fn srv_cleanup(rqs: &mut [SrvRq], p: u32, s: u32, proxies: &[Proxy], checks: &mu
 /// `srvrq_resolution_error_cb`: an SRV resolution that failed for longer than the hold of its
 /// status since the last valid answer drops every record and its slots.
 #[allow(clippy::too_many_arguments)]
-fn srv_error(r: &mut Resolution, e: &DnsError, holds: &Holds, now: Instant, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>) {
+fn srv_error(r: &mut Resolution, e: &DnsError, holds: &Holds, now: Instant, proxies: &crate::table::Table, checks: &mut [ServerCheckState], log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>) {
     let (cause, hold) = match e {
         DnsError::NxDomain => (Cause::Nx, holds.nx),
         DnsError::Refused => (Cause::Refused, holds.refused),
@@ -1373,7 +1373,7 @@ fn on_valid(
     by: Option<&str>,
     holds: &Holds,
     now: Instant,
-    proxies: &[Proxy],
+    proxies: &crate::table::Table,
     checks: &mut [ServerCheckState],
     log: &mut LogFn<'_>,
 ) -> bool {
@@ -1430,7 +1430,7 @@ enum Pick {
 
 /// `snr_resolution_cb` for requester `k`.
 #[allow(clippy::too_many_arguments)]
-fn server_answer(r: &mut Resolution, k: usize, by: &str, holds: &Holds, now: Instant, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) -> bool {
+fn server_answer(r: &mut Resolution, k: usize, by: &str, holds: &Holds, now: Instant, proxies: &crate::table::Table, checks: &mut [ServerCheckState], log: &mut LogFn<'_>) -> bool {
     let (p, s) = (r.reqs[k].proxy as usize, r.reqs[k].server as usize);
     let Some(px) = proxies.get(p) else { return false };
     let me = px.srv_set().at(s);
@@ -1544,7 +1544,7 @@ fn in_net(ip: IpAddr, net: IpAddr, bits: u8) -> bool {
 /// `resolv_process_responses` / `process_resolvers`, an error: each requester runs
 /// `snr_resolution_error_cb`; the items go unless a server keeps its address within its hold.
 #[allow(clippy::too_many_arguments)]
-fn on_error(r: &mut Resolution, e: &DnsError, holds: &Holds, now: Instant, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) {
+fn on_error(r: &mut Resolution, e: &DnsError, holds: &Holds, now: Instant, proxies: &crate::table::Table, checks: &mut [ServerCheckState], log: &mut LogFn<'_>) {
     r.status = Status::Error(match e {
         DnsError::NxDomain => Cause::Nx,
         DnsError::Refused => Cause::Refused,
@@ -1574,7 +1574,7 @@ fn on_error(r: &mut Resolution, e: &DnsError, holds: &Holds, now: Instant, proxi
 /// `snr_set_srv_down`: whether requester `k`'s server went into `SRV_ADMF_RMAINT` now (the
 /// hold of the status ran out since `last_valid`, which starts at the resolution's creation, T510).
 #[allow(clippy::many_single_char_names)] // HAProxy's names: r(esolution), k, p(roxy), s(erver)
-fn set_srv_down(r: &Resolution, k: usize, holds: &Holds, now: Instant, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) -> bool {
+fn set_srv_down(r: &Resolution, k: usize, holds: &Holds, now: Instant, proxies: &crate::table::Table, checks: &mut [ServerCheckState], log: &mut LogFn<'_>) -> bool {
     let req = &r.reqs[k];
     let (p, s) = (req.proxy as usize, req.server as usize);
     if proxies.get(p).is_none_or(|px| px.server_rmaint(s)) {
@@ -1618,7 +1618,7 @@ fn status_of(px: &Proxy, s: usize) -> u8 {
 }
 
 /// `srv_set_admin_flag(SRV_ADMF_RMAINT)` and its log line (`_srv_update_status_adm`).
-fn enter_rmaint(req: &Req, cause: Cause, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) {
+fn enter_rmaint(req: &Req, cause: Cause, proxies: &crate::table::Table, checks: &mut [ServerCheckState], log: &mut LogFn<'_>) {
     let (p, s) = (req.proxy as usize, req.server as usize);
     let px = &proxies[p];
     let before = status_of(px, s);
@@ -1670,7 +1670,7 @@ fn usable_servers(px: &Proxy) -> (usize, usize) {
 }
 
 /// `srv_clr_admin_flag(SRV_ADMF_RMAINT)` on a valid answer, and its two lines.
-fn leave_rmaint(req: &Req, fqdn: &str, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) {
+fn leave_rmaint(req: &Req, fqdn: &str, proxies: &crate::table::Table, checks: &mut [ServerCheckState], log: &mut LogFn<'_>) {
     let (p, s) = (req.proxy as usize, req.server as usize);
     let px = &proxies[p];
     let saved = px.server_rmaint_kept(s);

@@ -972,6 +972,47 @@ fn use_server_with_a_configured_name_looks_up_no_name_per_request() {
     assert_eq!(lookups, 0, "{lookups} by-name server lookups in 50 requests through use-server");
 }
 
+/// T637 S2: a `use_backend` rule's and the `default_backend`'s targets are resolved to a backend
+/// slot at load: the requests compare no backend name. Debug builds count the comparisons.
+#[cfg(debug_assertions)]
+#[test]
+fn use_backend_and_default_backend_compare_no_backend_name_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (srv, srv_addr) = loopback0();
+    let (fe1, fe2) = (common::reserve_addr(), common::reserve_addr());
+    let running = Arc::new(AtomicBool::new(true));
+    let be = start_keepalive_backend(srv, Arc::clone(&running), BENCH_RSP);
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         backend a0\n  server s 127.0.0.1:1 disabled\nbackend a1\n  server s 127.0.0.1:1 disabled\n\
+         backend a2\n  server s 127.0.0.1:1 disabled\nbackend b\n  server s1 {srv_addr}\n\
+         frontend f1\n  bind {fe1}\n  use_backend a1 if {{ path /nothing }}\n  use_backend b if TRUE\n\
+         frontend f2\n  bind {fe2}\n  default_backend b\n"
+    );
+    let mut engine = Engine::new(&alcyon_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut c1 = TcpStream::connect(fe1).expect("connect to f1");
+    let mut c2 = TcpStream::connect(fe2).expect("connect to f2");
+    c1.set_nonblocking(true).expect("set_nonblocking");
+    c2.set_nonblocking(true).expect("set_nonblocking");
+    for _ in 0..3 {
+        drive_request_expecting(&mut c1, &mut engine, b"HTTP/1.1 200", b"\r\n\r\nok");
+        drive_request_expecting(&mut c2, &mut engine, b"HTTP/1.1 200", b"\r\n\r\nok");
+    }
+    let before = alcyon_rt::table::backend_name_comparisons_on_this_thread();
+    for _ in 0..50 {
+        drive_request_expecting(&mut c1, &mut engine, b"HTTP/1.1 200", b"\r\n\r\nok");
+        drive_request_expecting(&mut c2, &mut engine, b"HTTP/1.1 200", b"\r\n\r\nok");
+    }
+    let n = alcyon_rt::table::backend_name_comparisons_on_this_thread() - before;
+    drop((c1, c2));
+    for _ in 0..5 {
+        let _ = engine.run_once();
+    }
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+    assert_eq!(n, 0, "{n} backend-name comparisons in 100 requests through use_backend and default_backend");
+}
+
 /// T436 A: a steady-state keep-alive request proxied to a server allocates nothing. Measured
 /// before (2026-10-19, uprobe on malloc under the pstat load): 2 per request, the method and the
 /// URI copied into `TcpSession::req_method` / `req_uri` as owned `String`s. The count for 1100

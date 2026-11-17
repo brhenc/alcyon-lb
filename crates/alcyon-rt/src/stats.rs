@@ -559,7 +559,7 @@ pub fn note_sched(tasks: usize, run_queue: usize) {
 /// Fills `p` with the `show info` pairs for the Prometheus scrape: the same function as the
 /// CLI's, fed from the proxies' counters and the recorded start time and task counts, so the
 /// numbers agree.
-pub fn process_info_pairs(p: &mut InfoPairs, proxies: &[Proxy]) {
+pub fn process_info_pairs(p: &mut InfoPairs, proxies: &crate::table::Table) {
     use std::sync::atomic::Ordering::Relaxed;
     let (mut max_conns, mut cum_conns, mut cum_reqs) = (0u32, 0u64, 0u64);
     for px in proxies {
@@ -815,7 +815,7 @@ fn fill_info_pairs(
 
 /// Generates the full `show stat` CSV text for all configured proxies and servers.
 #[must_use]
-pub fn format_show_stat(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) -> String {
+pub fn format_show_stat(proxies: &crate::table::Table, checks: &[ServerCheckState], pid: u32) -> String {
     format_show_stat_filtered(proxies, checks, pid, None, None, None)
 }
 
@@ -1135,7 +1135,7 @@ pub(crate) fn write_backend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy
 /// Generates `show stat` CSV text with optional filtering by proxy iid, type bitmask, and server sid.
 #[must_use]
 pub fn format_show_stat_filtered(
-    proxies: &[Proxy],
+    proxies: &crate::table::Table,
     checks: &[ServerCheckState],
     pid: u32,
     iid_filter: Option<i32>,
@@ -1149,7 +1149,7 @@ pub fn format_show_stat_filtered(
 /// a [`StatCursor`], all at once: what the stats page and the CLI send a buffer at a time.
 #[must_use]
 pub fn format_show_stat_as(
-    proxies: &[Proxy],
+    proxies: &crate::table::Table,
     checks: &[ServerCheckState],
     pid: u32,
     iid_filter: Option<i32>,
@@ -1225,7 +1225,7 @@ impl StatCursor {
 
     /// Writes the next unit of the dump to `out` -- the header, one row, or the end -- and
     /// returns `true`; `false` once the dump is over (nothing written).
-    pub fn next_unit(&mut self, proxies: &[Proxy], checks: &[ServerCheckState], pid: u32, out: &mut String) -> bool {
+    pub fn next_unit(&mut self, proxies: &crate::table::Table, checks: &[ServerCheckState], pid: u32, out: &mut String) -> bool {
         let start = out.len();
         loop {
             let i = self.px as usize;
@@ -1405,6 +1405,7 @@ mod tests {
             use_servers: Vec::new(),
             force_be_switch: Vec::new(),
             disabled_backends: std::sync::Arc::default(),
+            routes: None,
             monitor: None,
             acls: alcyon_sample::Acls::default(),
             stick_table: None,
@@ -1444,7 +1445,7 @@ mod tests {
             log_count: std::sync::Arc::default(),
         };
 
-        let csv = format_show_stat(&[proxy], &[], 9999);
+        let csv = format_show_stat(&crate::table::Table::new(vec![proxy]), &[], 9999);
         let lines: Vec<&str> = csv.lines().collect();
         assert!(
             lines.len() >= 4,
