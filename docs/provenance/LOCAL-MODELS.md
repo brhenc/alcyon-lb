@@ -32,7 +32,7 @@ How the code came in:
 | Gemini 4 Hydrogen (xhigh), via Antigravity | 1 | 337 | 323 |
 | Qwen3.8-Flash-Next | 1 | 201 | 194 |
 | Gemini 4 Hydrogen (medium), via Antigravity | 3 | 219 | 133 |
-| Qwen3.8-27B | 10 | 2444 | 2406 |
+| Qwen3.8-27B | 11 | 2787 | 2749 |
 
 ## Commits
 
@@ -92,6 +92,7 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-17 | CONNECTTGT | Qwen3.8-27B | `64f10ac83d` | 181 | 181 | `crates/alcyon-proto/src/authority.rs` +9/9<br>`crates/alcyon-rt/tests/it/connect_target_validation.rs` +171/171<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-17 | EARLYCLOSE | Qwen3.8-27B | `2b158a5633` | 183 | 182 | `crates/alcyon-rt/src/engine.rs` +29/29<br>`crates/alcyon-rt/src/proxy.rs` +47/46<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +107/107 | unmodified model output |
 | 2026-11-17 | ERR408ORDER | Qwen3.8-27B | `af24fa14a2` | 246 | 246 | `crates/alcyon-rt/src/engine.rs` +27/27<br>`crates/alcyon-rt/tests/it/builtin_error_wire.rs` +218/218<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
+| 2026-11-17 | HEADMETHOD | Qwen3.8-27B | `ac8b7cf325` | 343 | 343 | `crates/alcyon-rt/src/engine.rs` +54/54<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/set_method_head_resp.rs` +288/288 | unmodified model output |
 | 2026-11-17 | INSREQBENCH | Qwen3.8-27B | `c20f5ee876` | 120 | 118 | `tools/measure/insreq.sh` +19/18<br>`tools/measure/test_measure.py` +101/100 | unmodified model output |
 | 2026-11-17 | L7FOLD | Qwen3.8-27B | `6e9a8d8ca2` | 253 | 253 | `crates/alcyon-rt/src/engine.rs` +2/2<br>`crates/alcyon-rt/src/proxy.rs` +3/3<br>`crates/alcyon-rt/src/txn.rs` +3/3<br>`crates/alcyon-rt/tests/it/disable_l7_retry.rs` +229/229<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/struct_sizes.rs` +15/15 | unmodified model output |
 | 2026-11-17 | LBSNAP | Qwen3.8-27B | `d3084c2234` | 772 | 765 | `crates/alcyon-rt/src/buf.rs` +1/1<br>`crates/alcyon-rt/src/engine.rs` +65/61<br>`crates/alcyon-rt/src/lb.rs` +279/278<br>`crates/alcyon-rt/src/server_state.rs` +2/2<br>`crates/alcyon-rt/src/srv_set.rs` +1/1<br>`crates/alcyon-rt/src/track.rs` +3/3<br>`crates/alcyon-rt/tests/it/balance_uri_map.rs` +106/106<br>`crates/alcyon-rt/tests/it/hash_pick_concurrency.rs` +158/156<br>`crates/alcyon-rt/tests/it/lb_chash.rs` +63/63<br>`crates/alcyon-rt/tests/it/load_balancing.rs` +25/25<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/stream_object.rs` +4/4<br>`crates/alcyon-rt/tests/request_allocations.rs` +31/31<br>`tools/measure/scenarios/balance_uri.body` +16/16<br>`tools/measure/scenarios/balance_uri_chash.body` +17/17 | unmodified model output |
