@@ -755,13 +755,13 @@ fn fill_info_pairs(
     p.put("PipesUsed", format_args!("{}", "0"));
     p.put("PipesFree", format_args!("{}", "0"));
     p.put("ConnRate", format_args!("{}", crate::engine::global_conn_rate()));
-    p.put("ConnRateLimit", format_args!("{}", "0"));
+    p.put("ConnRateLimit", format_args!("{}", crate::ratelimit::conns()));
     p.put("MaxConnRate", format_args!("{}", crate::engine::max_conn_rate()));
     p.put("SessRate", format_args!("{}", crate::engine::global_sess_rate()));
-    p.put("SessRateLimit", format_args!("{}", "0"));
+    p.put("SessRateLimit", format_args!("{}", crate::ratelimit::sess()));
     p.put("MaxSessRate", format_args!("{}", crate::engine::max_sess_rate()));
     p.put("SslRate", format_args!("{}", SSL_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).rate()));
-    p.put("SslRateLimit", format_args!("{}", "0"));
+    p.put("SslRateLimit", format_args!("{}", crate::ratelimit::ssl()));
     p.put("MaxSslRate", format_args!("{}", SSL_MAX.load(std::sync::atomic::Ordering::Relaxed)));
     p.put("SslFrontendKeyRate", format_args!("{}", "0"));
     p.put("SslFrontendMaxKeyRate", format_args!("{}", "0"));
