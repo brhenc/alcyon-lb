@@ -26,13 +26,13 @@ How the code came in:
 |---|---:|---:|---:|
 | Qwen3.6-35B-A3B | 20 | 3999 | 2268 |
 | Qwen (version not recorded; the 10-15 queue ran Qwen3.6-35B-A3B) | 2 | 364 | 290 |
-| Muse Glimmer 30B | 18 | 3242 | 1174 |
+| Muse Glimmer 30B | 18 | 3242 | 1171 |
 | Gemini 4 Hydrogen (high), via Antigravity | 1 | 156 | 156 |
-| Gemini 4 Argon (high), via Antigravity | 1 | 216 | 216 |
+| Gemini 4 Argon (high), via Antigravity | 1 | 216 | 215 |
 | Gemini 4 Hydrogen (xhigh), via Antigravity | 1 | 337 | 337 |
 | Qwen3.8-Flash-Next | 1 | 201 | 194 |
 | gemini-4-hydrogen-medium | 2 | 169 | 91 |
-| Qwen3.8-27B | 5 | 830 | 803 |
+| Qwen3.8-27B | 6 | 1083 | 1054 |
 
 ## Commits
 
@@ -75,19 +75,20 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-10-17 | t331b-rfc7239-field | Muse Glimmer 30B | `8d20b15c40` | 457 | 27 | `crates/alcyon-rt/tests/it/main.rs` +1/0<br>`crates/alcyon-rt/tests/it/rfc7239_field.rs` +133/25<br>`crates/alcyon-sample/src/rfc7239.rs` +10/2<br>`crates/ibex-sample/src/rfc7239.rs.bak` (gone) +313/0 | unmodified model output |
 | 2026-10-17 | t331l-fc-rcvd-proxy | Muse Glimmer 30B | `f4a4c23798` | 141 | 24 | `crates/alcyon-rt/tests/it/fc_rcvd_proxy.rs` +131/19<br>`crates/alcyon-rt/tests/it/main.rs` +1/0<br>`crates/alcyon-sample/src/registry.rs` +9/5 | unmodified model output |
 | 2026-10-17 | t331m-fc-stream-info | Muse Glimmer 30B | `e7948d5a8e` | 155 | 10 | `crates/alcyon-rt/tests/it/fc_stream_info.rs` +138/9<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-sample/src/registry.rs` +16/0 | unmodified model output |
-| 2026-10-17 | t331n-srv-weights | Muse Glimmer 30B | `9a59404b8d` | 165 | 52 | `crates/alcyon-rt/src/proxy_state.rs` +3/3<br>`crates/alcyon-rt/tests/it/main.rs` +1/0<br>`crates/alcyon-rt/tests/it/srv_weights.rs` +143/32<br>`crates/alcyon-sample/src/registry.rs` +18/17 | unmodified model output |
+| 2026-10-17 | t331n-srv-weights | Muse Glimmer 30B | `9a59404b8d` | 165 | 49 | `crates/alcyon-rt/src/proxy_state.rs` +3/0<br>`crates/alcyon-rt/tests/it/main.rs` +1/0<br>`crates/alcyon-rt/tests/it/srv_weights.rs` +143/32<br>`crates/alcyon-sample/src/registry.rs` +18/17 | unmodified model output |
 | 2026-10-17 | t331o-bc-info | Muse Glimmer 30B | `8e8510a363` | 168 | 62 | `crates/alcyon-rt/tests/it/bc_info.rs` +138/44<br>`crates/alcyon-rt/tests/it/main.rs` +1/0<br>`crates/alcyon-sample/src/registry.rs` +29/18 | unmodified model output |
 | 2026-10-17 | t331r-request-date | Muse Glimmer 30B | `c15d3963f0` | 166 | 50 | `crates/alcyon-rt/src/engine.rs` +15/0<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/request_date.rs` +134/35<br>`crates/alcyon-sample/src/registry.rs` +16/14 | unmodified model output |
 | 2026-10-17 | t331s-process-ids | Muse Glimmer 30B | `1cdfee11d1` | 148 | 52 | `crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/process_ids.rs` +129/37<br>`crates/alcyon-sample/src/registry.rs` +18/14 | unmodified model output |
 | 2026-10-18 | t363l | Muse Glimmer 30B | `cd5612b260` | 15 | 15 | `harness/vtc_runner.py` +15/15 | Muse's `vtc_runner.py` hex fix, corrected by the maintainer in the same commit, together with unrelated docs; only `harness/vtc_runner.py` is counted |
 | 2026-11-15 | BALPARSE | Gemini 4 Hydrogen (high), via Antigravity | `09dee6b203` | 156 | 156 | `crates/alcyon-config/src/parser/mod.rs` +2/2<br>`crates/alcyon-config/src/parser/server.rs` +94/94<br>`crates/alcyon-config/tests/it/balance_options.rs` +60/60 | unmodified model output |
-| 2026-11-15 | BALSOURCE | Gemini 4 Argon (high), via Antigravity | `0bfb1d2ff0` | 216 | 216 | `crates/alcyon-rt/src/engine.rs` +2/2<br>`crates/alcyon-rt/src/lb.rs` +35/35<br>`crates/alcyon-rt/tests/it/balance_source_map.rs` +178/178<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
+| 2026-11-15 | BALSOURCE | Gemini 4 Argon (high), via Antigravity | `0bfb1d2ff0` | 216 | 215 | `crates/alcyon-rt/src/engine.rs` +2/1<br>`crates/alcyon-rt/src/lb.rs` +35/35<br>`crates/alcyon-rt/tests/it/balance_source_map.rs` +178/178<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-15 | H2URI | Gemini 4 Hydrogen (xhigh), via Antigravity | `1cd3399122` | 337 | 337 | `crates/alcyon-proto/src/authority.rs` +16/16<br>`crates/alcyon-proto/src/h2.rs` +5/5<br>`crates/alcyon-proto/src/mux_h2.rs` +3/3<br>`crates/alcyon-rt/src/engine.rs` +18/18<br>`crates/alcyon-rt/src/h2_bridge.rs` +6/6<br>`crates/alcyon-rt/src/lb.rs` +89/89<br>`crates/alcyon-rt/src/proxy.rs` +20/20<br>`crates/alcyon-rt/tests/it/balance_uri_map.rs` +180/180 | unmodified model output |
 | 2026-11-16 | REQBUF | Qwen3.8-Flash-Next | `7c6190bed5` | 201 | 194 | `crates/alcyon-rt/src/engine.rs` +31/24<br>`crates/alcyon-rt/tests/it/chunked_body_abort.rs` +169/169<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-16 | T632 | gemini-4-hydrogen-medium | `b754147a59` | 79 | 43 | `crates/alcyon-rt/src/engine.rs` +16/16<br>`crates/alcyon-rt/src/rule_compiled.rs` +22/22<br>`crates/alcyon-rt/tests/request_allocations.rs` +41/5 | unmodified model output |
 | 2026-11-16 | T632 | gemini-4-hydrogen-medium | `f14870b983` | 90 | 48 | `crates/alcyon-rt/src/engine.rs` +36/0<br>`crates/alcyon-rt/src/rule_compiled.rs` +18/14<br>`crates/alcyon-rt/tests/request_allocations.rs` +36/34 | unmodified model output |
 | 2026-11-17 | BADCHUNK | Qwen3.8-27B | `c0337e4598` | 77 | 54 | `crates/alcyon-rt/src/proxy.rs` +6/6<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +71/48 | unmodified model output |
-| 2026-11-17 | BODYWAITFLAG | Qwen3.8-27B | `ee6b31a750` | 24 | 24 | `crates/alcyon-rt/src/engine.rs` +13/13<br>`crates/alcyon-rt/src/txn.rs` +5/5<br>`crates/alcyon-rt/tests/it/struct_sizes.rs` +6/6 | unmodified model output |
-| 2026-11-17 | EARLYCLOSE | Qwen3.8-27B | `2b158a5633` | 183 | 183 | `crates/alcyon-rt/src/engine.rs` +29/29<br>`crates/alcyon-rt/src/proxy.rs` +47/47<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +107/107 | unmodified model output |
+| 2026-11-17 | BODYWAITFLAG | Qwen3.8-27B | `ee6b31a750` | 24 | 23 | `crates/alcyon-rt/src/engine.rs` +13/13<br>`crates/alcyon-rt/src/txn.rs` +5/5<br>`crates/alcyon-rt/tests/it/struct_sizes.rs` +6/5 | unmodified model output |
+| 2026-11-17 | EARLYCLOSE | Qwen3.8-27B | `2b158a5633` | 183 | 182 | `crates/alcyon-rt/src/engine.rs` +29/29<br>`crates/alcyon-rt/src/proxy.rs` +47/46<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +107/107 | unmodified model output |
 | 2026-11-17 | ERR408ORDER | Qwen3.8-27B | `af24fa14a2` | 246 | 246 | `crates/alcyon-rt/src/engine.rs` +27/27<br>`crates/alcyon-rt/tests/it/builtin_error_wire.rs` +218/218<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
+| 2026-11-17 | L7FOLD | Qwen3.8-27B | `6e9a8d8ca2` | 253 | 253 | `crates/alcyon-rt/src/engine.rs` +2/2<br>`crates/alcyon-rt/src/proxy.rs` +3/3<br>`crates/alcyon-rt/src/txn.rs` +3/3<br>`crates/alcyon-rt/tests/it/disable_l7_retry.rs` +229/229<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/struct_sizes.rs` +15/15 | unmodified model output |
 | 2026-11-17 | UNBUFABORT | Qwen3.8-27B | `a2b1111bba` | 300 | 296 | `crates/alcyon-rt/src/engine.rs` +49/49<br>`crates/alcyon-rt/src/txn.rs` +10/10<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +241/237 | unmodified model output |
