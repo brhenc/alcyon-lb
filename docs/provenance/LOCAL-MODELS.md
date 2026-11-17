@@ -32,7 +32,7 @@ How the code came in:
 | Gemini 4 Hydrogen (xhigh), via Antigravity | 1 | 337 | 323 |
 | Qwen3.8-Flash-Next | 1 | 201 | 194 |
 | Gemini 4 Hydrogen (medium), via Antigravity | 3 | 219 | 133 |
-| Qwen3.8-27B | 11 | 2787 | 2749 |
+| Qwen3.8-27B | 12 | 3300 | 3262 |
 
 ## Commits
 
@@ -89,6 +89,7 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-17 | BADCHUNK | Qwen3.8-27B | `c0337e4598` | 77 | 54 | `crates/alcyon-rt/src/proxy.rs` +6/6<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +71/48 | unmodified model output |
 | 2026-11-17 | BODYWAITFLAG | Qwen3.8-27B | `ee6b31a750` | 24 | 23 | `crates/alcyon-rt/src/engine.rs` +13/13<br>`crates/alcyon-rt/src/txn.rs` +5/5<br>`crates/alcyon-rt/tests/it/struct_sizes.rs` +6/5 | unmodified model output |
 | 2026-11-17 | CHUNK10 | Qwen3.8-27B | `4a997ff751` | 288 | 288 | `crates/alcyon-rt/src/engine.rs` +28/28<br>`crates/alcyon-rt/tests/it/chunked_resp_to_http10.rs` +254/254<br>`crates/alcyon-rt/tests/it/head_facts.rs` +5/5<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
+| 2026-11-17 | CLIPAYLOAD | Qwen3.8-27B | `e8d29c7f60` | 513 | 513 | `crates/alcyon-rt/src/applet.rs` +73/73<br>`crates/alcyon-rt/tests/it/cli_payload_refill.rs` +361/361<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-sample/src/patref.rs` +78/78 | unmodified model output |
 | 2026-11-17 | CONNECTTGT | Qwen3.8-27B | `64f10ac83d` | 181 | 181 | `crates/alcyon-proto/src/authority.rs` +9/9<br>`crates/alcyon-rt/tests/it/connect_target_validation.rs` +171/171<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-17 | EARLYCLOSE | Qwen3.8-27B | `2b158a5633` | 183 | 182 | `crates/alcyon-rt/src/engine.rs` +29/29<br>`crates/alcyon-rt/src/proxy.rs` +47/46<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +107/107 | unmodified model output |
 | 2026-11-17 | ERR408ORDER | Qwen3.8-27B | `af24fa14a2` | 246 | 246 | `crates/alcyon-rt/src/engine.rs` +27/27<br>`crates/alcyon-rt/tests/it/builtin_error_wire.rs` +218/218<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
