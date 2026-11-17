@@ -4501,6 +4501,12 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
     })
 }
 
+/// A proxy with no frontend, no backend and no servers: what an unused slot of a
+/// [`crate::table::Table`] holds, so a stale number reads nothing (T637 S2).
+pub(crate) fn empty_proxy() -> Proxy {
+    init_proxy_from_frontend(0, alcyon_config::ast::ProxyId::default(), &alcyon_config::FrontendSection::default())
+}
+
 fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, fe: &alcyon_config::FrontendSection) -> Proxy {
     let mut http_req_rules = fe.http_req_rules.clone();
     with_buffered_request(&mut http_req_rules, fe.buffer_request);

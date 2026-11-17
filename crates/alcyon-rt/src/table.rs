@@ -26,6 +26,11 @@ use alcyon_sched::task::TaskRef;
 /// Slots per chunk. A change copies one chunk (1,024 pointers), never the whole table.
 const CHUNK_SHIFT: usize = 10;
 const CHUNK: usize = 1 << CHUNK_SHIFT;
+/// Chunks a table can address: 131,072 slots. The top level is an inline array of this many
+/// pointers, indexed with a mask, so reading a slot has no bounds check to make (the request path
+/// reads the table about 90 times a request; with a `Box<[_]>` of chunks it cost 0.9% of ins/req).
+const MAX_CHUNKS: usize = 128;
+type Chunk = [Arc<Proxy>; CHUNK];
 
 thread_local! {
     static BACKEND_NAME_COMPARISONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -74,12 +79,24 @@ pub enum Routed {
 pub struct Table {
     epoch: u64,
     len: usize,
-    chunks: Vec<Arc<[Arc<Proxy>]>>,
+    /// Fixed-size chunks: an index is `chunks[slot >> 10][slot & 1023]` with the second bounds
+    /// check gone at compile time (T637 S2: the request path indexes the table ~100 times).
+    /// A slot at or past `len` holds the empty proxy `filler`: a stale number reads nothing.
+    chunks: [Arc<Chunk>; MAX_CHUNKS],
     /// Live backends by name; the first of two proxies with one name (a frontend and a
     /// backend) wins, as the scan it replaces did.
     by_name: Arc<HashMap<Box<str>, u32>>,
     /// The live slots in listing order.
     live: Arc<[u32]>,
+}
+
+impl Table {
+    fn build(epoch: u64, len: usize, items: &[Arc<Proxy>], filler: &Arc<Proxy>, by_name: Arc<HashMap<Box<str>, u32>>, live: Arc<[u32]>) -> Self {
+        let empty: Arc<Chunk> = Arc::new(std::array::from_fn(|_| Arc::clone(filler)));
+        let mut real = items.chunks(CHUNK).map(|c| Arc::new(std::array::from_fn(|i| Arc::clone(c.get(i).unwrap_or(filler)))));
+        let chunks = std::array::from_fn(|_| real.next().unwrap_or_else(|| Arc::clone(&empty)));
+        Self { epoch, len, chunks, by_name, live }
+    }
 }
 
 impl Table {
@@ -98,17 +115,10 @@ impl Table {
         for p in &mut proxies {
             resolve_routes(p, &by_name);
         }
-        let mut chunks = Vec::with_capacity(len.div_ceil(CHUNK));
-        let mut it = proxies.into_iter().map(Arc::new);
-        loop {
-            let chunk: Arc<[Arc<Proxy>]> = it.by_ref().take(CHUNK).collect();
-            if chunk.is_empty() {
-                break;
-            }
-            chunks.push(chunk);
-        }
+        assert!(len <= MAX_CHUNKS * CHUNK, "at most {} proxies", MAX_CHUNKS * CHUNK);
+        let items: Vec<Arc<Proxy>> = proxies.into_iter().map(Arc::new).collect();
         let live = (0..u32::try_from(len).expect("fewer than 2^32 proxies")).collect();
-        Self { epoch: 1, len, chunks, by_name: Arc::new(by_name), live }
+        Self::build(1, len, &items, &Arc::new(crate::engine::empty_proxy()), Arc::new(by_name), live)
     }
 
     /// The next table, with the proxy at `slot` replaced by `proxy` (same name). Every chunk but
@@ -122,9 +132,9 @@ impl Table {
         resolve_routes(&mut proxy, &self.by_name);
         let (c, i) = (slot >> CHUNK_SHIFT, slot & (CHUNK - 1));
         let mut chunks = self.chunks.clone();
-        let mut one: Vec<Arc<Proxy>> = self.chunks[c].to_vec();
+        let mut one: Chunk = (*self.chunks[c]).clone();
         one[i] = Arc::new(proxy);
-        chunks[c] = one.into();
+        chunks[c] = Arc::new(one);
         Self { epoch: self.epoch + 1, len: self.len, chunks, by_name: Arc::clone(&self.by_name), live: Arc::clone(&self.live) }
     }
 
@@ -192,7 +202,7 @@ impl Table {
     /// The proxies back, for a unit test that writes into them as the load does.
     #[cfg(test)]
     pub(crate) fn into_vec(self) -> Vec<Proxy> {
-        self.chunks.iter().flat_map(|c| c.iter().map(|p| (**p).clone())).collect()
+        self.iter().cloned().collect()
     }
 }
 
@@ -239,8 +249,10 @@ impl<'a> IntoIterator for &'a Table {
 
 impl std::ops::Index<usize> for Table {
     type Output = Proxy;
+    #[inline(always)]
     fn index(&self, slot: usize) -> &Proxy {
-        &self.chunks[slot >> CHUNK_SHIFT][slot & (CHUNK - 1)]
+        debug_assert!(slot < self.len, "slot {slot} of {}", self.len);
+        &self.chunks[(slot >> CHUNK_SHIFT) & (MAX_CHUNKS - 1)][slot & (CHUNK - 1)]
     }
 }
 
@@ -349,7 +361,7 @@ mod tests {
         let proxies = load(&big());
         let replacement = proxies[3].clone();
         let t1 = Table::new(proxies);
-        assert_eq!((t1.epoch(), t1.len(), t1.chunks.len(), t1.is_empty()), (1, 1_102, 2, false), "b, 1100 x, f: the disabled d has no proxy");
+        assert_eq!((t1.epoch(), t1.len(), t1.chunks.len(), t1.is_empty()), (1, 1_102, MAX_CHUNKS, false), "b, 1100 x, f: the disabled d has no proxy");
         let t2 = t1.replace(3, replacement);
         assert_eq!(t2.epoch(), 2);
         assert!(!Arc::ptr_eq(&t1.chunks[0], &t2.chunks[0]), "the chunk of the slot is copied");
@@ -361,6 +373,8 @@ mod tests {
         assert_eq!(t2.slot_by_name("x7"), Some(8));
         assert_eq!(t2.slot_by_name("nope"), None);
         assert_eq!(t2.get(1_102).map(|p| &*p.name), None);
+        assert!(Arc::ptr_eq(&t2.chunks[2], &t2.chunks[3]), "the chunks past the last proxy are one shared, empty chunk");
+        assert_eq!(&*t2.chunks[1][1_102 - CHUNK].name, "", "the unused slots of the last chunk read an empty proxy");
         assert_eq!(t2.get(1_101).map(|p| &*p.name), Some("f"));
         let names: Vec<&str> = t2.iter().map(|p| p.name.as_str()).collect();
         assert_eq!((names.len(), names[0], names[1_101], t2.iter().len()), (1_102, "b", "f", 1_102));
