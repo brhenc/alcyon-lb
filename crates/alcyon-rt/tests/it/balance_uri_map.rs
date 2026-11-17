@@ -9,11 +9,15 @@
 //! `get_server_uh` (`src/backend.c`) hashes the path with `sdbm`, and `map_get_server_hash`
 //! (`src/lb_map.c`) takes it modulo `tot_weight` into the interleaved weighted map. Reaches
 //! the data path in `lb::balance_uri`, called from `Proxy` server selection (`engine.rs`).
+//!
+//! `T281_ORACLE=/path/to/haproxy` to run these tests against `HAProxy`: it passes all.
 
 use crate::common;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -68,7 +72,8 @@ fn with_alcyon(bind_opts: &str, balance: &str, weights: &[u32], s2_down: bool, r
     );
     let path = std::env::temp_dir().join(format!("alcyon_baluri_{}_{}", std::process::id(), RUN.fetch_add(1, Ordering::Relaxed)));
     std::fs::write(&path, cfg).expect("write config");
-    let _child = Command::new(env!("CARGO_BIN_EXE_alcyon"))
+    let bin = std::env::var("T281_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_alcyon").to_string());
+    let _child = Command::new(&bin)
         .arg("-f")
         .arg(&path)
         .stdout(Stdio::null())
@@ -90,6 +95,67 @@ fn with_alcyon(bind_opts: &str, balance: &str, weights: &[u32], s2_down: bool, r
 /// (the `balance` line, and a `hash-type` one if any) and servers with `weights`.
 fn answers_of(balance: &str, weights: &[u32], s2_down: bool, uris: &[&str]) -> String {
     with_alcyon("", balance, weights, s2_down, |port| uris.iter().map(|u| get(port, u)).collect())
+}
+
+/// `with_alcyon`, with a `stats socket {sock} mode 600 level admin` in the `global` section
+/// (bound after the frontends listen), so `run` can drive the proxy over its admin socket.
+fn with_admin(balance: &str, weights: &[u32], run: impl FnOnce(u16, &Path) -> String) -> String {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RUN: AtomicUsize = AtomicUsize::new(0);
+    let mut servers = String::new();
+    for (i, w) in weights.iter().enumerate() {
+        servers.push_str(&format!("  server s{} 127.0.0.1:{} weight {w}\n", i + 1, backend(i + 1)));
+    }
+    let port = common::reserve_port();
+    let run_id = RUN.fetch_add(1, Ordering::Relaxed);
+    let sock = std::env::temp_dir().join(format!("alcyon_baluri_adm_{}_{}.sock", std::process::id(), run_id));
+    let _ = std::fs::remove_file(&sock);
+    let cfg = format!(
+        "global\n  stats socket {} mode 600 level admin\n\
+         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend f\n  bind 127.0.0.1:{port}\n  default_backend be\n\
+         backend be\n  {balance}\n{servers}",
+        sock.display()
+    );
+    let path = std::env::temp_dir().join(format!("alcyon_baluri_adm_{}_{}.cfg", std::process::id(), run_id));
+    std::fs::write(&path, &cfg).expect("write config");
+    let bin = std::env::var("T281_ORACLE").unwrap_or_else(|_| env!("CARGO_BIN_EXE_alcyon").to_string());
+    let _child = Command::new(&bin)
+        .arg("-f")
+        .arg(&path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(common::Alcyon)
+        .expect("spawn");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "the daemon never listened on {port}: {balance}");
+        thread::sleep(Duration::from_millis(25));
+    }
+    while !sock.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(sock.exists(), "the stats socket never appeared: {balance}");
+    let got = run(port, &sock);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&sock);
+    got
+}
+
+/// Sends `cmd` on the stats socket and reads the reply (the connection is closed after it).
+fn cli(sock: &Path, cmd: &str) -> String {
+    let mut s = UnixStream::connect(sock).expect("connect to the stats socket");
+    s.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+    s.write_all(format!("{cmd}\n").as_bytes()).expect("send");
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    out
+}
+
+/// The 35 URIs of `answers()`: `/p0` .. `/p31`, then `/q?a=1`, `/q?a=2` and `/q`.
+fn runtime_uris() -> Vec<String> {
+    (0..32).map(|i| format!("/p{i}")).chain(["/q?a=1", "/q?a=2", "/q"].map(String::from)).collect()
 }
 
 fn h2_frame(ftype: u8, flags: u8, sid: u32, payload: &[u8]) -> Vec<u8> {
@@ -174,6 +240,45 @@ fn unequal_weights_interleave_like_haproxys_map() {
 #[test]
 fn a_server_down_is_left_out_of_the_map() {
     assert_eq!(answers(&[1, 1, 1, 1], true), "34134134134134134134134134134134333");
+}
+
+/// A server `disabled` at run time (admin socket) leaves the map until it is `enable`d
+/// again, and nothing else moves: measured on the reference `HAProxy` (3.5-dev11,
+/// 2026-11-16) for `/p0` .. `/p31`, `/q?a=1`, `/q?a=2`, `/q`, four equal servers, `balance uri`.
+#[test]
+fn a_server_disabled_at_run_time_is_left_out_of_the_map_until_reenabled() {
+    with_admin("balance uri", &[1, 1, 1, 1], |port, sock| {
+        let uris = runtime_uris();
+        let init: String = uris.iter().map(|u| get(port, u)).collect();
+        assert_eq!(init, "41234123411234123412412341234134333", "before the change");
+        cli(sock, "disable server be/s2");
+        let down: String = uris.iter().map(|u| get(port, u)).collect();
+        assert_eq!(down, "34134134134134134134134134134134333", "while s2 is disabled");
+        cli(sock, "enable server be/s2");
+        let up: String = uris.iter().map(|u| get(port, u)).collect();
+        assert_eq!(up, init, "after s2 is re-enabled");
+        up
+    });
+}
+
+/// `set server be/s2 weight 0%` / `100%` at run time re-weighs the map and restores it.
+/// `balance uri` is a static LB algorithm: an absolute runtime weight is refused by `HAProxy`
+/// (only `0%` and `100%` are accepted), so those are the commands measured here (reference
+/// `HAProxy`, 3.5-dev11, 2026-11-16): weights 1 3 1 2, s2 to 0, then back.
+#[test]
+fn a_runtime_weight_change_reweighs_the_map() {
+    with_admin("balance uri", &[1, 3, 1, 2], |port, sock| {
+        let uris = runtime_uris();
+        let init: String = uris.iter().map(|u| get(port, u)).collect();
+        assert_eq!(init, "41224234122423412242234122423441222", "before the change");
+        cli(sock, "set server be/s2 weight 0%");
+        let w0: String = uris.iter().map(|u| get(port, u)).collect();
+        assert_eq!(w0, "41434143411434143414414341434134333", "s2 at weight 0");
+        cli(sock, "set server be/s2 weight 100%");
+        let back: String = uris.iter().map(|u| get(port, u)).collect();
+        assert_eq!(back, init, "s2 back at its configured weight");
+        back
+    });
 }
 
 /// The URIs of the option rows: twelve plain ones, then paths that share a directory, a

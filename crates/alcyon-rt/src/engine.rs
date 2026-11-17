@@ -2112,38 +2112,38 @@ impl Proxy {
     /// Selects the target backend server with load balancing algorithm (Source IP hash or round-robin),
     /// respecting backup failover and connection limits.
     #[must_use]
-    pub fn select_server_with_key(&self, source_ip: Option<IpAddr>, uri: Option<&str>) -> Option<SocketAddr> {
-        self.select_server_with_key_abs(source_ip, uri, None)
+    pub fn select_server_with_key(&self, source_ip: Option<IpAddr>, uri: Option<&str>, lb_snap: &mut crate::lb::LbSnapCache) -> Option<SocketAddr> {
+        self.select_server_with_key_abs(source_ip, uri, None, lb_snap)
     }
 
     /// [`Proxy::select_server_with_key`] with an optional `scheme://authority` prefix
     /// (`H2Child::req_abs`) for HTTP/2 and HTTP/3 `balance uri`.
     #[must_use]
-    pub fn select_server_with_key_abs(&self, source_ip: Option<IpAddr>, uri: Option<&str>, abs: Option<&str>) -> Option<SocketAddr> {
-        self.select_server_with_key_abs_idx(source_ip, uri, abs).map(|(_, a)| a)
+    pub fn select_server_with_key_abs(&self, source_ip: Option<IpAddr>, uri: Option<&str>, abs: Option<&str>, lb_snap: &mut crate::lb::LbSnapCache) -> Option<SocketAddr> {
+        self.select_server_with_key_abs_idx(source_ip, uri, abs, lb_snap).map(|(_, a)| a)
     }
 
     /// [`Proxy::select_server_with_key`], with the index of the server picked (`None`: the
     /// dispatch address), so that the caller does not look the address up again.
     #[must_use]
-    pub fn select_server_with_key_idx(&self, source_ip: Option<IpAddr>, uri: Option<&str>) -> Option<(Option<usize>, SocketAddr)> {
-        self.select_server_with_key_abs_idx(source_ip, uri, None)
+    pub fn select_server_with_key_idx(&self, source_ip: Option<IpAddr>, uri: Option<&str>, lb_snap: &mut crate::lb::LbSnapCache) -> Option<(Option<usize>, SocketAddr)> {
+        self.select_server_with_key_abs_idx(source_ip, uri, None, lb_snap)
     }
 
     /// [`Proxy::select_server_with_key_abs`], with the picked server index.
     #[must_use]
-    pub fn select_server_with_key_abs_idx(&self, source_ip: Option<IpAddr>, uri: Option<&str>, abs: Option<&str>) -> Option<(Option<usize>, SocketAddr)> {
+    pub fn select_server_with_key_abs_idx(&self, source_ip: Option<IpAddr>, uri: Option<&str>, abs: Option<&str>, lb_snap: &mut crate::lb::LbSnapCache) -> Option<(Option<usize>, SocketAddr)> {
         if self.srv_set().is_empty() {
             return self.dispatch.map(|a| (None, a));
         }
         match self.balance {
             BalanceAlgorithm::Source if source_ip.is_some() => {
                 let ip = source_ip?;
-                crate::lb::balance_source(self, ip).map(|idx| (Some(idx), self.srv_set().addr_at(idx))).or(self.dispatch.map(|a| (None, a)))
+                crate::lb::balance_source(self, ip, lb_snap).map(|idx| (Some(idx), self.srv_set().addr_at(idx))).or(self.dispatch.map(|a| (None, a)))
             }
             BalanceAlgorithm::Uri => {
                 let u = uri.unwrap_or("/");
-                if let Some(idx) = crate::lb::balance_uri_with_abs(self, u, abs) {
+                if let Some(idx) = crate::lb::balance_uri_with_abs(self, u, abs, lb_snap) {
                     Some((Some(idx), self.srv_set().addr_at(idx)))
                 } else {
                     self.select_server_idx()
@@ -2443,7 +2443,7 @@ impl Engine {
     /// above the pre-size). A close never does; only this does.
     fn compact_arenas(&mut self) {
         use alcyon_alloc::Arena;
-        let released = self.sessions.compact() + self.applets.compact() + self.scheduler.tasks.compact();
+        let released = self.sessions.compact() + self.applets.compact() + self.scheduler.tasks.compact() + self.lb_snap.compact();
         if released > 0 {
             let _ = alcyon_alloc::trim_heap();
         }
@@ -2490,6 +2490,10 @@ pub struct Engine {
     resolvers: Vec<crate::resolvers::Section>,
     pub sessions: SessionArena,
     pub applets: AppletArena,
+    /// This worker's hash-pick snapshots (T633): one `(generation, Arc<snapshot>)` per
+    /// hash-balanced backend picked on, so a steady-state pick takes no lock and scans
+    /// no server (design 3.5). The slots are the `lbsnap` pool (`show pools`).
+    pub lb_snap: crate::lb::LbSnapCache,
     pub cli_listener: Option<crate::cli_listener::CliListener>,
     /// The first CLI socket's file, unlinked on exit; `None` for TCP and abstract sockets.
     pub cli_socket_path: Option<PathBuf>,
@@ -5234,6 +5238,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             crate::promex::prewarm();
         }
 
+        // One hash-pick cache slot per hash-balanced proxy, made before the first pick (T633).
+        let hash_proxies = proxies
+            .iter()
+            .filter(|p| matches!(p.balance, BalanceAlgorithm::Uri | BalanceAlgorithm::Source))
+            .count();
+
         let mut engine = Engine {
             quic_listeners,
             poller,
@@ -5245,6 +5255,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             resolvers,
             sessions,
             applets,
+            lb_snap: crate::lb::LbSnapCache::with_hash_proxies(hash_proxies),
             cli_listener: None,
             cli_socket_path: None,
             cli_socket_name: None,
@@ -5797,6 +5808,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 let raw_fd = ql.raw_fd();
                 let (proxies, now) = (&self.proxies, self.now);
                 let (bufsize, maxrewrite, flood) = (self.global_bufsize, self.global_maxrewrite, self.global_h2_flood_config);
+                let lb_snap = &mut self.lb_snap;
                 // Refused by a rule, no mux context, or no session: one way out, which gives the
                 // tracked slots back and closes the connection.
                 let admitted = admitted.and_then(|(client_addr, server_addr, fc_src, fc_dst)| {
@@ -5823,6 +5835,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         flood,
                         false,
                         (false, false),
+                        lb_snap,
                     )
                     .map(|(sess, _, _)| (sess, mux))
                 });
@@ -6146,6 +6159,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.sessions.publish();
         self.applets.publish();
         self.scheduler.tasks.publish();
+        self.lb_snap.publish();
         // The accept limits: one test when none is in force.
         let poll_timeout = if self.accept_limited.is_some() || self.global_paused || self.fe_paused || self.cli_accept_retry.is_some() {
             self.limits_pass(now_inst, poll_timeout)
@@ -6294,6 +6308,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let mut dispatcher = EngineDispatcher {
             sessions: &mut self.sessions,
             applets: &mut self.applets,
+            lb_snap: &mut self.lb_snap,
             proxies: &mut self.proxies,
             checks: &mut self.checks,
             resolvers: &mut self.resolvers,
@@ -8149,6 +8164,7 @@ fn register_new_session(
         listener_idx
             .and_then(|i| engine.listeners.get(i))
             .map_or((false, false), |l| (l.accept_proxy, l.accept_proxy_v2)),
+        &mut engine.lb_snap,
     ) else {
         // TLS setup failed; the fd is dropped with the session and the connection closes.
         return;
@@ -8402,6 +8418,7 @@ fn init_client_session(
     global_h2_flood_config: alcyon_proto::H2FloodConfig,
     expect_proxy: bool,
     bind_proxy: (bool, bool),
+    lb_snap: &mut crate::lb::LbSnapCache,
 ) -> Option<(TcpSession, Option<SocketAddr>, Option<RawFd>)> {
     let mode = proxies[proxy_idx].mode;
     let timeouts = proxies[proxy_idx].timeouts;
@@ -8543,7 +8560,7 @@ fn init_client_session(
             Some(i) => Some(proxy.srv_set().addr_at(i)),
             None => proxy
                 .pick_and_take(true, || {
-                    let a = proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()), sess.req_uri.as_deref())?;
+                    let a = proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()), sess.req_uri.as_deref(), lb_snap)?;
                     Some((proxy.srv_set().slot_of_addr(a), a))
                 })
                 .map(|((_, a), _)| a),
@@ -8758,6 +8775,7 @@ fn trigger_resolutions(resolvers: &mut [crate::resolvers::Section], timers: &mut
 struct EngineDispatcher<'a> {
     sessions: &'a mut SessionArena,
     applets: &'a mut AppletArena,
+    lb_snap: &'a mut crate::lb::LbSnapCache,
     proxies: &'a mut Proxies,
     checks: &'a mut [ServerCheckState],
     resolvers: &'a mut [crate::resolvers::Section],
@@ -9404,6 +9422,7 @@ fn server_connect_failed(
     poller: &mut Poller,
     now: Tick,
     mut wait: bool,
+    lb_snap: &mut crate::lb::LbSnapCache,
 ) {
     loop {
         // The failed socket leaves the poller and the fd table before `server_failed`
@@ -9423,7 +9442,7 @@ fn server_connect_failed(
             }
             return;
         }
-        if !retry_server_connect(entry, proxies, fdtab, poller, now, wait) {
+        if !retry_server_connect(entry, proxies, fdtab, poller, now, wait, lb_snap) {
             return;
         }
         wait = false;
@@ -9441,9 +9460,9 @@ fn release_failed_server(entry: &mut SessionEntry, fdtab: &mut FdTab, poller: &m
 
 /// Connects again now, the retry of a connect that failed (a turnaround over, or the
 /// connect made at accept refused at once); a refusal at once is the next failure.
-fn retry_now(entry: &mut SessionEntry, proxies: &[Proxy], fdtab: &mut FdTab, poller: &mut Poller, now: Tick) {
-    if retry_server_connect(entry, proxies, fdtab, poller, now, false) {
-        server_connect_failed(entry, proxies, fdtab, poller, now, false);
+fn retry_now(entry: &mut SessionEntry, proxies: &[Proxy], fdtab: &mut FdTab, poller: &mut Poller, now: Tick, lb_snap: &mut crate::lb::LbSnapCache) {
+    if retry_server_connect(entry, proxies, fdtab, poller, now, false, lb_snap) {
+        server_connect_failed(entry, proxies, fdtab, poller, now, false, lb_snap);
     }
 }
 
@@ -9458,6 +9477,7 @@ fn retry_server_connect(
     poller: &mut Poller,
     now: Tick,
     wait: bool,
+    lb_snap: &mut crate::lb::LbSnapCache,
 ) -> bool {
     release_failed_server(entry, fdtab, poller);
     entry.sess.srv = None;
@@ -9524,13 +9544,13 @@ fn retry_server_connect(
         let others = proxies[be_idx].eligible_server_indices().len() > 1;
         let be = &proxies[be_idx];
         crate::lb::with_avoided(be, if hash || !others { None } else { old_idx }, || {
-            be.select_server_with_key_abs(source_ip, entry.sess.req_uri.as_deref(), entry.sess.req_abs())
+            be.select_server_with_key_abs(source_ip, entry.sess.req_uri.as_deref(), entry.sess.req_abs(), lb_snap)
         })
     } else {
         entry
             .sess
             .target_addr
-            .or_else(|| proxies[be_idx].select_server_with_key_abs(source_ip, entry.sess.req_uri.as_deref(), entry.sess.req_abs()))
+            .or_else(|| proxies[be_idx].select_server_with_key_abs(source_ip, entry.sess.req_uri.as_deref(), entry.sess.req_abs(), lb_snap))
     };
     // A different server is a redispatch (`wredis`), the same one a retry (`wretr`); the
     // client's persistence cookie no longer holds (`SF_DIRECT` cleared, `TX_CK_DOWN`).
@@ -9653,6 +9673,7 @@ fn check_srv_connect(
     fdtab: &mut FdTab,
     poller: &mut Poller,
     now: Tick,
+    lb_snap: &mut crate::lb::LbSnapCache,
 ) {
     if entry.sess.srv_state == ScState::Connecting {
         if let Some(sfd) = entry.srv_raw_fd {
@@ -9685,7 +9706,7 @@ fn check_srv_connect(
                     if let Ok(Some(e)) = &conn_err {
                         entry.sess.bc_err = Some(crate::proxy::bc_connect_errno(e));
                     }
-                    server_connect_failed(entry, proxies, fdtab, poller, now, true);
+                    server_connect_failed(entry, proxies, fdtab, poller, now, true, lb_snap);
                 }
             }
         }
@@ -10061,6 +10082,7 @@ impl EngineDispatcher<'_> {
         idle_pool: &mut IdlePool,
         wake_queue: &mut Vec<TaskRef>,
         now: Tick,
+        lb_snap: &mut crate::lb::LbSnapCache,
     ) -> Option<crate::stats_html::AdminAction> {
         // An HTTP/2 connection serving a stream is not between requests: the stream is its
         // child's, which ends it (T280).
@@ -10193,13 +10215,13 @@ impl EngineDispatcher<'_> {
         // one assigned a server waits for that one.
         if entry.sess.queue.is_some() {
             let (be_idx, srv) = (entry.backend_idx, entry.sess.queue.server());
-            admin = Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, srv);
+            admin = Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, srv, lb_snap);
         }
         if entry.sess.strm.txn.as_ref().is_some_and(|t| !t.req_rules_done) && entry.sess.tcp_inspect_done {
             if let Some(t) = entry.sess.strm.txn.as_mut() {
                 t.req_rules_done = true;
             }
-            admin = Self::connect_http_backend(entry, proxies, checks, pid, fdtab, poller, idle_pool, now);
+            admin = Self::connect_http_backend(entry, proxies, checks, pid, fdtab, poller, idle_pool, now, lb_snap);
             let sess = &mut entry.sess;
             if let Some(t) = sess.strm.txn.as_mut() {
                 if t.body_wait.is_some() {
@@ -10229,14 +10251,14 @@ impl EngineDispatcher<'_> {
             if entry.sess.strm.txn.as_ref().is_some_and(|t| t.rsp == MsgState::Waiting && t.reads_server())
                 && !entry.sess.rep.is_empty()
             {
-                if Self::l7_retry(entry, proxies, fdtab, poller, now) {
+                if Self::l7_retry(entry, proxies, fdtab, poller, now, lb_snap) {
                     continue;
                 }
                 if !Self::apply_http_response_rules(entry, proxies, now) {
                     Self::write_response_head_names(entry, proxies);
                 }
             }
-            if Self::l7_retry_failure(entry, proxies, fdtab, poller, now) {
+            if Self::l7_retry_failure(entry, proxies, fdtab, poller, now, lb_snap) {
                 continue;
             }
             // An HTTP/2 stream's response goes to the client through its connection's owner
@@ -11326,7 +11348,7 @@ impl EngineDispatcher<'_> {
             }
 
             // Step 1: Server connect check if connecting
-            check_srv_connect(entry, self.proxies, self.fdtab, self.poller, now);
+            check_srv_connect(entry, self.proxies, self.fdtab, self.poller, now, self.lb_snap);
 
             // A readiness event on either socket: reading it may make progress again.
             if let Some(sfd) = entry.srv_raw_fd {
@@ -11363,7 +11385,7 @@ impl EngineDispatcher<'_> {
                     && !entry.sess.is_done()
                 {
                     entry.sess.ending = None;
-                    server_connect_failed(entry, self.proxies, self.fdtab, self.poller, now, false);
+                    server_connect_failed(entry, self.proxies, self.fdtab, self.poller, now, false, self.lb_snap);
                     // The last attempt ran out of time, not out of luck: a server-side timeout
                     // (`sC--`), where a refusal is `SC--` (T496, VV-23).
                     if entry.sess.ending == Some(crate::proxy::Ending::ConnectFailed) {
@@ -11372,7 +11394,7 @@ impl EngineDispatcher<'_> {
                 }
                 // A retry that waited out its turnaround connects now.
                 if entry.sess.retry_after.is_set() && entry.sess.retry_after.is_expired(now) && !entry.sess.is_done() {
-                    retry_now(entry, self.proxies, self.fdtab, self.poller, now);
+                    retry_now(entry, self.proxies, self.fdtab, self.poller, now, self.lb_snap);
                 }
             }
 
@@ -11423,7 +11445,7 @@ impl EngineDispatcher<'_> {
                 // `HAProxy` records a `CO_ER_SSL_*` code here, which Alcyon does not tell
                 // apart yet: no `bc_err` rather than the 0 of the TCP connect.
                 entry.sess.bc_err = None;
-                server_connect_failed(entry, self.proxies, self.fdtab, self.poller, now, true);
+                server_connect_failed(entry, self.proxies, self.fdtab, self.poller, now, true, self.lb_snap);
             }
 
             // Steps 3.3 to 3.45, the rare checks of the request's start, behind one bit (T599).
@@ -11555,6 +11577,7 @@ impl EngineDispatcher<'_> {
                     self.idle_backend_pool,
                     &mut self.wake_queue,
                     now,
+                    self.lb_snap,
                 );
             }
 
@@ -11580,9 +11603,9 @@ impl EngineDispatcher<'_> {
                 if entry.sess.target_addr.is_some() {
                     // The connect made at accept was refused at once, retries remain: this
                     // is the retry (`wretr`, or `wredis` redispatched), at once.
-                    retry_now(entry, self.proxies, self.fdtab, self.poller, now);
+                    retry_now(entry, self.proxies, self.fdtab, self.poller, now, self.lb_snap);
                 } else {
-                    Self::connect_tcp_backend(entry, self.proxies, self.fdtab, self.poller, now);
+                    Self::connect_tcp_backend(entry, self.proxies, self.fdtab, self.poller, now, self.lb_snap);
                 }
             }
 
@@ -11914,7 +11937,7 @@ impl EngineDispatcher<'_> {
     /// the backend retries on (or a status line that is none), the request was copied whole
     /// when it was sent, and a retry is left: the answer is dropped and the request sent
     /// again (`l7_replay`). `true` when it was.
-    fn l7_retry(entry: &mut SessionEntry, proxies: &[Proxy], fdtab: &mut FdTab, poller: &mut Poller, now: Tick) -> bool {
+    fn l7_retry(entry: &mut SessionEntry, proxies: &[Proxy], fdtab: &mut FdTab, poller: &mut Poller, now: Tick, lb_snap: &mut crate::lb::LbSnapCache) -> bool {
         let retry_on = proxies[entry.backend_idx].ids.retry_on;
         if retry_on & (alcyon_config::RE_STATUS_MASK | alcyon_config::RE_JUNK_RESPONSE) == 0 {
             return false;
@@ -11928,13 +11951,13 @@ impl EngineDispatcher<'_> {
         } else {
             alcyon_config::RE_STATUSES.iter().any(|&(s, bit)| s == status && retry_on & bit != 0)
         };
-        due && Self::l7_replay(entry, proxies, fdtab, poller, now)
+        due && Self::l7_replay(entry, proxies, fdtab, poller, now, lb_snap)
     }
 
     /// `retry-on empty-response`, `response-timeout` and `junk-response`: the server ended
     /// the connection, or `timeout server` ran out, before a response head, and the backend
     /// retries on that.
-    fn l7_retry_failure(entry: &mut SessionEntry, proxies: &[Proxy], fdtab: &mut FdTab, poller: &mut Poller, now: Tick) -> bool {
+    fn l7_retry_failure(entry: &mut SessionEntry, proxies: &[Proxy], fdtab: &mut FdTab, poller: &mut Poller, now: Tick, lb_snap: &mut crate::lb::LbSnapCache) -> bool {
         let retry_on = proxies[entry.backend_idx].ids.retry_on;
         let timeout = entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Server));
         let srv_eof = matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed);
@@ -11951,14 +11974,14 @@ impl EngineDispatcher<'_> {
         } else {
             alcyon_config::RE_JUNK_RESPONSE
         };
-        retry_on & kind != 0 && Self::l7_replay(entry, proxies, fdtab, poller, now)
+        retry_on & kind != 0 && Self::l7_replay(entry, proxies, fdtab, poller, now, lb_snap)
     }
 
     /// `do_l7_retry`: one retry is spent, the answer so far dropped, the server connection
     /// closed, and the request, as it was sent, put back to go out again to the server the
     /// balancing picks (redispatching under `option redispatch`). `false` when no retry is
     /// left or the request was not kept.
-    fn l7_replay(entry: &mut SessionEntry, proxies: &[Proxy], fdtab: &mut FdTab, poller: &mut Poller, now: Tick) -> bool {
+    fn l7_replay(entry: &mut SessionEntry, proxies: &[Proxy], fdtab: &mut FdTab, poller: &mut Poller, now: Tick, lb_snap: &mut crate::lb::LbSnapCache) -> bool {
         if entry.sess.conn_retries == 0 {
             return false;
         }
@@ -11989,7 +12012,7 @@ impl EngineDispatcher<'_> {
         }
         // The connect that follows is any other retry's: a refusal at once is the next
         // failure (`server_connect_failed`: `econ` once, retries without turnaround).
-        retry_now(entry, proxies, fdtab, poller, now);
+        retry_now(entry, proxies, fdtab, poller, now, lb_snap);
         true
     }
 
@@ -13489,6 +13512,7 @@ impl EngineDispatcher<'_> {
         poller: &mut Poller,
         idle_pool: &mut IdlePool,
         now: Tick,
+        lb_snap: &mut crate::lb::LbSnapCache,
     ) -> Option<crate::stats_html::AdminAction> {
         let proxy_idx = entry.proxy_idx;
         // A request held for its body (`wait-for-body`) comes back here when the body is
@@ -14660,7 +14684,7 @@ impl EngineDispatcher<'_> {
         if !names_done && (lower || srv_table.is_some()) {
             entry.sess.req.edit_keeping_lines(|head, eoh| rewrite_header_names_before(head, eoh, srv_table, lower));
         }
-        Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, cookie_server)
+        Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, cookie_server, lb_snap)
     }
 
     /// A header `HAProxy` fails the request over (`return_int_err`) did not fit: the 500.
@@ -14684,6 +14708,7 @@ impl EngineDispatcher<'_> {
         now: Tick,
         be_idx: usize,
         cookie_server: Option<usize>,
+        lb_snap: &mut crate::lb::LbSnapCache,
     ) -> Option<crate::stats_html::AdminAction> {
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
         entry.sess.lb_picked = cookie_server.is_none();
@@ -14695,7 +14720,7 @@ impl EngineDispatcher<'_> {
         // Only a server with a `maxconn` is counted here; the others are counted once their
         // connection is in use, below (T224). `counted`: the slot is counted already.
         let be = &proxies[be_idx];
-        let pick = || be.pick_and_take(false, || be.select_server_with_key_abs_idx(source_ip, entry.sess.req_uri.as_deref(), entry.sess.req_abs()));
+        let mut pick = || be.pick_and_take(false, || be.select_server_with_key_abs_idx(source_ip, entry.sess.req_uri.as_deref(), entry.sess.req_abs(), lb_snap));
         let mut full;
         let target = if let Some(idx) = cookie_server {
             let t = be.take_server_slot(idx, false).map(|counted| ((Some(idx), be.srv_set().addr_at(idx)), counted));
@@ -14923,7 +14948,7 @@ impl EngineDispatcher<'_> {
                 }
             }
         } else {
-            server_connect_failed(entry, proxies, fdtab, poller, now, false);
+            server_connect_failed(entry, proxies, fdtab, poller, now, false, lb_snap);
         }
         None
     }
@@ -14953,6 +14978,7 @@ impl EngineDispatcher<'_> {
         fdtab: &mut FdTab,
         poller: &mut Poller,
         now: Tick,
+        lb_snap: &mut crate::lb::LbSnapCache,
     ) {
         let Some(be_idx) = Self::resolve_backend(entry, proxies) else {
             // `force-be-switch` sent the connection to a disabled backend: no server.
@@ -15032,7 +15058,7 @@ impl EngineDispatcher<'_> {
         let be = &proxies[be_idx];
         let target = match direct {
             Some(i) => Some(((Some(i), be.srv_set().addr_at(i)), false)),
-            None => be.pick_and_take(true, || be.select_server_with_key_idx(source_ip, entry.sess.req_uri.as_deref())),
+            None => be.pick_and_take(true, || be.select_server_with_key_idx(source_ip, entry.sess.req_uri.as_deref(), lb_snap)),
         };
 
         let Some(((s_idx, target_addr), counted)) = target else {
@@ -15078,7 +15104,7 @@ impl EngineDispatcher<'_> {
                 }
             }
         } else {
-            server_connect_failed(entry, proxies, fdtab, poller, now, false);
+            server_connect_failed(entry, proxies, fdtab, poller, now, false, lb_snap);
         }
     }
 

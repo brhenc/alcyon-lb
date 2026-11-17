@@ -65,6 +65,7 @@ fn propagate(proxies: &[Proxy], p: usize, s: usize) {
             let own = ServerStatus::from(tr.own.load(Ordering::Relaxed));
             px.srv_set().at(t).expect("tracking server").store_status(combine(own, state) as u8);
             px.fwrr.changed();
+            px.chash.changed();
             propagate(proxies, q, t);
         }
     }
@@ -115,9 +116,11 @@ fn set_status_inner(proxies: &[Proxy], p: usize, s: usize, raw: u8) {
         let eff = combine(st, load(proxies, tp, ts));
         proxies[p].srv_set().at(s).expect("tracking server").store_status(eff as u8);
         proxies[p].fwrr.changed();
+        proxies[p].chash.changed();
     } else if let Some(v) = proxies.get(p).and_then(|px| px.srv_set().at(s)) {
         v.store_status(raw);
         proxies[p].fwrr.changed();
+        proxies[p].chash.changed();
     }
     propagate(proxies, p, s);
 }

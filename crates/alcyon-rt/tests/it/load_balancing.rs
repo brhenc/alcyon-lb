@@ -89,17 +89,18 @@ backend test_be
         proxy.srv_set().status_cell(i).expect("status").store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
     
+    let mut cache = lb::LbSnapCache::new();
     let uri1 = "/api/v1/users";
-    let server_for_uri1 = lb::balance_uri(proxy, uri1).unwrap();
+    let server_for_uri1 = lb::balance_uri(proxy, uri1, &mut cache).unwrap();
     
     for _ in 0..100 {
-        assert_eq!(lb::balance_uri(proxy, uri1).unwrap(), server_for_uri1);
+        assert_eq!(lb::balance_uri(proxy, uri1, &mut cache).unwrap(), server_for_uri1);
     }
     
     let mut counts = vec![0; 3];
     for i in 0..100 {
         let uri = format!("/api/v1/resource/{}", i);
-        let idx = lb::balance_uri(proxy, &uri).unwrap();
+        let idx = lb::balance_uri(proxy, &uri, &mut cache).unwrap();
         counts[idx] += 1;
     }
     
@@ -125,11 +126,12 @@ backend test_be
         proxy.srv_set().status_cell(i).expect("status").store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
     
+    let mut cache = lb::LbSnapCache::new();
     let mut counts = vec![0; 3];
     for i in 0..100 {
         let uri = format!("/api/v1/resource/{}", i);
         // Drive the engine's real selection path -- not lb::balance_uri
-        let target = proxy.select_server_with_key(None, Some(&uri)).unwrap();
+        let target = proxy.select_server_with_key(None, Some(&uri), &mut cache).unwrap();
         let idx = proxy.srv_set().slot_of_addr(target).unwrap();
         counts[idx] += 1;
     }
@@ -160,8 +162,9 @@ backend test_be
         proxy.srv_set().status_cell(i).expect("status").store(check::ServerStatus::Up as u8, Ordering::Relaxed);
     }
 
+    let mut cache = lb::LbSnapCache::new();
     for _ in 0..20 {
-        let target = proxy.select_server_with_key(None, None).unwrap();
+        let target = proxy.select_server_with_key(None, None, &mut cache).unwrap();
         assert_eq!(target, proxy.srv_set().addr_at(0), "balance first must always pick the earliest server with a free slot");
     }
 }
@@ -186,7 +189,8 @@ backend test_be
     }
     proxy.srv_set().actconn_cell(0).expect("actconn").store(1, Ordering::Relaxed); // s1 (index 0) is full
 
-    let target = proxy.select_server_with_key(None, None).unwrap();
+    let mut cache = lb::LbSnapCache::new();
+    let target = proxy.select_server_with_key(None, None, &mut cache).unwrap();
     assert_eq!(target, proxy.srv_set().addr_at(1), "a full earlier server must be skipped in favour of the next one");
 }
 
@@ -212,8 +216,9 @@ backend test_be
     }
 
     let mut counts = vec![0; 3];
+    let mut cache = lb::LbSnapCache::new();
     for _ in 0..300 {
-        let target = proxy.select_server_with_key(None, None).unwrap();
+        let target = proxy.select_server_with_key(None, None, &mut cache).unwrap();
         let idx = proxy.srv_set().slot_of_addr(target).unwrap();
         counts[idx] += 1;
     }
@@ -243,8 +248,9 @@ backend test_be
     }
     proxy.srv_set().actconn_cell(0).expect("actconn").store(1, Ordering::Relaxed); // s1 is full
 
+    let mut cache = lb::LbSnapCache::new();
     for _ in 0..50 {
-        let target = proxy.select_server_with_key(None, None).unwrap();
+        let target = proxy.select_server_with_key(None, None, &mut cache).unwrap();
         assert_eq!(target, proxy.srv_set().addr_at(1), "a saturated server must never be drawn");
     }
 }
@@ -271,13 +277,14 @@ backend test_be
     }
 
     let uri = "/test-url";
-    let natural = proxy.select_server_with_key(None, Some(uri)).unwrap();
+    let mut cache = lb::LbSnapCache::new();
+    let natural = proxy.select_server_with_key(None, Some(uri), &mut cache).unwrap();
     let natural_idx = proxy.srv_set().slot_of_addr(natural).unwrap();
 
     // Saturate the natural target and confirm the ring moves to the other server.
     proxy.srv_set().actconn_cell(natural_idx).expect("actconn").store(1, Ordering::Relaxed);
     let other_idx = 1 - natural_idx;
-    let target = proxy.select_server_with_key(None, Some(uri)).unwrap();
+    let target = proxy.select_server_with_key(None, Some(uri), &mut cache).unwrap();
     assert_eq!(target, proxy.srv_set().addr_at(other_idx), "hash-preserve-affinity maxconn must skip a full natural target");
 }
 
@@ -297,15 +304,16 @@ fn random_and_first_fall_back_to_the_first_backup_only() {
             "backend b\n    balance {algo}\n    server a 127.0.0.1:8001\n    server b1 127.0.0.1:8002 backup\n    server b2 127.0.0.1:8003 backup\n"
         ));
         let proxy = &eng.proxies[0];
+        let mut cache = lb::LbSnapCache::new();
         all_up(proxy);
         proxy.srv_set().status_cell(0).expect("status").store(check::ServerStatus::Down as u8, Ordering::Relaxed);
         for _ in 0..50 {
-            assert_eq!(proxy.select_server_with_key(None, None), Some(proxy.srv_set().addr_at(1)), "balance {algo}");
+            assert_eq!(proxy.select_server_with_key(None, None, &mut cache), Some(proxy.srv_set().addr_at(1)), "balance {algo}");
         }
         // And nothing at all once the backups are down too.
         proxy.srv_set().status_cell(1).expect("status").store(check::ServerStatus::Down as u8, Ordering::Relaxed);
         proxy.srv_set().status_cell(2).expect("status").store(check::ServerStatus::Down as u8, Ordering::Relaxed);
-        assert_eq!(proxy.select_server_with_key(None, None), None, "balance {algo}");
+        assert_eq!(proxy.select_server_with_key(None, None, &mut cache), None, "balance {algo}");
     }
 }
 
@@ -317,7 +325,8 @@ fn random_draws_prefer_the_less_loaded_server() {
     let proxy = &eng.proxies[0];
     all_up(proxy);
     proxy.srv_set().actconn_cell(0).expect("actconn").store(50, Ordering::Relaxed);
-    let to_s2 = (0..1000).filter(|_| proxy.select_server_with_key(None, None) == Some(proxy.srv_set().addr_at(1))).count();
+    let mut cache = lb::LbSnapCache::new();
+    let to_s2 = (0..1000).filter(|_| proxy.select_server_with_key(None, None, &mut cache) == Some(proxy.srv_set().addr_at(1))).count();
     assert!(to_s2 > 950, "{to_s2}/1000 to the idle server");
 }
 
@@ -331,18 +340,19 @@ fn runtime_maxconn_and_weight_reach_the_fallback_selections() {
             "backend b\n    balance {algo}\n    server s1 127.0.0.1:8001\n    server s2 127.0.0.1:8002\n"
         ));
         let proxy = &eng.proxies[0];
+        let mut cache = lb::LbSnapCache::new();
         all_up(proxy);
         assert!(proxy.srv_set().set_maxconn(0, Some(1)));
         proxy.srv_set().actconn_cell(0).expect("actconn").store(1, Ordering::Relaxed);
         for _ in 0..10 {
-            assert_eq!(proxy.select_server_with_key(None, None), Some(proxy.srv_set().addr_at(1)), "balance {algo}");
+            assert_eq!(proxy.select_server_with_key(None, None, &mut cache), Some(proxy.srv_set().addr_at(1)), "balance {algo}");
             assert_eq!(proxy.select_server(), Some(proxy.srv_set().addr_at(1)), "balance {algo}");
         }
         proxy.srv_set().actconn_cell(0).expect("actconn").store(0, Ordering::Relaxed);
         proxy.set_weight(1, 0);
         assert_eq!(proxy.initial_weight(1), 1);
         for _ in 0..10 {
-            assert_eq!(proxy.select_server_with_key(None, None), Some(proxy.srv_set().addr_at(0)), "balance {algo}");
+            assert_eq!(proxy.select_server_with_key(None, None, &mut cache), Some(proxy.srv_set().addr_at(0)), "balance {algo}");
         }
     }
 }

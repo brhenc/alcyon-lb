@@ -205,11 +205,12 @@ fn balance_source_and_the_other_algorithms_pick_by_index_without_a_list() {
     };
     let e = engine(BalanceAlgorithm::Source);
     let px = &e.proxies[0];
+    let mut cache = alcyon_rt::lb::LbSnapCache::new();
     let v4 = Some(std::net::IpAddr::from([10, 0, 0, 3]));
     let v6 = Some(std::net::IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 5]));
-    assert_eq!(px.select_server_with_key_idx(v4, None).map(|p| p.0), Some(Some(1)));
-    assert_eq!(px.select_server_with_key_idx(v6, None).map(|p| p.0), Some(Some(1)));
-    let no_ip: Vec<_> = (0..4).map(|_| px.select_server_with_key_idx(None, None).and_then(|p| p.0)).collect();
+    assert_eq!(px.select_server_with_key_idx(v4, None, &mut cache).map(|p| p.0), Some(Some(1)));
+    assert_eq!(px.select_server_with_key_idx(v6, None, &mut cache).map(|p| p.0), Some(Some(1)));
+    let no_ip: Vec<_> = (0..4).map(|_| px.select_server_with_key_idx(None, None, &mut cache).and_then(|p| p.0)).collect();
     assert_eq!(no_ip.iter().filter(|i| **i == Some(0)).count(), 2, "{no_ip:?}");
     for algo in [BalanceAlgorithm::Leastconn, BalanceAlgorithm::StaticRr, BalanceAlgorithm::First] {
         let e = engine(algo);
