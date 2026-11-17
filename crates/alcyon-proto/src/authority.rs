@@ -266,9 +266,17 @@ pub fn check_and_normalize_with(htx: &mut HtxSlice<'_>, accept_unsafe: bool, kno
         if !connect {
             return Err(invalid("a target without a scheme on a method other than CONNECT"));
         }
-        let (_, authority, _) = parse_authority(&uri);
+        let (start, authority, path) = parse_authority(&uri);
         if !accept_unsafe && has_forbidden_char(authority.as_bytes()) {
             return Err(invalid("a forbidden character in the CONNECT authority"));
+        }
+        // RFC9112#3.2.3: the authority-form is `uri-host:port` and only that. The
+        // authority above is what a next hop would read of the target, so a userinfo
+        // before it (`a@host:port`), or a path, query or fragment after it, would make
+        // it differ from the target the rules see: refused (`h1_headers_to_hdr_list`
+        // checks the authority against the whole target, `HTTP_VIO_AUTH_CONNECT_INV`).
+        if !accept_unsafe && (start != 0 || !path.is_empty()) {
+            return Err(invalid("a CONNECT target that is not exactly host:port"));
         }
         if let Some(h) = validate_connect(authority, host.as_deref(), accept_unsafe)? {
             for &i in &host_idx {
