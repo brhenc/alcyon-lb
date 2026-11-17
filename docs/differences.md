@@ -881,3 +881,12 @@ and socket-per-connection are not exposed).
 | `tune.quic.mem.tx-max`, `tune.quic.sec.stateless-reset-rate`, `tune.quic.zero-copy-fwd-send` | memory cap, reset rate limit, zero copy | not implemented |
 | `tune.quic.be.*` (`cc.*`, `max-idle-timeout`, `sec.glitches-threshold`, `stream.data-ratio`, `stream.max-concurrent`, `stream.rxbuf`, `tx.pacing`, `tx.udp-gso`) | QUIC to servers | no QUIC backend (T461) |
 | bind `quic-cc-algo`, `quic-socket`, `allow-0rtt` | congestion algorithm, socket mode, 0-RTT | refused as before |
+
+## `del backend` answers one line (T637, decision D3)
+
+HAProxy 3.5-dev8, and dev10 as well, prints the leftover notices of earlier CLI commands before
+its own answer. An example is "Server nb/a is going DOWN for maintenance. ..." followed by
+"Backend deleted.". `cli_parse_delete_backend` answers with `cli_umsg` and never calls
+`usermsgs_clr` (proxy.c:5511-5545). Alcyon treats this as an upstream defect and answers
+"Backend deleted." alone. The probes are in `docs/design/runtime-server-set-2026-11-16.md`,
+appendix A.3.
