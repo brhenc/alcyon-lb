@@ -89,8 +89,10 @@ impl Drop for Proxy {
 /// pauses between; a scripted `POST` reply holds the connection afterwards); records what
 /// it receives of any other request into `seen`, and answers it with a 200 once its body
 /// is complete, or once nothing more has come for a second. `early`: answer a `POST` as
-/// soon as its head is complete, without the body.
-fn server(responses: Arc<Vec<Vec<Part>>>, seen: Arc<Mutex<Vec<u8>>>, early: bool) -> SocketAddr {
+/// soon as its head is complete, without the body. `close_delay`: after that early answer,
+/// hold the socket (so body bytes may land in it unread, and the close resets it) before
+/// letting it go.
+fn server(responses: Arc<Vec<Vec<Part>>>, seen: Arc<Mutex<Vec<u8>>>, early: bool, close_delay: Duration) -> SocketAddr {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = l.local_addr().unwrap();
     thread::spawn(move || {
@@ -143,6 +145,9 @@ fn server(responses: Arc<Vec<Vec<Part>>>, seen: Arc<Mutex<Vec<u8>>>, early: bool
                     }
                 }
                 let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+                // Hold the socket before letting it go, so body bytes may land in it
+                // unread and the close comes out as a reset (see `server`).
+                thread::sleep(close_delay);
             });
         }
     });
@@ -150,13 +155,20 @@ fn server(responses: Arc<Vec<Vec<Part>>>, seen: Arc<Mutex<Vec<u8>>>, early: bool
 }
 
 fn start(responses: Vec<Vec<Part>>, seen: Arc<Mutex<Vec<u8>>>, client_to: &str, early: bool) -> Proxy {
-    start_with("", responses, seen, client_to, early)
+    start_with("", responses, seen, client_to, early, Duration::ZERO)
 }
 
 /// `start` with `fe_opts` (whole config lines, each ending in a newline) added to frontend `f`.
-fn start_with(fe_opts: &str, responses: Vec<Vec<Part>>, seen: Arc<Mutex<Vec<u8>>>, client_to: &str, early: bool) -> Proxy {
+fn start_with(
+    fe_opts: &str,
+    responses: Vec<Vec<Part>>,
+    seen: Arc<Mutex<Vec<u8>>>,
+    client_to: &str,
+    early: bool,
+    close_delay: Duration,
+) -> Proxy {
     let (fe, sentinel) = (common::reserve_addr(), common::reserve_addr());
-    let be = server(Arc::new(responses), seen, early);
+    let be = server(Arc::new(responses), seen, early, close_delay);
     let mut cfg = NamedTempFile::new().expect("tmp");
     write!(
         cfg,
@@ -490,7 +502,7 @@ fn a_buffered_request_body_parse_error_is_logged_badreq() {
     // The body is checked with the head as it is parsed, before any rule runs, so buffering
     // changes nothing here; both are run (review of the BADCHUNK case).
     for (mode, opts) in [("unbuffered", ""), ("http-buffer-request", "  option http-buffer-request\n")] {
-        let p = start_with(opts, Vec::new(), Arc::default(), "5s", false);
+        let p = start_with(opts, Vec::new(), Arc::default(), "5s", false, Duration::ZERO);
         for (n, (name, body)) in cases.iter().enumerate() {
             let name = format!("{mode} {name}");
             let req = cat(&[&head(n), REQ_HEAD, body]);
@@ -670,4 +682,93 @@ fn a_client_that_idles_out_its_body_logs_the_client_timeout() {
         }
     }
     assert!(wrong.is_empty(), "{} of 3 cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// A server that answers a `POST` at its head and closes its side, while the client is
+/// still streaming the body: without `option http-buffer-request` the body is relayed as
+/// it arrives, and the answer's `Connection: close` is the server's, not the client's.
+/// `HAProxy` ends the transaction at the first write of the request that cannot reach the
+/// closed server: the log keeps the answer's status, the termination is the server's
+/// close (`SL--`), never an abort (`SD--`), and `%Ta` is that write -- never the client's
+/// body end, never `timeout client`. The rest of the body keeps going to the proxy, where
+/// it is read and dropped; the client's connection is not closed by it. Measured on
+/// 3.5-dev8: a body done within 0.4 s logs `SL--` at about 0.2 s, and one trickling over
+/// 2 s at about 0.4 s.
+#[test]
+fn a_server_that_answers_at_the_head_and_closes_logs_a_server_close() {
+    let seen: Arc<Mutex<Vec<u8>>> = Arc::default();
+    // `start`'s config has no `option http-buffer-request`: the body is relayed as it
+    // arrives. `early` answers a `POST` at its head (`200`, two bytes,
+    // `Connection: close`) and closes, without the body.
+    let p = start(Vec::new(), Arc::clone(&seen), "3s", true);
+    // 2: the server holds its socket 450 ms after its answer; the first chunk (300 ms)
+    // lands in it unread, so the close comes out as a reset the proxy has read before
+    // the next chunk's write can be made.
+    let p2 = start_with("", Vec::new(), Arc::clone(&seen), "3s", true, Duration::from_millis(450));
+    let clen = 4000;
+    let mut wrong = Vec::new();
+    for n in 0..3 {
+        seen.lock().unwrap().clear();
+        // 0: 4 x 1000 with 300 ms pauses (the body done in under a second);
+        // 1: 10 x 400 the same way (it trickles over three);
+        // 2: 4 x 1000, the server's close a reset, as above. The client asks for no
+        // close: what the server closes is its own side.
+        let (chunks, chunk) = match n {
+            0 | 2 => (4, 1000),
+            _ => (10, 400),
+        };
+        let head = format!("POST /{n} HTTP/1.1\r\nHost: x\r\nContent-Length: {clen}\r\n\r\n").into_bytes();
+        let head_len = head.len();
+        let mut parts = vec![Bytes(head)];
+        for i in 0..chunks {
+            if i > 0 || n == 2 {
+                parts.push(Pause);
+            }
+            parts.push(Bytes(vec![b'a'; chunk]));
+        }
+        let p = if n == 2 { &p2 } else { &p };
+        let (got, sent) = stream_body(p, &parts);
+        let log = log_of(p, n);
+        let Some((timers, status, _bytes, tsc)) = log_fields(&log) else {
+            wrong.push(format!("{n}: no parseable log line: {log}"));
+            continue;
+        };
+        // The whole body got out of the client: what was left of it after the answer was
+        // read and dropped, not met with a closed connection. The server's `Connection:
+        // close` is not the client's, and a client that asked for none is not sent one.
+        let head_end = got.windows(4).position(|w| w == b"\r\n\r\n").map_or(got.len(), |i| i);
+        let no_close = !got[..head_end].to_ascii_lowercase().windows(11).any(|w| w == b"connection:");
+        let fine = got.starts_with(b"HTTP/1.1 200 OK\r\n") && body_of(&got) == b"ok" && no_close
+            && status == 200 && tsc == "SL--" && sent == head_len + clen && timers[4] < 2000;
+        if !fine {
+            wrong.push(format!("{n}: got {} / sent {sent} of {} / log {log} (ST {status} T {timers:?} tsc {tsc})", esc(&got), head_len + clen));
+        }
+    }
+    assert!(wrong.is_empty(), "{} of 3 cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// Sends `parts` the way `exchange` does, but counts what the client managed to send: a
+/// connection the proxy closed or reset mid-body stops it short of the whole.
+fn stream_body(p: &Proxy, parts: &[Part]) -> (Vec<u8>, usize) {
+    let mut c = TcpStream::connect(p.fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut sent = 0;
+    for part in parts {
+        match part {
+            Bytes(b) => match c.write_all(b) {
+                Ok(()) => sent += b.len(),
+                Err(_) => break,
+            },
+            Pause => thread::sleep(PAUSE),
+        }
+    }
+    let mut got = Vec::new();
+    let mut b = [0u8; 65536];
+    loop {
+        match c.read(&mut b) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&b[..n]),
+        }
+    }
+    (got, sent)
 }

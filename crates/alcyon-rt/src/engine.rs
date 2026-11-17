@@ -11105,6 +11105,35 @@ impl EngineDispatcher<'_> {
         let Some(txn) = entry.sess.strm.txn.as_mut() else {
             return;
         };
+        // The write path set `SL` when a byte of the request could not reach the
+        // server that has already sent a complete response and closed: the client
+        // still sends its request (no `option http-buffer-request`) and the next
+        // write to it failed (or cannot be made, the connection reset behind the
+        // response). `HAProxy` ends the stream at that write -- the close is the
+        // end of the response, not an abort, `SL` -- and reads the rest of the
+        // request and drops it, keeping the connection for its next request when
+        // the client did not ask to close (measured on 3.5-dev8). Without this the
+        // stream waits the body out, to `timeout client`, and logs the server as
+        // aborting mid-data. A client that stops sending has no such failed write:
+        // the stream then lives out `timeout client`, `cL`.
+        if entry.sess.strm.log.term == Some(*b"SL")
+            && !h2_child
+            && !entry.sess.h3
+            && !txn.local
+            && !txn.aborted
+            && txn.rsp.is_done()
+            && !txn.req.is_done()
+        {
+            // The request's rest goes nowhere: it is read and dropped as it arrives
+            // (`drain_request`), and the stream ends with the body (`end_txn`), which
+            // keeps or closes the client connection on its own `close` alone.
+            txn.req_body_dropped = true;
+            set_stream_log(entry, proxies, std::process::id());
+            // The line is made; `end_txn`'s call for the same stream is a no-op then.
+            entry.sess.strm.log.asap_done = true;
+            entry.sess.drain_request();
+            return;
+        }
         // A response body that breaks its framing, or a chunk extension or trailer section
         // past its cap: what came before the violation is delivered and nothing after it.
         // The rest is never going to be relayed, so waiting for more of it (`timeout server`,
