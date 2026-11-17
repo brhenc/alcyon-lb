@@ -1,4 +1,6 @@
 {
- "measured_on": "HAProxy version 3.5-dev8-885761-29 2026/10/02 (reference binary), 2026-10-03",
- "haproxy_fails": {}
+ "measured_on": "HAProxy version 3.5-dev11-ce79f339c 2026/11/04 (reference binary), 2026-11-17",
+ "haproxy_fails": {
+  "an_upgrade_becomes_a_tunnel": "HAProxy regression in dev11 (mux-h1 commit 8fc09da21): the tunnel stays open after the client half-closes; Alcyon closes it, which is the correct behaviour. Upstream report drafted in review/upstream-2026-11-16/h1-tunnel-half-close/. Remove this entry when HAProxy fixes it."
+ }
 }

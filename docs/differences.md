@@ -366,6 +366,19 @@ in HAProxy).
 | TLS handshake that stalls | `timeout client` only | also `timeout http-request` (stricter) | none needed |
 | h2 connection that never sends a request | GOAWAY at `timeout http-request` | close at `timeout http-request` without GOAWAY | none needed |
 
+## Request-head violations that dev11 refuses and its `http-hardening` can accept
+
+HAProxy 3.5-dev11 refuses an absolute `http://` / `https://` target with an empty host
+(`GET http:///x`, `http://:8080/`, `https://@/x`; `4aa4c3d27`), a CONNECT target with no host
+(`CONNECT :443`) and `Content-Length` lines that differ (a 400 answer now; dev8 closed with
+nothing written). Alcyon refuses all three the same way, with the same bytes and log line
+(`<BADREQ>`, `PR--`), and adds the `Host` header HAProxy adds to an absolute-form or CONNECT
+request that has none. As on dev11, `option accept-unsafe-violations-in-http-request` lets the empty host through (forwarded as
+received). What differs: dev11's `http-hardening` setting and its per-violation list
+(`empty-authority-host` and the rest) do not exist in Alcyon, so there is no way to accept the
+empty host alone. Pinned in
+`crates/alcyon-rt/tests/it/h1_authority.rs` and `content_length_early_reject.rs`.
+
 ## `http-request normalize-uri` (T358, T359)
 
 All eight normalizers give HAProxy's answers on the paths measured (`path-strip-dot` and

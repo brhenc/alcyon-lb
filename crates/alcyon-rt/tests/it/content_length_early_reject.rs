@@ -8,8 +8,8 @@
 //!
 //! - a value that is not digits (`+5`, `-5`, `5 5`, empty, a trailing comma, too large), or
 //!   a list of different values in the first line: 400 at once;
-//! - a value that differs from an earlier `Content-Length` line's: the connection closes
-//!   with nothing written (logged as a 400).
+//! - a value that differs from an earlier `Content-Length` line's: 400 at once too (dev11;
+//!   dev8 closed the connection with nothing written, which T315 copied).
 //!
 //! Equal values (`5, 5`, `5` and `05`) are fine and the head is awaited. Each case sends
 //! the bytes of a head that never ends and reads for up to 1.5 s: a refusal arrives within
@@ -91,10 +91,13 @@ fn a_bad_content_length_line_is_refused_before_the_head_ends() {
         (b"Content-Length: \r\nX: y\r\n", Some("400")),
         (b"Content-Length: 5,\r\nX: y\r\n", Some("400")),
         (b"Content-Length: 99999999999999999999999\r\nX: y\r\n", Some("400")),
-        // different values in two lines: closed, nothing written
-        (b"Content-Length: 5\r\nContent-Length: 10\r\n \nhelloworld", Some("")),
-        (b"Content-Length: 5\r\nContent-Length: 10\r\nX: y", Some("")),
-        (b"Content-Length: 5\r\nContent-Length: 5, 6\r\nX: y\r\n", Some("")),
+        // different values in two lines: 400 since dev11 (fb53e904b, the error response is no
+        // longer lost once a length was parsed; dev8 closed with nothing written), also when
+        // the head ends at once (fuzzer input c1c2e347c1aacbfa)
+        (b"Content-Length: 5\r\nContent-Length: 10\r\n \nhelloworld", Some("400")),
+        (b"Content-Length: 5\r\nContent-Length: 10\r\nX: y", Some("400")),
+        (b"Content-Length: 5\r\nContent-Length: 5, 6\r\nX: y\r\n", Some("400")),
+        (b"Content-Length: 5\r\nContent-Length: 10\r\n\r\nhelloworld", Some("400")),
     ]);
 }
 

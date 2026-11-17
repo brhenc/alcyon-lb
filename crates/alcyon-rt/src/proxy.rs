@@ -3448,11 +3448,6 @@ impl TcpSession {
                     Err(e) => {
                         // 400, or the 413 / 422 HAProxy answers to some heads (T276).
                         self.fail_request(alcyon_proto::h1::Refusal::status_of(&e));
-                        if alcyon_proto::h1::Refusal::is_quiet(&e) {
-                            if let Some(t) = self.strm.txn.as_mut() {
-                                t.quiet = true;
-                            }
-                        }
                         return Ok(true);
                     }
                 };
@@ -3622,19 +3617,14 @@ impl TcpSession {
                 // that byte, not a 408 later (T291).
                 self.fail_request(400);
                 return Ok(true);
-            } else if let early @ (alcyon_proto::h1::ClEarly::Bad | alcyon_proto::h1::ClEarly::Conflict) = match alcyon_proto::h1::scan_request_line(self.req.readable(), self.accept_unsafe_request) {
+            } else if let alcyon_proto::h1::ClEarly::Bad = match alcyon_proto::h1::scan_request_line(self.req.readable(), self.accept_unsafe_request) {
                 alcyon_proto::h1::ReqLineScan::Complete(l) => alcyon_proto::h1::content_length_early(self.req.readable(), l.eol + l.eol_len),
                 _ => alcyon_proto::h1::ClEarly::Fine,
             } {
                 // A head not yet whole with a bad `Content-Length` line, refused when the
-                // line completes as HAProxy does: a 400, or for a value that differs from an
-                // earlier line's a close with nothing written (T315).
+                // line completes as HAProxy does: a 400, also for a value that differs from an
+                // earlier line's (dev11; dev8 closed with nothing written, T315).
                 self.fail_request(400);
-                if early == alcyon_proto::h1::ClEarly::Conflict {
-                    if let Some(t) = self.strm.txn.as_mut() {
-                        t.quiet = true;
-                    }
-                }
                 return Ok(true);
             } else if self.req.readable().len() + 56 >= self.bufsize {
                 // No end of head and the buffer is full: 431 as well. Measured on 3.5-dev8,

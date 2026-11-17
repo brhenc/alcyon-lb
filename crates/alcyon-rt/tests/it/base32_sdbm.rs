@@ -34,8 +34,9 @@ const CASES: &[(&str, &str)] = &[
         "GET http://b.example HTTP/1.1\r\nHost: b.example\r\nConnection: close\r\n\r\n",
         "[1925871626][72CA780A7F000001]",
     ),
-    // Absolute URI and no Host header: the authority is not hashed, the path alone.
-    ("GET http://c.example/q?x HTTP/1.0\r\n\r\n", "[2868956757][AB00CE557F000001]"),
+    // Absolute URI and no Host header: dev11 adds one from the authority, so it is hashed.
+    // (dev8 hashed the path alone: [2868956757][AB00CE557F000001].)
+    ("GET http://c.example/q?x HTTP/1.0\r\n\r\n", "[1525401759][5AEBC89F7F000001]"),
     (
         "GET /Some/Long/Path.html HTTP/1.1\r\nHost: www.Example.com:8080\r\nConnection: close\r\n\r\n",
         "[153990313][092DB4A97F000001]",

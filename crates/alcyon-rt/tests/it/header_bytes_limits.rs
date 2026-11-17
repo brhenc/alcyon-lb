@@ -402,14 +402,14 @@ fn the_request_line_version_is_http_digit_dot_digit() {
     ]);
 }
 
-/// Content-Length lines that differ are not answered: `HAProxy` closes the connection
-/// with nothing written and logs a 400 `PR--` (T286). A list in one line is a 400 reply.
+/// Content-Length lines that differ are answered 400 and logged `PR--` (dev11, `fb53e904b`;
+/// dev8 closed the connection with nothing written, T286), as is a list in one line.
 #[test]
-fn differing_content_length_lines_close_the_connection() {
+fn differing_content_length_lines_are_answered_400() {
     let p = start();
     let cl = |path: &str, n: usize| {
         let lines: String = (1..=n).map(|i| format!("Content-Length: {i}\r\n")).collect();
-        case(format!("POST {path} HTTP/1.1\r\nHost: x\r\n{lines}\r\nxx").as_bytes(), 0, None)
+        case(format!("POST {path} HTTP/1.1\r\nHost: x\r\n{lines}\r\nxx").as_bytes(), 400, None)
     };
     run(&p, p.fe, &[
         cl("/cl2", 2),

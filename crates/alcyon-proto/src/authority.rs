@@ -108,9 +108,13 @@ fn parse_authority(rest: &str) -> (usize, &str, &str) {
 
 /// `h1_validate_connect_authority`. On success, the value `Host` must be given, when it
 /// is to be normalised.
-fn validate_connect(authority: &str, host: Option<&str>) -> io::Result<Option<String>> {
+fn validate_connect(authority: &str, host: Option<&str>, accept_unsafe: bool) -> io::Result<Option<String>> {
     let uri_port = host_port(authority).filter(|p| !p.is_empty()).ok_or_else(|| invalid("CONNECT authority without a port"))?;
     let uri_host = strip_port(authority, Some(uri_port));
+    if uri_host.is_empty() {
+        // Refused, unless the violation is accepted: then it is let through as received.
+        return if accept_unsafe { Ok(None) } else { Err(invalid("CONNECT authority without a host")) };
+    }
     let Some(host_hdr) = host else { return Ok(None) };
     let hport = host_port(host_hdr);
     let h = strip_port(host_hdr, hport);
@@ -266,10 +270,17 @@ pub fn check_and_normalize_with(htx: &mut HtxSlice<'_>, accept_unsafe: bool, kno
         if !accept_unsafe && has_forbidden_char(authority.as_bytes()) {
             return Err(invalid("a forbidden character in the CONNECT authority"));
         }
-        if let Some(h) = validate_connect(authority, host.as_deref())? {
+        if let Some(h) = validate_connect(authority, host.as_deref(), accept_unsafe)? {
             for &i in &host_idx {
                 htx.replace_block_value(i, h.as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
             }
+            rewritten = true;
+        }
+        // No `Host`: the authority is the host, a default port removed (dev11, `h1_parse_msg_hdrs`).
+        if host.is_none() && !has_forbidden_char(authority.as_bytes()) && !strip_port(authority, host_port(authority)).is_empty() {
+            let port = host_port(authority);
+            let h = if port.is_some_and(|p| is_default_port(None, p)) { strip_port(authority, port) } else { authority };
+            htx.add_header("host", h).map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
             rewritten = true;
         }
         return Ok(rewritten);
@@ -281,6 +292,12 @@ pub fn check_and_normalize_with(htx: &mut HtxSlice<'_>, accept_unsafe: bool, kno
     let (auth_at, authority, path) = parse_authority(rest);
     if !accept_unsafe && has_forbidden_char(authority.as_bytes()) {
         return Err(invalid("a forbidden character in the request authority"));
+    }
+    // RFC 9110 4.2.1/4.2.2: an http(s) URI with an empty host is invalid, whatever its port or
+    // userinfo (dev11, `4aa4c3d27`): the target the rules see (no host) would differ from the
+    // one some servers read in the URI.
+    if !accept_unsafe && strip_port(authority, host_port(authority)).is_empty() && (scheme.eq_ignore_ascii_case("http://") || scheme.eq_ignore_ascii_case("https://")) {
+        return Err(invalid("an http(s) target with an empty host"));
     }
     if let Some(h) = host.as_deref() {
         if !authority.eq_ignore_ascii_case(h) && !mismatch_is_equivalent(scheme, authority, h) {
@@ -297,6 +314,12 @@ pub fn check_and_normalize_with(htx: &mut HtxSlice<'_>, accept_unsafe: bool, kno
     } else {
         path
     };
+    // No `Host`: the authority of the target is the host, a default port removed (dev11).
+    // `authority` is empty for a non-http(s) scheme such as `ftp:///x`: nothing to add then.
+    if host.is_none() && !authority.is_empty() && !has_forbidden_char(authority.as_bytes()) {
+        htx.add_header("host", norm_host).map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
+        rewritten = true;
+    }
     if normalize {
         let prefix = &uri[..scheme.len() + auth_at];
         let new_uri = format!("{prefix}{norm_host}{path}");
