@@ -834,12 +834,12 @@ row is here because the behaviour is surprising or measurable, not because it di
 
 | | |
 |---|---|
-| **What** | Keywords and actions that first appear in a 3.5 development release are refused at load (`unknown keyword`, rule 5) instead of ported. Declined so far: the `http-hardening` global keyword and its profiles (3.5-dev11; reg-tests `http-messaging/http_hardening_{h1,h2,profiles,trailers}.vtc`) and the `curve2name` converter (3.5-dev11; `ssl/curve2name.vtc`, the CURVE2NAME case, held). Bug fixes and stricter parsing that dev11 brings to existing behaviour are followed as usual (CONNECTTGT, CHUNK10). |
+| **What** | Keywords and actions that first appear in a 3.5 development release are refused at load (`unknown keyword`, rule 5) instead of ported. Declined so far: the `http-hardening` global keyword and its profiles (3.5-dev11; reg-tests `http-messaging/http_hardening_{h1,h2,profiles,trailers}.vtc`) and the `curve2name` converter (3.5-dev11; `ssl/curve2name.vtc`, the CURVE2NAME case, held), and the `no-fail` option of `http-request`/`http-response wait-for-body` (absent from the 3.4 and 3.5-dev8 documentation; reg-test `http-messaging/http_wait_for_body_no_fail.vtc`; Alcyon refuses it at load: "expects either 'if' or 'unless' ... but found 'no-fail'"). Bug fixes and stricter parsing that dev11 brings to existing behaviour are followed as usual (CONNECTTGT, CHUNK10). |
 | **Why** | These are HAProxy's own innovations, still in development. They should reach operators first in HAProxy, credited to the people who designed them, not in a reimplementation built from their unreleased tree. Alcyon is a proof of concept for a C-to-Rust translation; its target is HAProxy 3.6 LTS, which becomes the oracle when it is released (expected around May-June 2027). |
 | **Cost** | A configuration that uses one of these keywords does not load in Alcyon; the matching reg-tests stay red on the board and are listed here, not counted as gaps to close. |
 | **HAProxy** | Has them in 3.5-dev11 and, presumably, in 3.6. |
 | **Revisit if** | 3.6 LTS is released and becomes the oracle: then each keyword here is ported against the released behaviour. |
-| **V&V probe** | A configuration with `http-hardening` in `global` or `curve2name` in a sample expression is refused at load with the keyword's name; never accepted and ignored. |
+| **V&V probe** | A configuration with `http-hardening` in `global`, `curve2name` in a sample expression, or `wait-for-body ... no-fail` is refused at load with the keyword's name; never accepted and ignored. |
 
 ### 6.37 At most 131,072 proxies (frontends, backends, listens) per process (T637 S2) — **a hard limit; to revisit**
 
