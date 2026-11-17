@@ -12291,6 +12291,17 @@ impl EngineDispatcher<'_> {
             txn.close_after = true;
             txn.close_opt = false;
         }
+        // The chunked transfer-coding must not be used in a response to a request that is
+        // not HTTP/1.1 (RFC 9112 section 6.1; `h1_make_stline`, `src/mux_h1.c`): the
+        // `Transfer-Encoding` goes, a body that had it goes without its chunk framing until
+        // the close, and the client connection closes behind it. A bodyless reply (a `HEAD`)
+        // loses the header alone and keeps the connection's mode.
+        let sub11 = status >= 200 && !txn.req_http11 && framing != crate::txn::Framing::Tunnel;
+        if sub11 && framing == crate::txn::Framing::Chunked {
+            txn.rsp_dechunk = Some(Box::new(crate::txn::Chunk::START));
+            txn.close_after = true;
+            txn.close_opt = false;
+        }
         let client_close = txn.close_after;
         let req_http11 = txn.req_http11;
         let cookie_txn = txn.ck;
@@ -12412,6 +12423,12 @@ impl EngineDispatcher<'_> {
                     entry.sess.rep.replace_prefix(h + e, &alcyon_regex::bytetext::text_to_bytes(&new));
                     index = None;
                     *lowered = false;
+                }
+            }
+            if sub11 && (framing == crate::txn::Framing::Chunked || framing == crate::txn::Framing::None) {
+                // The `Transfer-Encoding` a sub-1.1 client cannot read goes from the head.
+                if entry.sess.rep.remove_http_header("Transfer-Encoding") {
+                    index = None;
                 }
             }
             // What an HTTP/2 or HTTP/3 client's HEADERS are written from.
@@ -12996,6 +13013,17 @@ impl EngineDispatcher<'_> {
         if framing == crate::txn::Framing::Chunked && was.chnk && !h.as_ref().header_bytes().any(|(k, _, _)| k.eq_ignore_ascii_case(b"transfer-encoding")) {
             if let Some(t) = entry.sess.strm.txn.as_mut() {
                 t.rsp_dechunk = Some(Box::new(crate::txn::Chunk::START));
+            }
+        }
+        // The sub-1.1 rule is `HAProxy`'s last word on the head it writes (`h1_make_stline`):
+        // a `Transfer-Encoding` that survived the rules still goes on its way to a 1.0 client.
+        if sub11 {
+            for i in (0..h.num_blocks()).rev() {
+                if let Some((k, _, _)) = crate::txn::htx_header_at(&mut h, i) {
+                    if k.eq_ignore_ascii_case(b"transfer-encoding") {
+                        h.remove_block(i);
+                    }
+                }
             }
         }
         // The same `Connection` handling as without rules, on the headers the rules left
