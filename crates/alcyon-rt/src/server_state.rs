@@ -159,6 +159,7 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &alcyon_config::Server, f: &[&str;
     }
     let before = p.srv_set().at(i).and_then(|s| s.swap_status(cur)).unwrap_or(cur);
     p.fwrr.changed();
+    p.chash.changed();
     // `srv_set_stopped` from the file: written on stderr only, the log is not up yet.
     // (The administrative changes are not: `_srv_update_status_adm` keeps quiet while
     // `MODE_STARTING`.)
@@ -186,6 +187,7 @@ fn apply_server(p: &mut Proxy, i: usize, srv: &alcyon_config::Server, f: &[&str;
     if v.iweight == cfg_iweight {
         p.srv_set().at(i).expect("server of the file").set_weight(v.uweight);
         p.fwrr.changed();
+        p.chash.changed();
     }
     // `i` is a server of the configuration, so of `p.servers`.
     let me = p.srv_set().at(i).expect("server of the file");

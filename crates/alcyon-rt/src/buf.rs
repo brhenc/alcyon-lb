@@ -148,6 +148,7 @@ pub fn large_buffer_pool_stats() -> Option<PoolHead> {
 
 fn register_arena_pools(reg: &alcyon_alloc::PoolRegistry) {
     reg.register_provider("session", crate::engine::session_pool_stats);
+    reg.register_provider("lbsnap", crate::lb::lbsnap_pool_stats);
     reg.register_provider("appctx", crate::applet::appctx_pool_stats);
     reg.register_provider("task", alcyon_sched::task_pool_stats);
     reg.register_provider("counters", crate::statcnt::counters_pool_stats);

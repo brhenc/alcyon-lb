@@ -242,6 +242,7 @@ mod bytes_samples_oracle;
 mod vars_bytes_oracle;
 mod hard_stop_websocket_fin;
 mod hatop_compat;
+mod hash_pick_concurrency;
 mod health_check;
 mod health_checks;
 mod hostile_peer_stalls;

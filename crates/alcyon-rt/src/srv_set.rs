@@ -495,6 +495,7 @@ impl Proxy {
             s.set_weight(weight);
         }
         self.fwrr.changed();
+        self.chash.changed();
     }
 
     /// The places where the load writes into the set (the proxy is not shared yet).

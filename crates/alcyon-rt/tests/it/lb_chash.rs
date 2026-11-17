@@ -12,6 +12,7 @@
 use std::sync::atomic::Ordering;
 
 use alcyon_rt::check::ServerStatus;
+use alcyon_rt::srvlog::{Cause, Kind};
 use alcyon_rt::Engine;
 
 const SERVERS: &str = "
@@ -39,6 +40,25 @@ const S3_DOWN: [(&str, &str); 20] = [
     ("/k3", "s2"), ("/k4", "s1"), ("/k5", "s2"),
 ];
 
+/// With s2 at weight 1 (`set server be/s2 weight 1` at run time), as the oracle
+/// (3.5-dev11) measured on 2026-11-16: only s2's keys move.
+const S2_W1: [(&str, &str); 20] = [
+    ("/test-url", "s3"), ("/", "s2"), ("/a", "s4"), ("/b", "s2"), ("/c", "s1"),
+    ("/img/1.png", "s2"), ("/img/2.png", "s4"), ("/q?x=1", "s3"), ("/q?x=2", "s3"),
+    ("/api/users", "s1"), ("/api/orders", "s3"), ("/x/y/z", "s4"), ("/index.html", "s4"),
+    ("/favicon.ico", "s1"), ("/static/app.js", "s1"), ("/k1", "s3"), ("/k2", "s4"),
+    ("/k3", "s3"), ("/k4", "s3"), ("/k5", "s2"),
+];
+
+/// With s2 at weight 5 (`set server be/s2 weight 5` at run time), oracle 2026-11-16.
+const S2_W5: [(&str, &str); 20] = [
+    ("/test-url", "s3"), ("/", "s2"), ("/a", "s4"), ("/b", "s2"), ("/c", "s1"),
+    ("/img/1.png", "s2"), ("/img/2.png", "s4"), ("/q?x=1", "s3"), ("/q?x=2", "s3"),
+    ("/api/users", "s1"), ("/api/orders", "s2"), ("/x/y/z", "s2"), ("/index.html", "s4"),
+    ("/favicon.ico", "s1"), ("/static/app.js", "s2"), ("/k1", "s2"), ("/k2", "s2"),
+    ("/k3", "s3"), ("/k4", "s2"), ("/k5", "s2"),
+];
+
 /// `hash-preserve-affinity maxconn`, every server `maxconn 1`, s3 busy with one request:
 /// the keys whose point is s3's walk forward round the ring.
 const S3_FULL: [(&str, &str); 6] = [
@@ -55,33 +75,56 @@ fn engine(extra: &str, servers: &str) -> Engine {
     engine
 }
 
-fn pick(engine: &mut Engine, uri: &str) -> Option<String> {
+fn set(e: &Engine, s: usize, st: ServerStatus) {
+    alcyon_rt::track::set_status(&e.proxies, 0, s, st, Kind::Admin, Cause::Cli);
+}
+
+/// The worker's snapshot cache of the test: one pick after every change must see the
+/// new generation, through the same cache the first picks built.
+fn pick(engine: &Engine, uri: &str, cache: &mut alcyon_rt::lb::LbSnapCache) -> Option<String> {
     let proxy = &engine.proxies[0];
-    let addr = proxy.select_server_with_key(None, Some(uri))?;
+    let addr = proxy.select_server_with_key(None, Some(uri), cache)?;
     let idx = proxy.srv_set().slot_of_addr(addr).expect("a configured server");
     Some(proxy.srv_set().name_at(idx).expect("name").to_string())
 }
 
-fn assert_choices(engine: &mut Engine, expected: &[(&str, &str)]) {
+fn assert_choices(engine: &Engine, expected: &[(&str, &str)], cache: &mut alcyon_rt::lb::LbSnapCache) {
     let got: Vec<(&str, String)> =
-        expected.iter().map(|&(u, _)| (u, pick(engine, u).unwrap_or_default())).collect();
+        expected.iter().map(|&(u, _)| (u, pick(engine, u, cache).unwrap_or_default())).collect();
     let want: Vec<(&str, String)> = expected.iter().map(|&(u, s)| (u, s.to_string())).collect();
     assert_eq!(got, want);
 }
 
 #[test]
 fn every_key_lands_where_haproxy_puts_it() {
-    assert_choices(&mut engine("", SERVERS), &ALL_UP);
+    assert_choices(&engine("", SERVERS), &ALL_UP, &mut alcyon_rt::lb::LbSnapCache::new());
 }
 
 #[test]
 fn a_server_going_down_moves_only_its_own_keys() {
     let mut e = engine("", SERVERS);
-    e.proxies[0].srv_set().status_cell(2).expect("status").store(ServerStatus::Down as u8, Ordering::Relaxed);
-    assert_choices(&mut e, &S3_DOWN);
+    let mut cache = alcyon_rt::lb::LbSnapCache::new();
+    set(&e, 2, ServerStatus::Maint);
+    assert_choices(&e, &S3_DOWN, &mut cache);
     // And back: the ring is rebuilt from who is up, not patched.
-    e.proxies[0].srv_set().status_cell(2).expect("status").store(ServerStatus::Up as u8, Ordering::Relaxed);
-    assert_choices(&mut e, &ALL_UP);
+    set(&e, 2, ServerStatus::Up);
+    assert_choices(&e, &ALL_UP, &mut cache);
+}
+
+/// `set server be/s2 weight N` at run time: the next pick from the same worker -- whose
+/// snapshot was built from the old weight -- rebuilds the ring, as the oracle measured
+/// on 2026-11-16: only s2's keys move, and the keys come back when the weight does.
+#[test]
+fn a_weight_change_at_run_time_moves_only_that_servers_keys() {
+    let mut e = engine("", SERVERS);
+    let mut cache = alcyon_rt::lb::LbSnapCache::new();
+    assert_choices(&e, &ALL_UP, &mut cache);
+    e.proxies[0].set_weight(1, 1);
+    assert_choices(&e, &S2_W1, &mut cache);
+    e.proxies[0].set_weight(1, 5);
+    assert_choices(&e, &S2_W5, &mut cache);
+    e.proxies[0].set_weight(1, 3);
+    assert_choices(&e, &ALL_UP, &mut cache);
 }
 
 #[test]
@@ -89,8 +132,9 @@ fn a_full_server_s_keys_walk_round_the_ring_under_maxconn_affinity() {
     let servers = SERVERS.replace("27101", "27101 maxconn 1").replace("27102 weight 3", "27102 weight 3 maxconn 1")
         .replace("27103", "27103 maxconn 1").replace("27104 weight 2", "27104 weight 2 maxconn 1");
     let mut e = engine("    hash-preserve-affinity maxconn\n", &servers);
+    let mut cache = alcyon_rt::lb::LbSnapCache::new();
     e.proxies[0].srv_set().actconn_cell(2).expect("actconn").store(1, Ordering::Relaxed);
-    assert_choices(&mut e, &S3_FULL);
+    assert_choices(&e, &S3_FULL, &mut cache);
 }
 
 /// HAProxy's default, `always`, would queue the request on the full server. Alcyon has no
@@ -101,9 +145,10 @@ fn a_full_server_s_keys_walk_round_the_ring_under_maxconn_affinity() {
 fn without_a_server_queue_always_walks_off_a_full_server_rather_than_exceed_maxconn() {
     let servers = SERVERS.replace("27103", "27103 maxconn 1");
     let mut e = engine("", &servers);
-    assert_eq!(pick(&mut e, "/test-url").as_deref(), Some("s3"));
+    let mut cache = alcyon_rt::lb::LbSnapCache::new();
+    assert_eq!(pick(&e, "/test-url", &mut cache).as_deref(), Some("s3"));
     e.proxies[0].srv_set().actconn_cell(2).expect("actconn").store(1, Ordering::Relaxed);
-    assert_eq!(pick(&mut e, "/test-url").as_deref(), Some("s1"));
+    assert_eq!(pick(&e, "/test-url", &mut cache).as_deref(), Some("s1"));
 }
 
 #[test]
@@ -113,17 +158,19 @@ fn with_no_active_server_up_the_first_backup_takes_every_key() {
         "",
         "    server a 127.0.0.1:27101\n    server b1 127.0.0.1:27102 backup\n    server b2 127.0.0.1:27103 backup\n",
     );
-    e.proxies[0].srv_set().status_cell(0).expect("status").store(ServerStatus::Down as u8, Ordering::Relaxed);
+    let mut cache = alcyon_rt::lb::LbSnapCache::new();
+    set(&e, 0, ServerStatus::Maint);
     for (u, _) in ALL_UP {
-        assert_eq!(pick(&mut e, u).as_deref(), Some("b1"), "{u}");
+        assert_eq!(pick(&e, u, &mut cache).as_deref(), Some("b1"), "{u}");
     }
 }
 
 #[test]
 fn with_no_server_up_there_is_no_server() {
     let mut e = engine("", SERVERS);
+    let mut cache = alcyon_rt::lb::LbSnapCache::new();
     for i in 0..e.proxies[0].srv_set().len() {
-        e.proxies[0].srv_set().status_cell(i).expect("status").store(ServerStatus::Down as u8, Ordering::Relaxed);
+        set(&e, i, ServerStatus::Maint);
     }
-    assert_eq!(pick(&mut e, "/a"), None);
+    assert_eq!(pick(&e, "/a", &mut cache), None);
 }

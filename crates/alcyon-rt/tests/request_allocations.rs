@@ -1042,6 +1042,37 @@ fn balance_uri_allocates_nothing_per_request() {
     assert_eq!(many, few, "1000 more balance-uri requests made {} more allocations", many as i64 - few as i64);
 }
 
+/// T633: the hash picks take no lock and scan no server per request in steady state. 1,100
+/// requests and 100 requests (fresh engine each: the first pick of each run builds the map
+/// or the ring, and that build is counted once) must give equal per-run counts, for
+/// `balance uri` (the weighted map) and for `balance uri` with `hash-type consistent` (the
+/// ring). Before: every pick took a `RwLock` read -- a write to the lock word every other
+/// worker reads -- and compared every server's weight and state with what the map or ring
+/// was built from, so 1,100 requests counted ~1,100 locks and scans against ~100.
+#[cfg(debug_assertions)]
+#[test]
+fn hash_picks_take_no_lock_and_scan_no_server_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (name, be) in [
+        ("balance uri", "  balance uri\n  server s2 127.0.0.1:1 weight 3 disabled\n"),
+        ("balance uri consistent", "  balance uri\n  hash-type consistent\n  server s2 127.0.0.1:1 weight 3 disabled\n"),
+    ] {
+        let counts = |n| {
+            let (l0, s0) = (alcyon_rt::lb::hash_pick_locks_on_this_thread(), alcyon_rt::lb::hash_pick_scans_on_this_thread());
+            keepalive_run_be("", be, BENCH_RSP, n, b"HTTP/1.1 200", b"\r\n\r\nok");
+            (
+                alcyon_rt::lb::hash_pick_locks_on_this_thread() - l0,
+                alcyon_rt::lb::hash_pick_scans_on_this_thread() - s0,
+            )
+        };
+        let (locks100, scans100) = counts(100);
+        let (locks1100, scans1100) = counts(1100);
+        println!("[MEASUREMENT T633 {name}] 100 requests: {locks100} lock acquisitions, {scans100} server scans; 1,100 requests: {locks1100} locks, {scans1100} scans");
+        assert_eq!(locks1100, locks100, "{name}: 1,000 more requests took {} more locks in the hash pick", locks1100 - locks100);
+        assert_eq!(scans1100, scans100, "{name}: 1,000 more requests scanned the servers {} more times", scans1100 - scans100);
+    }
+}
+
 /// The allocations of 100 and of 1100 keep-alive requests through a backend that balances
 /// with `be_lines` over a disabled server and the live one: a pick per request.
 fn balance_allocations(be_lines: &str) -> (usize, usize) {

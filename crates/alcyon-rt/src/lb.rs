@@ -6,8 +6,8 @@
 use crate::engine::Proxy;
 use crate::check::ServerStatus;
 use alcyon_config::{HashPreserveAffinity, HashType, UriHash};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{RwLock, RwLockReadGuard};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 thread_local! {
     /// The server a redispatch steers this worker's next selection away from (the one a
@@ -15,6 +15,48 @@ thread_local! {
     /// selection, so it is not on the `Proxy` the workers share (T160).
     static AVOID: std::cell::Cell<Option<(u32, usize)>> = const { std::cell::Cell::new(None) };
 }
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// How many times the hash picks (the `balance uri` map and the consistent-hash ring)
+    /// took one of their locks on this thread. The request path takes none of them in
+    /// steady state (T633); a change of a server's state or weight is what takes them.
+    static HASH_PICK_LOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// How many times the hash picks passed over the proxy's servers comparing each one's
+    /// state and weight with what the map or the ring was built from (T633).
+    static HASH_PICK_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn hash_pick_locks_on_this_thread() -> u64 {
+    HASH_PICK_LOCKS.with(std::cell::Cell::get)
+}
+
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn hash_pick_scans_on_this_thread() -> u64 {
+    HASH_PICK_SCANS.with(std::cell::Cell::get)
+}
+
+#[cfg(debug_assertions)]
+fn count_hash_pick_lock() {
+    HASH_PICK_LOCKS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(debug_assertions))]
+#[inline]
+fn count_hash_pick_lock() {}
+
+#[cfg(debug_assertions)]
+fn count_hash_pick_scan() {
+    HASH_PICK_SCANS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(debug_assertions))]
+#[inline]
+fn count_hash_pick_scan() {}
 
 /// Whether the server at `idx` is the one this worker's current selection avoids.
 #[inline]
@@ -40,7 +82,7 @@ pub(crate) fn clear_avoided() {
 /// Whether a lock of the balancing state of a backend was poisoned: a panic unwound
 /// through a change of it (T447).
 pub(crate) fn lb_poisoned(fwrr: &Fwrr, chash: &ChashRing) -> bool {
-    fwrr.0.is_poisoned() || chash.0.is_poisoned() || chash.1.is_poisoned()
+    fwrr.0.is_poisoned() || chash.0.is_poisoned()
 }
 
 /// Determines whether a server at `idx` in `proxy` is eligible to receive traffic.
@@ -586,21 +628,21 @@ pub fn static_rr(proxy: &Proxy) -> Option<usize> {
 /// two parts sequentially without joining unless `path-only` is set (`OPTIONS *` with
 /// `req_abs` hashes `req_abs` alone without `*`).
 #[must_use]
-pub fn balance_uri(proxy: &Proxy, uri: &str) -> Option<usize> {
-    balance_uri_with_abs(proxy, uri, None)
+pub fn balance_uri(proxy: &Proxy, uri: &str, cache: &mut LbSnapCache) -> Option<usize> {
+    balance_uri_with_abs(proxy, uri, None, cache)
 }
 
 /// [`balance_uri`] with an optional `scheme://authority` prefix (`H2Child::req_abs`).
 #[must_use]
-pub fn balance_uri_with_abs(proxy: &Proxy, uri: &str, abs: Option<&str>) -> Option<usize> {
+pub fn balance_uri_with_abs(proxy: &Proxy, uri: &str, abs: Option<&str>, cache: &mut LbSnapCache) -> Option<usize> {
     // `hash-preserve-affinity` only has an effect
     // on a consistent-hash ring (HAProxy gates
     // it the same way: the option is read only from `chash_get_server_hash`).
     if proxy.hash_type == HashType::Consistent {
-        return balance_uri_consistent(proxy, uri, abs);
+        return balance_uri_consistent(proxy, uri, abs, cache);
     }
     let hash = hash_uri(uri, abs, proxy.chash.2);
-    if let Some(idx) = proxy.chash.map_pick(proxy, hash) {
+    if let Some(idx) = proxy.chash.map_pick(proxy, hash, cache) {
         return Some(idx);
     }
 
@@ -765,8 +807,8 @@ fn gcd2(mut a: u32, mut b: u32) -> u32 {
 /// would instead queue the request on the full server; Alcyon has no server queue and never
 /// sends a server more than its `maxconn`, so `always` walks the same way once the server
 /// is full. `None` when no server is up, or every candidate is full.
-fn balance_uri_consistent(proxy: &Proxy, uri: &str, abs: Option<&str>) -> Option<usize> {
-    chash_lookup(proxy, |_| full_hash(hash_uri(uri, abs, proxy.chash.2)))
+fn balance_uri_consistent(proxy: &Proxy, uri: &str, abs: Option<&str>, cache: &mut LbSnapCache) -> Option<usize> {
+    consistent_pick(proxy, |_| full_hash(hash_uri(uri, abs, proxy.chash.2)), cache)
 }
 
 /// Source IP hash (`balance source`), `map-based` as `HAProxy` defaults it (`get_server_sh`
@@ -777,12 +819,12 @@ fn balance_uri_consistent(proxy: &Proxy, uri: &str, abs: Option<&str>) -> Option
 /// `map-based` mode), and `map_get_server_hash` indexes the interleaved [`WeightMap`]
 /// modulo `tot_weight`.
 #[must_use]
-pub fn balance_source(proxy: &Proxy, ip: std::net::IpAddr) -> Option<usize> {
+pub fn balance_source(proxy: &Proxy, ip: std::net::IpAddr, cache: &mut LbSnapCache) -> Option<usize> {
     if proxy.hash_type == HashType::Consistent {
-        return balance_source_consistent(proxy, ip);
+        return balance_source_consistent(proxy, ip, cache);
     }
     let hash = source_hash_key(ip);
-    if let Some(idx) = proxy.chash.map_pick(proxy, hash) {
+    if let Some(idx) = proxy.chash.map_pick(proxy, hash, cache) {
         return Some(idx);
     }
 
@@ -803,15 +845,15 @@ fn source_hash_key(ip: std::net::IpAddr) -> u32 {
 /// key is the XOR of the address' 32-bit words (host order), avalanched by `full_hash`,
 /// and 0 when only one server is left to choose from, then the ring as for `balance uri`.
 #[must_use]
-pub fn balance_source_consistent(proxy: &Proxy, ip: std::net::IpAddr) -> Option<usize> {
+pub fn balance_source_consistent(proxy: &Proxy, ip: std::net::IpAddr, cache: &mut LbSnapCache) -> Option<usize> {
     let key = source_hash_key(ip);
-    chash_lookup(proxy, |servers_in_ring| if servers_in_ring <= 1 { 0 } else { full_hash(key) })
+    consistent_pick(proxy, |servers_in_ring| if servers_in_ring <= 1 { 0 } else { full_hash(key) }, cache)
 }
 
 /// The server owning the ring point nearest to the key `hash(n)`, `n` being how many
-/// servers the ring holds (`tot_used`).
-fn chash_lookup(proxy: &Proxy, hash: impl FnOnce(usize) -> u32) -> Option<usize> {
-    let ring = proxy.chash.ring(proxy);
+/// servers the ring holds (`tot_used`), through the worker's snapshot ([`LbSnapCache`]).
+fn consistent_pick(proxy: &Proxy, hash: impl FnOnce(usize) -> u32, cache: &mut LbSnapCache) -> Option<usize> {
+    let ring = &proxy.chash.sync(proxy, cache).ring;
     let points = match &ring.members {
         RingMembers::Active => &ring.points,
         RingMembers::FirstBackup(idx) => {
@@ -886,102 +928,248 @@ struct Ring {
     servers: usize,
 }
 
-/// The consistent-hash ring of one proxy, shared by its workers (the `Proxy` clones).
-///
-/// `HAProxy` moves a server's points in and out as its state changes; here the ring is
-/// rebuilt from scratch whenever the set of up servers differs from the one it was built
-/// from. A server's points depend only on its id and weight, so the rebuilt ring is the
-/// one `HAProxy` holds, and keys move only to and from the server that changed.
-///
-/// The third field is the proxy's `balance uri` options, set when the proxy is built and
-/// never written again: they sit here, with the rest of what a hash pick reads, because
-/// `Proxy` is paid for by every proxy and must not grow (`struct_sizes`).
-#[derive(Debug, Default)]
-pub struct ChashRing(RwLock<Ring>, RwLock<WeightMap>, UriHash);
-
-impl ChashRing {
-    /// The balancing state of a proxy whose `balance uri` line had the options `uri`.
-    #[must_use]
-    pub fn new(uri: UriHash) -> Self {
-        ChashRing(RwLock::default(), RwLock::default(), uri)
-    }
-
-
-    /// The server `balance uri` or `balance source` (map-based) picks for `hash`, from the
-    /// [`WeightMap`] of the usable primary servers; `None` when none is usable. Per request:
-    /// one read lock and one pass over the servers comparing state and weight to what the map
-    /// was built from. The map is rebuilt, under the write lock, only when that differs.
-    fn map_pick(&self, proxy: &Proxy, hash: u32) -> Option<usize> {
-        let in_map = |idx: usize| -> u32 {
-            if proxy.srv_set().backup_at(idx) || !is_selectable(proxy, idx) {
-                0
-            } else {
-                proxy.srv_set().weight_at(idx).unwrap_or(1)
-            }
-        };
-        let current = |m: &WeightMap| {
-            m.built_from.len() == proxy.srv_set().len() && m.built_from.iter().enumerate().all(|(i, &w)| w == in_map(i))
-        };
-        {
-            let map = self.1.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if current(&map) {
-                return map.pick(hash);
-            }
-        }
-        let mut map = self.1.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !current(&map) {
-            map.rebuild(proxy, in_map);
-        }
-        map.pick(hash)
-    }
-
-    fn ring<'a>(&'a self, proxy: &Proxy) -> RwLockReadGuard<'a, Ring> {
+impl Ring {
+    /// (Re)builds, in place, from the servers' states: the up primaries with a weight, each
+    /// with `weight * 16` points keyed by its `puid` (T633: called only when a server's
+    /// state or weight moves the generation, under the builder's lock). A server's points
+    /// depend only on its id and weight, so the rebuilt ring is the one `HAProxy` holds,
+    /// and keys move only to and from the server that changed.
+    fn rebuild(&mut self, proxy: &Proxy) {
         let in_ring = |idx: usize| {
             !proxy.srv_set().backup_at(idx)
                 && is_server_up(proxy, idx)
                 && proxy.srv_set().weight_at(idx).unwrap_or(1) > 0
         };
-        {
-            let ring = self.0.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if ring.built_from.len() == proxy.srv_set().len()
-                && ring.built_from.iter().enumerate().all(|(i, &b)| b == in_ring(i))
-            {
-                return ring;
-            }
+        self.built_from.clear();
+        self.built_from.extend((0..proxy.srv_set().len()).map(in_ring));
+        self.points.clear();
+        self.servers = 0;
+        for idx in (0..proxy.srv_set().len()).filter(|&i| self.built_from[i]) {
+            // `puid`: the server's id, from 1 in declaration order around the ones
+            // with an `id`; `hash-key id` is the default.
+            let puid = proxy.server_puid(idx);
+            let base = puid.wrapping_mul(SRV_EWGHT_RANGE);
+            let nodes = proxy.srv_set().weight_at(idx).unwrap_or(1) * BE_WEIGHT_SCALE;
+            let server = u32::try_from(idx).unwrap_or(u32::MAX);
+            self.points.extend((0..nodes).map(|j| (full_hash(base.wrapping_add(j)), server)));
+            self.servers += usize::from(nodes > 0);
         }
-        {
-            let mut ring = self.0.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let ring = &mut *ring;
-            // Into the buffers of the previous build: a rebuild allocates only to grow.
-            ring.built_from.clear();
-            ring.built_from.extend((0..proxy.srv_set().len()).map(in_ring));
-            ring.points.clear();
-            ring.servers = 0;
-            for idx in (0..proxy.srv_set().len()).filter(|&i| ring.built_from[i]) {
-                // `puid`: the server's id, from 1 in declaration order around the ones
-                // with an `id`; `hash-key id` is the default.
-                let puid = proxy.server_puid(idx);
-                let base = puid.wrapping_mul(SRV_EWGHT_RANGE);
-                let nodes = proxy.srv_set().weight_at(idx).unwrap_or(1) * BE_WEIGHT_SCALE;
-                let server = u32::try_from(idx).unwrap_or(u32::MAX);
-                ring.points.extend((0..nodes).map(|j| (full_hash(base.wrapping_add(j)), server)));
-                ring.servers += usize::from(nodes > 0);
+        // Stable, so equal keys keep HAProxy's insertion order.
+        self.points.sort_by_key(|&(k, _)| k);
+        self.members = if !self.points.is_empty() {
+            RingMembers::Active
+        } else if let Some(b) = (0..proxy.srv_set().len()).find(|&i| {
+            proxy.srv_set().backup_at(i) && is_server_up(proxy, i)
+        }) {
+            RingMembers::FirstBackup(b)
+        } else {
+            RingMembers::None
+        };
+    }
+}
+
+/// The immutable snapshot of a proxy's hash-pick state (T633): the weighted map and the
+/// consistent-hash ring, both built from one generation of the servers' states and weights.
+/// Built once per generation change, read by every worker afterwards, never written.
+#[derive(Debug, Default)]
+pub struct ChashSnap {
+    /// The map of the usable primary servers: the `balance uri`/`balance source` picks.
+    pub map: WeightMap,
+    /// The ring of the up primary servers: the `hash-type consistent` picks.
+    pub ring: Ring,
+}
+
+/// What the builder holds while the workers hold the published [`ChashSnap`]s (T633): the
+/// snapshot the last build published and the generation it was built from.
+#[derive(Debug, Default)]
+struct SnapPub {
+    snap: Option<Arc<ChashSnap>>,
+    generation: u32,
+}
+
+/// One worker's view of the snapshots its hash picks are reading (T633): per hash-balanced
+/// backend the worker has picked on, the generation it last saw and the `Arc` of the
+/// snapshot built from it. The worker writes only its own slots; a pick takes no lock and
+/// scans no server while the generation it holds is the current one. One `Arena` slot per
+/// backend per worker (`show pools`, pool `lbsnap`).
+#[derive(Debug, Default)]
+pub struct LbSnapCache {
+    slots: Vec<LbSnapSlot>,
+    published: alcyon_alloc::arena::Published,
+}
+
+/// One [`LbSnapCache`] slot: the proxy's id, the generation the worker's snapshot was built
+/// from, and the snapshot.
+#[derive(Debug)]
+pub struct LbSnapSlot {
+    key: u32,
+    generation: u32,
+    snap: Arc<ChashSnap>,
+}
+
+/// Slots of every worker's [`LbSnapCache`], for `show pools` (pool `lbsnap`).
+pub static LB_SNAP_POOL: alcyon_alloc::ArenaStats = alcyon_alloc::ArenaStats::new(
+    "lbsnap",
+    std::mem::size_of::<LbSnapSlot>(),
+    std::mem::align_of::<LbSnapSlot>(),
+    file!(),
+    line!(),
+);
+
+/// `show pools` provider for the `lbsnap` pool: the slots ever created, those in use.
+#[allow(clippy::unnecessary_wraps)]
+pub fn lbsnap_pool_stats() -> Option<alcyon_alloc::PoolHead> {
+    Some(LB_SNAP_POOL.head())
+}
+
+impl LbSnapCache {
+    /// The worker's empty cache: the first pick on a hash-balanced backend makes its slot
+    /// (the tests use it; the engine's cache is pre-sized, [`Self::with_hash_proxies`]).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The worker's cache for an engine holding `hash_proxies` hash-balanced proxies: the
+    /// slots are reserved at creation, so a pick never grows them.
+    #[must_use]
+    pub fn with_hash_proxies(hash_proxies: usize) -> Self {
+        let mut slots = Vec::new();
+        slots.reserve(hash_proxies);
+        Self { slots, ..Default::default() }
+    }
+
+    /// Publishes the slot counts to `show pools` (once per loop pass, only when moved).
+    pub fn publish(&mut self) {
+        let mut last = self.published;
+        LB_SNAP_POOL.publish_arena::<LbSnapSlot>(&mut last, self);
+        self.published = last;
+    }
+}
+
+impl alcyon_alloc::Arena<LbSnapSlot> for LbSnapCache {
+    fn slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Every slot is in use for the worker's lifetime: nothing to give back.
+    fn live(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn compact(&mut self) -> usize {
+        0
+    }
+}
+
+impl Drop for LbSnapCache {
+    fn drop(&mut self) {
+        LB_SNAP_POOL.retire(&mut self.published);
+    }
+}
+
+/// The hash-pick state of one proxy, shared by its workers (the `Proxy` clones).
+///
+/// `HAProxy` updates its map or tree only where a server changes state (`lb_map.c`,
+/// `lb_chash.c`): here the map and the ring are immutable once built ([`ChashSnap`]), the
+/// one current snapshot sits behind one mutex taken only when the generation has moved,
+/// and each worker keeps its own `Arc` of it in its [`LbSnapCache`] (design 2026-11-16,
+/// section 3.5). A pick reads the generation -- one `Acquire` load, no lock, no pass over
+/// the servers -- and follows the snapshot it already holds.
+///
+/// The third field is the proxy's `balance uri` options, set when the proxy is built and
+/// never written again: they sit here, with the rest of what a hash pick reads, because
+/// `Proxy` is paid for by every proxy and must not grow (`struct_sizes`).
+#[derive(Debug, Default)]
+pub struct ChashRing(Mutex<SnapPub>, AtomicU32, UriHash);
+
+impl ChashRing {
+    /// The balancing state of a proxy whose `balance uri` line had the options `uri`.
+    #[must_use]
+    pub fn new(uri: UriHash) -> Self {
+        ChashRing(Mutex::default(), AtomicU32::new(0), uri)
+    }
+
+    /// A server's state or weight was written, or the set of servers moved: the next pick
+    /// from a worker holding the older snapshot takes the lock and rebuilds (like
+    /// [`Fwrr::changed`]).
+    pub fn changed(&self) {
+        self.1.fetch_add(1, Ordering::Release);
+    }
+
+    /// The generation the current snapshot was built from.
+    #[must_use]
+    pub fn generation(&self) -> u32 {
+        self.1.load(Ordering::Acquire)
+    }
+
+    /// The snapshot of `proxy`'s hash state at the current generation, through the worker's
+    /// cache: the worker's own if its slot's generation is the current one, else the one
+    /// just built (or built by another worker since the load), into the slot. Per pick in
+    /// steady state: one `Acquire` load and one read through the worker's own slot -- no
+    /// lock, no scan.
+    fn sync<'c>(&self, proxy: &Proxy, cache: &'c mut LbSnapCache) -> &'c ChashSnap {
+        let gen = self.1.load(Ordering::Acquire);
+        let key = proxy.id;
+        if let Some(i) = cache.slots.iter().position(|s| s.key == key) {
+            let slot = &mut cache.slots[i];
+            if slot.generation != gen {
+                slot.snap = self.build_if_changed(proxy, gen);
+                slot.generation = gen;
             }
-            // Stable, so equal keys keep HAProxy's insertion order.
-            ring.points.sort_by_key(|&(k, _)| k);
-            ring.members = if !ring.points.is_empty() {
-                RingMembers::Active
-            } else if let Some(b) = (0..proxy.srv_set().len()).find(|&i| {
-                proxy.srv_set().backup_at(i) && is_server_up(proxy, i)
-            }) {
-                RingMembers::FirstBackup(b)
-            } else {
-                RingMembers::None
+            return &slot.snap;
+        }
+        // The worker's first pick on this backend: make the slot. In the engine's
+        // pre-sized cache the push grows nothing.
+        let snap = self.build_if_changed(proxy, gen);
+        cache.slots.push(LbSnapSlot { key, generation: gen, snap });
+        cache.slots.last().map(|s| s.snap.as_ref()).expect("the slot above is pushed")
+    }
+
+    /// The snapshot at generation `gen`, under the builder's lock: rebuilt only when no
+    /// worker has yet built for it (a worker that lost the race reads the other's build).
+    /// One pass over the servers, on the way.
+    fn build_if_changed(&self, proxy: &Proxy, gen: u32) -> Arc<ChashSnap> {
+        count_hash_pick_lock();
+        let mut pub_ = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pub_.snap.is_none() || pub_.generation != gen {
+            count_hash_pick_scan();
+            // By state and weight only: a server at its `maxconn`, or the one this worker's
+            // redispatch avoids, moves no generation, so leaving it out here would keep it out
+            // of every worker's map until the next state change. The pick walks past it.
+            let in_map = |idx: usize| -> u32 {
+                if proxy.srv_set().backup_at(idx) || !is_server_up(proxy, idx) || proxy.srv_set().weight_at(idx).unwrap_or(1) == 0 {
+                    0
+                } else {
+                    proxy.srv_set().weight_at(idx).unwrap_or(1)
+                }
             };
+            let mut snap = ChashSnap::default();
+            snap.map.rebuild(proxy, in_map);
+            snap.ring.rebuild(proxy);
+            pub_.snap = Some(Arc::new(snap));
+            pub_.generation = gen;
         }
-        // Read again rather than downgrade (std has no downgrade); another writer in
-        // between would have built the same ring from the same states.
-        self.0.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+        pub_.snap.clone().expect("the build above published a snapshot")
+    }
+
+    /// The server `balance uri` or `balance source` (map-based) picks for `hash`, from the
+    /// [`WeightMap`] of the usable primary servers; `None` when none is usable. Per request,
+    /// in steady state: one `Acquire` load of the generation and one read through the
+    /// worker's own snapshot -- no lock, no scan. The map is rebuilt, under the lock, only
+    /// when a server's state or weight moves the generation.
+    fn map_pick(&self, proxy: &Proxy, hash: u32, cache: &mut LbSnapCache) -> Option<usize> {
+        let map = &self.sync(proxy, cache).map;
+        // The snapshot cannot shed a slot whose server stopped being selectable since the
+        // build: a `maxconn` saturation (and this worker's redispatch-avoided server)
+        // moves no generation. The walk passes the slot over, the way the ring's
+        // `hash-preserve-affinity` walks, so a full server is not sent one connection
+        // more; the steady state (every slot's server selectable) reads one slot.
+        let len = u32::try_from(map.slots.len()).ok()?;
+        (0..len).find_map(|off| {
+            let idx = map.slots[(hash.wrapping_add(off) % len) as usize] as usize;
+            is_selectable(proxy, idx).then_some(idx)
+        })
     }
 }
 
