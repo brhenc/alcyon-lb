@@ -65,8 +65,22 @@ fn server_check_state_stays_small() {
 /// at routing in place of the log's `CR` (which was control state, not a record). It took a
 /// new word: the one-byte holes of `HttpTxn` are the `Option`s' niches. A box would be 8 as
 /// well and an allocation per request.
+/// The fold of `l7_off` into `L7Retry` gave back the word `wait_client_gone` took: the byte
+/// it frees is the one that pushed `HttpTxn`'s small fields over 40. The dataless `Disabled`
+/// variant that `http-request disable-l7-retry` now sets costs the enum nothing -- it is 16
+/// bytes with or without it (its own tag, no niche in `Saved(L7Box)`;
+/// `l7_retry_stays_16_bytes`).
 #[test]
 fn session_entry_stays_small() {
     let n = size_of::<alcyon_rt::engine::SessionEntry>();
-    assert!(n <= 1672, "SessionEntry grew to {n} bytes (bound 1672): one is held per client connection, box the new field");
+    assert!(n <= 1664, "SessionEntry grew to {n} bytes (bound 1664): one is held per client connection, box the new field");
+}
+
+/// `L7Retry` is 16 bytes: its own tag (the niche of `Saved(L7Box)`'s `Option` is inside the
+/// newtype, so the enum cannot use it) and the 8-byte `L7Box` payload. A dataless variant
+/// costs it nothing -- `Disabled` was folded into it for that reason.
+#[test]
+fn l7_retry_stays_16_bytes() {
+    let n = size_of::<alcyon_rt::txn::L7Retry>();
+    assert_eq!(n, 16, "L7Retry is {n} bytes (bound 16): a dataless variant must not grow it");
 }

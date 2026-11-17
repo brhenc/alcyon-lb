@@ -2294,8 +2294,6 @@ pub struct HttpTxn {
     /// `H1_MF_CHNK`, T442). Boxed: few responses have it, and a transaction is held per
     /// connection.
     pub rsp_dechunk: Option<Box<Chunk>>,
-    /// `http-request disable-l7-retry` ran for this request (`TX_D_L7_RETRY`).
-    pub l7_off: bool,
     /// The request's body wait ended with the client gone (`http_wait_for_msg_body` left the
     /// wait on `SC_FL_EOS`/`SC_FL_ERROR`): the rules went on and named the backend, and the
     /// stream is ended before a server is picked.
@@ -2311,6 +2309,9 @@ pub enum L7Retry {
     /// Not a candidate: the backend does not retry on a response, or nothing armed it.
     #[default]
     Off,
+    /// `http-request disable-l7-retry` ran for this request (`TX_D_L7_RETRY`): it is no
+    /// candidate, and it never becomes one again, for the rest of the request.
+    Disabled,
     /// A candidate; the request is copied when it is first sent.
     Armed,
     /// The request did not fit, or was not whole when it was first sent: no retry.
@@ -2438,7 +2439,6 @@ impl HttpTxn {
             srv_kal_rule: false,
             req_len_long: false,
             rsp_dechunk: None,
-            l7_off: false,
             wait_client_gone: false,
             l7: L7Retry::Off,
         }
