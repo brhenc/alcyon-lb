@@ -840,3 +840,14 @@ row is here because the behaviour is surprising or measurable, not because it di
 | **HAProxy** | Has them in 3.5-dev11 and, presumably, in 3.6. |
 | **Revisit if** | 3.6 LTS is released and becomes the oracle: then each keyword here is ported against the released behaviour. |
 | **V&V probe** | A configuration with `http-hardening` in `global` or `curve2name` in a sample expression is refused at load with the keyword's name; never accepted and ignored. |
+
+### 6.37 At most 131,072 proxies (frontends, backends, listens) per process (T637 S2) — **a hard limit; to revisit**
+
+| | |
+|---|---|
+| **What** | The proxy table (`crates/alcyon-rt/src/table.rs`) is 128 chunks of 1,024 proxies, with the top level an inline array indexed by a mask. `Table::new` asserts at most 131,072 proxies, so a larger configuration stops at load on that assertion (a panic with "at most 131072 proxies"), not on a configuration error naming the cause. |
+| **Why** | The request path indexes the table about 91 times per request. A table with a growable top level paid two bounds checks and three loads on each of those: +2.1-2.5% instructions per request (e0ad1360). Fixed-size chunks and a masked inline top level put S2 back at base (keepalive 35177 -> 35099, rules 50518 -> 50569, h2s1 51228 -> 50937; 5b6aca4d). |
+| **Cost** | A configuration with more than 131,072 proxies does not load. The table's top level costs 128 pointers whatever the configuration's size; chunks past the last proxy share one empty chunk. A slot past the table's length reads an empty filler proxy in release builds rather than panicking (`debug_assert!` only). |
+| **HAProxy** | Has no such limit: proxies are a linked list and an ebtree by name, bounded by memory and by the proxy ID space. |
+| **Revisit if** | Runtime `add backend` lands (T637 S6), which can grow the table past its load-time size: the limit must then become a refusal of the command (and of the configuration at load) with a message, or the top level must grow without putting a bounds check back on the request path. Also if an operator reports a configuration near the limit. |
+| **V&V probe** | Generate a configuration with 131,072 proxies (loads) and 131,073 (must be refused; today it is an assertion, which is the defect to fix with S6). |
