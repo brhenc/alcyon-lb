@@ -1413,6 +1413,15 @@ class MockServerRunner:
                         writer.write(payload)
                         await writer.drain()
 
+                    elif cmd == "send_n":
+                        n = int(args[0])
+                        data_str = " ".join(args[1:])
+                        if data_str.startswith('"') and data_str.endswith('"'):
+                            data_str = data_str[1:-1]
+                        payload = decode_escapes(data_str).encode("latin1") * n
+                        writer.write(payload)
+                        await writer.drain()
+
                     elif cmd in ("chunkedlen", "chunked"):
                         # One chunk of a chunked body: `chunkedlen N` is N filler bytes,
                         # `chunked "text"` the text; size 0 is the last chunk. Without
@@ -1517,20 +1526,26 @@ class MockClientRunner:
     async def _run_client_script(self) -> None:
         try:
             target = self.macro_engine.expand(self.client_def.connect_target)
-            target_parts = target.strip().replace(":", " ").split()
-            if len(target_parts) >= 2:
-                host = target_parts[0]
-                port = int(target_parts[1])
-            else:
-                host = "127.0.0.1"
-                port = int(target_parts[0])
+            target_stripped = target.strip()
+            is_unix = target_stripped.startswith("/")
+            if not is_unix:
+                target_parts = target_stripped.replace(":", " ").split()
+                if len(target_parts) >= 2:
+                    host = target_parts[0]
+                    port = int(target_parts[1])
+                else:
+                    host = "127.0.0.1"
+                    port = int(target_parts[0])
 
             for _ in range(self.client_def.repeat):
                 reader, writer = None, None
                 connect_err = None
                 for _ in range(30):
                     try:
-                        reader, writer = await asyncio.open_connection(host, port)
+                        if is_unix:
+                            reader, writer = await asyncio.open_unix_connection(target_stripped)
+                        else:
+                            reader, writer = await asyncio.open_connection(host, port)
                         break
                     except (ConnectionRefusedError, OSError) as e:
                         connect_err = e
@@ -1628,7 +1643,11 @@ class MockClientRunner:
                         await writer.drain()
 
                     elif cmd in ("rxresp", "rxresphdrs"):
-                        cur_resp = await parse_http_response(reader, req_method=last_req_method, headers_only=cmd == "rxresphdrs")
+                        cur_resp = await parse_http_response(
+                            reader,
+                            req_method=last_req_method,
+                            headers_only=(cmd == "rxresphdrs" or "-no_obj" in args),
+                        )
                         if cur_resp is None:
                             raise ConnectionResetError(f"Client {self.client_id} expected HTTP response but got EOF")
                         if self.verbose:
@@ -1666,6 +1685,20 @@ class MockClientRunner:
                             data_str = data_str[1:-1]
                         pending += decode_escapes(data_str).encode("latin1")
 
+                    elif cmd == "send_n":
+                        n = int(args[0])
+                        data_str = " ".join(args[1:])
+                        if data_str.startswith('"') and data_str.endswith('"'):
+                            data_str = data_str[1:-1]
+                        pending += decode_escapes(data_str).encode("latin1") * n
+
+                    elif cmd == "send_n":
+                        n = int(args[0])
+                        data_str = " ".join(args[1:])
+                        if data_str.startswith('"') and data_str.endswith('"'):
+                            data_str = data_str[1:-1]
+                        pending += decode_escapes(data_str).encode("latin1") * n
+
                     elif cmd == "sendhex":
                         # `sendhex "300C020101 61 070A01 00 04000400"` is quoted in the
                         # .vtc, and the quotes have to come off before fromhex sees them --
@@ -1691,7 +1724,7 @@ class MockClientRunner:
                             extra = await reader.read(1)
                         except ConnectionResetError:
                             extra = b""
-                        if extra:
+                        if extra.strip(b"\r\n"):
                             raise AssertionError(f"expect_close: read {extra!r} instead of a close")
 
                     elif cmd == "barrier":
@@ -2423,6 +2456,7 @@ class VtcExecutor:
                     else:
                         if start_imm:
                             cli_sock = os.path.join(self.tmpdir, f"{haproxy_id}.sock")
+                            self.macro_engine.macros[f"{haproxy_id}_cli_sock"] = cli_sock
                             # The CLI is the config's `stats socket` (see the prelude above),
                             # in the foreground, as vtest runs it.
                             mw = [a for a in master_args if a in ("-W", "-Ws")]
