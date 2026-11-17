@@ -2701,6 +2701,33 @@ impl TcpSession {
         }
     }
 
+    /// The server sent a complete response and its connection is dead (or its last write
+    /// just failed) while the client's request still comes: the request's next byte cannot
+    /// be forwarded. `HAProxy` ends the stream at that write -- the close is the end of the
+    /// response, logged `SL`, never an abort -- and the rest of the request is read and
+    /// dropped (measured on 3.5-dev8). The write path calls this when a send to the server
+    /// fails, the read path when bytes were committed to a connection that is too dead to
+    /// be written again (a reset one is never offered a write); `http_server_side` takes
+    /// the `SL` it leaves and logs the stream. A client that stops sending has no such
+    /// byte to end the stream, and it then lives out `timeout client`, `cL`.
+    fn server_close_ends_stream(&self) -> bool {
+        self.mode == Mode::Http
+            && self.srv_xprt.h2().is_none()
+            && self.strm.log.term.is_none()
+            && self.strm
+                .txn
+                .as_ref()
+                // A retry on the answer (`L7Retry::Armed`, `Saved`) may still replay the
+                // request on another server: the close is not the stream's end then.
+                .is_some_and(|t| {
+                    matches!(t.l7, txn::L7Retry::Off | txn::L7Retry::Dead)
+                        && !t.local
+                        && !t.aborted
+                        && t.rsp.is_done()
+                        && !t.req.is_done()
+                })
+    }
+
     /// The request cannot be parsed. It is answered with `status` -- by the engine, which
     /// has the error pages -- and the connection closes; nothing more is read from it.
     pub(crate) fn fail_request(&mut self, status: u16) {
@@ -3213,6 +3240,22 @@ impl TcpSession {
                         self.rewrite_req_chunk_framing();
                         self.bytes_in += n as u64;
                         self.strm.log.first_byte_now();
+                        // The server is gone behind a complete response: the request's
+                        // next byte cannot be forwarded.
+                        if !self.srv_state.can_write()
+                            && self.req_window() > 0
+                            && self.server_close_ends_stream()
+                        {
+                            // The write that would carry it cannot be made (the connection
+                            // is reset, and a dead one is never written again): the stream
+                            // ends at it, `SL`; `http_server_side` takes the mark, logs
+                            // the stream, and sets the drop the reads then act on.
+                            self.strm.log.term = Some(*b"SL");
+                        } else if matches!(self.srv_state, ScState::Closed | ScState::Error) {
+                            // Already logged: the rest is read and dropped as it arrives,
+                            // so the client's body ends and the stream can.
+                            self.drain_request();
+                        }
                         changed = true;
                     }
                     // Nothing came: the buffer taken for the read goes back
@@ -3923,6 +3966,10 @@ impl TcpSession {
                 Io::Closed => {
                     self.srv_state = ScState::Closed;
                     self.ending.get_or_insert(Ending::ServerAbort);
+                    if self.server_close_ends_stream() {
+                        // The write to the closed server failed: the stream ends at it, `SL`.
+                        self.strm.log.term = Some(*b"SL");
+                    }
                     changed = true;
                 }
                 Io::Done(_) | Io::WouldBlock | Io::Eof => {}
