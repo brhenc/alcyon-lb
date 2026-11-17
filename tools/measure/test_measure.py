@@ -7,9 +7,17 @@ Unit tests for Alcyon Continuous Measurement regression detector.
 """
 
 import os
+import signal
 import subprocess
+import sys
 import tempfile
 import unittest
+
+# The gate runs `cd tools/measure && python3 -m unittest test_measure`; the file also runs
+# directly as `python3 -I tools/measure/test_measure.py`, and -I (--safe-path) keeps this
+# directory off sys.path, so find measure.py by the file's own location.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from measure import (check_regressions, MetricDelta, Verdict, reference_sha, split_modes,
                      parse_insreq, min_ins_per_req, host_problems, load_previous_measurements)
 from h3board import board, render
@@ -237,6 +245,99 @@ class TestSplitModes(unittest.TestCase):
         m = split_modes([12438, 14966, 15454, 13519], [15034, 11017, 18832, 13445])
         self.assertEqual(m["cand"]["slow"] + m["cand"]["fast"], 4)
         self.assertGreaterEqual(m["threshold"] or 0, 15454)
+
+
+class TestInsreqShBackend(unittest.TestCase):
+    """T639 (11-17): when the measure-bench backend binary is missing, the backend dies
+    without a word, the proxy has no server, and the warm-up ab waits forever on a
+    connection the proxy will never answer. The script must fail fast with the path,
+    not hold the load slot until the overnight queue is stopped by hand."""
+
+    # A stand-in proxy: accepts every connection and answers nothing, as the real proxy
+    # does for a request its missing backend cannot serve, so the warm-up ab waits.
+    FAKE_PROXY = """\
+#!/usr/bin/env python3
+import re, socket, sys
+cfg = sys.argv[sys.argv.index("-f") + 1]
+port = int(re.search(r"bind 127\\.0\\.0\\.1:(\\d+)", open(cfg).read()).group(1))
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port)); s.listen(128)
+held = []
+while True:
+    held.append(s.accept()[0])
+"""
+
+    def setUp(self):
+        self.fakes = []
+
+    def tearDown(self):
+        # On its error paths the script does not stop the proxy, and a timed-out run is
+        # killed mid warm-up; a fake left behind holds its port, and the ab that waits on
+        # it. Kill them by the fake's unique path.
+        for path in self.fakes:
+            for pid in os.listdir("/proc"):
+                if not pid.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{pid}/cmdline", "rb") as f:
+                        cmd = f.read().decode(errors="replace")
+                except OSError:
+                    continue
+                if path in cmd:
+                    try:
+                        os.kill(int(pid), signal.SIGTERM)
+                    except OSError:
+                        pass
+
+    def run_insreq(self, out, bench):
+        """insreq.sh with small N and rounds, bounded at 30 s; the fake stand-in proxy is
+        its proxy binary. A hang is a failure: that is the T639 defect."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        fake = os.path.join(out, "fake-proxy")
+        with open(fake, "w") as f:
+            f.write(self.FAKE_PROXY)
+        os.chmod(fake, 0o755)
+        self.fakes.append(fake)
+        env = {k: v for k, v in os.environ.items() if k not in ("MEASURE_BENCH", "ALCYON_MEASURE_CPUS")}
+        env["MEASURE_BENCH"] = bench
+        env["ALCYON_MEASURE_CPUS"] = ",".join(str(i) for i in range(min(3, os.cpu_count() or 1)))
+        p = subprocess.Popen([os.path.join(here, "insreq.sh"), "t", fake,
+                              os.path.join(here, "scenarios", "keepalive.body"), "ab1", "1", "1", out],
+                             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                             start_new_session=True)
+        try:
+            stdout, stderr = p.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            p.wait()
+            p.stdout.close(); p.stderr.close()
+            self.fail(f"insreq.sh hung with MEASURE_BENCH={bench} (T639: expected a fail-fast error)")
+        return p.returncode, stdout + stderr
+
+    def test_missing_measure_bench_fails_fast_with_the_path(self):
+        # The caller named the binary (MEASURE_BENCH), so the script must not build it; it
+        # reports the missing path and exits non-zero within the bound, not in 35 minutes.
+        with tempfile.TemporaryDirectory() as out:
+            rc, output = self.run_insreq(out, "/nonexistent/measure-bench")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("measure-bench not found", output)
+        self.assertIn("/nonexistent/measure-bench", output)
+
+    def test_backend_that_never_listens_fails_fast(self):
+        # The named binary exists but is not a backend: it never listens, so the script
+        # stops with "backend did not start" instead of letting ab poll a proxy with no
+        # server forever.
+        with tempfile.TemporaryDirectory() as out:
+            bench = os.path.join(out, "not-a-backend")
+            with open(bench, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(bench, 0o755)
+            rc, output = self.run_insreq(out, bench)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("backend did not start", output)
+        self.assertIn(bench, output)
+
 
 if __name__ == "__main__":
     unittest.main()
