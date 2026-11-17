@@ -22,7 +22,7 @@
 use crate::common;
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -85,10 +85,12 @@ impl Drop for Proxy {
     }
 }
 
-/// The server: answers `GET /<n>` with `responses[n]` (its parts, with pauses between);
-/// records what it receives of any other request into `seen`, and answers it with a 200
-/// once its body is complete, or once nothing more has come for a second.
-fn server(responses: Arc<Vec<Vec<Part>>>, seen: Arc<Mutex<Vec<u8>>>) -> SocketAddr {
+/// The server: answers `GET /<n>` and `POST /<n>` with `responses[n]` (its parts, with
+/// pauses between; a scripted `POST` reply holds the connection afterwards); records what
+/// it receives of any other request into `seen`, and answers it with a 200 once its body
+/// is complete, or once nothing more has come for a second. `early`: answer a `POST` as
+/// soon as its head is complete, without the body.
+fn server(responses: Arc<Vec<Vec<Part>>>, seen: Arc<Mutex<Vec<u8>>>, early: bool) -> SocketAddr {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = l.local_addr().unwrap();
     thread::spawn(move || {
@@ -112,13 +114,13 @@ fn server(responses: Arc<Vec<Vec<Part>>>, seen: Arc<Mutex<Vec<u8>>>) -> SocketAd
                         }
                     }
                     let Some(eoh) = req.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
-                    if req.starts_with(b"GET") {
-                        let n: usize = String::from_utf8_lossy(&req)
-                            .split(' ')
-                            .nth(1)
-                            .and_then(|p| p.trim_start_matches('/').parse().ok())
-                            .unwrap_or(0);
-                        for p in &responses[n] {
+                    let n: usize = String::from_utf8_lossy(&req)
+                        .split(' ')
+                        .nth(1)
+                        .and_then(|p| p.trim_start_matches('/').parse().ok())
+                        .unwrap_or(0);
+                    if let Some(parts) = responses.get(n).filter(|ps| !ps.is_empty()) {
+                        for p in parts {
                             match p {
                                 Bytes(b) => {
                                     if s.write_all(b).is_err() {
@@ -128,8 +130,13 @@ fn server(responses: Arc<Vec<Vec<Part>>>, seen: Arc<Mutex<Vec<u8>>>) -> SocketAd
                                 Pause => thread::sleep(PAUSE),
                             }
                         }
-                        thread::sleep(Duration::from_millis(500));
+                        // A GET keeps the connection for the 500 ms the tests time against;
+                        // a scripted POST reply holds it (a body that will not come).
+                        thread::sleep(if req.starts_with(b"GET") { Duration::from_millis(500) } else { Duration::from_secs(30) });
                         return;
+                    }
+                    if early {
+                        break;
                     }
                     if req.len() > eoh + 4 && req.ends_with(b"\r\n\r\n") {
                         break;
@@ -142,20 +149,20 @@ fn server(responses: Arc<Vec<Vec<Part>>>, seen: Arc<Mutex<Vec<u8>>>) -> SocketAd
     addr
 }
 
-fn start(responses: Vec<Vec<Part>>, seen: Arc<Mutex<Vec<u8>>>) -> Proxy {
-    start_with("", responses, seen)
+fn start(responses: Vec<Vec<Part>>, seen: Arc<Mutex<Vec<u8>>>, client_to: &str, early: bool) -> Proxy {
+    start_with("", responses, seen, client_to, early)
 }
 
 /// `start` with `fe_opts` (whole config lines, each ending in a newline) added to frontend `f`.
-fn start_with(fe_opts: &str, responses: Vec<Vec<Part>>, seen: Arc<Mutex<Vec<u8>>>) -> Proxy {
+fn start_with(fe_opts: &str, responses: Vec<Vec<Part>>, seen: Arc<Mutex<Vec<u8>>>, client_to: &str, early: bool) -> Proxy {
     let (fe, sentinel) = (common::reserve_addr(), common::reserve_addr());
-    let be = server(Arc::new(responses), seen);
+    let be = server(Arc::new(responses), seen, early);
     let mut cfg = NamedTempFile::new().expect("tmp");
     write!(
         cfg,
         "global\n  log stdout format raw local0\n\
          defaults\n  mode http\n  log global\n  option httplog\n  timeout connect 2s\n  \
-         timeout client 5s\n  timeout server 5s\n  timeout http-request 5s\n\
+         timeout client {client_to}\n  timeout server 5s\n  timeout http-request 5s\n\
          frontend f\n  bind {fe}\n{fe_opts}  default_backend b\n\
          frontend s\n  bind {sentinel}\n  http-request return status 200\n\
          backend b\n  server s {be}\n"
@@ -201,11 +208,103 @@ fn exchange(p: &Proxy, parts: &[Part]) -> (Vec<u8>, Duration) {
     (got, t0.elapsed())
 }
 
+/// Sends `parts`, half-closes the write side, then reads until the proxy closes: what came
+/// back, and how long the close took from the last byte sent.
+fn exchange_fin(p: &Proxy, parts: &[Part]) -> (Vec<u8>, Duration) {
+    let mut c = TcpStream::connect(p.fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+    for part in parts {
+        match part {
+            Bytes(b) => {
+                if c.write_all(b).is_err() {
+                    break;
+                }
+            }
+            Pause => thread::sleep(PAUSE),
+        }
+    }
+    let _ = c.shutdown(Shutdown::Write);
+    let t0 = Instant::now();
+    let mut got = Vec::new();
+    let mut b = [0u8; 65536];
+    loop {
+        match c.read(&mut b) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&b[..n]),
+        }
+    }
+    (got, t0.elapsed())
+}
+
+/// Sends `parts`, reads until `stop` holds of what came back, half-closes the write side,
+/// then reads until the proxy closes: what came back, and how long the close took from the
+/// FIN.
+fn exchange_fin_when(p: &Proxy, parts: &[Part], stop: impl Fn(&[u8]) -> bool) -> (Vec<u8>, Duration) {
+    let mut c = TcpStream::connect(p.fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+    for part in parts {
+        match part {
+            Bytes(b) => {
+                if c.write_all(b).is_err() {
+                    break;
+                }
+            }
+            Pause => thread::sleep(PAUSE),
+        }
+    }
+    let mut got = Vec::new();
+    let mut b = [0u8; 65536];
+    loop {
+        if stop(&got) {
+            break;
+        }
+        match c.read(&mut b) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&b[..n]),
+        }
+    }
+    let _ = c.shutdown(Shutdown::Write);
+    let t0 = Instant::now();
+    loop {
+        match c.read(&mut b) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&b[..n]),
+        }
+    }
+    (got, t0.elapsed())
+}
+
+/// The line's `%TR/%Tw/%Tc/%Tr/%Ta`, `%ST`, `%B`, and `%tsc`, by position (the default
+/// `httplog` format of `HAProxy` and Alcyon).
+fn log_fields(l: &str) -> Option<([i64; 5], i64, i64, String)> {
+    let f: Vec<&str> = l.split_whitespace().collect();
+    let parts: Vec<&str> = f.get(4)?.split('/').collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    let t = [parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?, parts[3].parse().ok()?, parts[4].parse().ok()?];
+    Some((t, f.get(5)?.parse().ok()?, f.get(6)?.parse().ok()?, f.get(9)?.to_string()))
+}
+
+/// A `POST /<n>` head with a `Content-Length` body of `clen` bytes.
+fn cl_head(n: usize, clen: usize) -> Vec<u8> {
+    format!("POST /{n} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {clen}\r\n\r\n").into_bytes()
+}
+
+/// A `POST /<n>` request line, before its head fields.
+fn post_head(n: usize) -> Vec<u8> {
+    format!("POST /{n} HTTP/1.1\r\n").into_bytes()
+}
+
 /// The log line naming `/<n>` (or the `<BADREQ>` of a request refused before it was one).
+/// The `wait_listening` sentinel connect leaves its own `<BADREQ>` line on the `s`
+/// frontend; it is not a request of this test and is never returned. The log's prefix
+/// (the listening proxy) is the third field: `<ci>:<cp> [<date>] <prefix> <be>/<srv>`.
 fn log_of(p: &Proxy, n: usize) -> String {
     let want = format!("/{n} HTTP/");
     while let Ok(l) = p.logs.recv_timeout(Duration::from_secs(3)) {
-        if l.contains(&want) || l.contains("<BADREQ>") {
+        let on_fe = l.split_whitespace().nth(2) == Some("f");
+        if l.contains(&want) || (l.contains("<BADREQ>") && on_fe) {
             return l;
         }
     }
@@ -285,7 +384,7 @@ fn a_malformed_response_body_is_refused_or_cut_as_haproxy_does() {
         ),
         ("trailer_16300_after_head", vec![Bytes(RSP_HEAD.to_vec()), Pause, Bytes(big_trailer(16300))], Rsp::Whole(16322)),
     ];
-    let p = start(cases.iter().map(|c| c.1.clone()).collect(), Arc::default());
+    let p = start(cases.iter().map(|c| c.1.clone()).collect(), Arc::default(), "5s", false);
     let mut wrong = Vec::new();
     for (n, (name, _, want)) in cases.iter().enumerate() {
         let (got, took) = exchange(&p, &[Bytes(format!("GET /{n} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").into_bytes())]);
@@ -343,7 +442,7 @@ fn a_request_trailer_section_too_large_or_refused_never_half_reaches_the_server(
         ("bad_chunk_after_chunk", vec![Bytes(b"5\r\nhello\r\n".to_vec()), Pause, Bytes(b"-5\r\nhello\r\n0\r\n\r\n".to_vec())], Req::Dropped(Some(b"5\r\nhello\r\n"), "PH--")),
     ];
     let seen: Arc<Mutex<Vec<u8>>> = Arc::default();
-    let p = start(Vec::new(), Arc::clone(&seen));
+    let p = start(Vec::new(), Arc::clone(&seen), "5s", false);
     let mut wrong = Vec::new();
     for (n, (name, parts, want)) in cases.iter().enumerate() {
         seen.lock().unwrap().clear();
@@ -391,7 +490,7 @@ fn a_buffered_request_body_parse_error_is_logged_badreq() {
     // The body is checked with the head as it is parsed, before any rule runs, so buffering
     // changes nothing here; both are run (review of the BADCHUNK case).
     for (mode, opts) in [("unbuffered", ""), ("http-buffer-request", "  option http-buffer-request\n")] {
-        let p = start_with(opts, Vec::new(), Arc::default());
+        let p = start_with(opts, Vec::new(), Arc::default(), "5s", false);
         for (n, (name, body)) in cases.iter().enumerate() {
             let name = format!("{mode} {name}");
             let req = cat(&[&head(n), REQ_HEAD, body]);
@@ -448,4 +547,127 @@ fn log_line_port(p: &Proxy, port: u16) -> String {
         }
     }
     String::new()
+}
+
+/// A client that abandons its body after the head was forwarded: no `option
+/// http-buffer-request`, so the body is relayed as it arrives. `n` 0: a `Content-Length`
+/// body; 1: a chunked one; both FIN mid-body before the server answers, so `HAProxy`
+/// answers the 400 nobody reads and logs the client abort (`CH--`), the request not
+/// complete (`Tr` -1). 2 and 3 FIN mid-body after the server already answered, a 200 of
+/// two bytes and one of 12000 in flight: the log keeps the response's status, `CL--` all
+/// of it delivered, `CD--` still in flight, the answer stopping behind the FIN, the
+/// client seeing the close at once. In every case the server got the head and what was
+/// relayed of the body before the close.
+#[test]
+fn a_client_that_fins_mid_body_logs_the_client_abort() {
+    let seen: Arc<Mutex<Vec<u8>>> = Arc::default();
+    // 2: a 200 of two bytes, all of it. 3: a 200 of 12000 bytes, 1000 at a time.
+    let early = vec![Bytes(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec())];
+    let mut stream = vec![Bytes(cat(&[b"HTTP/1.1 200 OK\r\nContent-Length: 12000\r\n\r\n", &[b'x'; 1000]]))];
+    for _ in 0..11 {
+        stream.push(Pause);
+        stream.push(Bytes(vec![b'x'; 1000]));
+    }
+    let p = start(vec![Vec::new(), Vec::new(), early, stream], Arc::clone(&seen), "5s", false);
+    let mut wrong = Vec::new();
+    for n in 0..4 {
+        seen.lock().unwrap().clear();
+        let head: Vec<u8> = if n == 1 {
+            cat(&[&post_head(n), REQ_HEAD])
+        } else {
+            cl_head(n, 100)
+        };
+        let body: &[u8] = if n == 1 {
+            b"5\r\nhel"
+        } else if n == 3 {
+            &[b'a'; 10]
+        } else {
+            &[b'a'; 50]
+        };
+        let (got, _took) = if n < 2 {
+            exchange_fin(&p, &[Bytes(cat(&[&head, body]))])
+        } else if n == 2 {
+            // The whole two-byte response, then the FIN.
+            exchange_fin_when(&p, &[Bytes(cat(&[&head, body]))], |g| g.windows(2).any(|w| w == b"ok"))
+        } else {
+            // Into the third 1000-byte chunk of the 12000-byte answer, then the FIN.
+            exchange_fin_when(&p, &[Bytes(cat(&[&head, body]))], |g| g.len() >= 2500)
+        };
+        let log = log_of(&p, n);
+        thread::sleep(Duration::from_millis(300));
+        let be = seen.lock().unwrap().clone();
+        let Some((timers, status, bytes, tsc)) = log_fields(&log) else {
+            wrong.push(format!("{n}: no parseable log line: {log}"));
+            continue;
+        };
+        // `HAProxy` lowercases the forwarded header names and strips the `Connection`
+        // header; compare case-insensitively against the head minus that header.
+        let be_head: Vec<u8> = if n == 1 {
+            format!("POST /{n} HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n").into_bytes()
+        } else {
+            format!("POST /{n} HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n").into_bytes()
+        }
+        .to_ascii_lowercase();
+        let be_lc = be.to_ascii_lowercase();
+        let ok200 = got.starts_with(b"HTTP/1.1 200 OK\r\n");
+        let fine = match n {
+            0 | 1 => {
+                let want: Vec<u8> = cat(&[&be_head, body]).to_ascii_lowercase();
+                got.is_empty() && status == 400 && tsc == "CH--" && timers[3] == -1 && bytes == 0 && be_lc.starts_with(&want)
+            }
+            2 => ok200 && body_of(&got) == b"ok" && status == 200 && tsc == "CL--" && bytes > 0 && be_lc.starts_with(&be_head),
+            _ => ok200 && body_of(&got).len() >= 1000 && status == 200 && tsc == "CD--" && bytes > 0 && be_lc.starts_with(&be_head),
+        };
+        if !fine {
+            wrong.push(format!("{n}: got {} / server {} / log {log} (ST {status} B {bytes} T {timers:?} tsc {tsc})", esc(&got), esc(&be)));
+        }
+    }
+    assert!(wrong.is_empty(), "{} of 4 cases differ:\n{}", wrong.len(), wrong.join("\n"));
+}
+
+/// The same abandonment left to idle out `timeout client` (1 s here), after the server
+/// already answered `200` to the head: the response reached the client, and the log keeps
+/// the `200` and the client time-out (`cL--`), the transaction living out its timer. 2:
+/// the answer itself still in flight when the client stops sending -- a 200 of 12000
+/// bytes of which 3000 arrived, the server holding the connection: the time-out ends the
+/// transaction mid-body, `cD--`.
+#[test]
+fn a_client_that_idles_out_its_body_logs_the_client_timeout() {
+    let seen: Arc<Mutex<Vec<u8>>> = Arc::default();
+    // 2: 3000 of the 12000, then the connection held open, nothing more coming.
+    let stall = vec![Bytes(cat(&[b"HTTP/1.1 200 OK\r\nContent-Length: 12000\r\n\r\n", &[b'x'; 3000]]))];
+    let p = start(vec![Vec::new(), Vec::new(), stall], Arc::clone(&seen), "1s", true);
+    let mut wrong = Vec::new();
+    for n in 0..3 {
+        seen.lock().unwrap().clear();
+        let parts: Vec<Part> = if n == 0 {
+            let head = cl_head(n, 100);
+            vec![Bytes(head), Pause, Bytes(vec![b'a'; 50])]
+        } else if n == 2 {
+            let head = cl_head(n, 100);
+            vec![Bytes(head), Pause, Bytes(vec![b'a'; 50])]
+        } else {
+            vec![Bytes(cat(&[&post_head(n), REQ_HEAD])), Pause, Bytes(b"5\r\nhel".to_vec())]
+        };
+        let (got, _took) = exchange(&p, &parts);
+        let log = log_of(&p, n);
+        thread::sleep(Duration::from_millis(300));
+        let Some((timers, status, bytes, tsc)) = log_fields(&log) else {
+            wrong.push(format!("{n}: no parseable log line: {log}"));
+            continue;
+        };
+        let ok200 = got.starts_with(b"HTTP/1.1 200 OK\r\n");
+        // `timers[4]` is `%Ta`, the close from the start: the client's own time-out ends
+        // it, so it is its 1 s plus slack -- never the 5 s `timeout server` a proxy that
+        // lets the stream live on waits for.
+        let fine = if n < 2 {
+            body_of(&got) == b"ok" && status == 200 && tsc == "cL--" && (900..3000).contains(&timers[4]) && bytes > 0
+        } else {
+            ok200 && body_of(&got).len() >= 1000 && status == 200 && tsc == "cD--" && (900..3000).contains(&timers[4]) && bytes > 0
+        };
+        if !fine {
+            wrong.push(format!("{n}: got {} / log {log} (ST {status} B {bytes} T {timers:?} tsc {tsc})", esc(&got)));
+        }
+    }
+    assert!(wrong.is_empty(), "{} of 3 cases differ:\n{}", wrong.len(), wrong.join("\n"));
 }

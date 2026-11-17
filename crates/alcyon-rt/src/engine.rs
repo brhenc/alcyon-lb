@@ -10786,6 +10786,12 @@ impl EngineDispatcher<'_> {
     /// (`CD`); queued or connecting, the request is dropped (`CQ`, `CC`, status -1). A
     /// client's reset does all that whatever the option (`CD` 400 waiting for the head).
     /// Without the option, a FIN changes nothing until the response is complete.
+    ///
+    /// The same when the request's body was still coming (`return_cli_abort`): the server
+    /// connection is reset, nothing more is sent to the client, and the log keeps the
+    /// phase the response had reached -- `CH--` with a 400 nobody reads waiting for the
+    /// head, `CD--` during the body, `CL--` with the response's own status once it was
+    /// all delivered -- the stream ending at once.
     fn client_left(
         entry: &mut SessionEntry,
         proxies: &[Proxy],
@@ -10800,8 +10806,12 @@ impl EngineDispatcher<'_> {
             return false;
         }
         // Not a transaction a client's leaving can abort: none, a reply of the proxy's own,
-        // one already ending, a tunnel, or a response that is all in.
-        let Some(txn) = entry.sess.strm.txn.as_ref().filter(|t| !(t.local || t.aborted || t.req == MsgState::Tunnel || t.rsp.is_done())) else {
+        // one already ending, a tunnel, or both messages complete (a `Connection: close`
+        // teardown, not an abort).
+        let Some(txn) = entry.sess.strm.txn
+            .as_ref()
+            .filter(|t| !(t.local || t.aborted || t.req == MsgState::Tunnel || (t.rsp.is_done() && t.req.is_done())))
+        else {
             return false;
         };
         // A FIN leaves no ending, a reset `ClientAbort`; any other ending (a timeout, an
@@ -10815,11 +10825,36 @@ impl EngineDispatcher<'_> {
             return false;
         }
         if !txn.req.is_done() {
+            // The head was forwarded and the body was still coming: the upload is dead
+            // (`HAProxy`'s `return_cli_abort`). The server connection is reset, nothing
+            // more goes to the client -- a half-closed one reads no 400, and there is no
+            // answer to a request that never completed -- and the log keeps the phase the
+            // response had reached: waiting for its head, a 400 nobody reads (`CH--`);
+            // during its body, the answer stops (`CD--`); all of it delivered, the
+            // response's own status with the client left behind it (`CL--`). Measured on
+            // 3.5-dev8: the client sees the close at once.
+            if !matches!(txn.req, MsgState::Head { body: crate::txn::Framing::None, .. }) {
+                let (term, aborted_400) = if txn.rsp == MsgState::Waiting {
+                    (*b"CH", true)
+                } else if txn.rsp.is_done() {
+                    (*b"CL", false)
+                } else {
+                    (*b"CD", false)
+                };
+                if aborted_400 {
+                    entry.sess.strm.log.status = Some(400);
+                }
+                entry.sess.strm.log.term = Some(term);
+                if let Some(srv) = entry.sess.srv.as_ref() {
+                    raw::abort_with_rst(srv.as_fd());
+                }
+                entry.sess.srv_state = ScState::Closed;
+                entry.sess.rep.clear();
+                close_http_session(entry, proxies, fdtab, poller, idle_pool, false);
+                return true;
+            }
             // Not at the server yet: queued, or connecting. Only a whole request; one whose
             // body was still coming is cut short, as before.
-            if !matches!(txn.req, MsgState::Head { body: crate::txn::Framing::None, .. }) {
-                return false;
-            }
             let queued = entry.sess.queue.leave();
             if queued {
                 entry.sess.strm.log.queue.get_or_insert_with(crate::txnlog::loop_now);
@@ -10966,9 +11001,13 @@ impl EngineDispatcher<'_> {
     /// stream of an HTTP/2 connection is aborted alone: its server connection reset, its
     /// log `cD--` (or as the phase reads), `RST_STREAM CANCEL`; one whose response went out
     /// whole before its upload stalled (the server answered early) logs `cL--`, its server
-    /// connection closed, and is reset `NO_ERROR` (T305 item 2). Measured on `HAProxy`
-    /// 3.5-dev8 (`tests/it/h2_stream_timers.rs`). `cli_before`: the client side's state
-    /// before the timeout, which a stream keeps (the connection is its owner's).
+    /// connection closed, and is reset `NO_ERROR` (T305 item 2). On HTTP/1 nothing is
+    /// answered here: the timeout's own close ends the stream with the response's status
+    /// and the phase it had reached (`cL--` all of it delivered, `cD--` still in flight),
+    /// the client holding on until `timeout client`, not the response's end. Measured on
+    /// `HAProxy` 3.5-dev8 (`tests/it/h2_stream_timers.rs`, and here:
+    /// `tests/it/chunked_body_errors.rs`). `cli_before`: the client side's state before
+    /// the timeout, which a stream keeps (the connection is its owner's).
     #[allow(clippy::too_many_arguments)]
     fn client_timed_out(
         entry: &mut SessionEntry,
@@ -11025,6 +11064,8 @@ impl EngineDispatcher<'_> {
             return;
         }
         if !child {
+            // The HTTP/1 stream is left to the close the timeout itself brings: the
+            // response's status with `cL--` or `cD--` by the phase `term_state` reads.
             return;
         }
         // A response delivered whole before its upload ended (the server answered early):
