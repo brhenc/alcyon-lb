@@ -1829,12 +1829,6 @@ impl Proxies {
     }
 }
 
-impl Default for Proxies {
-    fn default() -> Self {
-        Self::new(Vec::new())
-    }
-}
-
 impl std::ops::Deref for Proxies {
     type Target = crate::table::Table;
     fn deref(&self) -> &crate::table::Table {
