@@ -14780,10 +14780,12 @@ impl EngineDispatcher<'_> {
                     if !counted {
                         server_actconn_add(entry, proxies, true);
                     }
-                } else if counted {
-                    if let Some(a) = picked_idx.and_then(|i| proxies[be_idx].srv_set().actconn_cell(i)) {
-                        a.fetch_sub(1, Ordering::Relaxed);
-                    }
+                } else {
+                    // Since T592 a connection left attached at a transaction's end is kept
+                    // (`srv_kept`) or parked, so it is uncounted here: a counted pick never
+                    // meets a counted connection. No test reached the old give-back arm
+                    // (probe, 2026-11-17, the whole `it` suite).
+                    debug_assert!(!counted, "a counted pick on a connection that holds its own slot");
                 }
                 entry.sess.server_connected(now);
                 entry.sess.bc_idle = false;
