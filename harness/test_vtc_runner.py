@@ -304,6 +304,12 @@ class ClientSendCoalescing(unittest.TestCase):
         self.assertIn(b"Transfer-Encoding: chunked", got)
         self.assertNotIn(b"Content-Length", got)
 
+    def test_client_send_n_repeats_payload(self):
+        # T640 (http_wait_for_body_no_fail.vtc): `send_n N "..."` in a client.
+        A = vtc_runner.ActionItem
+        got = b"".join(self._received([A("send", ['"ab"']), A("send_n", ["3", '"cd"'])]))
+        self.assertEqual(got, b"abcdcdcd")
+
 
 class HeadersOnly(unittest.TestCase):
     """`rxreqhdrs` / `rxresphdrs` stop after the head: the body is for a later `recv` (T363f,
