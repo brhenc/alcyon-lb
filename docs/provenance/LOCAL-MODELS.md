@@ -33,7 +33,7 @@ How the code came in:
 | qwen3.8-flash-next | 1 | 569 | 235 |
 | Qwen3.8-Flash-Next | 1 | 201 | 194 |
 | Gemini 4 Hydrogen (medium), via Antigravity | 3 | 219 | 133 |
-| Qwen3.8-27B | 13 | 3550 | 3483 |
+| Qwen3.8-27B | 14 | 3835 | 3768 |
 
 ## Commits
 
@@ -99,6 +99,7 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-17 | INSREQBENCH | Qwen3.8-27B | `c20f5ee876` | 120 | 118 | `tools/measure/insreq.sh` +19/18<br>`tools/measure/test_measure.py` +101/100 | unmodified model output |
 | 2026-11-17 | L7FOLD | Qwen3.8-27B | `6e9a8d8ca2` | 253 | 253 | `crates/alcyon-rt/src/engine.rs` +2/2<br>`crates/alcyon-rt/src/proxy.rs` +3/3<br>`crates/alcyon-rt/src/txn.rs` +3/3<br>`crates/alcyon-rt/tests/it/disable_l7_retry.rs` +229/229<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/struct_sizes.rs` +15/15 | unmodified model output |
 | 2026-11-17 | LBSNAP | Qwen3.8-27B | `d3084c2234` | 772 | 765 | `crates/alcyon-rt/src/buf.rs` +1/1<br>`crates/alcyon-rt/src/engine.rs` +65/61<br>`crates/alcyon-rt/src/lb.rs` +279/278<br>`crates/alcyon-rt/src/server_state.rs` +2/2<br>`crates/alcyon-rt/src/srv_set.rs` +1/1<br>`crates/alcyon-rt/src/track.rs` +3/3<br>`crates/alcyon-rt/tests/it/balance_uri_map.rs` +106/106<br>`crates/alcyon-rt/tests/it/hash_pick_concurrency.rs` +158/156<br>`crates/alcyon-rt/tests/it/lb_chash.rs` +63/63<br>`crates/alcyon-rt/tests/it/load_balancing.rs` +25/25<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/stream_object.rs` +4/4<br>`crates/alcyon-rt/tests/request_allocations.rs` +31/31<br>`tools/measure/scenarios/balance_uri.body` +16/16<br>`tools/measure/scenarios/balance_uri_chash.body` +17/17 | unmodified model output |
+| 2026-11-17 | PPAUTHORITY | Qwen3.8-27B | `e18eacace3` | 285 | 285 | `crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/pp_authority.rs` +265/265<br>`crates/alcyon-sample/src/registry.rs` +19/19 | unmodified model output |
 | 2026-11-17 | T640 | Gemini 4 Hydrogen (medium), via Antigravity | `cd618b51ee` | 50 | 42 | `harness/test_vtc_runner.py` +6/6<br>`harness/vtc_runner.py` +44/36 | unmodified model output |
 | 2026-11-17 | UNBUFABORT | Qwen3.8-27B | `a2b1111bba` | 300 | 296 | `crates/alcyon-rt/src/engine.rs` +49/49<br>`crates/alcyon-rt/src/txn.rs` +10/10<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +241/237 | unmodified model output |
 | 2026-11-17 | UNPUBLISH | Qwen3.8-27B | `6d22e64553` | 250 | 221 | `crates/alcyon-rt/src/applet.rs` +31/2<br>`crates/alcyon-rt/src/engine.rs` +113/113<br>`crates/alcyon-rt/src/stats.rs` +9/9<br>`crates/alcyon-rt/src/table.rs` +18/18<br>`crates/alcyon-rt/tests/it/cli_unpublish_del_backend.rs` +79/79 | unmodified model output |
