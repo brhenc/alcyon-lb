@@ -32,7 +32,7 @@ How the code came in:
 | Gemini 4 Hydrogen (xhigh), via Antigravity | 1 | 337 | 337 |
 | Qwen3.8-Flash-Next | 1 | 201 | 194 |
 | gemini-4-hydrogen-medium | 2 | 169 | 91 |
-| Qwen3.8-27B | 6 | 1083 | 1054 |
+| Qwen3.8-27B | 7 | 1203 | 1174 |
 
 ## Commits
 
@@ -90,5 +90,6 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-17 | BODYWAITFLAG | Qwen3.8-27B | `ee6b31a750` | 24 | 23 | `crates/alcyon-rt/src/engine.rs` +13/13<br>`crates/alcyon-rt/src/txn.rs` +5/5<br>`crates/alcyon-rt/tests/it/struct_sizes.rs` +6/5 | unmodified model output |
 | 2026-11-17 | EARLYCLOSE | Qwen3.8-27B | `2b158a5633` | 183 | 182 | `crates/alcyon-rt/src/engine.rs` +29/29<br>`crates/alcyon-rt/src/proxy.rs` +47/46<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +107/107 | unmodified model output |
 | 2026-11-17 | ERR408ORDER | Qwen3.8-27B | `af24fa14a2` | 246 | 246 | `crates/alcyon-rt/src/engine.rs` +27/27<br>`crates/alcyon-rt/tests/it/builtin_error_wire.rs` +218/218<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
+| 2026-11-17 | INSREQBENCH | Qwen3.8-27B | `c20f5ee876` | 120 | 120 | `tools/measure/insreq.sh` +19/19<br>`tools/measure/test_measure.py` +101/101 | unmodified model output |
 | 2026-11-17 | L7FOLD | Qwen3.8-27B | `6e9a8d8ca2` | 253 | 253 | `crates/alcyon-rt/src/engine.rs` +2/2<br>`crates/alcyon-rt/src/proxy.rs` +3/3<br>`crates/alcyon-rt/src/txn.rs` +3/3<br>`crates/alcyon-rt/tests/it/disable_l7_retry.rs` +229/229<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/struct_sizes.rs` +15/15 | unmodified model output |
 | 2026-11-17 | UNBUFABORT | Qwen3.8-27B | `a2b1111bba` | 300 | 296 | `crates/alcyon-rt/src/engine.rs` +49/49<br>`crates/alcyon-rt/src/txn.rs` +10/10<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +241/237 | unmodified model output |
