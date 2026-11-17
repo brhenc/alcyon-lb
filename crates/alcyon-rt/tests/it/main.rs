@@ -102,6 +102,7 @@ mod cli_batch_coverage;
 mod cli_changes_all_workers;
 mod cli_clear_counters;
 mod cli_get_var;
+mod cli_payload_refill;
 mod cli_unescape;
 mod cli_limits;
 mod cli_map_payload_cap;

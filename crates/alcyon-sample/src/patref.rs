@@ -565,6 +565,84 @@ fn show_entries(r: &PatRef) -> String {
     out
 }
 
+/// `get map <id> <key>` (`HAProxy`'s `cli_parse_get_map` + `cli_io_handler_map_lookup`),
+/// what the CLI prints, without the closing empty line.
+///
+/// The line is built piece by piece against a `limit` of bytes: `HAProxy` assembles the
+/// answer in one `tune.bufsize` trash chunk, and a piece that does not fit is dropped
+/// whole — a value longer than the chunk leaves the line truncated after
+/// `key="..."` instead of losing the connection (T281).
+#[must_use]
+pub fn get_map(id: Option<&str>, key: Option<&str>, limit: usize) -> String {
+    let missing = "Missing map identifier and/or key.\n";
+    let (Some(id), Some(key)) = (id, key) else {
+        return missing.to_string();
+    };
+    let r = match find(RefKind::Map, id) {
+        Ok(r) => r,
+        Err(e) => return format!("{e}\n"),
+    };
+    let keys = *lock(&r.map_keys);
+    let vals = *lock(&r.map_vals);
+    let hit = {
+        let t = read(&r.entries);
+        match keys {
+            MapKeys::Str => t.match_str(key),
+            MapKeys::Int => t.match_int(key),
+            MapKeys::Ip => t.match_ip(key),
+            MapKeys::Reg => t.match_reg(key),
+            // `match_regm` answers the value with the `\<n>` groups substituted, but the
+            // CLI prints the stored pattern value (`pat->ref->sample`), so take the raw
+            // value of the entry that matched.
+            MapKeys::Regm => t.match_regm(key).map(|(_, k)| {
+                let v = t.iter().find(|(_, e)| e.key.as_ref() == k.as_str()).map(|(_, e)| e.val.to_string()).unwrap_or_default();
+                (v, k)
+            }),
+        }
+    };
+    let method = match keys {
+        MapKeys::Str => "str",
+        MapKeys::Int => "int",
+        MapKeys::Ip => "ip",
+        MapKeys::Reg => "reg",
+        MapKeys::Regm => "regm",
+    };
+    let mut line = String::new();
+    let put = |line: &mut String, piece: &str| {
+        if line.len() + piece.len() <= limit {
+            line.push_str(piece);
+        }
+    };
+    put(&mut line, &format!("type={method}"));
+    put(&mut line, ", case=sensitive");
+    match hit {
+        None => put(&mut line, ", found=no"),
+        Some((v, k)) => {
+            // `match_*` answers `(value, key)`.
+            put(&mut line, ", found=yes");
+            // `str`, `beg` and `ip` map through an ebtree, the rest are lists.
+            put(&mut line, if matches!(keys, MapKeys::Int | MapKeys::Reg | MapKeys::Regm) { ", idx=list" } else { ", idx=tree" });
+            // Pieces that do not fit in the CLI buffer are dropped whole. Compute the
+            // length before building the piece so an oversized key/value never allocates
+            // a piece that is immediately discarded.
+            if line.len() + 8 + k.len() <= limit {
+                line.push_str(&format!(", key=\"{k}\""));
+            }
+            // `smp_to_type` names of the stored value's sample type.
+            let value_type = match vals {
+                MapVals::Str => "str",
+                MapVals::Int => "sint",
+                MapVals::Ip => if v.contains(':') { "ipv6" } else { "ipv4" },
+            };
+            if line.len() + 19 + value_type.len() + v.len() <= limit {
+                line.push_str(&format!(", value=\"{v}\", type=\"{value_type}\""));
+            }
+        }
+    }
+    put(&mut line, "\n");
+    line
+}
+
 /// Runs `show|add|set|del|clear map|acl <args>` (`verb` and `kind` already split off).
 /// `payload` carries the lines of an `add map <id> <<` command. The answer is what the CLI
 /// prints, without the closing empty line.
