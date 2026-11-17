@@ -35,7 +35,7 @@ pub fn format_bytes(bytes: u64) -> String {
 
 /// Renders the complete, modern single-page HTML stats and administration dashboard.
 #[must_use]
-pub fn render_stats_html(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) -> String {
+pub fn render_stats_html(proxies: &crate::table::Table, checks: &[ServerCheckState], pid: u32) -> String {
     render_stats_html_for(proxies, checks, pid, &alcyon_config::StatsConfig::default())
 }
 
@@ -67,7 +67,7 @@ fn proxy_desc(proxy: &Proxy) -> String {
 /// HAProxy prints it).
 #[must_use]
 pub fn render_stats_html_for(
-    proxies: &[Proxy],
+    proxies: &crate::table::Table,
     checks: &[ServerCheckState],
     pid: u32,
     serving: &alcyon_config::StatsConfig,
@@ -139,7 +139,7 @@ impl HtmlCursor {
     #[allow(clippy::too_many_arguments)]
     pub fn next_unit(
         &mut self,
-        proxies: &[Proxy],
+        proxies: &crate::table::Table,
         checks: &[ServerCheckState],
         pid: u32,
         serving: &alcyon_config::StatsConfig,
@@ -1168,7 +1168,7 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
 
 /// Renders JSON telemetry data matching the dashboard layout for live `fetch` auto-refresh.
 #[must_use]
-pub fn render_stats_json(proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) -> String {
+pub fn render_stats_json(proxies: &crate::table::Table, checks: &[ServerCheckState], pid: u32) -> String {
     let mut out = String::with_capacity(8192);
     let mut cur = JsonCursor::new();
     while cur.next_unit(proxies, checks, pid, &mut out) {}
@@ -1197,7 +1197,7 @@ impl JsonCursor {
     }
 
     /// Writes the next unit to `out` and returns `true`; `false` once the document is over.
-    pub fn next_unit(&mut self, proxies: &[Proxy], checks: &[ServerCheckState], pid: u32, out: &mut String) -> bool {
+    pub fn next_unit(&mut self, proxies: &crate::table::Table, checks: &[ServerCheckState], pid: u32, out: &mut String) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         match self.step {
             J_HEAD => {

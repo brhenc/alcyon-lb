@@ -763,7 +763,7 @@ fn render_check_formats(
     fmts: &HttpSendFormats,
     check: &ServerCheckState,
     px: &Proxy,
-    proxies: &[Proxy],
+    proxies: &crate::table::Table,
 ) -> RenderedSend {
     let reg = crate::engine::sample_registry();
     with_check_ctx(check, px, proxies, &check.run.vars, None, |data, ctx| {
@@ -778,7 +778,7 @@ fn render_check_formats(
 fn with_check_ctx<R>(
     check: &ServerCheckState,
     px: &Proxy,
-    proxies: &[Proxy],
+    proxies: &crate::table::Table,
     vars: &alcyon_sample::VarStore,
     resp: Option<&HttpResp>,
     f: impl FnOnce(&LogData, &alcyon_sample::SampleContext) -> R,
@@ -822,7 +822,7 @@ fn with_check_ctx<R>(
 /// sees the response `resp` when there is one.
 fn run_var_rules(
     check: &ServerCheckState,
-    proxies: &[Proxy],
+    proxies: &crate::table::Table,
     rules: &[ResolvedHttpRule],
     vars: &mut alcyon_sample::VarStore,
     resp: Option<&HttpResp>,
@@ -913,7 +913,7 @@ pub fn check_status_of(n: i64) -> Option<(&'static str, &'static str)> {
 ///
 /// The backend's stream count in `scur=<srv>/<backend>` is the streams on the backend's
 /// servers: Alcyon counts no backend streams of its own, and has no queue to subtract.
-fn server_state_header(check: &ServerCheckState, proxies: &[Proxy]) -> String {
+fn server_state_header(check: &ServerCheckState, proxies: &crate::table::Table) -> String {
     let health = i64::from(check.health);
     let (rise, fall) = (i64::from(check.config.rise), i64::from(check.config.fall));
     let stopped = matches!(check.status, ServerStatus::Down | ServerStatus::Maint);
@@ -955,7 +955,7 @@ fn server_state_header(check: &ServerCheckState, proxies: &[Proxy]) -> String {
 /// Builds the HTTP request payload for a health check, as `tcpcheck_eval_send` sends it:
 /// the request line, the `hdr` headers (one whose value renders empty is left out), the
 /// server state, `content-length` when there is a body, `connection: close`.
-fn build_http_request_payload(chk: &ResolvedHttpCheck, target_addr: SocketAddr, check: &ServerCheckState, proxies: &[Proxy]) -> Vec<u8> {
+fn build_http_request_payload(chk: &ResolvedHttpCheck, target_addr: SocketAddr, check: &ServerCheckState, proxies: &crate::table::Table) -> Vec<u8> {
     let mut payload = Vec::new();
 
     if chk.send_proxy {
@@ -1354,7 +1354,7 @@ fn http_expect(rule: &ResolvedHttpExpectRule, resp: &HttpResp, last_read: bool, 
 
 /// What the rules of an HTTP check say of the bytes received so far (`last_read`: no more
 /// are coming).
-fn http_verdict(check: &ServerCheckState, chk: &ResolvedHttpCheck, buf: &[u8], last_read: bool, proxies: &[Proxy]) -> HttpVerdict {
+fn http_verdict(check: &ServerCheckState, chk: &ResolvedHttpCheck, buf: &[u8], last_read: bool, proxies: &crate::table::Table) -> HttpVerdict {
     let resp = match parse_http_response(buf) {
         Ok(Some(r)) => r,
         Ok(None) if !last_read => return HttpVerdict::Wait,
@@ -1424,7 +1424,7 @@ pub fn step_check(
     fdtab: &mut FdTab,
     poller: &mut Poller,
     now: Tick,
-    proxies: &[Proxy],
+    proxies: &crate::table::Table,
 ) -> io::Result<CheckStep> {
     if !check.enabled {
         if check.in_progress {
@@ -1919,7 +1919,7 @@ fn progress_http_check(
     poller: &mut Poller,
     now: Tick,
     duration: u32,
-    proxies: &[Proxy],
+    proxies: &crate::table::Table,
 ) -> io::Result<CheckStep> {
     let Some(raw_fd) = check.run.check_fd else {
         cleanup_check_socket(check, fdtab, poller);
@@ -3629,7 +3629,7 @@ mod tests {
     fn server_state_word_follows_the_health_counter() {
         let config = ServerCheckConfig { rise: 2, fall: 2, ..ServerCheckConfig::default() };
         let mut s = ServerCheckState::new(0, 0, "127.0.0.1:1".parse().unwrap(), config, Tick(0));
-        let word = |s: &ServerCheckState| server_state_header(s, &[]);
+        let word = |s: &ServerCheckState| server_state_header(s, &crate::table::Table::new(Vec::new()));
         s.status = ServerStatus::Up;
         s.health = 3;
         assert_eq!(word(&s), "UP");
@@ -3945,7 +3945,7 @@ mod tests {
         s.run.sub_state = CheckSubState::TcpConnecting;
         let mut fdtab = FdTab::with_capacity(16);
         let mut poller = Poller::new(4).unwrap();
-        let step = step_check(&mut s, &mut fdtab, &mut poller, Tick(100), &[]).unwrap();
+        let step = step_check(&mut s, &mut fdtab, &mut poller, Tick(100), &crate::table::Table::new(Vec::new())).unwrap();
         assert!(!s.in_progress);
         assert!(matches!(s.run.sub_state, CheckSubState::Idle));
         assert!(!s.run.is_held(), "the run goes back to the pool");
@@ -4009,7 +4009,7 @@ mod tests {
         s.exp = Tick(10_000);
         let len = 16 << 20;
         s.run.sub_state = CheckSubState::HttpSending { req_buf: vec![b'x'; len], send_offset: 0 };
-        let step = progress_http_check(&mut s, &mut fdtab, &mut poller, Tick(1), 0, &[]).unwrap();
+        let step = progress_http_check(&mut s, &mut fdtab, &mut poller, Tick(1), 0, &crate::table::Table::new(Vec::new())).unwrap();
         assert_eq!(step.next, Some(Tick(10_000)), "pending until the check's expiry");
         let CheckSubState::HttpSending { send_offset, .. } = &s.run.sub_state else { panic!("{:?}", s.run.sub_state) };
         assert!(*send_offset > 0 && *send_offset < len, "sent {send_offset} of {len}");

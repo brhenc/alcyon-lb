@@ -204,7 +204,7 @@ pub fn describe(px: &Proxy, s: usize, before: u8, after: u8, kind: Kind, cause: 
 
 /// Server `s` of proxy `p` went from `before` to `after`, and the backend went from having a
 /// server to having none if `be_went_down`: queue the lines `HAProxy` writes for it.
-pub fn note(proxies: &[Proxy], p: usize, s: usize, before: u8, after: u8, kind: Kind, cause: Cause<'_>, be_went_down: bool) {
+pub fn note(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize, s: usize, before: u8, after: u8, kind: Kind, cause: Cause<'_>, be_went_down: bool) {
     let Some(px) = proxies.get(p) else { return };
     if let Some((level, text)) = describe(px, s, before, after, kind, cause) {
         px.txn_counters().srv_events.push(Event { proxy: p, level, alert: false, stderr: text.clone(), log: format!("{text}.") });
@@ -223,7 +223,7 @@ pub fn note(proxies: &[Proxy], p: usize, s: usize, before: u8, after: u8, kind: 
 
 /// A line about server `s` of proxy `p` that no state change describes (the admin state kept
 /// under `SRV_ADMF_RMAINT` moved), queued with the others: `[{backup}Server px/srv {text}]`.
-pub fn line(proxies: &[Proxy], p: usize, s: usize, level: LogLevel, text: &str) {
+pub fn line(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize, s: usize, level: LogLevel, text: &str) {
     let Some(px) = proxies.get(p) else { return };
     let Some(srv) = px.srv_set().at(s) else { return };
     let name = srv.name();
@@ -234,9 +234,9 @@ pub fn line(proxies: &[Proxy], p: usize, s: usize, level: LogLevel, text: &str) 
 
 /// Writes the lines noted since the last call on `proxies`, in the order they were noted,
 /// through `send` (the log targets of the proxy). Every line goes to stderr too.
-pub fn drain(proxies: &[Proxy], mut send: impl FnMut(usize, LogLevel, &str)) {
+pub fn drain(proxies: &(impl crate::table::ProxyList + ?Sized), mut send: impl FnMut(usize, LogLevel, &str)) {
     let mut events = Vec::new();
-    for px in proxies {
+    for px in proxies.iter() {
         let Some(tc) = px.ids.tc.get() else { continue };
         let mut q = tc.srv_events.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !q.is_empty() {

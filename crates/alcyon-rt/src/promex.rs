@@ -20,7 +20,6 @@
 //! allocated per scrape once [`prewarm`] has run at start-up.
 
 use crate::check::ServerCheckState;
-use crate::engine::Proxy;
 use crate::promex_tables::{Metric, BACK, FRONT, PROCESS, SRV};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -275,7 +274,7 @@ pub fn prewarm() {
 }
 
 /// Position `pos` of the proxies in declaration order (`show stat`'s order).
-fn proxy_at(proxies: &[Proxy], sorted: bool, pos: usize) -> Option<usize> {
+fn proxy_at(proxies: &crate::table::Table, sorted: bool, pos: usize) -> Option<usize> {
     if sorted {
         return (pos < proxies.len()).then_some(pos);
     }
@@ -283,7 +282,7 @@ fn proxy_at(proxies: &[Proxy], sorted: bool, pos: usize) -> Option<usize> {
 }
 
 struct Ctx<'a> {
-    proxies: &'a [Proxy],
+    proxies: &'a crate::table::Table,
     checks: &'a [ServerCheckState],
     pid: u32,
     sorted: bool,
@@ -574,7 +573,7 @@ pub const MIN_ROOM: usize = 1024;
 /// written (0 when `dst` has too little room or the scrape is over). Whole units only: the one
 /// that does not fit waits for the next call. The closing `0` chunk is written once everything
 /// else has been, and sets `cur.finished`. Allocates nothing once [`prewarm`] has run.
-pub fn scrape_chunk(cur: &mut Cursor, proxies: &[Proxy], checks: &[ServerCheckState], pid: u32, uri: &str, dst: &mut [u8]) -> usize {
+pub fn scrape_chunk(cur: &mut Cursor, proxies: &crate::table::Table, checks: &[ServerCheckState], pid: u32, uri: &str, dst: &mut [u8]) -> usize {
     use std::io::Write as _;
     if cur.finished || dst.len() < MIN_ROOM {
         return 0;
@@ -583,7 +582,7 @@ pub fn scrape_chunk(cur: &mut Cursor, proxies: &[Proxy], checks: &[ServerCheckSt
         cur.finished = true;
         return 0;
     };
-    let sorted = proxies.windows(2).all(|w| w[0].ids.decl < w[1].ids.decl);
+    let sorted = proxies.iter().zip(proxies.iter().skip(1)).all(|(a, b)| a.ids.decl < b.ids.decl);
     let c = Ctx { proxies, checks, pid, sorted };
     let room = dst.len() - CHUNK_PRE - CHUNK_POST;
     let mut w = 0usize;
@@ -632,7 +631,7 @@ pub fn scrape_chunk(cur: &mut Cursor, proxies: &[Proxy], checks: &[ServerCheckSt
 
 /// Fills the session's response buffer with the next chunk of its scrape, if the buffer has
 /// room; called on every pass over the session while `sess.scrape` is set.
-pub fn pump(sess: &mut crate::proxy::TcpSession, proxies: &[Proxy], checks: &[ServerCheckState], pid: u32) {
+pub fn pump(sess: &mut crate::proxy::TcpSession, proxies: &crate::table::Table, checks: &[ServerCheckState], pid: u32) {
     let Some(mut cur) = sess.scrape() else { return };
     // `writable` compacts a buffer whose consumed head leaves the tail exhausted.
     let uri = sess.req_uri.as_deref().unwrap_or("");
