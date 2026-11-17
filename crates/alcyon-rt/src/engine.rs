@@ -14773,18 +14773,14 @@ impl EngineDispatcher<'_> {
                 // A parked or kept connection is in use again: the slot taken with the pick,
                 // or one counted now (T592). One that was neither holds its own, and the
                 // pick's goes back.
-                if entry.sess.srv_uncounted() {
-                    entry.sess.srv_park_exp = Tick::ETERNITY;
-                    entry.sess.srv_kept = false;
-                    if !counted {
-                        server_actconn_add(entry, proxies, true);
-                    }
-                } else {
-                    // Since T592 a connection left attached at a transaction's end is kept
-                    // (`srv_kept`) or parked, so it is uncounted here: a counted pick never
-                    // meets a counted connection. No test reached the old give-back arm
-                    // (probe, 2026-11-17, the whole `it` suite).
-                    debug_assert!(!counted, "a counted pick on a connection that holds its own slot");
+                // Since T592 a connection left attached at a transaction's end is kept
+                // (`srv_kept`) or parked, so it is always uncounted here. No test reached the
+                // old arm for a counted one (probe, 2026-11-17, the whole `it` suite).
+                debug_assert!(entry.sess.srv_uncounted(), "a reused connection that holds its own slot");
+                entry.sess.srv_park_exp = Tick::ETERNITY;
+                entry.sess.srv_kept = false;
+                if !counted {
+                    server_actconn_add(entry, proxies, true);
                 }
                 entry.sess.server_connected(now);
                 entry.sess.bc_idle = false;
