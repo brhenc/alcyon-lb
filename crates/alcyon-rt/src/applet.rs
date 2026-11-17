@@ -461,7 +461,10 @@ impl CliApplet {
             }
             // A connection that is not in `prompt` mode runs one command line and closes;
             // what came after it in the same write is never run (HAProxy, T146 item 4).
+            // `user`/`operator` end their answer without closing (the rest of the line
+            // still runs), so the line itself owns the close here.
             if !self.interactive {
+                self.is_done = true;
                 self.in_buf.clear();
                 break;
             }
@@ -525,7 +528,14 @@ impl CliApplet {
             self.level = self.level.min(if cmd == "user" { CliLevel::User } else { CliLevel::Operator });
             // HAProxy replaces the whole level, mode bits included.
             self.expert = false;
-            self.finish_msg("");
+            // The rest of this line still runs, at the new level: emit only the separator,
+            // not `finish_msg`, which would mark the connection done and swallow the
+            // commands after the `;` (reg-test cli/levels.vtc).
+            if self.interactive {
+                self.out_buf.extend_from_slice(b"\n> ");
+            } else {
+                self.out_buf.extend_from_slice(b"\n");
+            }
         } else if cmd == "show cli level" {
             self.finish_msg(self.level.name());
         } else if cmd == "show cli sockets" {
@@ -810,11 +820,7 @@ impl CliApplet {
             }
         } else if cmd == "experimental-mode on" || cmd == "experimental-mode off" {
             self.experimental = cmd.ends_with(" on");
-            if self.interactive {
-                self.out_buf.extend_from_slice(b"\n> ");
-            } else {
-                self.is_done = true;
-            }
+            self.finish_msg("");
         } else if cmd == "get var" || cmd.starts_with("get var ") {
             self.handle_get_var(cmd["get var".len()..].trim());
         } else if cmd.starts_with("set var ") && !self.experimental {

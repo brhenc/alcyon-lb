@@ -101,6 +101,7 @@ mod cli_answer_delivery;
 mod cli_batch_coverage;
 mod cli_changes_all_workers;
 mod cli_clear_counters;
+mod cli_levels;
 mod cli_get_var;
 mod cli_unescape;
 mod cli_limits;
