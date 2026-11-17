@@ -508,6 +508,8 @@ in the model's code, and regenerate `LOCAL-MODELS.md`. Its tombstones are not ke
 **Answers (user, 2026-11-17 ~06:30):**
 - **D1:** `purge` is deferred until the oracle moves to dev11. Until then the parser answers
   "Unknown command", as dev8 does.
+  Revised 2026-11-17 (user): `purge` is new in 3.5-dev, so it stays deferred until the 3.6 LTS
+  oracle (tradeoff 6.36), even though the oracle is now dev11. S8 waits for that.
 - **D2:** go. Claude Sonnet agents build the structural core, S1a, S1b and S2. S3 to S6 and S7
   are local-model (Qwen) cases on top of it. S9 is V&V.
 - **D3:** HAProxy's leftover notices are a defect. `del backend` answers the one line, recorded
