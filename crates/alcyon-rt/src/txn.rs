@@ -2510,9 +2510,18 @@ impl HttpTxn {
     }
 
     /// Both messages are complete: the transaction can end once output has drained.
+    ///
+    /// A not-complete request keeps the stream alive whatever `close_after` says:
+    /// `HAProxy` lets the server's `Connection: close` close the server connection, but the
+    /// transaction lives until the client's body ends, or `timeout client` ends it
+    /// (`cL--`, measured on 3.5-dev8). Two exceptions end at the response's end whatever
+    /// the upload: a tunnel, where either side's close ends it once the other has (T505),
+    /// and a reply of the proxy's own, which no upload is owed to -- a 408 over a body that
+    /// never comes logs `cR--` at the page's end, and so does the stats applet's cut body
+    /// (`LR`); both measured on 3.5-dev8.
     #[must_use]
     pub fn finished(&self) -> bool {
-        self.rsp.is_done() && (self.req.is_done() || self.close_after)
+        self.rsp.is_done() && (self.req.is_done() || (self.close_after && (self.local || self.req == MsgState::Tunnel)))
     }
 }
 
