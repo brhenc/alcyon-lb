@@ -95,6 +95,7 @@ mod http_reject_silent_drop;
 mod silent_drop_repair;
 mod http_reply_refusals;
 mod chunked_body_errors;
+mod chunked_resp_to_http10;
 mod cli_answer_delivery;
 mod cli_batch_coverage;
 mod cli_changes_all_workers;

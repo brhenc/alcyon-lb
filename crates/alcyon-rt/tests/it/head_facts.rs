@@ -138,13 +138,15 @@ fn a_response_is_relayed_by_its_facts() {
         false,
     );
     check(
-        "chunked to an HTTP/1.0 keep-alive client",
+        // RFC 9112 section 6.1: the chunked coding does not reach an HTTP/1.0 client; the
+        // body goes unframed until the close, and the close comes.
+        "chunked to an HTTP/1.0 keep-alive client goes unframed, with the close",
         "",
         b"GET / HTTP/1.0\r\nHost: a\r\nConnection: keep-alive\r\n\r\n",
         b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
         &["GET / HTTP/1.0\r\nhost: a\r\nconnection: keep-alive"],
-        "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: keep-alive\r\n\r\n2\r\nok\r\n0\r\n\r\n",
-        false,
+        "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\nok",
+        true,
     );
 }
 
