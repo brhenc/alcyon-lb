@@ -14577,8 +14577,7 @@ impl EngineDispatcher<'_> {
                     }
                     alcyon_config::HttpReqAction::DisableL7Retry => {
                         if let Some(t) = sess.strm.txn.as_mut() {
-                            t.l7_off = true;
-                            t.l7 = crate::txn::L7Retry::Off;
+                            t.l7 = crate::txn::L7Retry::Disabled;
                         }
                     }
                     alcyon_config::HttpReqAction::SetTimeout { timeout_type, timeout_val } => {
@@ -15031,7 +15030,7 @@ impl EngineDispatcher<'_> {
         // unless `http-request disable-l7-retry` ran). It reaches the data path in
         // `process_srv_io` (the copy) and `l7_retry` (the replay).
         if !resume_be && proxies[be_idx].ids.retry_on & !alcyon_config::RE_CONN_FAILED != 0 {
-            if let Some(t) = entry.sess.strm.txn.as_mut().filter(|t| !t.l7_off && matches!(t.l7, crate::txn::L7Retry::Off)) {
+            if let Some(t) = entry.sess.strm.txn.as_mut().filter(|t| matches!(t.l7, crate::txn::L7Retry::Off)) {
                 t.l7 = crate::txn::L7Retry::Armed;
             }
         }

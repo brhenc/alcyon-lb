@@ -2719,8 +2719,10 @@ impl TcpSession {
                 .as_ref()
                 // A retry on the answer (`L7Retry::Armed`, `Saved`) may still replay the
                 // request on another server: the close is not the stream's end then.
+                // `Disabled` is the disabled candidate: it cannot replay either, so the
+                // close ends the stream, as it does for `Off` and `Dead`.
                 .is_some_and(|t| {
-                    matches!(t.l7, txn::L7Retry::Off | txn::L7Retry::Dead)
+                    matches!(t.l7, txn::L7Retry::Off | txn::L7Retry::Disabled | txn::L7Retry::Dead)
                         && !t.local
                         && !t.aborted
                         && t.rsp.is_done()

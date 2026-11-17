@@ -139,6 +139,7 @@ mod debug_converter;
 mod default_nbthread;
 mod defaults_rules;
 mod dgram_path;
+mod disable_l7_retry;
 mod dump_all_vars;
 mod deny_keeps_server_conn;
 mod empty_conditions;
