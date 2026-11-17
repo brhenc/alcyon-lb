@@ -254,8 +254,8 @@ pub struct CliApplet {
     /// the workers have answered (T226).
     pub read_shut: bool,
     pub interest: Interest,
-    /// An `add map <id> <<` waiting for its payload: the command and the lines so far.
-    pub payload: Option<(String, String)>,
+    /// An `add map <id> <<[pattern]` waiting for its payload.
+    payload: Option<Payload>,
     /// When the connection was accepted, for its own `show sess` line.
     pub created: Instant,
     /// A command waiting for the other workers, and what followed it on its line.
@@ -265,6 +265,15 @@ pub struct CliApplet {
     table_dump: Option<TableDump>,
     /// A `show stat` being written, a buffer at a time (`pump_table`, T572).
     stat_dump: Option<crate::stats_stream::Dump>,
+}
+
+/// An `add map <id> <<[pattern]` waiting for its payload: the command with the marker
+/// word cut off, the lines so far (each kept with its `\n`), and the line that ends it
+/// (the empty one for a bare `<<`).
+struct Payload {
+    cmd: String,
+    body: String,
+    end: String,
 }
 
 /// Where a `show table` is: the filters, the proxy and the slot of its table to read next.
@@ -336,10 +345,15 @@ impl CliApplet {
                     // A command line is at most one buffer (`tune.bufsize`): HAProxy answers
                     // this and closes (measured, T239). Nothing longer is kept.
                     let tail = self.in_buf.iter().rposition(|&b| b == b'\n').map_or(self.in_buf.len(), |p| self.in_buf.len() - p - 1);
-                    // A payload line (after `<cmd> <<`) is limited by the payload cap
-                    // instead (T251).
+                    // A payload line (after `<cmd> <<[pattern]`) is limited by the payload
+                    // cap instead (T251): the last word of a command line starts with
+                    // `<<`, as in `HAProxy`'s master CLI.
                     let in_payload = self.payload.is_some()
-                        || self.in_buf[..self.in_buf.len() - tail].split(|&b| b == b'\n').any(|l| l.trim_ascii_end().ends_with(b"<<"));
+                        || self.in_buf[..self.in_buf.len() - tail].split(|&b| b == b'\n').any(|l| {
+                            let l = l.trim_ascii_end();
+                            let word = l.iter().rposition(|&c| c == b' ' || c == b'\t').map_or(l, |p| &l[p + 1..]);
+                            word.starts_with(b"<<")
+                        });
                     if in_payload {
                         if tail > CLI_MAX_PAYLOAD {
                             self.refuse_payload();
@@ -427,18 +441,18 @@ impl CliApplet {
             let line = String::from_utf8_lossy(&line_bytes);
             let line = line.trim_end_matches('\r');
 
-            if let Some((_, body)) = self.payload.as_mut() {
-                if line.is_empty() {
-                    if let Some((cmd, body)) = self.payload.take() {
-                        self.run_patref(&cmd, Some(&body));
-                    }
+            if let Some(mut pl) = self.payload.take() {
+                if line == pl.end {
+                    // The end-of-payload line is not part of the payload.
+                    self.run_patref(&pl.cmd, Some(&pl.body));
                 } else {
-                    body.push_str(line);
-                    body.push('\n');
-                    if body.len() > CLI_MAX_PAYLOAD {
+                    pl.body.push_str(line);
+                    pl.body.push('\n');
+                    if pl.body.len() > CLI_MAX_PAYLOAD {
                         self.refuse_payload();
                         return;
                     }
+                    self.payload = Some(pl);
                     continue;
                 }
             } else {
@@ -467,7 +481,7 @@ impl CliApplet {
             }
         }
         // A payload line that has not ended yet counts as well.
-        if self.payload.as_ref().is_some_and(|(_, body)| body.len() + self.in_buf.len() > CLI_MAX_PAYLOAD) {
+        if self.payload.as_ref().is_some_and(|pl| pl.body.len() + self.in_buf.len() > CLI_MAX_PAYLOAD) {
             self.refuse_payload();
         }
     }
@@ -824,11 +838,20 @@ impl CliApplet {
         } else if cmd == "help" {
             self.handle_help();
         } else if Self::is_patref_command(cmd) {
-            if cmd.ends_with(" <<") && cmd.starts_with("add map ") {
-                self.payload = Some((cmd.trim_end_matches('<').trim_end().to_string(), String::new()));
+            if cmd.starts_with("add map ") {
+                if let Some((cmd, end)) = Self::payload_marker(cmd) {
+                    self.payload = Some(Payload { cmd, body: String::new(), end });
+                } else {
+                    self.run_patref(cmd, None);
+                }
             } else {
                 self.run_patref(cmd, None);
             }
+        } else if Self::payload_without_command(cmd) {
+            // The marker line has no command before it. `HAProxy` prints the error and
+            // closes without the trailing empty line, interactive mode or not (measured, T281).
+            self.out_buf.extend_from_slice(b"The payload cannot be passed without command.\n");
+            self.is_done = true;
         } else {
             let msg = crate::cli_unknown::answer(&cli_words(cmd));
             self.out_buf.extend_from_slice(msg.as_bytes());
@@ -840,11 +863,36 @@ impl CliApplet {
         }
     }
 
-    /// `show|add|set|del|clear` of `map` or `acl`.
+    /// `show|add|set|del|clear` of `map` or `acl`, and `get map` (`get acl` has no
+    /// per-pattern match method stored, so it is not a patref command here).
     fn is_patref_command(cmd: &str) -> bool {
         // The words `run_patref` sees: `show\ map` is one word there, not two.
         let w = cli_words(cmd);
-        w.len() >= 2 && matches!(w[0].as_str(), "show" | "add" | "set" | "del" | "clear") && matches!(w[1].as_str(), "map" | "acl")
+        if w.len() < 2 {
+            return false;
+        }
+        if w[0] == "get" {
+            return w[1] == "map";
+        }
+        matches!(w[0].as_str(), "show" | "add" | "set" | "del" | "clear") && matches!(w[1].as_str(), "map" | "acl")
+    }
+
+    /// The payload start marker at the end of an `add map` line, as `HAProxy`'s master
+    /// CLI takes it: the last word starts with `<<` (the word is the whole line's tail
+    /// after the last blank), and the pattern after `<<` is at most 64 characters (a
+    /// longer one is not a payload there either). `None` when the line carries no
+    /// marker; otherwise the command with the marker word cut off and the
+    /// end-of-payload pattern (empty for a bare `<<`).
+    fn payload_marker(cmd: &str) -> Option<(String, String)> {
+        let pos = cmd.rfind(|c| c == ' ' || c == '\t')?;
+        let pat = cmd[pos + 1..].strip_prefix("<<")?;
+        (pat.len() <= 64).then(|| (cmd[..pos].to_string(), pat.to_string()))
+    }
+
+    /// A line whose only word is a payload start marker: there is no command before it,
+    /// and `HAProxy` refuses the line instead of gathering a payload.
+    fn payload_without_command(cmd: &str) -> bool {
+        !cmd.contains(|c| c == ' ' || c == '\t') && cmd.starts_with("<<")
     }
 
     /// Runs a map or ACL command on the process-wide pattern references
@@ -858,7 +906,13 @@ impl CliApplet {
             return;
         }
         let kind = if words[1] == "map" { alcyon_sample::patref::RefKind::Map } else { alcyon_sample::patref::RefKind::Acl };
-        let out = alcyon_sample::patref::command(words[0], kind, &words[2..], payload);
+        // `get map` answers in one `tune.bufsize` buffer; a piece that does not fit is
+        // dropped whole (T281). The other verbs build their answers in place.
+        let out = if words[0] == "get" {
+            alcyon_sample::patref::get_map(words.get(2).copied(), words.get(3).copied(), crate::buf::get_bufsize())
+        } else {
+            alcyon_sample::patref::command(words[0], kind, &words[2..], payload)
+        };
         self.out_buf.extend_from_slice(out.as_bytes());
         self.finish_msg("");
     }
