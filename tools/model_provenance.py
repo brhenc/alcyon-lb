@@ -42,6 +42,7 @@ MODEL_ALIASES = {"Qwen": "Qwen (version not recorded; the 10-15 queue ran Qwen3.
 AGY_NAMES = {
     "gemini-4-hydrogen-high": "Gemini 4 Hydrogen (high), via Antigravity",
     "gemini-4-hydrogen-xhigh": "Gemini 4 Hydrogen (xhigh), via Antigravity",
+    "gemini-4-hydrogen-medium": "Gemini 4 Hydrogen (medium), via Antigravity",
     "gemini-4-argon-high": "Gemini 4 Argon (high), via Antigravity",
     "gemini-pro-orchestrator-g1-pro": "Gemini 4 Orchestrator (Argon + Hydrogen), via Antigravity",
 }
