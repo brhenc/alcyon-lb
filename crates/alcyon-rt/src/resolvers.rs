@@ -1259,15 +1259,15 @@ fn srv_answer(r: &mut Resolution, answers: &[Answer], holds: &Holds, now: Instan
 fn srv_fill(it: &SrvItem, p: u32, s: u32, opts: &ResolveOpts, proxies: &[Proxy], log: &mut LogFn<'_>, acts: &mut Vec<SrvAct>, leave: &mut Vec<(u32, u32)>) {
     let (pi, si) = (p as usize, s as usize);
     let Some(px) = proxies.get(pi) else { return };
-    let Some(old) = px.servers.get(si) else { return };
-    let srv = &px.server_ids[si];
+    let Some((me, old)) = px.srv_set().at(si).and_then(|m| Some((m, m.addr()?))) else { return };
+    let srv = me.name();
     if let Some((ip, _)) = it.ar {
         acts.push(SrvAct::Unlink(p, s));
         // `server_set_inetaddr_warn`: a port 0 is a mapped port (`+0`).
         let ip_change = old.ip() != ip;
         let port_change = old.port() != it.port || old.port() == 0;
         if ip_change || port_change {
-            px.servers.set(si, SocketAddr::new(ip, it.port));
+            me.set_addr(SocketAddr::new(ip, it.port));
             let mut msg = format!("{}/{srv}: ", px.name);
             if ip_change {
                 let from = if old.ip().is_unspecified() { "(none)".to_string() } else { old.ip().to_string() };
@@ -1285,7 +1285,7 @@ fn srv_fill(it: &SrvItem, p: u32, s: u32, opts: &ResolveOpts, proxies: &[Proxy],
             leave.push((p, s));
         }
     } else if old.port() != it.port {
-        px.servers.set(si, SocketAddr::new(old.ip(), it.port));
+        me.set_addr(SocketAddr::new(old.ip(), it.port));
     }
     if px.server_srv_fqdn(si).is_none() {
         if it.target.is_empty() || it.target.len() > 255 || it.target.bytes().any(|b| !(b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_')) {
@@ -1318,7 +1318,7 @@ fn srv_cleanup(rqs: &mut [SrvRq], p: u32, s: u32, proxies: &[Proxy], checks: &mu
         enter_rmaint(&req, Cause::NoEnt, proxies, checks, log);
     }
     px.set_server_srv_fqdn(s as usize, None);
-    px.servers.set(s as usize, SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
+    srv_of(px, s as usize).set_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
     if let Some(rq) = rqs.iter_mut().find(|q| q.proxy == p) {
         rq.free.push(s);
     }
@@ -1433,15 +1433,16 @@ enum Pick {
 fn server_answer(r: &mut Resolution, k: usize, by: &str, holds: &Holds, now: Instant, proxies: &[Proxy], checks: &mut [ServerCheckState], log: &mut LogFn<'_>) -> bool {
     let (p, s) = (r.reqs[k].proxy as usize, r.reqs[k].server as usize);
     let Some(px) = proxies.get(p) else { return false };
-    let cur = px.servers.get(s).map(|a| a.ip()).filter(|ip| !ip.is_unspecified());
+    let me = px.srv_set().at(s);
+    let cur = me.and_then(|m| m.addr()).map(|a| a.ip()).filter(|ip| !ip.is_unspecified());
     match pick(r, k, cur, active_families(now)) {
         Pick::No => false,
         Pick::New(ip) => {
             // `srv_update_addr` (the line where an answer becomes the server's address).
-            let old = px.servers.get(s).unwrap_or_else(|| SocketAddr::new(ip, 0));
-            px.servers.set(s, SocketAddr::new(ip, old.port()));
+            let old = me.and_then(|m| m.addr()).unwrap_or_else(|| SocketAddr::new(ip, 0));
+            srv_of(px, s).set_addr(SocketAddr::new(ip, old.port()));
             let from = cur.map_or_else(|| "(none)".to_string(), |c| c.to_string());
-            let srv = &px.server_ids[s];
+            let srv = srv_of(px, s).name();
             log(p, LogLevel::Notice, &format!("{}/{srv}: IP changed from '{from}' to '{ip}' by '{by}'.", px.name), true);
             if px.server_rmaint(s) {
                 leave_rmaint(&r.reqs[k], &r.name, proxies, checks, log);
@@ -1599,15 +1600,21 @@ fn set_srv_down(r: &Resolution, k: usize, holds: &Holds, now: Instant, proxies: 
     true
 }
 
+/// Server `s` of `px`, which the caller got from a resolution of that server.
+fn srv_of(px: &Proxy, s: usize) -> crate::srv_set::Srv<'_> {
+    px.srv_set().at(s).expect("server of a resolution")
+}
+
 /// The server's address is gone (`AF_UNSPEC`, `-` in `show servers state`); its port stays.
 fn clear_addr(px: &Proxy, s: usize) {
-    if let Some(a) = px.servers.get(s) {
-        px.servers.set(s, SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), a.port()));
+    let me = srv_of(px, s);
+    if let Some(a) = me.addr() {
+        me.set_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), a.port()));
     }
 }
 
 fn status_of(px: &Proxy, s: usize) -> u8 {
-    px.server_statuses.get(s).map_or(ServerStatus::Up as u8, |a| a.load(std::sync::atomic::Ordering::Relaxed))
+    px.srv_set().at(s).and_then(|m| m.raw_status()).unwrap_or(ServerStatus::Up as u8)
 }
 
 /// `srv_set_admin_flag(SRV_ADMF_RMAINT)` and its log line (`_srv_update_status_adm`).
@@ -1626,8 +1633,8 @@ fn enter_rmaint(req: &Req, cause: Cause, proxies: &[Proxy], checks: &mut [Server
     };
     px.set_server_rmaint(s, Some(kept));
     crate::track::set_admin(proxies, checks, p, s, ServerStatus::Maint, crate::srvlog::Cause::Dns);
-    let srv = &px.server_ids[s];
-    let backup = if px.server_backups.get(s).copied().unwrap_or(false) { "Backup " } else { "" };
+    let srv = srv_of(px, s).name();
+    let backup = if srv_of(px, s).backup() { "Backup " } else { "" };
     let msg = match ServerStatus::from(before) {
         // Already in maintenance: one more reason, no line.
         ServerStatus::Maint => return,
@@ -1635,7 +1642,7 @@ fn enter_rmaint(req: &Req, cause: Cause, proxies: &[Proxy], checks: &mut [Server
         _ if before == DRAIN_DOWN => format!("{backup}Server {}/{srv} was DOWN and now enters maintenance ({}).", px.name, cause.text()),
         _ => {
             let (act, bck) = usable_servers(px);
-            let sess = px.server_actconn.get(s).map_or(0, |a| a.load(std::sync::atomic::Ordering::Relaxed));
+            let sess = srv_of(px, s).actconn();
             let on_backup = if bck > 0 && act == 0 { " Running on backup." } else { "" };
             format!(
                 "{backup}Server {}/{srv} is going DOWN for maintenance ({}). {act} active and {bck} backup servers left.{on_backup} {sess} sessions active, 0 requeued, 0 remaining in queue.",
@@ -1650,9 +1657,9 @@ fn enter_rmaint(req: &Req, cause: Cause, proxies: &[Proxy], checks: &mut [Server
 /// `srv_act` and `srv_bck`: the servers of `px` that take traffic.
 fn usable_servers(px: &Proxy) -> (usize, usize) {
     let mut n = (0, 0);
-    for s in 0..px.server_ids.len() {
-        if status_of(px, s) == ServerStatus::Up as u8 {
-            if px.server_backups.get(s).copied().unwrap_or(false) {
+    for srv in px.srv_set().live() {
+        if status_of(px, srv.index()) == ServerStatus::Up as u8 {
+            if srv.backup() {
                 n.1 += 1;
             } else {
                 n.0 += 1;
@@ -1669,8 +1676,8 @@ fn leave_rmaint(req: &Req, fqdn: &str, proxies: &[Proxy], checks: &mut [ServerCh
     let saved = px.server_rmaint_kept(s);
     px.set_server_rmaint(s, None);
     crate::track::set_admin(proxies, checks, p, s, saved, crate::srvlog::Cause::Dns);
-    let srv = &px.server_ids[s];
-    let backup = if px.server_backups.get(s).copied().unwrap_or(false) { "Backup " } else { "" };
+    let srv = srv_of(px, s).name();
+    let backup = if srv_of(px, s).backup() { "Backup " } else { "" };
     let after = status_of(px, s);
     let msg = if saved == ServerStatus::Maint {
         format!("{backup}Server {}/{srv} ('{fqdn}') resolves again but remains in maintenance.", px.name)

@@ -44,14 +44,11 @@ pub fn combine(own: ServerStatus, target: ServerStatus) -> ServerStatus {
 }
 
 fn track_of(proxies: &[Proxy], p: usize, s: usize) -> Option<&Track> {
-    proxies.get(p)?.server_track.as_ref()?.get(s)?.as_ref()
+    proxies.get(p)?.srv_set().track(s)
 }
 
 fn load(proxies: &[Proxy], p: usize, s: usize) -> ServerStatus {
-    proxies
-        .get(p)
-        .and_then(|px| px.server_statuses.get(s))
-        .map_or(ServerStatus::Up, |a| ServerStatus::from(a.load(Ordering::Relaxed)))
+    proxies.get(p).and_then(|px| px.srv_set().at(s)).and_then(|v| v.raw_status()).map_or(ServerStatus::Up, ServerStatus::from)
 }
 
 /// Recomputes every server that tracks `(p, s)`, and those that track them. A chain cannot
@@ -59,14 +56,14 @@ fn load(proxies: &[Proxy], p: usize, s: usize) -> ServerStatus {
 fn propagate(proxies: &[Proxy], p: usize, s: usize) {
     let state = load(proxies, p, s);
     for (q, px) in proxies.iter().enumerate() {
-        let Some(tracks) = &px.server_track else { continue };
+        let Some(tracks) = px.srv_set().tracks() else { continue };
         for (t, tr) in tracks.iter().enumerate() {
             let Some(tr) = tr else { continue };
             if tr.target != (p, s) {
                 continue;
             }
             let own = ServerStatus::from(tr.own.load(Ordering::Relaxed));
-            px.server_statuses[t].store(combine(own, state) as u8, Ordering::Relaxed);
+            px.srv_set().at(t).expect("tracking server").store_status(combine(own, state) as u8);
             px.fwrr.changed();
             propagate(proxies, q, t);
         }
@@ -85,7 +82,7 @@ pub fn set_status(proxies: &[Proxy], p: usize, s: usize, st: ServerStatus, kind:
 ///
 /// `kind` and `cause` say what `HAProxy` would write about the change ([`crate::srvlog`]).
 pub fn set_raw(proxies: &[Proxy], p: usize, s: usize, raw: u8, kind: Kind, cause: Cause<'_>) {
-    let status_of = || proxies.get(p).and_then(|px| px.server_statuses.get(s)).map_or(0, |a| a.load(Ordering::Relaxed));
+    let status_of = || proxies.get(p).and_then(|px| px.srv_set().at(s)).and_then(|v| v.raw_status()).unwrap_or(0);
     let before = status_of();
     set_status_inner(proxies, p, s, raw);
     // `lastchg`, `downtime` and `chkdown` of `show stat` follow the server's state.
@@ -101,7 +98,7 @@ pub fn set_raw(proxies: &[Proxy], p: usize, s: usize, raw: u8, kind: Kind, cause
         // The backend is down when no server of it is up; its own `lastchg`, `downtime` and
         // `chkdown` move when that flips (measured: `disable server` on the only server
         // turns the backend `DOWN`, `chkdown` 1).
-        let be_down = !px.server_statuses.iter().any(|a| a.load(Ordering::Relaxed) == ServerStatus::Up as u8);
+        let be_down = !px.srv_set().any_up();
         let was_be_down = pc.be.down_since.load(Ordering::Relaxed) != 0;
         if be_down != was_be_down {
             pc.be.state_changed(was_be_down, be_down);
@@ -116,10 +113,10 @@ fn set_status_inner(proxies: &[Proxy], p: usize, s: usize, raw: u8) {
         tr.own.store(st as u8, Ordering::Relaxed);
         let (tp, ts) = tr.target;
         let eff = combine(st, load(proxies, tp, ts));
-        proxies[p].server_statuses[s].store(eff as u8, Ordering::Relaxed);
+        proxies[p].srv_set().at(s).expect("tracking server").store_status(eff as u8);
         proxies[p].fwrr.changed();
-    } else if let Some(a) = proxies.get(p).and_then(|px| px.server_statuses.get(s)) {
-        a.store(raw, Ordering::Relaxed);
+    } else if let Some(v) = proxies.get(p).and_then(|px| px.srv_set().at(s)) {
+        v.store_status(raw);
         proxies[p].fwrr.changed();
     }
     propagate(proxies, p, s);
@@ -144,7 +141,7 @@ pub fn attach(proxies: &mut [Proxy], config: &alcyon_config::Config) {
         .collect();
     let find = |px: &str, sv: &str| -> Option<(usize, usize)> {
         let p = proxies.iter().position(|x| x.name == px)?;
-        Some((p, proxies[p].server_ids.iter().position(|i| i == sv)?))
+        Some((p, proxies[p].srv_set().find(sv)?.index()))
     };
     // Section order is proxy order: `build_shared_state` pushes listens, then backends.
     let mut tracks: Vec<Vec<Option<Track>>> = Vec::new();
@@ -166,14 +163,14 @@ pub fn attach(proxies: &mut [Proxy], config: &alcyon_config::Config) {
     }
     for (p, t) in tracks.into_iter().enumerate() {
         if t.iter().any(Option::is_some) {
-            proxies[p].server_track = Some(std::sync::Arc::new(t));
+            proxies[p].srv_set_mut().set_tracks(t);
         }
     }
     // Targets first: a chain's state flows from the server that has a check.
     let roots: Vec<(usize, usize)> = proxies
         .iter()
         .enumerate()
-        .flat_map(|(p, px)| (0..px.server_ids.len()).map(move |s| (p, s)))
+        .flat_map(|(p, px)| px.srv_set().live().map(move |v| (p, v.index())))
         .filter(|&(p, s)| track_of(proxies, p, s).is_none())
         .collect();
     for (p, s) in roots {
@@ -185,7 +182,7 @@ pub fn attach(proxies: &mut [Proxy], config: &alcyon_config::Config) {
 /// nothing.
 #[must_use]
 pub fn tracked_label(proxy: &Proxy, s: usize) -> &str {
-    proxy.server_track.as_ref().and_then(|t| t.get(s)).and_then(Option::as_ref).map_or("", |t| t.label.as_str())
+    proxy.srv_set().track(s).map_or("", |t| t.label.as_str())
 }
 
 /// Whether the maintenance or drain of server `s` comes from its target and not from the
@@ -193,10 +190,10 @@ pub fn tracked_label(proxy: &Proxy, s: usize) -> &str {
 /// admin flags).
 #[must_use]
 pub fn inherited(proxy: &Proxy, s: usize) -> bool {
-    let Some(tr) = proxy.server_track.as_ref().and_then(|t| t.get(s)).and_then(Option::as_ref) else {
+    let Some(tr) = proxy.srv_set().track(s) else {
         return false;
     };
-    let status = proxy.server_statuses.get(s).map_or(ServerStatus::Up, |a| ServerStatus::from(a.load(Ordering::Relaxed)));
+    let status = proxy.srv_set().at(s).and_then(|v| v.raw_status()).map_or(ServerStatus::Up, ServerStatus::from);
     let own = ServerStatus::from(tr.own.load(Ordering::Relaxed));
     matches!(status, ServerStatus::Maint | ServerStatus::Drain) && own != status
 }
@@ -236,9 +233,9 @@ pub fn set_admin(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckState
         c.set_admin_status(to);
         publish_view(px, c);
         set_raw(proxies, p, s, c.published(), Kind::Admin, cause);
-    } else if let Some(cur) = px.server_statuses.get(s) {
+    } else if let Some(cur) = px.srv_set().at(s).and_then(|v| v.raw_status()) {
         queue(&mut ops, px, s, CheckOp::Admin(to));
-        set_raw(proxies, p, s, crate::check::admin_transition(cur.load(Ordering::Relaxed), to), Kind::Admin, cause);
+        set_raw(proxies, p, s, crate::check::admin_transition(cur, to), Kind::Admin, cause);
     }
 }
 
@@ -276,7 +273,7 @@ pub fn check_view<'a>(px: &Proxy, checks: &'a [crate::check::ServerCheckState], 
         let i = checks.partition_point(|c| (c.proxy(), c.server()) < (p, s));
         return checks.get(i).filter(|c| c.proxy() == p && c.server() == s).map(crate::check::ServerCheckState::view);
     }
-    px.server_check_configs.get(s).filter(|c| c.is_some())?;
+    px.srv_set().checked(s).then_some(())?;
     let views = px.txn_counters().check_views.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     views.get(s).and_then(Clone::clone)
 }
@@ -286,7 +283,7 @@ pub fn publish_view(px: &Proxy, check: &crate::check::ServerCheckState) {
     let s = check.server();
     let mut views = px.txn_counters().check_views.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if views.len() <= s {
-        views.resize(px.server_check_configs.len().max(s + 1), None);
+        views.resize(px.srv_set().check_slots().max(s + 1), None);
     }
     match &mut views[s] {
         Some(v) => v.refresh(check),
@@ -308,7 +305,7 @@ fn lock_ops(px: &Proxy) -> std::sync::MutexGuard<'_, Vec<(u32, CheckOp)>> {
 /// Queues `op` for server `s` when it has a check (held by another worker); a server with
 /// no check has nothing but `Proxy::server_statuses`.
 fn queue(ops: &mut Vec<(u32, CheckOp)>, px: &Proxy, s: usize, op: CheckOp) {
-    if px.server_check_configs.get(s).is_some_and(Option::is_some) {
+    if px.srv_set().checked(s) {
         ops.push((crate::engine::usize_to_u32(s), op));
         OPS_PENDING.fetch_add(1, Ordering::Release);
     }
@@ -384,7 +381,7 @@ pub fn set_check_enabled(proxies: &[Proxy], checks: &mut [crate::check::ServerCh
         }
         publish_view(px, c);
         true
-    } else if px.server_check_configs.get(s).is_some_and(Option::is_some) {
+    } else if px.srv_set().checked(s) {
         queue(&mut ops, px, s, CheckOp::Enabled(enabled));
         true
     } else {
@@ -402,7 +399,7 @@ pub fn publish_check(proxies: &[Proxy], check: &mut crate::check::ServerCheckSta
     let mut ops = lock_ops(px);
     adopt(&mut ops, p, std::slice::from_mut(check));
     publish_view(px, check);
-    if check.enabled && s < px.server_statuses.len() {
+    if check.enabled && px.srv_set().at(s).is_some() {
         set_raw(proxies, p, s, check.published(), Kind::Op, Cause::Check(check));
     }
 }
@@ -422,9 +419,9 @@ pub fn apply_health(proxies: &[Proxy], checks: &mut [crate::check::ServerCheckSt
         c.set_health(up);
         publish_view(px, c);
         set_raw(proxies, p, s, c.published(), Kind::Op, cause);
-    } else if let Some(cur) = px.server_statuses.get(s) {
+    } else if let Some(cur) = px.srv_set().at(s).and_then(|v| v.raw_status()) {
         queue(&mut ops, px, s, CheckOp::Health(up));
-        set_raw(proxies, p, s, crate::check::health_transition(cur.load(Ordering::Relaxed), up), Kind::Op, cause);
+        set_raw(proxies, p, s, crate::check::health_transition(cur, up), Kind::Op, cause);
     }
 }
 
@@ -439,8 +436,8 @@ mod tests {
         let config = alcyon_config::parse_str(c).expect("config");
         let proxies = crate::engine::Engine::build_shared_state(&config).expect("proxies");
         let p = proxies.iter().position(|x| x.name == "b").expect("b");
-        let cfg = proxies[p].server_check_configs[0].clone().expect("check");
-        let addr = proxies[p].servers.get(0).expect("s1");
+        let cfg = proxies[p].srv_set().at(0).and_then(|v| v.check_config().cloned()).expect("check");
+        let addr = proxies[p].srv_set().at(0).and_then(|v| v.addr()).expect("s1");
         let check = ServerCheckState::new(p, 0, addr, cfg, alcyon_sched::Tick(1));
         (proxies, check)
     }
@@ -452,7 +449,7 @@ mod tests {
     }
 
     fn status(proxies: &[Proxy], p: usize) -> u8 {
-        proxies[p].server_statuses[0].load(Ordering::Relaxed)
+        proxies[p].srv_set().at(0).and_then(|v| v.raw_status()).expect("s1")
     }
 
     /// T593: the stats page runs on any worker, the check of the server on worker 0 only. A
@@ -536,8 +533,8 @@ mod tests {
         let proxies = crate::engine::Engine::build_shared_state(&config).expect("proxies");
         let p = proxies.iter().position(|x| x.name == "b").expect("b");
         let mk = |s: usize| {
-            let cfg = proxies[p].server_check_configs[s].clone().expect("check");
-            ServerCheckState::new(p, s, proxies[p].servers.get(s).expect("addr"), cfg, alcyon_sched::Tick(1))
+            let cfg = proxies[p].srv_set().at(s).and_then(|v| v.check_config().cloned()).expect("check");
+            ServerCheckState::new(p, s, proxies[p].srv_set().at(s).and_then(|v| v.addr()).expect("addr"), cfg, alcyon_sched::Tick(1))
         };
         let (mut c1, mut c2) = (mk(0), mk(1));
         assert!(!set_check_enabled(&proxies, &mut [], p, 2, false, alcyon_sched::Tick(1)), "s3 has no check");
@@ -565,5 +562,5 @@ mod tests {
 /// Whether another server's `track` names server `s` of proxy `p` (`SRV_F_NAME_REFD`).
 #[must_use]
 pub fn is_tracked(proxies: &[Proxy], p: usize, s: usize) -> bool {
-    proxies.iter().any(|px| px.server_track.as_ref().is_some_and(|t| t.iter().flatten().any(|t| t.target == (p, s))))
+    proxies.iter().any(|px| px.srv_set().tracks().is_some_and(|t| t.iter().flatten().any(|t| t.target == (p, s))))
 }

@@ -29,7 +29,6 @@ use std::fmt::Write as _;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 /// Availability state of a backend server.
@@ -785,7 +784,7 @@ fn with_check_ctx<R>(
     f: impl FnOnce(&LogData, &alcyon_sample::SampleContext) -> R,
 ) -> R {
     let reg = crate::engine::sample_registry();
-    let srv = px.server_ids.get(check.server());
+    let srv = px.srv_set().at(check.server()).map(|s| s.name());
     let view = ProxiesView(proxies);
     let mut ctx = alcyon_sample::PhaseCtx {
         fe_name: Some(&px.name),
@@ -933,20 +932,21 @@ fn server_state_header(check: &ServerCheckState, proxies: &[Proxy]) -> String {
     };
     let Some(px) = proxies.get(check.proxy()) else { return out };
     let i = check.server();
-    let addr = px.servers.get(i).unwrap_or(check.addr);
-    let cur = |j: usize| px.server_actconn.get(j).map_or(0, |a| a.load(Ordering::Relaxed));
-    let be_streams: u32 = (0..px.servers.len()).map(cur).sum();
+    let set = px.srv_set();
+    let me = set.at(i);
+    let addr = me.and_then(|s| s.addr()).unwrap_or(check.addr);
+    let be_streams: u32 = set.live().map(|s| s.actconn()).sum();
     let _ = write!(
         out,
         "; address={}; port={}; name={}/{}; node={}; weight={}/{}; scur={}/{}; qcur=0",
         addr.ip(),
         addr.port(),
         px.name,
-        px.server_ids.get(i).map_or("", |s| s),
+        me.map_or("", |s| s.name()),
         crate::engine::log_hostname(),
-        px.server_weights.get(i).unwrap_or(1),
+        me.and_then(|s| s.weight()).unwrap_or(1),
         total_weight(px),
-        cur(i),
+        me.map_or(0, |s| s.actconn()),
         be_streams,
     );
     out
@@ -1737,7 +1737,7 @@ pub fn step_check(
     } else {
         // Start a brand new check, at the server's address now: `set server addr` or a
         // resolver may have moved it since the last one (T484).
-        if let Some(a) = proxies.get(check.proxy()).and_then(|px| px.servers.get(check.server())) {
+        if let Some(a) = proxies.get(check.proxy()).and_then(|px| px.srv_set().at(check.server())).and_then(|s| s.addr()) {
             check.addr = a;
         }
         check.run.start_tick = now;

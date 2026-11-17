@@ -109,11 +109,11 @@ fn down_of(raw: u8) -> bool {
 fn more(px: &Proxy, s: usize, going_down: bool, out: &mut String) {
     use std::fmt::Write as _;
     let (mut act, mut bck) = (0, 0);
-    for (i, st) in px.server_statuses.iter().enumerate() {
-        if st.load(Ordering::Relaxed) != ServerStatus::Up as u8 {
+    for srv in px.srv_set().live() {
+        if srv.raw_status() != Some(ServerStatus::Up as u8) {
             continue;
         }
-        if px.server_backups.get(i).copied().unwrap_or(false) {
+        if srv.backup() {
             bck += 1;
         } else {
             act += 1;
@@ -121,7 +121,7 @@ fn more(px: &Proxy, s: usize, going_down: bool, out: &mut String) {
     }
     let on_backup = if bck > 0 && act == 0 { " Running on backup." } else { "" };
     if going_down {
-        let scur = px.server_actconn.get(s).map_or(0, |a| a.load(Ordering::Relaxed));
+        let scur = px.srv_set().at(s).map_or(0, |v| v.actconn());
         let _ = write!(
             out,
             ". {act} active and {bck} backup servers left.{on_backup} {scur} sessions active, 0 requeued, 0 remaining in queue"
@@ -140,8 +140,9 @@ pub fn describe(px: &Proxy, s: usize, before: u8, after: u8, kind: Kind, cause: 
     if matches!(cause, Cause::Dns) {
         return None;
     }
-    let name = px.server_ids.get(s)?;
-    let backup = if px.server_backups.get(s).copied().unwrap_or(false) { "Backup " } else { "" };
+    let srv = px.srv_set().at(s)?;
+    let name = srv.name();
+    let backup = if srv.backup() { "Backup " } else { "" };
     let head = format!("{backup}Server {}/{name}", px.name);
     let (b, a) = (adm_of(before), adm_of(after));
     let was_stopping = b == Adm::Drain;
@@ -224,8 +225,9 @@ pub fn note(proxies: &[Proxy], p: usize, s: usize, before: u8, after: u8, kind: 
 /// under `SRV_ADMF_RMAINT` moved), queued with the others: `[{backup}Server px/srv {text}]`.
 pub fn line(proxies: &[Proxy], p: usize, s: usize, level: LogLevel, text: &str) {
     let Some(px) = proxies.get(p) else { return };
-    let Some(name) = px.server_ids.get(s) else { return };
-    let backup = if px.server_backups.get(s).copied().unwrap_or(false) { "Backup " } else { "" };
+    let Some(srv) = px.srv_set().at(s) else { return };
+    let name = srv.name();
+    let backup = if srv.backup() { "Backup " } else { "" };
     let text = format!("{backup}Server {}/{name} {text}", px.name);
     px.txn_counters().srv_events.push(Event { proxy: p, level, alert: false, stderr: text.clone(), log: format!("{text}.") });
 }

@@ -73,6 +73,7 @@ pub mod rule_compiled;
 pub mod reuse;
 pub mod resolvers;
 pub mod srv_rt;
+pub mod srv_set;
 pub mod srv_h2;
 pub mod srv_tls;
 pub mod stats;

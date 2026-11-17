@@ -32,17 +32,17 @@ use std::sync::atomic::Ordering;
 pub struct ProxiesView<'a>(pub &'a [Proxy]);
 
 fn status(p: &Proxy, i: usize) -> ServerStatus {
-    p.server_statuses.get(i).map_or(ServerStatus::Down, |s| ServerStatus::from(s.load(Ordering::Relaxed)))
+    p.srv_set().at(i).and_then(|s| s.raw_status()).map_or(ServerStatus::Down, ServerStatus::from)
 }
 
 /// `srv_currently_usable`: running, and with a weight to take traffic (a server drained
 /// from the CLI has its weight taken away in `HAProxy`).
 fn usable(p: &Proxy, i: usize) -> bool {
-    status(p, i) == ServerStatus::Up && p.server_weights.get(i).unwrap_or(1) > 0
+    status(p, i) == ServerStatus::Up && p.srv_set().at(i).and_then(|s| s.weight()).unwrap_or(1) > 0
 }
 
 fn is_backup(p: &Proxy, i: usize) -> bool {
-    p.server_backups.get(i).copied().unwrap_or(false)
+    p.srv_set().at(i).is_some_and(|s| s.backup())
 }
 
 /// `smp_fetch_srv_is_up`: not in maintenance, and not stopped by its check.
@@ -51,13 +51,13 @@ fn is_up(p: &Proxy, i: usize) -> bool {
 }
 
 fn cur_sess(p: &Proxy, i: usize) -> u32 {
-    p.server_actconn.get(i).map_or(0, |a| a.load(Ordering::Relaxed))
+    p.srv_set().at(i).map_or(0, |s| s.actconn())
 }
 
 /// The usable active servers, and the first usable backup (`lbprm.fbck`: Alcyon has no
 /// `option allbackups`, so the first one is the one that takes traffic).
 fn recount(p: &Proxy) -> (usize, Option<usize>) {
-    let n = p.servers.len();
+    let n = p.srv_set().len();
     let act = (0..n).filter(|&i| !is_backup(p, i) && usable(p, i)).count();
     let fbck = (0..n).find(|&i| is_backup(p, i) && usable(p, i));
     (act, fbck)
@@ -84,11 +84,11 @@ pub fn usable_servers(p: &Proxy) -> i64 {
 /// when there are none (`update_backend_weight`).
 #[must_use]
 pub fn total_weight(p: &Proxy) -> u32 {
-    let weight = |i: usize| p.server_weights.get(i).unwrap_or(1);
+    let weight = |i: usize| p.srv_set().at(i).and_then(|s| s.weight()).unwrap_or(1);
     match recount(p) {
         (0, Some(b)) => weight(b),
         (0, None) => 0,
-        _ => (0..p.servers.len()).filter(|&i| !is_backup(p, i) && usable(p, i)).map(weight).sum(),
+        _ => (0..p.srv_set().len()).filter(|&i| !is_backup(p, i) && usable(p, i)).map(weight).sum(),
     }
 }
 
@@ -101,11 +101,11 @@ impl ProxyState for ProxiesView<'_> {
         let p = self.backend(backend)?;
         let (act, fbck) = recount(p);
         let mut free = 0i64;
-        for i in 0..p.servers.len() {
+        for i in 0..p.srv_set().len() {
             if !usable(p, i) || (is_backup(p, i) && (act > 0 || fbck != Some(i))) {
                 continue;
             }
-            match p.server_maxconn.get(i) {
+            match p.srv_set().at(i).and_then(|s| s.maxconn()) {
                 None | Some(0) => return Some(-1),
                 Some(mc) => free += i64::from(mc.saturating_sub(cur_sess(p, i))),
             }
@@ -115,15 +115,16 @@ impl ProxyState for ProxiesView<'_> {
 
     fn server(&self, backend: &str, server: &str) -> Option<ServerState> {
         let p = self.backend(backend)?;
-        let i = p.server_ids.iter().position(|s| s == server)?;
+        let me = p.srv_set().find(server)?;
+        let i = me.index();
         Some(ServerState {
             is_up: is_up(p, i),
             cur_sess: cur_sess(p, i),
-            maxconn: p.server_maxconn.get(i),
-            sess_rate: p.server_sess_rates.get(i).map_or(0, |r| to_i64(r.rate())),
-            weight: p.server_weights.get(i).unwrap_or(1),
-            iweight: p.server_weights.initial(i).unwrap_or(1),
-            uweight: p.server_weights.get(i).unwrap_or(1),
+            maxconn: me.maxconn(),
+            sess_rate: me.sess_rate().map_or(0, |r| to_i64(r.rate())),
+            weight: me.weight().unwrap_or(1),
+            iweight: me.initial_weight().unwrap_or(1),
+            uweight: me.weight().unwrap_or(1),
         })
     }
 

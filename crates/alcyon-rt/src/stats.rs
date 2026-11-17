@@ -945,12 +945,9 @@ pub(crate) fn write_server_row(
     sid: u32,
     legends: bool,
 ) {
-    let srv_name = if s_idx < proxy.server_ids.len() {
-        &proxy.server_ids[s_idx]
-    } else {
-        "srv"
-    };
-    let srv_addr = proxy.servers.at(s_idx);
+    let srv = proxy.srv_set().at(s_idx);
+    let srv_name = srv.map_or("srv", |s| s.name());
+    let srv_addr = srv.and_then(|s| s.addr()).expect("address of a listed server");
     // Everything below is written into the row's strings as it is read: a `show stat` row of
     // a scrape allocates nothing (T369).
     struct Word<'a>(Option<&'a crate::check::CheckView<'a>>, &'static str, &'a str);
@@ -984,7 +981,7 @@ pub(crate) fn write_server_row(
     } else if let Some(c) = &check_state {
         Word(Some(c), "", "")
     } else {
-        let s = proxy.server_statuses.get(s_idx).map(|s| ServerStatus::from(s.load(std::sync::atomic::Ordering::Relaxed))).unwrap_or(ServerStatus::Up);
+        let s = srv.and_then(|s| s.raw_status()).map_or(ServerStatus::Up, ServerStatus::from);
         let tracker = !crate::track::tracked_label(proxy, s_idx).is_empty();
         match s {
             ServerStatus::Up if tracker => Word(None, "UP", ""),
@@ -1008,11 +1005,11 @@ pub(crate) fn write_server_row(
     let check_desc = check_state.as_ref().map_or("", |c| c.last_status_desc);
     let has_check = check_state.is_some();
 
-    let is_backup = proxy.server_backups.get(s_idx).copied().unwrap_or(false);
+    let is_backup = srv.is_some_and(|s| s.backup());
     let (act, bck) = if is_backup { (0, 1) } else { (1, 0) };
-    let scur = proxy.server_actconn.get(s_idx).map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
-    let weight = proxy.server_weights.get(s_idx).unwrap_or(1);
-    let slim = Opt(proxy.server_maxconn.get(s_idx));
+    let scur = srv.map_or(0, |s| s.actconn());
+    let weight = srv.and_then(|s| s.weight()).unwrap_or(1);
+    let slim = Opt(srv.and_then(|s| s.maxconn()));
 
     let mut r = StatRow::new();
     r.set("pxname", &proxy.name);
@@ -1036,13 +1033,7 @@ pub(crate) fn write_server_row(
     r.set("lastchg", proxy.ids.server_lastchg(s_idx, c.last_chg.load(std::sync::atomic::Ordering::Relaxed)));
     fill_counters(&mut r, &n, c, proxy.mode == alcyon_config::Mode::Http, true);
     r.set("uweight", weight);
-    let (wretr, wredis, econ) = proxy
-        .server_retr
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&s_idx)
-        .copied()
-        .unwrap_or_default();
+    let (wretr, wredis, econ) = proxy.srv_set().retr(s_idx);
     r.set("econ", econ);
     r.set("wretr", wretr);
     r.set("wredis", wredis);
@@ -1085,16 +1076,17 @@ pub(crate) fn write_backend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy
     let http = proxy.mode == alcyon_config::Mode::Http;
     let up = |i: usize| {
         proxy
-            .server_statuses
-            .get(i)
-            .is_none_or(|s| matches!(ServerStatus::from(s.load(Relaxed)), ServerStatus::Up | ServerStatus::Drain))
+            .srv_set()
+            .at(i)
+            .and_then(|s| s.raw_status())
+            .is_none_or(|s| matches!(ServerStatus::from(s), ServerStatus::Up | ServerStatus::Drain))
     };
-    let backup = |i: usize| proxy.server_backups.get(i).copied().unwrap_or(false);
-    let act = (0..proxy.servers.len()).filter(|&i| !backup(i) && up(i)).count();
-    let bck = (0..proxy.servers.len()).filter(|&i| backup(i) && up(i)).count();
-    let weight: u32 = (0..proxy.servers.len()).filter(|&i| !backup(i) && up(i)).map(|i| proxy.server_weights.get(i).unwrap_or(1)).sum();
-    let scur: u32 = (0..proxy.servers.len()).map(|i| proxy.server_actconn.get(i).map_or(0, |a| a.load(Relaxed))).sum();
-    let be_down = !proxy.servers.is_empty() && act + bck == 0 && proxy.ids.tc.get().is_some_and(|p| p.be.down_since.load(Relaxed) != 0);
+    let backup = |i: usize| proxy.srv_set().at(i).is_some_and(|s| s.backup());
+    let act = (0..proxy.srv_set().len()).filter(|&i| !backup(i) && up(i)).count();
+    let bck = (0..proxy.srv_set().len()).filter(|&i| backup(i) && up(i)).count();
+    let weight: u32 = (0..proxy.srv_set().len()).filter(|&i| !backup(i) && up(i)).map(|i| proxy.srv_set().at(i).and_then(|s| s.weight()).unwrap_or(1)).sum();
+    let scur: u32 = (0..proxy.srv_set().len()).map(|i| proxy.srv_set().at(i).map_or(0, |s| s.actconn())).sum();
+    let be_down = !proxy.srv_set().is_empty() && act + bck == 0 && proxy.ids.tc.get().is_some_and(|p| p.be.down_since.load(Relaxed) != 0);
     let mut r = StatRow::new();
     r.set("pxname", &proxy.name);
     r.set("svname", "BACKEND");
@@ -1272,7 +1264,7 @@ impl StatCursor {
                 ST_SERVERS => {
                     let p = &proxies[i];
                     let s = self.s as usize;
-                    if !self.type_wanted(2) || s >= p.servers.len() {
+                    if !self.type_wanted(2) || s >= p.srv_set().len() {
                         self.step = ST_BACKEND;
                         continue;
                     }
