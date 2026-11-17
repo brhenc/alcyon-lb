@@ -4036,6 +4036,25 @@ impl Registry {
                 None
             },
         });
+        // `smp_fetch_fc_pp_authority`: `fc_pp_tlv(PP2_TYPE_AUTHORITY)`, first occurrence only:
+        // the authority TLV (type 0x02) of the PROXY protocol v2 header the connection was
+        // accepted with, its value as a string of its raw bytes (`src/connection.c`).
+        self.register_fetch(FetchDesc {
+            name: "fc_pp_authority",
+            out_type: SampleType::Str,
+            func: |ctx, _args| {
+                let mut t = ctx.proxy_tlvs()?;
+                while t.len() >= 3 {
+                    let len = usize::from(u16::from_be_bytes([t[1], t[2]]));
+                    let value = t.get(3..3 + len)?;
+                    if t[0] == alcyon_proto::tlv_types::PP2_TYPE_AUTHORITY {
+                        return Some(Sample::Str(String::from_utf8_lossy(value).into_owned()));
+                    }
+                    t = &t[3 + len..];
+                }
+                None
+            },
+        });
         self.register_fetch(FetchDesc {
             name: "fc_pp_tlv",
             out_type: SampleType::Bin,
