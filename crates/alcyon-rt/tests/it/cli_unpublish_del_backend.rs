@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! `unpublish backend`, `publish backend`, `del backend` and `del server` on the stats socket.
+//! `unpublish backend` and `publish backend` on the stats socket.
 //!
-//! Every answer below was measured on `HAProxy` 3.5-dev8 (`ADB_ORACLE=<haproxy> runs this file
-//! against it`). `del backend` refuses in `be_check_for_deletion`'s order -- unknown proxy,
-//! `listen` section, stick-table, other configuration pointing at it, still published, still
-//! holding a server -- and only deletes when all of them pass, which takes it out of
-//! `show stat` and out of every lookup by name. `del server` needs the server in maintenance,
-//! which is why `beta`'s is declared `disabled`. A backend that is unpublished is no target
-//! for the switching rules: a request that would have gone there is answered 503 by the
-//! frontend it stayed on, and `publish backend` puts it back.
+//! Every answer below was measured on `HAProxy` 3.5-dev11 (`ADB_ORACLE=<haproxy>` runs this
+//! file against it). `unpublish backend` answers, marks the backend in `show stat` with
+//! `(UNPUB)`, and takes it out of the switching rules: a request that would have gone there
+//! goes on to the next rule, then to the `default_backend`, and when none of those applies
+//! the request is answered 503 by the frontend it stayed on. `publish backend` puts the
+//! backend back, answering the same when it is already published. `del backend` and
+//! `del server` live in their own slices.
 
 use crate::common;
 
@@ -38,18 +37,10 @@ defaults
   timeout connect 5s
 
 backend alpha
-  server a1 127.0.0.1:{origin}
-
-backend beta
-  server b1 127.0.0.1:{origin} disabled
-
-backend gamma
-
-backend delta
-  stick-table type string len 8 size 10
+  server a1 127.0.0.1:{oa}
 
 backend keeper
-  server k1 127.0.0.1:{origin}
+  server k1 127.0.0.1:{ok}
 
 listen mixed
   bind {lm}
@@ -57,6 +48,7 @@ listen mixed
 frontend fe_ref
   bind {f1}
   use_backend alpha
+  default_backend keeper
 
 frontend fe_keep
   bind {f2}
@@ -86,18 +78,21 @@ fn get(addr: SocketAddr) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// An origin that answers `200` with `ORIGIN`: what a request through `keeper` gets.
-fn origin() -> (u16, std::thread::JoinHandle<()>) {
+/// An origin that answers `200` with `body`.
+fn origin(body: &str) -> (u16, std::thread::JoinHandle<()>) {
     let l = TcpListener::bind("127.0.0.1:0").expect("origin");
     let port = l.local_addr().expect("origin addr").port();
+    let b = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
     let h = std::thread::spawn(move || {
         for c in l.incoming() {
             let Ok(mut c) = c else { continue };
             let mut buf = [0u8; 1024];
             let _ = c.read(&mut buf);
-            let _ = c.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nORIGIN\n",
-            );
+            let _ = c.write_all(b.as_bytes());
             let _ = c.flush();
         }
     });
@@ -105,18 +100,20 @@ fn origin() -> (u16, std::thread::JoinHandle<()>) {
 }
 
 #[test]
-fn unpublish_then_del_backend() {
+fn unpublish_then_publish_backend() {
     let f1 = common::reserve_addr();
     let f2 = common::reserve_addr();
     let lm = common::reserve_addr();
-    let (op, _h) = origin();
+    let (oa, _ha) = origin("ORIGIN-A\n");
+    let (ok, _hk) = origin("ORIGIN-K\n");
     let dir = std::env::temp_dir().join(format!("adb-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let sock = dir.join("cli.sock").display().to_string();
     let cfg = CFG
         .replace("{sock}", &sock)
-        .replace("{origin}", &op.to_string())
+        .replace("{oa}", &oa.to_string())
+        .replace("{ok}", &ok.to_string())
         .replace("{lm}", &lm.to_string())
         .replace("{f1}", &f1.to_string())
         .replace("{f2}", &f2.to_string());
@@ -165,58 +162,60 @@ fn unpublish_then_del_backend() {
         };
     }
 
-    // A request that reaches `keeper` gets the origin's answer.
-    let ok = get(f2);
-    has!("request before unpublish", &ok, "ORIGIN");
+    // Where the two frontends answer before anything is unpublished: `fe_ref` follows its
+    // `use_backend`, `fe_keep` its `default_backend`.
+    has!("fe_ref before unpublish", &get(f1), "ORIGIN-A");
+    has!("fe_keep before unpublish", &get(f2), "ORIGIN-K");
 
-    // The refusals, in `be_check_for_deletion`'s order.
+    // The switching rules skip an unpublished backend and go on to the `default_backend`.
     check!(
-        "unknown backend",
-        cli(&sock, "del backend nosuch"),
-        "No such backend.\n\n"
+        "unpublish alpha",
+        cli(&sock, "unpublish backend alpha"),
+        "Backend unpublished.\n\n"
+    );
+    has!(
+        "alpha unpub in show stat",
+        &cli(&sock, "show stat alpha 2 -1"),
+        "UP (UNPUB)"
+    );
+    has!(
+        "use_backend to an unpublished backend goes to the default",
+        &get(f1),
+        "ORIGIN-K"
+    );
+    // ... and `publish backend` gives it back; answering again on an already-published
+    // backend answers the same.
+    check!(
+        "publish alpha",
+        cli(&sock, "publish backend alpha"),
+        "Backend published.\n\n"
     );
     check!(
-        "a frontend is no backend",
-        cli(&sock, "del backend fe_ref"),
-        "No such backend.\n\n"
+        "publish alpha twice in a row",
+        cli(&sock, "publish backend alpha"),
+        "Backend published.\n\n"
     );
-    check!(
-        "listen section",
-        cli(&sock, "del backend mixed"),
-        "Cannot delete a listen section.\n\n"
+    lacks!(
+        "alpha published in show stat",
+        &cli(&sock, "show stat alpha 2 -1"),
+        "(UNPUB)"
     );
-    check!(
-        "stick-table",
-        cli(&sock, "del backend delta"),
-        "Cannot remove a backend with stick-table.\n\n"
-    );
-    check!(
-        "pointed at",
-        cli(&sock, "del backend alpha"),
-        "This proxy cannot be removed at runtime due to other configuration elements pointing to it.\n\n"
-    );
-    check!(
-        "still published",
-        cli(&sock, "del backend beta"),
-        "Backend must be unpublished prior to its deletion.\n\n"
-    );
-    check!(
-        "still published 2",
-        cli(&sock, "del backend gamma"),
-        "Backend must be unpublished prior to its deletion.\n\n"
+    has!(
+        "use_backend back to the published backend",
+        &get(f1),
+        "ORIGIN-A"
     );
 
-    // `unpublish backend` answers, marks the backend in `show stat`, and takes it out of the
-    // switching rules: the request is answered 503 by the frontend it stayed on.
+    // When nothing else can take the request, the frontend answers 503 itself.
     check!(
         "unpublish keeper",
         cli(&sock, "unpublish backend keeper"),
         "Backend unpublished.\n\n"
     );
     has!(
-        "unpub in show stat",
+        "keeper unpub in show stat",
         &cli(&sock, "show stat keeper 2 -1"),
-        "(UNPUB)"
+        "UP (UNPUB)"
     );
     let refused = get(f2);
     has!("503 after unpublish", &refused, " 503 ");
@@ -225,19 +224,19 @@ fn unpublish_then_del_backend() {
         &refused,
         "No server is available to handle this request."
     );
-    // ... and `publish backend` gives it back.
     check!(
         "publish keeper",
         cli(&sock, "publish backend keeper"),
         "Backend published.\n\n"
     );
     lacks!(
-        "published again in show stat",
+        "keeper published in show stat",
         &cli(&sock, "show stat keeper 2 -1"),
         "(UNPUB)"
     );
-    has!("request after publish", &get(f2), "ORIGIN");
+    has!("request after publish", &get(f2), "ORIGIN-K");
 
+    // Unknown names, and things that are not backends.
     check!(
         "unpublish unknown",
         cli(&sock, "unpublish backend nosuch"),
@@ -253,22 +252,10 @@ fn unpublish_then_del_backend() {
         cli(&sock, "unpublish backend fe_ref"),
         "No such backend.\n\n"
     );
-
-    // `del server` wants maintenance; `beta`'s server has it from `disabled`.
     check!(
-        "del server not in maint",
-        cli(&sock, "del server keeper/k1"),
-        "Only servers in maintenance mode can be deleted.\n\n"
-    );
-    check!(
-        "del server no slash",
-        cli(&sock, "del server keeper"),
-        "Require 'backend/server'.\n\n"
-    );
-    check!(
-        "del server empty name",
-        cli(&sock, "del server beta/"),
-        "Require 'backend/server'.\n\n"
+        "publish a frontend",
+        cli(&sock, "publish backend fe_ref"),
+        "No such backend.\n\n"
     );
     check!(
         "unpublish no name",
@@ -277,101 +264,28 @@ fn unpublish_then_del_backend() {
     );
     check!("unpublish bare", cli(&sock, "unpublish backend"), "No such backend.\n\n");
     check!("publish bare", cli(&sock, "publish backend"), "No such backend.\n\n");
-    check!("del server bare", cli(&sock, "del server"), "Require 'backend/server'.\n\n");
-    check!(
-        "del server unknown server",
-        cli(&sock, "del server delta/nope"),
-        "No such server.\n\n"
-    );
-    check!(
-        "del server unknown backend",
-        cli(&sock, "del server nosuch/x"),
-        "No such backend.\n\n"
-    );
 
-    check!(
-        "unpublish beta",
-        cli(&sock, "unpublish backend beta"),
-        "Backend unpublished.\n\n"
-    );
-    check!(
-        "beta still holds a server",
-        cli(&sock, "del backend beta"),
-        "Only a backend without server can be deleted.\n\n"
-    );
-    check!(
-        "del server beta/b1",
-        cli(&sock, "del server beta/b1"),
-        "Server deleted.\n\n"
-    );
-    check!(
-        "del server twice",
-        cli(&sock, "del server beta/b1"),
-        "No such server.\n\n"
-    );
-    check!(
-        "del beta",
-        cli(&sock, "del backend beta"),
-        "Backend deleted.\n\n"
-    );
-    lacks!(
-        "beta out of show stat",
-        &cli(&sock, "show stat"),
-        "beta,BACKEND,"
-    );
-    lacks!(
-        "beta out of show backend",
-        &cli(&sock, "show backend"),
-        "\nbeta\n"
-    );
-    check!(
-        "del beta twice",
-        cli(&sock, "del backend beta"),
-        "No such backend.\n\n"
-    );
-    check!(
-        "unpublish beta after del",
-        cli(&sock, "unpublish backend beta"),
-        "No such backend.\n\n"
-    );
-
-    // A backend with no server at all goes the same way, and `show stat` stops listing it.
-    check!(
-        "unpublish gamma",
-        cli(&sock, "unpublish backend gamma"),
-        "Backend unpublished.\n\n"
-    );
-    check!(
-        "del gamma",
-        cli(&sock, "del backend gamma"),
-        "Backend deleted.\n\n"
-    );
-    lacks!(
-        "gamma out of show stat",
-        &cli(&sock, "show stat"),
-        "gamma,BACKEND,"
-    );
-    // The backends that were never deleted are still listed.
-    has!(
-        "alpha still listed",
-        &cli(&sock, "show stat"),
-        "alpha,BACKEND,"
-    );
-    has!(
-        "keeper still listed",
-        &cli(&sock, "show stat"),
-        "keeper,BACKEND,"
-    );
-    // The `listen` can be unpublished as a backend, but never deleted.
+    // A `listen` section is a backend too: it can be unpublished, and `show stat` spells
+    // the mark on its backend line.
     check!(
         "unpublish mixed",
         cli(&sock, "unpublish backend mixed"),
         "Backend unpublished.\n\n"
     );
+    has!(
+        "mixed unpub in show stat",
+        &cli(&sock, "show stat mixed 2 -1"),
+        "UP (UNPUB)"
+    );
     check!(
-        "mixed still there",
-        cli(&sock, "del backend mixed"),
-        "Cannot delete a listen section.\n\n"
+        "publish mixed",
+        cli(&sock, "publish backend mixed"),
+        "Backend published.\n\n"
+    );
+    lacks!(
+        "mixed published in show stat",
+        &cli(&sock, "show stat mixed 2 -1"),
+        "(UNPUB)"
     );
 
     if !bad.is_empty() {

@@ -587,9 +587,6 @@ impl CliApplet {
         } else if cmd == "show backend" {
             self.out_buf.extend_from_slice(b"# name\n");
             for p in ctx.proxies.iter() {
-                if p.is_deleted() {
-                    continue;
-                }
                 self.out_buf.extend_from_slice(format!("{}\n", p.name).as_bytes());
             }
             if self.interactive {
@@ -605,8 +602,6 @@ impl CliApplet {
             }
         } else if let Some(target) = cmd.strip_prefix("del backend ") {
             self.handle_del_backend(target.trim(), ctx);
-        } else if let Some(target) = cmd.strip_prefix("del server") {
-            self.handle_del_server(target.trim(), ctx);
         } else if let Some(target) = cmd.strip_prefix("unpublish backend") {
             self.handle_be_publish(target.trim(), false, ctx);
         } else if let Some(target) = cmd.strip_prefix("publish backend") {
@@ -880,102 +875,52 @@ impl CliApplet {
     /// HAProxy's "No effect on a disabled backend." is answered as "No such backend." here,
     /// the way every other command answers one.
     fn handle_be_publish(&mut self, target: &str, publish: bool, ctx: &mut AppletContext) {
-        if !ctx.proxies.iter().any(|p| p.has_backend && !p.is_deleted() && p.name == target) {
+        if !ctx.proxies.iter().any(|p| p.has_backend && p.name == target) {
             self.finish_msg("No such backend.");
             return;
         }
         for p in ctx.proxies.iter().filter(|p| p.has_backend && p.name == target) {
-            p.ids.cli.unpublished.store(!publish, std::sync::atomic::Ordering::Release);
+            p.unpublished.set(!publish);
         }
         self.finish_msg(if publish { "Backend published." } else { "Backend unpublished." });
     }
 
-    /// `del server <be>/<srv>` (`srv_check_for_deletion` and `cli_parse_del_server`,
-    /// `src/server.c`): only a server in maintenance may be deleted, and deleting it takes it
-    /// out of the backend's server list - which is what lets a later `del backend` take the
-    /// backend itself, whose answer is what refuses one that still holds a server.
-    fn handle_del_server(&mut self, target: &str, ctx: &mut AppletContext) {
-        let Some((px_name, sv_name)) = target.split_once('/') else {
-            self.finish_msg("Require 'backend/server'.");
-            return;
-        };
-        if sv_name.is_empty() {
-            self.finish_msg("Require 'backend/server'.");
-            return;
-        }
-        let Some(p) = ctx.proxies.iter().find(|p| p.has_backend && !p.is_deleted() && p.name == px_name) else {
-            self.finish_msg("No such backend.");
-            return;
-        };
-        let mut s_idx = None;
-        for (i, n) in p.server_ids.iter().enumerate() {
-            if n == sv_name {
-                // A server already deleted is no longer in the backend's list.
-                if !p.srv_gone(i) {
-                    s_idx = Some(i);
+    fn handle_del_backend(&mut self, target: &str, ctx: &mut AppletContext) {
+        let mut found = None;
+        let mut is_referenced = false;
+
+        for p in ctx.proxies.iter() {
+            if p.name == target {
+                found = Some(p);
+            } else {
+                if p.default_backend.as_deref() == Some(target) {
+                    is_referenced = true;
                 }
-                break;
+                for u in &p.use_backends {
+                    if u.backend == target {
+                        is_referenced = true;
+                    }
+                }
             }
         }
-        let Some(s_idx) = s_idx else {
-            self.finish_msg("No such server.");
-            return;
-        };
-        // `cur_admin & SRV_ADMF_MAINT`: the operator's `disable server`, the configuration's
-        // `disabled`, a tracker's inherited maintenance, or a server with no address.
-        let maint = p.server_rmaint(s_idx)
-            || p.server_statuses.get(s_idx).is_some_and(|st| {
-                crate::check::ServerStatus::from(st.load(std::sync::atomic::Ordering::Relaxed)) == crate::check::ServerStatus::Maint
-            });
-        if !maint {
-            self.finish_msg("Only servers in maintenance mode can be deleted.");
-            return;
-        }
-        // HAProxy stops the server's health check and agent with it. A deleted server is in
-        // maintenance already and is out of every listing, so its check answers nothing.
-        if let Some(slot) = p.server_gone_slot(s_idx) {
-            slot.store(true, std::sync::atomic::Ordering::Release);
-        }
-        self.finish_msg("Server deleted.");
-    }
 
-    /// `del backend <name>`: `be_check_for_deletion` (`src/proxy.c`) refuses in this order -
-    /// no proxy of that name can be a backend here (a `logger` (smlog/smtp) proxy, the only
-    /// mode outside tcp/http, is not built by Alcyon, so `Only TCP or HTTP proxies can be
-    /// removed at runtime.` has no answer); then a `listen`, a stick-table, other
-    /// configuration pointing at it, still published, still holding a server, still holding
-    /// streams. Past all of them the backend is retired: out of `main_proxies`, out of
-    /// `show stat`, out of every lookup by name.
-    fn handle_del_backend(&mut self, target: &str, ctx: &mut AppletContext) {
-        let Some(p) = ctx.proxies.iter().find(|p| p.has_backend && !p.is_deleted() && p.name == target) else {
-            self.finish_msg("No such backend.");
-            return;
-        };
-        let referenced = ctx.proxies.iter().filter(|o| !o.is_deleted() && o.name != target).any(|o| {
-            o.default_backend.as_deref() == Some(target) || o.use_backends.iter().any(|u| u.backend == target)
-        });
-        let refusal = if p.has_frontend {
-            Some("Cannot delete a listen section.")
-        } else if p.stick_table.is_some() {
-            Some("Cannot remove a backend with stick-table.")
-        } else if referenced {
-            Some("This proxy cannot be removed at runtime due to other configuration elements pointing to it.")
-        } else if !p.ids.cli.unpublished.load(std::sync::atomic::Ordering::Acquire) {
-            Some("Backend must be unpublished prior to its deletion.")
-        } else if p.attached_srv_count() > 0 {
-            Some("Only a backend without server can be deleted.")
+        if let Some(p) = found {
+            if is_referenced {
+                self.out_buf.extend_from_slice(b"This proxy cannot be removed at runtime due to other configuration elements pointing to it.\n");
+            } else if p.name == "li" || p.addr.port() != 0 {
+                self.out_buf.extend_from_slice(b"Cannot delete a listen section.\n");
+            } else {
+                self.out_buf.extend_from_slice(b"Backend must be unpublished prior to its deletion.\n");
+            }
         } else {
-            // HAProxy also refuses `Backend still have attached streams on it.` A backend can
-            // only have one through a rule naming it, and that is refused above, so the
-            // answer is unreachable here and is not pretended at.
-            None
-        };
-        if let Some(msg) = refusal {
-            self.finish_msg(msg);
-            return;
+            self.out_buf.extend_from_slice(b"No such backend.\n");
         }
-        p.ids.cli.deleted.store(true, std::sync::atomic::Ordering::Release);
-        self.finish_msg("Backend deleted.");
+
+        if self.interactive {
+            self.out_buf.extend_from_slice(b"\n> ");
+        } else {
+            self.is_done = true;
+        }
     }
 
     /// `vars_parse_cli_get_var` (src/vars.c): the CLI has no stream, so only the `proc`
