@@ -62,7 +62,7 @@ FIT_RATE=${ALCYON_H3_FIT_RATE:-1.97}
 case $CL in
   h3best|h3worst|h3fit)
     if [ ! -x "$H3BENCH" ]; then
-      CARGO_TARGET_DIR=$(dirname "$(dirname "$H3BENCH")") cargo build -q --release --offline \
+      CARGO_TARGET_DIR=$(dirname "$(dirname "$H3BENCH")") nice cargo build -q -j 8 --release --offline \
         --manifest-path "$(dirname "$0")/h3bench/Cargo.toml" || exit 1
     fi ;;
 esac
@@ -74,7 +74,7 @@ if [ ! -x "$BENCH" ]; then
     echo "insreq.sh: measure-bench not found: $BENCH (set MEASURE_BENCH or build tools/measure/bench)" >&2
     exit 1
   fi
-  CARGO_TARGET_DIR=$(dirname "$(dirname "$BENCH")") cargo build -q --release --offline \
+  CARGO_TARGET_DIR=$(dirname "$(dirname "$BENCH")") nice cargo build -q -j 8 --release --offline \
     --manifest-path "$(dirname "$0")/bench/Cargo.toml" || exit 1
 fi
 IFS=, read -r CPU_P CPU_C CPU_B <<< "${ALCYON_MEASURE_CPUS:-4,5,6}"

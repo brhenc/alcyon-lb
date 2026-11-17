@@ -301,7 +301,10 @@ while True:
         self.fakes.append(fake)
         env = {k: v for k, v in os.environ.items() if k not in ("MEASURE_BENCH", "ALCYON_MEASURE_CPUS")}
         env["MEASURE_BENCH"] = bench
-        env["ALCYON_MEASURE_CPUS"] = ",".join(str(i) for i in range(min(3, os.cpu_count() or 1)))
+        # Three CPUs (proxy, client, backend) even on a host with fewer: a short list leaves
+        # `taskset -c ""` to fail, and the test would pass on that failure, not on the fix.
+        n = os.cpu_count() or 1
+        env["ALCYON_MEASURE_CPUS"] = ",".join(str(i % n) for i in range(3))
         p = subprocess.Popen([os.path.join(here, "insreq.sh"), "t", fake,
                               os.path.join(here, "scenarios", "keepalive.body"), "ab1", "1", "1", out],
                              env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
