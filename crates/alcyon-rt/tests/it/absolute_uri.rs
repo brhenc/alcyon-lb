@@ -111,7 +111,7 @@ frontend fe
         // No Host header, or an empty one: base is what path gives, baseq what pathq gives.
         (b"GET /x?y HTTP/1.0\r\n\r\n", "[/x|/x?y|/x?y|/x|/x?y|/x?y]"),
         (b"GET /x?y HTTP/1.0\r\nHost:\r\n\r\n", "[/x|/x?y|/x?y|/x|/x?y|/x?y]"),
-        (b"GET http://h.example?q=1 HTTP/1.0\r\n\r\n", "[|?q=1|?q=1||http://h.example?q=1|?q=1]"),
+        (b"GET http://h.example?q=1 HTTP/1.0\r\n\r\n", "[h.example|h.example|?q=1||http://h.example?q=1|?q=1]"), // dev11 adds `Host` from the authority (dev8: none, base empty)
         // The H1 parser gives an absolute URI without a path the path `/`.
         (b"GET http://h.example HTTP/1.1\r\nHost: h.example\r\nConnection: close\r\n\r\n", "[h.example/|h.example/|/|/|http://h.example/|/]"),
     ];
