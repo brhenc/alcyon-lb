@@ -616,6 +616,10 @@ impl CliApplet {
             }
         } else if let Some(target) = cmd.strip_prefix("del backend ") {
             self.handle_del_backend(target.trim(), ctx);
+        } else if let Some(target) = cmd.strip_prefix("unpublish backend") {
+            self.handle_be_publish(target.trim(), false, ctx);
+        } else if let Some(target) = cmd.strip_prefix("publish backend") {
+            self.handle_be_publish(target.trim(), true, ctx);
         } else if cmd == "show servers state" || cmd.starts_with("show servers state ") {
             let be_filter = cmd.strip_prefix("show servers state").map(str::trim).filter(|s| !s.is_empty());
             if let Some(target) = be_filter {
@@ -915,6 +919,24 @@ impl CliApplet {
         };
         self.out_buf.extend_from_slice(out.as_bytes());
         self.finish_msg("");
+    }
+
+    /// `publish backend <be>` and `unpublish backend <be>` (`cli_parse_publish_backend` and
+    /// `cli_parse_unpublish_backend`, `src/proxy.c`): the flag the switching rules skip and
+    /// `show stat` spells `(UNPUB)`, and the answer.
+    ///
+    /// A backend the configuration `disabled` is not built at all (`init_proxies`), so
+    /// HAProxy's "No effect on a disabled backend." is answered as "No such backend." here,
+    /// the way every other command answers one.
+    fn handle_be_publish(&mut self, target: &str, publish: bool, ctx: &mut AppletContext) {
+        if !ctx.proxies.iter().any(|p| p.has_backend && p.name == target) {
+            self.finish_msg("No such backend.");
+            return;
+        }
+        for p in ctx.proxies.iter().filter(|p| p.has_backend && p.name == target) {
+            p.unpublished.set(!publish);
+        }
+        self.finish_msg(if publish { "Backend published." } else { "Backend unpublished." });
     }
 
     fn handle_del_backend(&mut self, target: &str, ctx: &mut AppletContext) {

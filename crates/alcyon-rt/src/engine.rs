@@ -42,7 +42,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use std::time::{Duration, Instant};
 
@@ -1850,6 +1850,32 @@ impl Monitor {
     }
 }
 
+/// A bool shared through every `Arc<Proxy>` of one backend while [`Proxy`] stays `Clone`: the
+/// derived clone copies its value; the `Arc` is what makes it shared. A raw atomic in the
+/// derived `Clone` would not compile, and an `Arc` of one costs a pointer chase and an
+/// allocation per backend for the same one byte.
+#[derive(Debug, Default)]
+pub struct SharedFlag {
+    flag: AtomicBool,
+}
+
+impl SharedFlag {
+    #[must_use]
+    pub fn get(&self) -> bool {
+        self.flag.load(Ordering::Acquire)
+    }
+
+    pub fn set(&self, v: bool) {
+        self.flag.store(v, Ordering::Release);
+    }
+}
+
+impl Clone for SharedFlag {
+    fn clone(&self) -> Self {
+        Self { flag: AtomicBool::new(self.flag.load(Ordering::Relaxed)) }
+    }
+}
+
 /// A configured proxy instance.
 #[derive(Debug, Clone)]
 // More than three bools, and they are genuinely independent switches rather than a state
@@ -1862,6 +1888,12 @@ pub struct Proxy {
     /// The proxy's index in the engine's list, which the engine addresses it by. Not the
     /// number `HAProxy` shows for it: that is [`Proxy::iid`].
     pub id: u32,
+    /// The `unpublish backend` flag, read on the request path by [`crate::table::Table::route`]
+    /// (its only reader there) and by `show stat`, which spells it `(UNPUB)`. One byte in the
+    /// proxy, behind the same `Arc<Proxy>` every worker holds; [`SharedFlag`] keeps `Proxy`
+    /// `Clone` (the clone copies the value, as the table's unit tests expect of a replaced
+    /// slot).
+    pub unpublished: SharedFlag,
     /// The ids of the proxy, its servers and its listeners: cold (the CLI, `show stat` and the
     /// id fetches read them), so boxed, as every proxy pays for the struct.
     pub ids: Box<ProxyIdInfo>,
@@ -4448,6 +4480,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         srvexp,
         srv: ServerArrays::build(&listen.servers, &listen.server_extras, listen.timeouts.check),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
+        unpublished: SharedFlag::default(),
         stats: Arc::new(vec![ProxyStats::default()]),
         desc: listen.description.as_deref().map(Box::from),
         stats_config: {
@@ -4582,6 +4615,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         srvexp: Vec::new(),
         srv: ServerArrays::default(),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
+        unpublished: SharedFlag::default(),
         stats: Arc::new(vec![ProxyStats::default()]),
         desc: fe.description.as_deref().map(Box::from),
         stats_config: {
@@ -4711,6 +4745,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         srvexp,
         srv: ServerArrays::build(&be.servers, &be.server_extras, be.timeouts.check),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
+        unpublished: SharedFlag::default(),
         stats: Arc::new(vec![ProxyStats::default()]),
         desc: be.description.as_deref().map(Box::from),
         stats_config: {
@@ -9991,8 +10026,13 @@ impl EngineDispatcher<'_> {
             if matches {
                 match proxies.route(proxy, Some(i)) {
                     Routed::Backend(idx) => return Some(idx),
+                    // `force-be-switch` overrides an unpublished target (`be_is_eligible` and
+                    // `lookup_fe_persist_rules`, `src/stream.c`); without it the rule is
+                    // skipped for the next one.
                     Routed::Disabled if forced() => return None,
+                    Routed::Unpublished(idx) if forced() => return Some(idx),
                     Routed::Disabled | Routed::Miss => {}
+                    Routed::Unpublished(_) => {}
                 }
             }
         }
@@ -10001,7 +10041,10 @@ impl EngineDispatcher<'_> {
             match proxies.route(proxy, None) {
                 Routed::Backend(idx) => return Some(idx),
                 Routed::Disabled if forced() => return None,
+                // An unpublished default keeps the request on the frontend, as a missing one.
+                Routed::Unpublished(idx) if forced() => return Some(idx),
                 Routed::Disabled | Routed::Miss => {}
+                Routed::Unpublished(_) => {}
             }
         }
 
@@ -19303,5 +19346,74 @@ fn buf_wait_enter(entry: &mut SessionEntry, session_idx: u32) -> bool {
     } else {
         entry.sess.fail_alloc();
         true
+    }
+}
+
+#[cfg(test)]
+mod unpublished_tests {
+    use super::*;
+
+    const CFG: &str = "defaults\n  mode http\n  timeout connect 1s\n  timeout client 1s\n  timeout server 1s\n\
+                       backend b\n  server s 127.0.0.1:1\n\
+                       backend k\n  server s 127.0.0.1:1\n\
+                       frontend f\n  bind 127.0.0.1:1\n  force-be-switch if TRUE\n  use_backend b\n  default_backend k\n\
+                       frontend g\n  bind 127.0.0.1:1\n  force-be-switch if TRUE\n  default_backend b\n\
+                       frontend h\n  bind 127.0.0.1:1\n  use_backend b\n  default_backend k\n";
+
+    fn load() -> Table {
+        Table::new(
+            Engine::build_shared_state(&alcyon_config::parse_str(CFG).expect("parse"))
+                .expect("build_shared_state")
+                .into_vec(),
+        )
+    }
+
+    fn entry(fe_idx: usize) -> SessionEntry {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        SessionEntry {
+            sess: TcpSession::new(OwnedFd::from(a), Default::default(), 0, Tick::ETERNITY),
+            task: TaskRef::NONE,
+            proxy_idx: fe_idx,
+            backend_idx: fe_idx,
+            srv_backend_idx: fe_idx,
+            target_server_idx: None,
+            cli_raw_fd: -1,
+            srv_raw_fd: None,
+            cli_interest: Interest::NONE,
+            srv_interest: Interest::NONE,
+            actconn_reclaimed: false,
+            stats_done: false,
+            be_counted: Default::default(),
+            connect_log_due: false,
+            rate_max_due: false,
+            srv_served: 0,
+            log_line: None,
+            log_err: false,
+            log_sd: 0,
+            buf_wait: Default::default(),
+            parked: false,
+        }
+    }
+
+    /// `force-be-switch` overrides an unpublished target (`be_is_eligible` and
+    /// `lookup_fe_persist_rules`, `src/stream.c`): a matching persist rule keeps both the
+    /// `use_backend` rule and the `default_backend` pointing at it; without one, a rule
+    /// whose backend `unpublish backend` took out of the switching rules is skipped and
+    /// the evaluation goes on to the next rule, then to the `default_backend`.
+    #[test]
+    fn a_forced_switch_reaches_an_unpublished_backend() {
+        let t = load();
+        let b = t.slot_by_name("b").expect("b");
+        let k = t.slot_by_name("k").expect("k");
+        let f = t.slot_by_name("f").expect("f");
+        let g = t.slot_by_name("g").expect("g");
+        let h = t.slot_by_name("h").expect("h");
+        for (fe, want) in [(f, Some(b)), (g, Some(b)), (h, Some(b))] {
+            assert_eq!(EngineDispatcher::resolve_backend(&entry(fe), &t), want, "published");
+        }
+        t[b].unpublished.set(true);
+        assert_eq!(EngineDispatcher::resolve_backend(&entry(f), &t), Some(b), "force-be-switch overrides an unpublished use_backend");
+        assert_eq!(EngineDispatcher::resolve_backend(&entry(g), &t), Some(b), "and an unpublished default_backend");
+        assert_eq!(EngineDispatcher::resolve_backend(&entry(h), &t), Some(k), "without force the rule is skipped for the default");
     }
 }

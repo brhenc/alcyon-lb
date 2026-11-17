@@ -1102,7 +1102,14 @@ pub(crate) fn write_backend_row(out: &mut String, fmt: StatFormat, proxy: &Proxy
     r.set("eresp", n.eresp);
     r.set("wretr", proxy.counters().retries_count.load(Relaxed));
     r.set("wredis", proxy.counters().redispatches.load(Relaxed));
-    r.set("status", if be_down { "DOWN" } else { "UP" });
+    let status = if be_down { "DOWN" } else { "UP" };
+    r.set("status", status);
+    if proxy.unpublished.get() {
+        // `unpublish backend` took the backend out of the switching rules: `stats-proxy.c`
+        // appends ` (UNPUB)` to its status. The stats dump is the CLI's own path, so it
+        // spells the pair out.
+        r.set("status", &format!("{status} (UNPUB)"));
+    }
     r.set("weight", weight);
     r.set("uweight", weight);
     r.set("act", act);
@@ -1395,6 +1402,7 @@ mod tests {
             cliexp: Vec::new(),
             srvexp: Vec::new(),
             next_server_idx: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            unpublished: crate::engine::SharedFlag::default(),
             stats: std::sync::Arc::new(vec![crate::engine::ProxyStats::default()]),
             stats_config: alcyon_config::StatsConfig::default(),
             desc: None,

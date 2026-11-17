@@ -68,6 +68,9 @@ pub struct Routes {
 pub enum Routed {
     /// The request goes to the backend at this slot.
     Backend(usize),
+    /// The rule names a backend `unpublish backend` took out of the switching rules: the
+    /// rule is skipped, as one naming a backend the configuration disabled.
+    Unpublished(usize),
     /// The rule names a backend the configuration disabled.
     Disabled,
     /// The rule names no backend: the next rule is tried.
@@ -182,18 +185,30 @@ impl Table {
     }
 
     /// What rule `rule` of `fe` (`None`: its `default_backend`) names. The only reader of a
-    /// [`Target`]: `resolve_backend` calls it for every rule it evaluates.
+    /// [`Target`] and of the backend's `unpublished` flag on the request path:
+    /// `resolve_backend` calls it for every rule it evaluates. A rule whose backend
+    /// `unpublish backend` took out of the switching rules is skipped, and the evaluation
+    /// goes on to the next rule, then to the `default_backend`.
     #[must_use]
     pub fn route(&self, fe: &Proxy, rule: Option<usize>) -> Routed {
         let (target, name) = match rule {
             Some(i) => (fe.routes.as_deref().and_then(|r| r.rules.get(i)), fe.use_backends.get(i).map(|u| u.backend.as_str())),
             None => (fe.routes.as_deref().and_then(|r| r.default.as_ref()), fe.default_backend.as_deref()),
         };
+        // The backend of a found slot: published, or unpublished (this function is the flag's
+        // only reader on the request path).
+        let found = |s: usize| -> Routed {
+            if self[s].unpublished.get() {
+                Routed::Unpublished(s)
+            } else {
+                Routed::Backend(s)
+            }
+        };
         match target.copied().unwrap_or(Target::Name) {
-            Target::Slot(s) => Routed::Backend(s as usize),
+            Target::Slot(s) => found(s as usize),
             Target::Disabled => Routed::Disabled,
             Target::Name => match name.and_then(|n| self.slot_by_name(n).map(|s| (s, n))) {
-                Some((s, _)) => Routed::Backend(s),
+                Some((s, _)) => found(s),
                 None => Routed::Miss,
             },
         }
