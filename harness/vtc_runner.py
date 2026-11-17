@@ -1692,13 +1692,6 @@ class MockClientRunner:
                             data_str = data_str[1:-1]
                         pending += decode_escapes(data_str).encode("latin1") * n
 
-                    elif cmd == "send_n":
-                        n = int(args[0])
-                        data_str = " ".join(args[1:])
-                        if data_str.startswith('"') and data_str.endswith('"'):
-                            data_str = data_str[1:-1]
-                        pending += decode_escapes(data_str).encode("latin1") * n
-
                     elif cmd == "sendhex":
                         # `sendhex "300C020101 61 070A01 00 04000400"` is quoted in the
                         # .vtc, and the quotes have to come off before fromhex sees them --
@@ -1718,14 +1711,18 @@ class MockClientRunner:
                             raise AssertionError(f"recv {n_bytes}: connection closed after {len(e.partial)} byte(s)")
 
                     elif cmd == "expect_close":
-                        # vtest: the peer closes (EOF or reset) and sends nothing more.
+                        # vtest: the peer closes (EOF or reset); white space before it is
+                        # passed over (`vct_islws`), any other byte fails.
                         _note_assertion()
-                        try:
-                            extra = await reader.read(1)
-                        except ConnectionResetError:
-                            extra = b""
-                        if extra.strip(b"\r\n"):
-                            raise AssertionError(f"expect_close: read {extra!r} instead of a close")
+                        while True:
+                            try:
+                                extra = await reader.read(1)
+                            except ConnectionResetError:
+                                extra = b""
+                            if not extra:
+                                break
+                            if extra not in (b" ", b"\t", b"\r", b"\n"):
+                                raise AssertionError(f"expect_close: read {extra!r} instead of a close")
 
                     elif cmd == "barrier":
                         if len(args) >= 2 and args[1] == "sync":

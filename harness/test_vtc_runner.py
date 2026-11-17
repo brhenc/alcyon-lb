@@ -311,6 +311,42 @@ class ClientSendCoalescing(unittest.TestCase):
         self.assertEqual(got, b"abcdcdcd")
 
 
+class ExpectClose(unittest.TestCase):
+    """`expect_close` reads until EOF, passing over white space (SP, HT, CR, LF) and failing on
+    any other byte, as vtest's `cmd_http_expect_close` does (T640: one LF before the close)."""
+
+    def _expect_close(self, sent):
+        async def go():
+            async def handle(reader, writer):
+                writer.write(sent)
+                await writer.drain()
+                writer.close()
+
+            srv = await asyncio.start_server(handle, "127.0.0.1", 0)
+            port = srv.sockets[0].getsockname()[1]
+            blk = vtc_runner.ClientBlock("c1", [], [vtc_runner.ActionItem("expect_close", [])], [],
+                                         connect_target=f"127.0.0.1 {port}")
+            runner = vtc_runner.MockClientRunner(blk, vtc_runner.MacroEngine({}), {})
+            runner.start()
+            await asyncio.wait_for(runner.done_event.wait(), 5)
+            srv.close()
+            return runner.error
+
+        return asyncio.run(go())
+
+    def test_a_bare_close_passes(self):
+        self.assertIsNone(self._expect_close(b""))
+
+    def test_white_space_before_the_close_passes(self):
+        self.assertIsNone(self._expect_close(b"\r\n\n \t"))
+
+    def test_data_after_a_line_feed_fails(self):
+        self.assertIsNotNone(self._expect_close(b"\nHTTP/1.1 200 OK\r\n"))
+
+    def test_data_fails(self):
+        self.assertIsNotNone(self._expect_close(b"X"))
+
+
 class HeadersOnly(unittest.TestCase):
     """`rxreqhdrs` / `rxresphdrs` stop after the head: the body is for a later `recv` (T363f,
     http_transfer_encoding.vtc c12 reads 47 bytes of a chunked body and its trailers)."""
