@@ -48,9 +48,9 @@
 # ins/req` (the round with the least total, its own user and kernel). If perf may not count :k (perf_event_paranoid), the kernel lines read `kernel: n/a`,
 # with one warning, and the run goes on. The h3fit mode counts user space only. Takes no lock: hold
 # `flock -x /tmp/alcyon-load.lock` around a batch, and keep a batch under 15 minutes. Needs
-# $ALCYON_TARGETS/gate-slot1/release/measure-bench (ALCYON_TARGETS: ~/.cache/alcyon/targets; MEASURE_BENCH overrides; for an h3 POST one
-# built since T555, which frames a body that arrives in a read of its own), and for h3best,
-# h3worst, h3fit $ALCYON_TARGETS/h3bench/release/h3bench (H3BENCH overrides; built if missing).
+# $ALCYON_TARGETS/gate-slot1/release/measure-bench (ALCYON_TARGETS: ~/.cache/alcyon/targets; built if missing, but
+# missing when named by MEASURE_BENCH is an error, not a build, T639; for an h3 POST one built since T555, which
+# frames a body that arrives in a read of its own), and for h3best, h3worst, h3fit $ALCYON_TARGETS/h3bench/release/h3bench (H3BENCH overrides; built if missing).
 set -u
 if [ $# -ne 7 ]; then sed -n '5,56p' "$0"; exit 2; fi
 LABEL=$1; BIN=$2; BODY=$3; CL=$4; N=$5; ROUNDS=$6; OUT=$7
@@ -66,6 +66,17 @@ case $CL in
         --manifest-path "$(dirname "$0")/h3bench/Cargo.toml" || exit 1
     fi ;;
 esac
+# T639: a missing backend died without a word and the warm-up ab waited forever on a proxy
+# with no server. A binary named by MEASURE_BENCH is not something to build; a missing
+# default is, as h3bench above.
+if [ ! -x "$BENCH" ]; then
+  if [ -n "${MEASURE_BENCH:-}" ]; then
+    echo "insreq.sh: measure-bench not found: $BENCH (set MEASURE_BENCH or build tools/measure/bench)" >&2
+    exit 1
+  fi
+  CARGO_TARGET_DIR=$(dirname "$(dirname "$BENCH")") cargo build -q --release --offline \
+    --manifest-path "$(dirname "$0")/bench/Cargo.toml" || exit 1
+fi
 IFS=, read -r CPU_P CPU_C CPU_B <<< "${ALCYON_MEASURE_CPUS:-4,5,6}"
 port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 FE=$(port); BE=$(port); TP=$(port)
@@ -77,7 +88,11 @@ if grep -q @CRT@ "$BODY" && [ ! -s "$CRT" ]; then
 fi
 sed -e "s/@FE@/$FE/g; s/@BE@/$BE/g; s/@TP@/$TP/g; s#@CRT@#$CRT#g" "$BODY" > "$CFG" || exit 1
 taskset -c "$CPU_B" "$BENCH" backend "$BE" >/dev/null 2>&1 & BEPID=$!
-sleep 0.3
+# T639: wait for the backend's port the way the proxy's is waited for below, so a backend
+# that never listens fails here, not after the warm-up ab has waited forever.
+BEUP=0
+for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/"$BE") 2>/dev/null && { BEUP=1; break; }; sleep 0.1; done
+[ "$BEUP" = 1 ] || { echo "insreq.sh: backend did not start: $BENCH" >&2; kill "$BEPID" 2>/dev/null; exit 1; }
 taskset -c "$CPU_P" "$BIN" -f "$CFG" > "$OUT/$LABEL.proxy.log" 2>&1 & P=$!
 for _ in $(seq 1 50); do (exec 3<>/dev/tcp/127.0.0.1/"$FE") 2>/dev/null && break; sleep 0.1; done
 client() {
