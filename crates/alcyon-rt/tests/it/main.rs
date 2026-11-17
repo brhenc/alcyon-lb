@@ -116,6 +116,7 @@ mod cli_show_quic;
 mod cli_show_sess;
 mod cli_show_stat_end;
 mod cli_show_typed_json;
+mod cli_full_buffer;
 mod cli_unknown_command;
 mod cli_socket_prebind;
 mod client_gone_while_blocked;

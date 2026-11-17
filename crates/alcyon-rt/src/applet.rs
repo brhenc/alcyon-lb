@@ -35,6 +35,10 @@ use std::time::Instant;
 /// 3.5-dev8-885761-29`, 131070 bytes of lines with their LFs pass and 131071 are refused.
 const CLI_MAX_PAYLOAD: usize = 131_070;
 
+/// The refusal of a command line of more than one buffer (`tune.bufsize`), feed included,
+/// byte-exact against `HAProxy 3.5-dev11` (reg-tests/cli/cmdline_full_buffer.vtc, T617).
+const CMDLINE_TOO_BIG: &[u8] = b"The command line is too big for the buffer size. Please change 'tune.bufsize' in the configuration to use a bigger command.\n";
+
 /// Runtime context passed to CLI applet command handlers.
 pub struct AppletContext<'a> {
     pub proxies: &'a mut crate::engine::Proxies,
@@ -346,10 +350,10 @@ impl CliApplet {
                             break;
                         }
                     } else if tail >= crate::buf::get_bufsize() {
+                        // A partial line that already fills the buffer will never finish:
+                        // refuse it now, before more data arrives.
                         self.in_buf.clear();
-                        self.out_buf.extend_from_slice(
-                            b"The command line is too big for the buffer size. Please change 'tune.bufsize' in the configuration to use a bigger command.\n",
-                        );
+                        self.out_buf.extend_from_slice(CMDLINE_TOO_BIG);
                         self.is_done = true;
                         break;
                     }
@@ -441,6 +445,15 @@ impl CliApplet {
                     }
                     continue;
                 }
+            } else if newline_pos + 1 > crate::buf::get_bufsize() {
+                // A line of more than the buffer, feed included, is refused whole and the
+                // connection closed. A line of exactly the buffer size, feed included,
+                // filled the chunk it was copied into and its last command used to go
+                // unseen (T617); it must run in full.
+                self.in_buf.clear();
+                self.out_buf.extend_from_slice(CMDLINE_TOO_BIG);
+                self.is_done = true;
+                return;
             } else {
                 self.execute_line(line, ctx);
                 if self.pending.is_some() {
@@ -481,6 +494,45 @@ impl CliApplet {
             b"The payload is too big. Please change 'tune.cli.max-payload-size' in the configuration to use a bigger payload.\n",
         );
         self.is_done = true;
+    }
+
+    /// The support list of `set rate-limit`, byte-exact against the oracle
+    /// (`cli_parse_set_ratelimit`, src/cli.c). No final line feed: `finish_msg` terminates.
+    const RATE_LIMIT_ONLY_SUPPORTS: &str = "'set rate-limit' only supports :\n   - 'connections global' to set the per-process maximum connection rate\n   - 'sessions global' to set the per-process maximum session rate\n   - 'ssl-sessions global' to set the per-process maximum SSL session rate\n   - 'http-compression global' to set the per-process maximum compression speed in kB/s";
+
+    /// `set rate-limit <setting> <value>` (src/cli.c). Admin-only, enforced by the dispatch
+    /// (`CliLevel::required_for` defaults it to admin), which answers `Permission denied`
+    /// below admin -- the byte-exact reply the oracle (3.5-dev11) sends from a user or
+    /// operator socket -- so this handler only ever runs at admin level.
+    fn handle_set_rate_limit(&mut self, cmd: &str) {
+        // `args[0]` is `set`, `args[1]` is `rate-limit` (src/cli.c).
+        let w = cli_words(cmd);
+        let (Some(setting), Some(target)) = (w.get(2).map(String::as_str), w.get(3).map(String::as_str)) else {
+            return self.finish_msg(Self::RATE_LIMIT_ONLY_SUPPORTS);
+        };
+        if target != "global" || !matches!(setting, "connections" | "sessions" | "ssl-sessions" | "http-compression") {
+            return self.finish_msg(Self::RATE_LIMIT_ONLY_SUPPORTS);
+        }
+        let Some(v_str) = w.get(4) else {
+            return self.finish_msg("Expects an integer value.");
+        };
+        // C's `atoi` returns an `int`: a digit string whose value wraps negative in 32 bits
+        // is refused, measured (setting `2147483648` leaves the previous value).
+        let v = atoi(v_str) as i32;
+        if v < 0 {
+            return self.finish_msg("Value out of range.");
+        }
+        let v = u32::try_from(v).expect("non-negative i32");
+        if setting == "connections" {
+            crate::ratelimit::set_conns(v);
+        } else if setting == "sessions" {
+            crate::ratelimit::set_sess(v);
+        } else if setting == "ssl-sessions" {
+            crate::ratelimit::set_ssl(v);
+        } else {
+            crate::ratelimit::set_comp_kbs(v);
+        }
+        self.finish_msg("");
     }
 
     fn execute_line(&mut self, line: &str, ctx: &mut AppletContext) {
@@ -823,6 +875,8 @@ impl CliApplet {
             self.handle_set_var(&cli_words(target).join(" "));
         } else if cmd == "help" {
             self.handle_help();
+        } else if cmd == "set rate-limit" || cmd.starts_with("set rate-limit ") {
+            self.handle_set_rate_limit(cmd);
         } else if Self::is_patref_command(cmd) {
             if cmd.ends_with(" <<") && cmd.starts_with("add map ") {
                 self.payload = Some((cmd.trim_end_matches('<').trim_end().to_string(), String::new()));
