@@ -356,3 +356,38 @@ fn runtime_maxconn_and_weight_reach_the_fallback_selections() {
         }
     }
 }
+
+/// A server at its `maxconn` when a worker builds the hash snapshot (T633) must not be left
+/// out of the `balance uri` map once it has room again: saturation moves no generation, so a
+/// map built without the full server would keep it out for every worker until the next state
+/// change. The map holds the UP servers with a weight; the pick walks past a full one.
+#[test]
+fn a_server_full_at_the_snapshot_build_gets_its_keys_back_when_it_has_room() {
+    let cfg = "
+backend test_be
+    mode http
+    balance uri
+    server s1 127.0.0.1:8001 maxconn 1
+    server s2 127.0.0.1:8002 maxconn 1
+    server s3 127.0.0.1:8003 maxconn 1
+    server s4 127.0.0.1:8004 maxconn 1
+";
+    let uris: Vec<String> = (0..64).map(|i| format!("/p{i}")).collect();
+    let clean = get_proxy(cfg);
+    let clean_px = &clean.proxies[0];
+    all_up(clean_px);
+    let mut clean_cache = lb::LbSnapCache::new();
+    let want: Vec<_> = uris.iter().map(|u| clean_px.select_server_with_key(None, Some(u), &mut clean_cache).unwrap()).collect();
+    assert!(want.contains(&clean_px.srv_set().addr_at(1)), "some of the URIs hash to s2");
+
+    let eng = get_proxy(cfg);
+    let proxy = &eng.proxies[0];
+    all_up(proxy);
+    let mut cache = lb::LbSnapCache::new();
+    // s2 is full when this worker's first pick builds the snapshot.
+    proxy.srv_set().actconn_cell(1).expect("actconn").store(1, Ordering::Relaxed);
+    let _ = proxy.select_server_with_key(None, Some("/build"), &mut cache);
+    proxy.srv_set().actconn_cell(1).expect("actconn").store(0, Ordering::Relaxed);
+    let got: Vec<_> = uris.iter().map(|u| proxy.select_server_with_key(None, Some(u), &mut cache).unwrap()).collect();
+    assert_eq!(got, want, "with room again, s2 takes its own keys back");
+}

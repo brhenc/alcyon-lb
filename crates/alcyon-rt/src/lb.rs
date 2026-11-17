@@ -1134,8 +1134,11 @@ impl ChashRing {
         let mut pub_ = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if pub_.snap.is_none() || pub_.generation != gen {
             count_hash_pick_scan();
+            // By state and weight only: a server at its `maxconn`, or the one this worker's
+            // redispatch avoids, moves no generation, so leaving it out here would keep it out
+            // of every worker's map until the next state change. The pick walks past it.
             let in_map = |idx: usize| -> u32 {
-                if proxy.srv_set().backup_at(idx) || !is_selectable(proxy, idx) {
+                if proxy.srv_set().backup_at(idx) || !is_server_up(proxy, idx) || proxy.srv_set().weight_at(idx).unwrap_or(1) == 0 {
                     0
                 } else {
                     proxy.srv_set().weight_at(idx).unwrap_or(1)
