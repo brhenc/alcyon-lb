@@ -60,8 +60,13 @@ fn server_check_state_stays_small() {
 /// T599 added 8: `rare_armed`, the one bit that keeps the rare per-run checks (timeouts, drain,
 /// soft stop) off a pass; the bools before it filled their word. A box would be 8 and an
 /// allocation.
+/// The client-gone body-wait flag added 8: `HttpTxn::wait_client_gone`, the one byte a
+/// request's `wait-for-body` leaves behind when the client is gone before the body is, read
+/// at routing in place of the log's `CR` (which was control state, not a record). It took a
+/// new word: the one-byte holes of `HttpTxn` are the `Option`s' niches. A box would be 8 as
+/// well and an allocation per request.
 #[test]
 fn session_entry_stays_small() {
     let n = size_of::<alcyon_rt::engine::SessionEntry>();
-    assert!(n <= 1664, "SessionEntry grew to {n} bytes (bound 1664): one is held per client connection, box the new field");
+    assert!(n <= 1672, "SessionEntry grew to {n} bytes (bound 1672): one is held per client connection, box the new field");
 }
