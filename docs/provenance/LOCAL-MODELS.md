@@ -32,7 +32,7 @@ How the code came in:
 | Gemini 4 Hydrogen (xhigh), via Antigravity | 1 | 337 | 337 |
 | Qwen3.8-Flash-Next | 1 | 201 | 194 |
 | gemini-4-hydrogen-medium | 2 | 169 | 91 |
-| Qwen3.8-27B | 7 | 1203 | 1174 |
+| Qwen3.8-27B | 8 | 1384 | 1355 |
 
 ## Commits
 
@@ -88,6 +88,7 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-16 | T632 | gemini-4-hydrogen-medium | `f14870b983` | 90 | 48 | `crates/alcyon-rt/src/engine.rs` +36/0<br>`crates/alcyon-rt/src/rule_compiled.rs` +18/14<br>`crates/alcyon-rt/tests/request_allocations.rs` +36/34 | unmodified model output |
 | 2026-11-17 | BADCHUNK | Qwen3.8-27B | `c0337e4598` | 77 | 54 | `crates/alcyon-rt/src/proxy.rs` +6/6<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +71/48 | unmodified model output |
 | 2026-11-17 | BODYWAITFLAG | Qwen3.8-27B | `ee6b31a750` | 24 | 23 | `crates/alcyon-rt/src/engine.rs` +13/13<br>`crates/alcyon-rt/src/txn.rs` +5/5<br>`crates/alcyon-rt/tests/it/struct_sizes.rs` +6/5 | unmodified model output |
+| 2026-11-17 | CONNECTTGT | Qwen3.8-27B | `64f10ac83d` | 181 | 181 | `crates/alcyon-proto/src/authority.rs` +9/9<br>`crates/alcyon-rt/tests/it/connect_target_validation.rs` +171/171<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-17 | EARLYCLOSE | Qwen3.8-27B | `2b158a5633` | 183 | 182 | `crates/alcyon-rt/src/engine.rs` +29/29<br>`crates/alcyon-rt/src/proxy.rs` +47/46<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +107/107 | unmodified model output |
 | 2026-11-17 | ERR408ORDER | Qwen3.8-27B | `af24fa14a2` | 246 | 246 | `crates/alcyon-rt/src/engine.rs` +27/27<br>`crates/alcyon-rt/tests/it/builtin_error_wire.rs` +218/218<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-17 | INSREQBENCH | Qwen3.8-27B | `c20f5ee876` | 120 | 120 | `tools/measure/insreq.sh` +19/19<br>`tools/measure/test_measure.py` +101/101 | unmodified model output |
