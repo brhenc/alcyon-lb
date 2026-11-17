@@ -30,9 +30,10 @@ How the code came in:
 | Gemini 4 Hydrogen (high), via Antigravity | 1 | 156 | 156 |
 | Gemini 4 Argon (high), via Antigravity | 1 | 216 | 208 |
 | Gemini 4 Hydrogen (xhigh), via Antigravity | 1 | 337 | 323 |
+| qwen3.8-flash-next | 1 | 569 | 235 |
 | Qwen3.8-Flash-Next | 1 | 201 | 194 |
 | Gemini 4 Hydrogen (medium), via Antigravity | 3 | 219 | 133 |
-| Qwen3.8-27B | 12 | 3300 | 3262 |
+| Qwen3.8-27B | 13 | 3550 | 3483 |
 
 ## Commits
 
@@ -83,6 +84,7 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-15 | BALPARSE | Gemini 4 Hydrogen (high), via Antigravity | `09dee6b203` | 156 | 156 | `crates/alcyon-config/src/parser/mod.rs` +2/2<br>`crates/alcyon-config/src/parser/server.rs` +94/94<br>`crates/alcyon-config/tests/it/balance_options.rs` +60/60 | unmodified model output |
 | 2026-11-15 | BALSOURCE | Gemini 4 Argon (high), via Antigravity | `0bfb1d2ff0` | 216 | 208 | `crates/alcyon-rt/src/engine.rs` +2/1<br>`crates/alcyon-rt/src/lb.rs` +35/28<br>`crates/alcyon-rt/tests/it/balance_source_map.rs` +178/178<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-15 | H2URI | Gemini 4 Hydrogen (xhigh), via Antigravity | `1cd3399122` | 337 | 323 | `crates/alcyon-proto/src/authority.rs` +16/16<br>`crates/alcyon-proto/src/h2.rs` +5/5<br>`crates/alcyon-proto/src/mux_h2.rs` +3/3<br>`crates/alcyon-rt/src/engine.rs` +18/9<br>`crates/alcyon-rt/src/h2_bridge.rs` +6/6<br>`crates/alcyon-rt/src/lb.rs` +89/84<br>`crates/alcyon-rt/src/proxy.rs` +20/20<br>`crates/alcyon-rt/tests/it/balance_uri_map.rs` +180/180 | unmodified model output |
+| 2026-11-16 | DELBE | qwen3.8-flash-next | `4397540f91` | 569 | 235 | `crates/alcyon-rt/src/applet.rs` +105/19<br>`crates/alcyon-rt/src/engine.rs` +70/0<br>`crates/alcyon-rt/src/stats.rs` +13/0<br>`crates/alcyon-rt/tests/it/cli_unpublish_del_backend.rs` +380/215<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-16 | REQBUF | Qwen3.8-Flash-Next | `7c6190bed5` | 201 | 194 | `crates/alcyon-rt/src/engine.rs` +31/24<br>`crates/alcyon-rt/tests/it/chunked_body_abort.rs` +169/169<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-16 | T632 | Gemini 4 Hydrogen (medium), via Antigravity | `b754147a59` | 79 | 43 | `crates/alcyon-rt/src/engine.rs` +16/16<br>`crates/alcyon-rt/src/rule_compiled.rs` +22/22<br>`crates/alcyon-rt/tests/request_allocations.rs` +41/5 | unmodified model output |
 | 2026-11-16 | T632 | Gemini 4 Hydrogen (medium), via Antigravity | `f14870b983` | 90 | 48 | `crates/alcyon-rt/src/engine.rs` +36/0<br>`crates/alcyon-rt/src/rule_compiled.rs` +18/14<br>`crates/alcyon-rt/tests/request_allocations.rs` +36/34 | unmodified model output |
@@ -99,3 +101,4 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-17 | LBSNAP | Qwen3.8-27B | `d3084c2234` | 772 | 765 | `crates/alcyon-rt/src/buf.rs` +1/1<br>`crates/alcyon-rt/src/engine.rs` +65/61<br>`crates/alcyon-rt/src/lb.rs` +279/278<br>`crates/alcyon-rt/src/server_state.rs` +2/2<br>`crates/alcyon-rt/src/srv_set.rs` +1/1<br>`crates/alcyon-rt/src/track.rs` +3/3<br>`crates/alcyon-rt/tests/it/balance_uri_map.rs` +106/106<br>`crates/alcyon-rt/tests/it/hash_pick_concurrency.rs` +158/156<br>`crates/alcyon-rt/tests/it/lb_chash.rs` +63/63<br>`crates/alcyon-rt/tests/it/load_balancing.rs` +25/25<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/stream_object.rs` +4/4<br>`crates/alcyon-rt/tests/request_allocations.rs` +31/31<br>`tools/measure/scenarios/balance_uri.body` +16/16<br>`tools/measure/scenarios/balance_uri_chash.body` +17/17 | unmodified model output |
 | 2026-11-17 | T640 | Gemini 4 Hydrogen (medium), via Antigravity | `cd618b51ee` | 50 | 42 | `harness/test_vtc_runner.py` +6/6<br>`harness/vtc_runner.py` +44/36 | unmodified model output |
 | 2026-11-17 | UNBUFABORT | Qwen3.8-27B | `a2b1111bba` | 300 | 296 | `crates/alcyon-rt/src/engine.rs` +49/49<br>`crates/alcyon-rt/src/txn.rs` +10/10<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +241/237 | unmodified model output |
+| 2026-11-17 | UNPUBLISH | Qwen3.8-27B | `6d22e64553` | 250 | 221 | `crates/alcyon-rt/src/applet.rs` +31/2<br>`crates/alcyon-rt/src/engine.rs` +113/113<br>`crates/alcyon-rt/src/stats.rs` +9/9<br>`crates/alcyon-rt/src/table.rs` +18/18<br>`crates/alcyon-rt/tests/it/cli_unpublish_del_backend.rs` +79/79 | unmodified model output |
