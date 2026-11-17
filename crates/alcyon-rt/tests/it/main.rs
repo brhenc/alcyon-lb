@@ -406,6 +406,7 @@ mod server_tls;
 mod server_track;
 mod session_errors;
 mod set_dst_port_retries;
+mod set_method_head_resp;
 mod set_src_dst;
 mod set_status_reason;
 mod silent_drop_ttl;

@@ -12195,7 +12195,7 @@ impl EngineDispatcher<'_> {
             (Some(_), Some(f)) => Some(f),
             _ => crate::txn::HeadFacts::scan(&entry.sess.rep.readable()[..total_hdr_len], false),
         };
-        let (status, framing, srv_has_close, srv_http11) = {
+        let (status, mut framing, srv_has_close, srv_http11) = {
             let raw = &entry.sess.rep.readable()[..total_hdr_len];
             let method = entry.sess.req_method.as_deref();
             if let Some(f) = rsp_facts {
@@ -12274,6 +12274,9 @@ impl EngineDispatcher<'_> {
         } else {
             h2_htx_overcount(&entry.sess.rep.readable()[..total_hdr_len])
         };
+        // Read before the `txn` borrow below: the client's protocol is the one the `Connection`
+        // (and, for the `set-method HEAD` corner, the body completion) is decided for.
+        let cli_is_h2 = entry.sess.is_h2_child();
         let Some(txn) = entry.sess.strm.txn.as_mut() else {
             return;
         };
@@ -12353,6 +12356,56 @@ impl EngineDispatcher<'_> {
             txn.rsp_dechunk = Some(Box::new(crate::txn::Chunk::START));
             txn.close_after = true;
             txn.close_opt = false;
+        }
+        // The HEAD the rules left for the server, against a client that asked for a body:
+        // `client_head` is the client's own method, read before the rules ran. The server's
+        // answer is the head alone, yet the head still promises the body its fields
+        // describe, and the client would wait for it forever (reg-test
+        // `http-messaging/h1_set_method_head_resp.vtc`). `HAProxy` settles it at the client
+        // (`h1_make_headers`): a `Content-Length` body is closed, announced with
+        // `Connection: close`; a `Transfer-Encoding: chunked` body, and for an HTTP/1.1
+        // client a body promised until the close, is completed by the empty chunked body
+        // behind the head, and the connection is kept; for a sub-1.1 or an HTTP/2 client
+        // the body cannot be completed and the connection closes behind the head.
+        if framing == crate::txn::Framing::None
+            && status >= 200
+            && status != 204
+            && status != 304
+            && !txn.client_head
+        {
+            // What the client's own method (a `GET`: its body framing is the head's fields
+            // alone, whatever it was) expects of this head.
+            let client_framing = rsp_facts
+                .map_or(crate::txn::Framing::None, |f| f.response_framing(Some("GET"), status).unwrap_or(crate::txn::Framing::None));
+            if matches!(client_framing, crate::txn::Framing::None | crate::txn::Framing::Length(0)) {
+                // The head promises the client no body: it gets exactly what it asked for.
+            } else {
+                // The body the head promises cannot come: close behind the head, and say so
+                // with the `Connection` the head goes out with (`client_close` below writes
+                // it), or end there for a client that reads until the close (the
+                // `Transfer-Encoding` the sub-1.1 rule takes off the head goes with it).
+                let was_closed = txn.close_after;
+                let was_opt = txn.close_opt;
+                txn.close_after = true;
+                txn.close_opt = false;
+                // ...unless an HTTP/1.1 client (an HTTP/2 client streams the head as its
+                // whole answer: it takes the close) expects a chunked or until-close body
+                // and the head alone sits in the buffer: complete the empty body the head
+                // promises with its last chunk behind the head, and leave the connection's
+                // fate as decided before (a client `Connection: close` still closes).
+                if txn.req_http11
+                    && !cli_is_h2
+                    && matches!(client_framing, crate::txn::Framing::Chunked | crate::txn::Framing::UntilClose)
+                    && entry.sess.rep.len() == total_hdr_len
+                    && (client_framing != crate::txn::Framing::UntilClose
+                        || entry.sess.rep.insert_last_header(b"transfer-encoding: chunked\r\n"))
+                    && entry.sess.rep.put(b"0\r\n\r\n")
+                {
+                    txn.close_after = was_closed;
+                    txn.close_opt = was_opt;
+                    framing = crate::txn::Framing::Chunked;
+                }
+            }
         }
         let client_close = txn.close_after;
         let req_http11 = txn.req_http11;
