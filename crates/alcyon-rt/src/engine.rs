@@ -14702,10 +14702,14 @@ impl EngineDispatcher<'_> {
                                 // it does not fail the request there. The analysis therefore
                                 // goes on: the request is routed, which is what names the
                                 // backend in the log, and the aborted client then ends the
-                                // stream before a server is picked: the `CR` is what that
-                                // routing test reads, and is the only source of a bare `CR`
-                                // this early (`HAProxy`'s `SC_FL_EOS`/`SC_ABRT`, which its log
-                                // turns into the `C` of `CR--`).
+                                // stream before a server is picked. The wait records that on
+                                // the transaction, where the routing test reads it; `CR` is
+                                // written for the log line alone (`HAProxy`'s
+                                // `SC_FL_EOS`/`SC_ABRT`, which its log turns into the `C` of
+                                // `CR--`).
+                                if let Some(t) = sess.strm.txn.as_mut() {
+                                    t.wait_client_gone = true;
+                                }
                                 sess.strm.log.term.get_or_insert(*b"CR");
                             }
                             BodyWait::Malformed => return Err(400),
@@ -14978,9 +14982,11 @@ impl EngineDispatcher<'_> {
         // backend on its way past the switching rules and then the aborted client ends the
         // stream, so no server is picked or connected and nothing is written back to a client
         // that has gone (`http_wait_for_msg_body` leaves the wait on `SC_FL_EOS`/`SC_FL_ERROR`,
-        // and the request never reaches the server). Measured on the reference for a chunked
-        // body abandoned after `0\r\n`: `fe be/<NOSRV> 0/-1/-1/-1/0 400 0 - - CR--`, no bytes.
-        if entry.sess.strm.log.term == Some(*b"CR") {
+        // and the request never reaches the server). The wait's own `ClientGone` recorded it
+        // on the transaction (`wait_client_gone`, alongside the `CR` it wrote for the log);
+        // that flag, not the log, decides here. Measured on the reference for a chunked body
+        // abandoned after `0\r\n`: `fe be/<NOSRV> 0/-1/-1/-1/0 400 0 - - CR--`, no bytes.
+        if entry.sess.strm.txn.as_ref().is_some_and(|t| t.wait_client_gone) {
             entry.sess.strm.log.status = Some(400);
             if let Some(txn) = entry.sess.strm.txn.as_mut() {
                 txn.close_after = true;

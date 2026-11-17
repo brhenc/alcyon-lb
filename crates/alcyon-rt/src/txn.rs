@@ -2296,6 +2296,10 @@ pub struct HttpTxn {
     pub rsp_dechunk: Option<Box<Chunk>>,
     /// `http-request disable-l7-retry` ran for this request (`TX_D_L7_RETRY`).
     pub l7_off: bool,
+    /// The request's body wait ended with the client gone (`http_wait_for_msg_body` left the
+    /// wait on `SC_FL_EOS`/`SC_FL_ERROR`): the rules went on and named the backend, and the
+    /// stream is ended before a server is picked.
+    pub wait_client_gone: bool,
     /// A retry on the server's answer (`retry-on <status>`): the request as it was sent.
     pub l7: L7Retry,
 }
@@ -2435,6 +2439,7 @@ impl HttpTxn {
             req_len_long: false,
             rsp_dechunk: None,
             l7_off: false,
+            wait_client_gone: false,
             l7: L7Retry::Off,
         }
     }
