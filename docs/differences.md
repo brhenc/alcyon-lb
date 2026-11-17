@@ -373,10 +373,10 @@ HAProxy 3.5-dev11 refuses an absolute `http://` / `https://` target with an empt
 (`CONNECT :443`) and `Content-Length` lines that differ (a 400 answer now; dev8 closed with
 nothing written). Alcyon refuses all three the same way, with the same bytes and log line
 (`<BADREQ>`, `PR--`), and adds the `Host` header HAProxy adds to an absolute-form or CONNECT
-request that has none. What differs: HAProxy's `http-hardening` section and the
-`accept-unsafe-violations-in-http-request` family can let an operator accept `empty-authority-host`;
-Alcyon has no such setting for it (`accept-unsafe-violations-in-http-request` accepts only what
-it did on dev8), so an empty host is always a 400. Pinned in
+request that has none. As on dev11, `option accept-unsafe-violations-in-http-request` lets the empty host through (forwarded as
+received). What differs: dev11's `http-hardening` setting and its per-violation list
+(`empty-authority-host` and the rest) do not exist in Alcyon, so there is no way to accept the
+empty host alone. Pinned in
 `crates/alcyon-rt/tests/it/h1_authority.rs` and `content_length_early_reject.rs`.
 
 ## `http-request normalize-uri` (T358, T359)

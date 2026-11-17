@@ -227,6 +227,20 @@ fn an_authority_that_disagrees_with_host_is_refused() {
     );
 }
 
+/// `option accept-unsafe-violations-in-http-request` accepts an empty host as dev11 does
+/// (`empty-authority-host`): forwarded as received, and no `Host` is made from an empty host.
+#[test]
+fn accept_unsafe_violations_lets_an_empty_host_through() {
+    let wrong = run_with(
+        &[
+            ok("u1", "GET", "http:///x", &[], "GET http:///x HTTP/1.1", &[]),
+            ok("u2", "CONNECT", ":443", &[":443"], "CONNECT :443 HTTP/1.1", &[":443"]),
+        ],
+        "  option accept-unsafe-violations-in-http-request\n",
+    );
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// An absolute `http://` or `https://` target with an empty host is refused whatever the
 /// port, userinfo or `Host` (HAProxy 3.5-dev11, `4aa4c3d27`; dev8 let it through, the c32-c35
 /// of the vtc were 200 then). `reg-tests/http-messaging/h1_absolute_uri_empty_host.vtc` c1-c3
