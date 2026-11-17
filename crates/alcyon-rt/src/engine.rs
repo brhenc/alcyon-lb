@@ -10643,6 +10643,15 @@ impl EngineDispatcher<'_> {
         {
             let fe = &proxies[entry.proxy_idx];
             let mut page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
+            // The request is an HTX message here (its head was accepted and the wait holds
+            // it), so the built-in 408 goes out in the form `HAProxy` builds for HTX replies:
+            // `connection: close` last, after `content-type` (measured on 3.5-dev8), not the
+            // raw page text the pre-parse errors send. `errorfile` and `http-error` are not
+            // parsed, so the page is the built-in one; the comparison keeps an operator page
+            // unaltered should one ever be parsed.
+            if builtin_error_page(408).is_some_and(|b| page.as_slice() == b) {
+                builtin_page_htx_form(&mut page);
+            }
             rewrite_header_names(&mut page, client_case_table(fe));
             entry.sess.send_before_close(&page);
             entry.sess.strm.log.status = Some(408);
@@ -18362,6 +18371,23 @@ fn client_case_table(fe: &Proxy) -> Option<&std::collections::HashMap<String, St
     (fe.h1_adjust & alcyon_config::H1_ADJ_CLIENT != 0).then_some(&*fe.h1_case)
 }
 
+/// The head of the built-in 400 and 408 pages in the form `HAProxy` sends them once the
+/// request is an HTX message -- a reply to an accepted head, the 408 of a body that does not
+/// come in time -- rather than in the form of the raw page text (`http_err_msgs`) the
+/// pre-parse errors send: `HAProxy` builds that reply from the page's body and adds its
+/// `connection: close` after its other headers, so the header stands last in the head there,
+/// not before `content-type` where the page's text keeps it. Rewrites the head of `buf` in
+/// place, with the names the page keeps them in (the caller lower-cases them after): no line
+/// moves except that one, and the body is not touched. A page without the header -- every
+/// other status, an `errorfile` -- is left alone, so the caller guards on the built-in page.
+fn builtin_page_htx_form(buf: &mut Vec<u8>) {
+    const CLOSE: &[u8] = b"Connection: close\r\n";
+    let Some(at) = buf.windows(CLOSE.len()).position(|w| w == CLOSE) else { return };
+    buf.drain(at..at + CLOSE.len());
+    let h = crate::proxy::find_eoh(buf).map_or(buf.len(), |(h, _)| h);
+    buf.splice(h..h, b"\r\nConnection: close".iter().copied());
+}
+
 /// The reply the proxy generates as `HAProxy` sends it: header names in lower case, and the
 /// built-in 400 and 408 pages with `connection: close` after their other headers (a page
 /// from `errorfile` keeps the order of its file; the request-parsing path has its own).
@@ -18370,14 +18396,7 @@ fn htx_reply_into(raw: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(raw);
     let status = crate::txn::status_of(&String::from_utf8_lossy(&raw[..crate::proxy::find_eoh(raw).map_or(raw.len(), |(h, _)| h)]));
     if matches!(status, 400 | 408) && builtin_error_page(status) == Some(raw) {
-        const CLOSE: &[u8] = b"Connection: close\r\n";
-        // The built-in page has the header; the position is always there.
-        let at = out.windows(CLOSE.len()).position(|w| w == CLOSE);
-        at.into_iter().for_each(|i| {
-            out.drain(i..i + CLOSE.len());
-            let h = crate::proxy::find_eoh(&out).map_or(out.len(), |(h, _)| h);
-            out.splice(h..h, b"\r\nConnection: close".iter().copied());
-        });
+        builtin_page_htx_form(out);
     }
     lowercase_header_names(out);
 }
