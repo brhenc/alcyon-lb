@@ -462,6 +462,7 @@ mod stick_table_bounds;
 mod stick_untrack;
 mod track_rule_order;
 mod cli_clear_table;
+mod cli_unpublish_del_backend;
 mod cli_set_server_name;
 mod str_to_int_cast;
 mod stream_timeouts;
