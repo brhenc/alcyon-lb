@@ -19,6 +19,8 @@ and it is the standard for code that must not misparse.
 **What Rust has.** rustc had `-Zcoverage-options=mcdc` (built on LLVM's MC/DC support) on
 nightly until 2025-08-08; it was removed after that (`tasks/T311-rustc-mcdc-coverage.md`). LLVM
 still has it.
+Still absent in 1.100.0 and on nightly as of 2026-11-17: `-Zcoverage-options` offers `block`,
+`branch` and `condition` (condition coverage, not MC/DC); the tracking issue is rust-lang/rust#124144.
 
 **Evidence.** Measured once with the last nightly that had it (T311, 2026-10-11): 3,367
 conditions in the workspace, 64.42% covered; `h1.rs` 75.21%, `mux_h1.rs` 34.04%, `mux_h2.rs`
@@ -40,6 +42,12 @@ dependency (rustls, ring, the HTTP/2 decoder) reports a failure.
 **Evidence.** `tradeoff.md` 6.23 and 3.4: Alcyon made its own sites fallible (buffers,
 sessions, the arena, the timer tree, the idle lists; T445, T465, T465b), and each of those fails
 one stream as HAProxy does. Every other allocation still aborts.
+
+**Rust 1.100.0 (2026-11-12)** stabilised the `Allocator` trait (`Global`, `System`, and the
+`*_in` constructors of `Box` and `Vec`; rust-lang/rust#156882). That is half of the candidate below:
+an `alcyon_alloc::Pool` can now be the allocator of a `Box` or `Vec` on stable. The fallible
+constructors (`Box::try_new`, `Vec::try_with_capacity`) and `oom=panic` are still unstable, so an
+infallible allocation still aborts. Alcyon builds with 1.99.1 today.
 
 **Candidate.** Stable fallible allocation on `Box`, `Rc`/`Arc` and the collections
 (`try_new`, `try_with_capacity`), a stable allocator parameter, and a stable recoverable OOM
