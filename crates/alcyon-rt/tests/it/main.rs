@@ -90,6 +90,7 @@ mod check_columns_workers;
 mod check_stats_columns;
 mod check_status_word;
 mod check_verdicts;
+mod clear_counters_server;
 mod chunk_extensions;
 mod head_facts;
 mod host_authority_sync;

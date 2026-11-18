@@ -2339,7 +2339,7 @@ impl CliApplet {
                       shutdown sessions server <backend>/<server>: Terminate active sessions on server\n\
                       shutdown sessions backend <backend>        : Terminate active sessions on backend\n\
                       shutdown session [id]                   : kill a specific session\n\
-                      clear counters [all|<backend>]             : Clear accumulated statistics counters\n\
+                      clear counters [all|server <bk>/<sv> [force]]: Clear accumulated statistics counters (all, or one server's)\n\
                       enable health <backend>/<server>           : Resume active health check\n\
                       disable health <backend>/<server>          : Pause active health check\n\
                       enable server <backend>/<server>           : Resume traffic to server\n\

@@ -8751,9 +8751,18 @@ fn clear_one(p: &Proxy) {
     p.srv_set().retr_clear();
 }
 
-/// `clear counters server`: the counters of server `idx` of `p`, and no other.
+/// `clear counters server`: the counters of server `idx` of `p`, and no other (the proxy's
+/// own and the other servers' are kept: `counters_be_reset` and
+/// `srv_stats_clear_extra_counters` in `HAProxy`).
 pub fn clear_server_counters(p: &Proxy, idx: usize) {
     p.srv_set().retr_remove(idx);
+    if let Some(c) = p.ids.tc.get() {
+        c.srv.get(idx).map(crate::statcnt::TxnCounters::clear);
+    }
+    // The per-thread rows: each owner zeroes its own (T582), the readers count it as zero.
+    if let Some(t) = p.ids.rows.as_deref() {
+        t.clear_row(p.id as usize, crate::statcnt::SRV + idx);
+    }
 }
 
 /// `clear counters` without `all`: the maxima of every proxy, nothing else.

@@ -438,7 +438,12 @@ pub struct CounterTable {
     /// value reads as zero (or as no maxima), and its owner zeroes them before it next
     /// writes: no thread writes another's slab.
     epochs: Box<[AtomicU64]>,
-    /// Bumped after any of [`Self::epochs`]: an owner looks at the proxies' only when it moved.
+    /// Per slab row, bumped by `clear counters server`: that one row alone reads as zero (or
+    /// as no maxima) in every slab until its owner zeroes its copy; the proxies' [`Self::epochs`]
+    /// stay, the other rows do.
+    row_epochs: Box<[AtomicU64]>,
+    /// Bumped after any of [`Self::epochs`] or [`Self::row_epochs`]: an owner looks at the
+    /// proxies' only when it moved.
     cleared: AtomicU64,
     slabs: Box<[std::sync::OnceLock<Slab>]>,
 }
@@ -457,9 +462,11 @@ impl CounterTable {
             spans.push((at, n));
             at = at.saturating_add(n);
         }
+        let n_rows = spans.last().map_or(2, |&(b, n)| (b + n) as usize + 1);
         CounterTable {
             spans: spans.into_boxed_slice(),
             epochs: proxies.iter().map(|_| AtomicU64::new(0)).collect(),
+            row_epochs: (0..n_rows).map(|_| AtomicU64::new(0)).collect(),
             cleared: AtomicU64::new(0),
             slabs: (0..threads.max(1)).map(|_| std::sync::OnceLock::new()).collect(),
         }
@@ -496,7 +503,11 @@ impl CounterTable {
         let n = self.slab_rows();
         let mut rows = Vec::new();
         let mut seen = Vec::new();
-        if rows.try_reserve_exact(n).is_err() || seen.try_reserve_exact(self.epochs.len()).is_err() {
+        let mut row_seen = Vec::new();
+        if rows.try_reserve_exact(n).is_err()
+            || seen.try_reserve_exact(self.epochs.len()).is_err()
+            || row_seen.try_reserve_exact(n).is_err()
+        {
             return Err(std::io::Error::other(format!(
                 "tune.alcyon.counters per-thread: cannot allocate the {} bytes of thread {}'s counter rows",
                 n * std::mem::size_of::<HotRow>(),
@@ -506,7 +517,14 @@ impl CounterTable {
         rows.extend((0..n).map(|_| HotRow::default()));
         let cleared = AtomicU64::new(self.cleared.load(Ordering::Acquire));
         seen.extend(self.epochs.iter().map(|e| AtomicU64::new(e.load(Ordering::Relaxed))));
-        let mut slab = Slab { rows: rows.into_boxed_slice(), seen: seen.into_boxed_slice(), cleared_seen: cleared, published: alcyon_alloc::arena::Published::default() };
+        row_seen.extend(self.row_epochs.iter().map(|e| AtomicU64::new(e.load(Ordering::Relaxed))));
+        let mut slab = Slab {
+            rows: rows.into_boxed_slice(),
+            seen: seen.into_boxed_slice(),
+            row_seen: row_seen.into_boxed_slice(),
+            cleared_seen: cleared,
+            published: alcyon_alloc::arena::Published::default(),
+        };
         let mut last = slab.published;
         COUNTERS_POOL.publish_arena::<HotRow>(&mut last, &slab);
         slab.published = last;
@@ -524,6 +542,17 @@ impl CounterTable {
         self.cleared.fetch_add(1, Ordering::Release);
     }
 
+    /// `clear counters server` of row `k` of proxy `p`: its readers count the row as zero in
+    /// every slab until each owner has zeroed its copy (which the owner does before it next
+    /// writes); the proxies' [`Self::epochs`] and the other rows are untouched.
+    pub fn clear_row(&self, p: usize, k: usize) {
+        debug_assert!(p < self.spans.len(), "proxy {p} of a table of {}", self.spans.len());
+        let (base, n) = self.spans[p];
+        debug_assert!(k < n as usize, "row {k} of a proxy of {n}");
+        self.row_epochs[base as usize + k].fetch_add(1, Ordering::Relaxed);
+        self.cleared.fetch_add(1, Ordering::Release);
+    }
+
     /// The rows of object `k` of proxy `p` in every slab that has them, with whether the
     /// slab's maxima of the proxy are current; a slab whose totals were cleared since it last
     /// wrote them is left out. The session rate is not cleared: it is in `rate` of every slab.
@@ -537,9 +566,13 @@ impl CounterTable {
         debug_assert!(k < n as usize, "row {k} of a proxy of {n}");
         let at = base as usize + k;
         let want = epoch.load(Ordering::Relaxed);
+        let row_want = self.row_epochs[at].load(Ordering::Relaxed);
         for slab in self.slabs.iter().filter_map(std::sync::OnceLock::get) {
             let seen = slab.seen[p].load(Ordering::Relaxed);
-            f(&slab.rows[at], seen >> 32 == want >> 32, seen == want);
+            // A row `clear counters server` cleared since the owner last wrote it counts as
+            // zero (its maxima too), the rest of the proxy's rows do not.
+            let row_ok = slab.row_seen[at].load(Ordering::Relaxed) == row_want;
+            f(&slab.rows[at], seen >> 32 == want >> 32 && row_ok, seen == want && row_ok);
         }
     }
 }
@@ -552,31 +585,44 @@ pub struct Slab {
     rows: Box<[HotRow]>,
     /// Per proxy, the [`CounterTable::epochs`] value its rows here belong to.
     seen: Box<[AtomicU64]>,
+    /// Per slab row, the [`CounterTable::row_epochs`] value its row here has been zeroed to.
+    row_seen: Box<[AtomicU64]>,
     /// The [`CounterTable::cleared`] the slab caught up with.
     cleared_seen: AtomicU64,
     published: alcyon_alloc::arena::Published,
 }
 
 impl Slab {
-    /// Zeroes this thread's rows of every proxy `clear counters` cleared since it last looked
-    /// (`cleared` being [`CounterTable::cleared`] as just read). The owner's call only.
+    /// Zeroes this thread's rows `clear counters` (a proxy's) and `clear counters server` (one
+    /// row's) cleared since it last looked (`cleared` being [`CounterTable::cleared`] as just
+    /// read). The owner's call only.
     #[cold]
     #[inline(never)]
     fn catch_up(&self, table: &CounterTable, cleared: u64) {
         for ((epoch, seen), &(base, n)) in table.epochs.iter().zip(&self.seen).zip(&table.spans) {
+            let span = (base as usize)..(base + n) as usize;
             let want = epoch.load(Ordering::Relaxed);
             let had = seen.load(Ordering::Relaxed);
-            if want == had {
-                continue;
+            if want != had {
+                for r in self.rows.get(span.clone()).unwrap_or(&[]) {
+                    if had >> 32 == want >> 32 {
+                        r.rate_max.store(0, Ordering::Relaxed);
+                    } else {
+                        r.clear();
+                    }
+                }
+                seen.store(want, Ordering::Relaxed);
             }
-            for r in self.rows.get(base as usize..(base + n) as usize).unwrap_or(&[]) {
-                if had >> 32 == want >> 32 {
-                    r.rate_max.store(0, Ordering::Relaxed);
-                } else {
-                    r.clear();
+            // The row a `clear counters server` cleared since, the proxy's epoch untouched.
+            for at in span {
+                let row_want = table.row_epochs[at].load(Ordering::Relaxed);
+                if self.row_seen[at].load(Ordering::Relaxed) != row_want {
+                    if let Some(r) = self.rows.get(at) {
+                        r.clear();
+                    }
+                    self.row_seen[at].store(row_want, Ordering::Relaxed);
                 }
             }
-            seen.store(want, Ordering::Relaxed);
         }
         self.cleared_seen.store(cleared, Ordering::Relaxed);
     }
