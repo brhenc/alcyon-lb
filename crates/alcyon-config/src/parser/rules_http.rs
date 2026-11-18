@@ -99,6 +99,47 @@ fn strict_mode_arg(list: &str, tokens: &[Token], act_token: &Token) -> Result<(b
     Ok((on, expect_cond_in(list, tokens, 3, act_token)?))
 }
 
+/// The pattern-file actions of `src/http_act.c` (`parse_http_set_map`, one parse function
+/// for `add-acl`, `del-acl`, `set-map` and `del-map`): the file is given inside the action's
+/// own parentheses (`add-acl(<file>)`, the `file@`/`opt@`/`virt@` prefix included), the key
+/// is the following argument and `set-map` takes one more, the value; key and value are
+/// log-format strings. Returns `(file, key, value, cond)`, `value` for `set-map` only.
+fn parse_pat_file_action(
+    list: &str,
+    tokens: &[Token],
+    act_token: &Token,
+) -> Result<(String, String, Option<String>, Option<AclCondition>), ConfigError> {
+    let name = act_token.text.split_once('(').map_or("", |(n, _)| n);
+    let refuse = |args: usize| {
+        ConfigError::new(
+            act_token.line,
+            act_token.col,
+            format!("error detected while parsing '{list} {}' rule : expects exactly {args} arguments.", act_token.text),
+        )
+    };
+    // `HAProxy` counts the arguments before reading the file.
+    if name == "set-map" && (tokens.get(2).is_none() || tokens.get(3).is_none()) {
+        return Err(refuse(2));
+    }
+    let Some(key_tok) = tokens.get(2) else {
+        return Err(refuse(1));
+    };
+    // The key and the value are taken by position, as `HAProxy` does: a token whose text is
+    // `if` is still an argument, and the condition starts after them.
+    let (value, at) = match name {
+        "set-map" => (Some(tokens[3].text.clone()), 4),
+        _ => (None, 3),
+    };
+    // The file is the action's own token with `name(` and the last byte dropped: `/f` for
+    // `add-acl(/f)`. A token whose parentheses do not balance keeps whatever is left inside
+    // and is no error: the name then matches no registered reference and the action does
+    // nothing, as in `HAProxy`.
+    let end = act_token.text.len().saturating_sub(1).max(8);
+    let file = act_token.text.get(8..end).unwrap_or("").to_string();
+    let cond = expect_cond_in(list, tokens, at, act_token)?;
+    Ok((file, key_tok.text.clone(), value, cond))
+}
+
 /// The condition after the one `<format>` argument of `set-path`, `set-pathq`, `set-query`,
 /// `set-uri` and `set-method`: another word is refused with `HAProxy`'s arity message
 /// (`parse_set_req_line`, `src/http_act.c`), not skipped.
@@ -1086,6 +1127,19 @@ fn parse_http_req_rule_at(
     } else if act_str == "pause" {
         let (time_ms, expr, cond) = parse_pause(tokens, "http-request", act_token)?;
         rules.push(HttpReqRule { action: HttpReqAction::Pause { time_ms, expr }, cond, line: 0 });
+    } else if act_str.starts_with("add-acl(")
+        || act_str.starts_with("del-acl(")
+        || act_str.starts_with("set-map(")
+        || act_str.starts_with("del-map(")
+    {
+        let (file, key, value, cond) = parse_pat_file_action("http-request", tokens, act_token)?;
+        let action = match act_str.split_once('(').map(|(n, _)| n) {
+            Some("add-acl") => HttpReqAction::AddAcl { file, key },
+            Some("del-acl") => HttpReqAction::DelAcl { file, key },
+            Some("del-map") => HttpReqAction::DelMap { file, key },
+            _ => HttpReqAction::SetMap { file, key, value: value.unwrap_or_default() },
+        };
+        rules.push(HttpReqRule { action, cond, line: 0 });
     } else {
         return Err(ConfigError::new(
             act_token.line,
@@ -1799,6 +1853,19 @@ pub(crate) fn parse_http_after_res_rule(
     } else if act_str == "capture" {
         let (expr, id, cond) = parse_res_capture(tokens, act_token, "http-after-response")?;
         rules.push(HttpAfterResRule { action: HttpAfterResAction::Capture { expr, id }, cond });
+    } else if act_str.starts_with("del-acl(")
+        || act_str.starts_with("set-map(")
+        || act_str.starts_with("del-map(")
+    {
+        // `HAProxy` lists `del-acl`, `set-map` and `del-map` for `http-after-response`, not
+        // `add-acl` (`http_after_res_actions`, `src/http_act.c`).
+        let (file, key, value, cond) = parse_pat_file_action("http-after-response", tokens, act_token)?;
+        let action = match act_str.split_once('(').map(|(n, _)| n) {
+            Some("del-acl") => HttpAfterResAction::DelAcl { file, key },
+            Some("del-map") => HttpAfterResAction::DelMap { file, key },
+            _ => HttpAfterResAction::SetMap { file, key, value: value.unwrap_or_default() },
+        };
+        rules.push(HttpAfterResRule { action, cond });
     } else {
         return Err(ConfigError::new(
             act_token.line,

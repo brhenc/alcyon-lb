@@ -3377,6 +3377,35 @@ fn render_res_format(f: &crate::rule_compiled::Format, out: &mut String, ctx: &S
     }
 }
 
+/// Runs the pattern-file action compiled into `op` (the `add-acl`/`del-acl`/`set-map`/
+/// `del-map` of `http-request` and `http-after-response`): the key -- and the value, for
+/// `set-map` -- render into the per-thread strings, and the change goes through the
+/// reference resolved at load, the one the CLI commands change. `render` is the rendering of
+/// the side the rule runs on. As `HAProxy`'s `http_action_set_map`, a change that fails (a
+/// key the file's method refuses) fails silently: the rule answers `ACT_RET_CONT` either way.
+fn apply_pat_op(op: &crate::rule_compiled::PatOp, render: impl Fn(&crate::rule_compiled::Format, &mut String)) {
+    crate::reuse::with_string(|key| {
+        render(&op.key, key);
+        let k = key.as_str();
+        match op.kind {
+            crate::rule_compiled::PatOpKind::AddAcl => {
+                let _ = op.ref_.add_acl(k);
+            }
+            crate::rule_compiled::PatOpKind::DelAcl | crate::rule_compiled::PatOpKind::DelMap => {
+                let _ = op.ref_.del(k);
+            }
+            crate::rule_compiled::PatOpKind::SetMap => {
+                // `pat_op` compiles the value of every `set-map` rule, so it is always here.
+                let value = op.value.as_ref().expect("set-map compiles with its value");
+                crate::reuse::with_string2(|val| {
+                    render(value, val);
+                    let _ = op.ref_.set_map(k, val);
+                });
+            }
+        }
+    });
+}
+
 /// The request line as the access log keeps it, from what a context holds of the request
 /// (`%r`, `%HM`, ... in a rule's format).
 fn request_line_of(ctx: &SampleContext) -> String {
@@ -14236,6 +14265,18 @@ impl EngineDispatcher<'_> {
                             t.l7 = crate::txn::L7Retry::Disabled;
                         }
                     }
+                    alcyon_config::HttpReqAction::AddAcl { .. }
+                    | alcyon_config::HttpReqAction::DelAcl { .. }
+                    | alcyon_config::HttpReqAction::SetMap { .. }
+                    | alcyon_config::HttpReqAction::DelMap { .. } => {
+                        // `http_action_set_map`: the reference it changes was resolved at
+                        // load (`rc.pat`); when no registered reference answers its name the
+                        // action does nothing, as `HAProxy`'s `pat_ref_lookup` finds none.
+                        if let Some(op) = rc.pat.as_ref() {
+                            let ctx = make_ctx!(sess);
+                            apply_pat_op(op, |f, out| render_rule_format(f, out, &ctx, registry, sess, proxies));
+                        }
+                    }
                     alcyon_config::HttpReqAction::SetTimeout { timeout_type, timeout_val } => {
                         let ms = match rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &make_ctx!(sess))) {
                             // The sample is cast to an integer of milliseconds (no units) and
@@ -16973,6 +17014,9 @@ enum ResOp<'a> {
     Redirect(u16, Option<&'a alcyon_config::RedirectCookie>, &'a crate::rule_compiled::Rule),
     /// `http-response return`: status, content type, formatted body, error page.
     Return(u16, Option<&'a str>, Option<&'a alcyon_config::ErrorPageSource>, &'a crate::rule_compiled::Rule),
+    /// The `http-after-response` pattern-file actions (`set-map`, `del-map`, `del-acl`), and
+    /// what the rule compiled of them.
+    MapAction(&'a crate::rule_compiled::Rule),
 }
 
 /// The `wait-for-body` of a response rule list: the rule the pass starts at, and the check a
@@ -17021,6 +17065,10 @@ impl<'a> ResOp<'a> {
             alcyon_config::HttpAfterResAction::SetHeader { name, fmt } => Self::Set(name, fmt, rc),
             alcyon_config::HttpAfterResAction::AddHeader { name, .. } => Self::Add(name, rc),
             alcyon_config::HttpAfterResAction::DelHeader { name } => Self::Del(name),
+            // `HAProxy` lists `del-acl`, `set-map` and `del-map` for `http-after-response`.
+            alcyon_config::HttpAfterResAction::SetMap { .. }
+            | alcyon_config::HttpAfterResAction::DelMap { .. }
+            | alcyon_config::HttpAfterResAction::DelAcl { .. } => Self::MapAction(rc),
         })
     }
 }
@@ -17489,6 +17537,14 @@ fn res_action(
                 None => status_msg.set_usual(status_reason(st)),
             }
             CURRENT_RES_STATUS.set(st);
+            return Ok(true);
+        }
+        ResOp::MapAction(rc) => {
+            // The pattern-file actions change no byte of the response (`http_after_res`
+            // rules answer `ACT_RET_CONT`), so the pass goes on when the action ran.
+            if let Some(op) = rc.pat.as_ref() {
+                apply_pat_op(op, |f, out| render_res_format(f, out, ctx, registry, *status));
+            }
             return Ok(true);
         }
         ResOp::Del(name) => {
