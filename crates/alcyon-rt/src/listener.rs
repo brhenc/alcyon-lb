@@ -57,6 +57,11 @@ pub struct Listener {
     /// The `listen()` backlog of the bind ([`listener_backlog`]), for the `listen()` that
     /// resumes a paused listener ([`Listener::resume`]).
     pub backlog: i32,
+    /// Stopped because a per-process per-second rate limit (`maxconnrate`, `maxsessrate`,
+    /// `maxsslrate`) was reached: the connections wait in the backlog and the engine's
+    /// `resume_rate_paused_listeners` re-arms the bind once the rate is back under its
+    /// limits (src/listener.c, `limit_global`).
+    pub rate_paused: bool,
 }
 
 /// `tcp-ut` and `cc` of a `bind` line. A refusal by the kernel (an algorithm that is not
@@ -165,6 +170,7 @@ impl Listener {
             proto_h2: false,
             luid: 0,
             backlog,
+            rate_paused: false,
         })
     }
 
@@ -220,6 +226,7 @@ impl Listener {
             proto_h2: false,
             luid: 0,
             backlog: 1024,
+            rate_paused: false,
         })
     }
 

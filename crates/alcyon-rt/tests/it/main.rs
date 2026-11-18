@@ -528,3 +528,5 @@ mod connection_flags;
 mod stats_json_page;
 mod stats_typed_page;
 mod res_caps_clone;
+
+mod rate_limit;

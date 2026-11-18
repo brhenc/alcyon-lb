@@ -225,9 +225,15 @@ fn set_rate_limit_argu_errors_answer_like_haproxy() {
     assert_eq!(data, b"\n");
     assert_eq!(info_value(&env, "SslRateLimit"), "9");
 
+    // Alcyon has no HTTP compression, so the setting is refused and nothing is stored
+    // (docs/differences.md); the oracle stores it and answers an empty line.
     let (data, closed) = drive(&env, "set rate-limit http-compression global 9\n");
     assert!(closed);
-    assert_eq!(data, b"\n");
+    assert_eq!(
+        data,
+        b"Alcyon does not implement HTTP compression; 'http-compression' cannot be rate-limited.\n\n"
+    );
+    assert_eq!(info_value(&env, "CompressBpsRateLim"), "0");
 
     let (data, closed) = drive(&env, "set rate-limit connections global 2147483647\n");
     assert!(closed);

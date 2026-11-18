@@ -355,7 +355,8 @@ in HAProxy).
 
 | | HAProxy | Alcyon | what to do |
 |---|---|---|---|
-| `maxconnrate`, `maxsessrate` (global), `rate-limit sessions` (frontend) | accepted | **refused at load** (unknown keyword) | limit per source with a stick table (`sc_conn_rate`) until implemented (T349) |
+| `maxconnrate`, `maxsessrate`, `maxsslrate` (global) | accepted; the listeners stop when the per-second rate is reached | implemented (T349): see the `maxcomprate` section below |
+| `rate-limit sessions` (frontend) | accepted | **refused at load** (unknown keyword) | limit per source with a stick table (`sc_conn_rate`) until implemented (T349) |
 | `timeout client-fin` | accepted | **refused at load** | remove it; half-closed clients wait for `timeout client` (T349) |
 | Idle HTTP/2 connection after a request | GOAWAY after `timeout http-keep-alive` (else `http-request`, else `client`) | GOAWAY after `timeout client` only: an idle h2 connection lives longer (5.7 s vs 1.7 s with client 6s, http-request 4s, keep-alive 2s) | set `timeout client` close to the keep-alive you want for h2 until fixed (T349) |
 | `tcp-request inspect-delay` + `tcp-request content accept if { req.proto_http }` (or `req.len`, `req.payload`) when the first segment is short | waits for more data up to the inspect delay | **decides on the partial data and resets at once** | avoid content rules that need the whole head on slow links until fixed (T349) |
@@ -903,3 +904,27 @@ its own answer. An example is "Server nb/a is going DOWN for maintenance. ..." f
 `usermsgs_clr` (proxy.c:5511-5545). Alcyon treats this as an upstream defect and answers
 "Backend deleted." alone. The probes are in `docs/design/runtime-server-set-2026-11-16.md`,
 appendix A.3.
+
+## `maxcomprate` and `set rate-limit http-compression`: refused, no HTTP compression
+
+HAProxy limits the process's compression speed with `global maxcomprate <n>` (in kB/s,
+`global.compr_lim`, src/global-t.h) and at run time with `set rate-limit http-compression
+global <n>`. Alcyon does not implement HTTP compression -- the proxy `compression` keyword is
+itself refused at load -- so there is no rate to limit, and neither is kept in a value nothing
+reads:
+
+| | HAProxy | Alcyon |
+|---|---|---|
+| `global maxcomprate <n>` | caps the process at n kB/s compressed | refused at load: `'maxcomprate' is not supported: Alcyon does not implement HTTP compression.` |
+| `set rate-limit http-compression global <n>` | sets `global.compr_lim` at run time | refused: "Alcyon does not implement HTTP compression; 'http-compression' cannot be rate-limited." -- nothing is stored |
+
+The support list a bare `set rate-limit` answers is byte-exact against the oracle's, which still
+names `http-compression`; `show info`'s `CompressBpsRateLim` line reads `0` on both.
+
+The sibling limits are enforced: `maxconnrate`, `maxsessrate` and `maxsslrate` at load, and
+`set rate-limit connections|sessions|ssl-sessions global` at run time, stop the listeners when
+the per-second per-process rate is reached (src/listener.c `limit_global`; the connections wait
+in the kernel backlog, nothing is refused); `0` lifts a limit. Measured in
+`crates/alcyon-rt/tests/it/rate_limit.rs`. As with HAProxy, the check lives only in the TCP
+accept path: a `quic4@`/`quic6@` bind is neither stopped by the limits nor counted against
+them (the oracle checks and counts `cps_lim`/`sps_lim`/`ssl_lim` only in src/listener.c).

@@ -2540,6 +2540,11 @@ pub struct Engine {
     /// A listener stopped polling because its frontend reached `maxconn`: the limit is shared
     /// by every worker, so a slot freed or a limit raised elsewhere is noticed by looking.
     fe_paused: bool,
+    /// A listener is stopped because a per-process per-second rate limit (`maxconnrate`,
+    /// `maxsessrate`, `maxsslrate`) was reached: the connections wait in the backlog and
+    /// [`Self::resume_rate_paused_listeners`] re-arms it when the rate is back under the
+    /// limit (src/listener.c `limit_global`).
+    rate_paused: bool,
     /// Connections may have waited in a listener's backlog, for it was stopped at a
     /// `maxconn` and has not been drained since: their clients may have left (T231).
     backlog_waits: bool,
@@ -2672,6 +2677,10 @@ impl Engine {
             if !listening || full {
                 continue;
             }
+            // A listener still under its per-second rate limit comes back armed too, as on
+            // `HAProxy` (a resumed listener re-checks its limits on the next accept): it
+            // cannot accept past the limit, because `accept_from_listener` re-pauses it
+            // before accepting, and `resume_rate_paused_listeners` settles its flag.
             if l.is_full() {
                 self.fe_paused = true;
                 continue;
@@ -4323,6 +4332,19 @@ pub fn configure_maxconn(config: &Config) {
     crate::globalconn::configure(config.global.as_ref().and_then(|g| g.maxconn), listeners, stats_socket);
 }
 
+/// `maxconnrate`, `maxsessrate` and `maxsslrate` (src/global-t.h `cps_lim`, `sps_lim`,
+/// `ssl_lim`): the per-process per-second limits, read once here, `0` when unset. The parser
+/// already stores them the way the oracle does (any integer, 32-bit truncated, `int`), so
+/// this is a copy. The accept loop enforces them from [`crate::ratelimit`];
+/// `set rate-limit ... global` changes the same values at run time.
+pub fn configure_rate_limits(config: &Config) {
+    if let Some(g) = config.global.as_ref() {
+        crate::ratelimit::set_conns(g.maxconnrate.unwrap_or(0));
+        crate::ratelimit::set_sess(g.maxsessrate.unwrap_or(0));
+        crate::ratelimit::set_ssl(g.maxsslrate.unwrap_or(0));
+    }
+}
+
 /// The listeners a configuration opens, stats sockets included, and whether it has a stats
 /// socket: what `maxconn` and `maxsock` leave room for.
 /// `global.maxsock` for `config` run by `workers` threads, `global maxconn` as
@@ -4960,6 +4982,7 @@ impl Engine {
     // The clock of `lastchg` and `lastsess` (`show stat`) starts with the proxies.
     let _ = crate::statcnt::now_ms();
     configure_maxconn(config);
+    configure_rate_limits(config);
     // `global` `set-var` lines: once per process, before any worker serves. Run again in each
     // worker, a `set-var-fmt` reading its own variable saw what the others had appended.
     init_global_vars(config.global.as_ref());
@@ -5291,6 +5314,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             global_paused: false,
             accept_limited: None,
             fe_paused: false,
+            rate_paused: false,
             backlog_waits: false,
             cli_level: crate::applet::CliLevel::Admin,
             cli_timeout_ms: crate::applet::DEFAULT_CLI_TIMEOUT_MS,
@@ -6141,9 +6165,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             }
         };
 
-        // While the listeners are stopped for `global maxconn`, a connection closed by
-        // another worker is only noticed by looking: do not sleep through it.
-        let poll_timeout = if self.global_paused || self.fe_paused { poll_timeout.min(Duration::from_millis(5)) } else { poll_timeout };
+        // While the listeners are stopped for `global maxconn` or a per-second rate limit,
+        // a connection closed by another worker -- or the trailing second rolling -- is
+        // only noticed by looking: do not sleep through it.
+        let poll_timeout = if self.global_paused || self.fe_paused || self.rate_paused { poll_timeout.min(Duration::from_millis(5)) } else { poll_timeout };
 
         // A QUIC transport's next deadline can be sooner than the scheduler's. Waiting past
         // it would delay loss recovery; the shortest of the two wins.
@@ -6192,7 +6217,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.scheduler.tasks.publish();
         self.lb_snap.publish();
         // The accept limits: one test when none is in force.
-        let poll_timeout = if self.accept_limited.is_some() || self.global_paused || self.fe_paused || self.cli_accept_retry.is_some() {
+        let poll_timeout = if self.accept_limited.is_some() || self.global_paused || self.fe_paused || self.rate_paused || self.cli_accept_retry.is_some() {
             self.limits_pass(now_inst, poll_timeout)
         } else {
             poll_timeout
@@ -6607,6 +6632,22 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // The frontend's `maxconn` slot is taken the same way (`ConnLimit::try_inc`).
         // `tune.maxaccept` reaches the data path here: at most that many accepts per wakeup.
         let mut left = self.maxaccept;
+        // `maxconnrate` / `maxsessrate` / `maxsslrate` (src/listener.c, `limit_global`):
+        // per-process per-second ceilings. Reaching one stops the listener; the
+        // connections wait in the kernel backlog and the poll timeout stays short while
+        // this worker is rate-paused, so the listener is re-armed when the trailing
+        // second's rate falls back under the limit. With no limit set (the default)
+        // `active()` is 0 and this is one load.
+        if crate::ratelimit::active() != 0 {
+            match Self::rate_limit_room(self.listeners[l_idx].tls.is_some()) {
+                Some(0) => {
+                    self.pause_listener_for_rate(l_idx);
+                    return;
+                }
+                Some(room) => left = left.min(room),
+                None => {}
+            }
+        }
         while left > 0 && self.listeners[l_idx].maxconn.try_inc() {
             left -= 1;
             if !crate::globalconn::try_acquire() {
@@ -6634,6 +6675,78 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let local_addr = self.listeners[l_idx].addr();
             self.admit_connection(proxy_idx, Some(l_idx), cli_fd, peer_addr, local_addr, None);
         }
+    }
+
+    /// How many more connections a listener may accept in the trailing second under the
+    /// per-process rate limits that apply to it (`maxconnrate` and `maxsessrate` on every
+    /// TCP listener, `maxsslrate` in addition on an `ssl` bind, as the `BC_O_USE_SSL` test in
+    /// src/listener.c). The counts are the ones `show info` reports (`ConnRate`, `SessRate`,
+    /// `SslRate`); each admitted connection ticks its counter in `admit_connection`
+    /// (`count_global_conn`, `count_global_sess`) or `register_new_session`
+    /// (`stats::ssl_conn_accepted`), so what is admitted this pass is already in `rate` by
+    /// the next read. `None` when no active limit applies to the listener.
+    #[inline]
+    fn rate_limit_room(is_tls: bool) -> Option<u32> {
+        let active = crate::ratelimit::active();
+        let mut room: u64 = u64::MAX;
+        let mut any = false;
+        if active & 1 != 0 {
+            room = room.min(crate::ratelimit::remain(crate::ratelimit::conns(), global_conn_rate()));
+            any = true;
+        }
+        if active & 2 != 0 {
+            room = room.min(crate::ratelimit::remain(crate::ratelimit::sess(), global_sess_rate()));
+            any = true;
+        }
+        if active & 4 != 0 && is_tls {
+            let r = crate::stats::SSL_RATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            room = room.min(crate::ratelimit::remain(crate::ratelimit::ssl(), r.rate()));
+            any = true;
+        }
+        any.then(|| room.min(u32::MAX as u64) as u32)
+    }
+
+    /// A per-process per-second rate limit was reached: stop this listener
+    /// (`limit_global`). The connections wait in the backlog; nothing is refused or
+    /// closed. [`Self::resume_rate_paused_listeners`] re-arms it once the rate is back
+    /// under the limit.
+    fn pause_listener_for_rate(&mut self, l_idx: usize) {
+        let lfd = self.listeners[l_idx].raw_fd();
+        let _ = self.poller.modify(self.listeners[l_idx].borrowed_fd(), raw_fd_to_u64(lfd), false, false);
+        self.fdtab.set_interest(lfd, Interest::NONE);
+        self.listeners[l_idx].rate_paused = true;
+        self.rate_paused = true;
+        self.backlog_waits = true;
+    }
+
+    /// Re-arms the listeners a per-process per-second rate limit stopped, once every limit
+    /// that applies to each is back in its room again: the trailing second's rate fell below
+    /// the limit, or `set rate-limit ... global 0` lifted it. Skips the listeners that are
+    /// stopped for their own reasons still (a full frontend, a full `global maxconn`).
+    fn resume_rate_paused_listeners(&mut self) {
+        if !self.rate_paused {
+            return;
+        }
+        let mut any = false;
+        for l in self.listeners.iter_mut() {
+            if !l.rate_paused {
+                continue;
+            }
+            let lfd = l.raw_fd();
+            if !self.fdtab.interest(lfd).is_none() {
+                // Re-armed meanwhile (a `SIGTTIN` after a `SIGTTOU`): only the flag is left.
+                l.rate_paused = false;
+                continue;
+            }
+            if crate::globalconn::full() || l.is_full() || matches!(Self::rate_limit_room(l.tls.is_some()), Some(0)) {
+                any = true;
+                continue;
+            }
+            l.rate_paused = false;
+            let _ = self.poller.modify(l.borrowed_fd(), raw_fd_to_u64(lfd), true, false);
+            self.fdtab.set_interest(lfd, Interest::READ);
+        }
+        self.rate_paused = any;
     }
 
     /// `accept` failed other than with an empty queue -- out of fds or memory: stop polling
@@ -6664,6 +6777,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             if !self.fdtab.interest(lfd).is_none() {
                 continue;
             }
+            if l.rate_paused {
+                // Its stop belongs to the rate path ([`Self::resume_rate_paused_listeners`]).
+                continue;
+            }
             if l.is_full() {
                 still_full = true;
             } else {
@@ -6688,10 +6805,17 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         if self.fe_paused && !self.global_paused {
             self.resume_listeners_after_frontend_limit();
         }
+        // The rate-paused listeners are re-armed by their own path: the limits are shared
+        // by every worker, as the frontend's, so looking is how the room comes back.
+        self.resume_rate_paused_listeners();
     }
 
     /// Undoes [`Self::pause_listeners_for_global`] for the listeners that have room of
-    /// their own.
+    /// their own. A rate-paused listener comes back armed too: with one worker it cannot
+    /// be rate-paused here (the accept that filled `global maxconn` re-armed it and the
+    /// rate settled its flag on the way), and with several a worker's flag may outlive the
+    /// global it belongs to; either way `accept_from_listener` re-checks the limit before
+    /// accepting and re-pauses, and `resume_rate_paused_listeners` settles the flag.
     fn resume_listeners_after_global(&mut self) {
         self.global_paused = false;
         for l in &self.listeners {

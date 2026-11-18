@@ -513,6 +513,11 @@ impl CliApplet {
         if target != "global" || !matches!(setting, "connections" | "sessions" | "ssl-sessions" | "http-compression") {
             return self.finish_msg(Self::RATE_LIMIT_ONLY_SUPPORTS);
         }
+        if setting == "http-compression" {
+            // Alcyon has no HTTP compression: there is no rate to limit, so the setting is
+            // refused rather than stored where nothing would read it (docs/differences.md).
+            return self.finish_msg("Alcyon does not implement HTTP compression; 'http-compression' cannot be rate-limited.");
+        }
         let Some(v_str) = w.get(4) else {
             return self.finish_msg("Expects an integer value.");
         };
@@ -522,15 +527,12 @@ impl CliApplet {
         if v < 0 {
             return self.finish_msg("Value out of range.");
         }
-        let v = u32::try_from(v).expect("non-negative i32");
         if setting == "connections" {
             crate::ratelimit::set_conns(v);
         } else if setting == "sessions" {
             crate::ratelimit::set_sess(v);
-        } else if setting == "ssl-sessions" {
-            crate::ratelimit::set_ssl(v);
         } else {
-            crate::ratelimit::set_comp_kbs(v);
+            crate::ratelimit::set_ssl(v);
         }
         self.finish_msg("");
     }
