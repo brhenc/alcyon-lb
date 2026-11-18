@@ -33,7 +33,7 @@ How the code came in:
 | qwen3.8-flash-next | 1 | 569 | 235 |
 | Qwen3.8-Flash-Next | 1 | 201 | 194 |
 | Gemini 4 Hydrogen (medium), via Antigravity | 3 | 219 | 133 |
-| Qwen3.8-27B | 16 | 4280 | 4212 |
+| Qwen3.8-27B | 17 | 4549 | 4450 |
 
 ## Commits
 
@@ -104,4 +104,5 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-17 | UNBUFABORT | Qwen3.8-27B | `a2b1111bba` | 300 | 296 | `crates/alcyon-rt/src/engine.rs` +49/49<br>`crates/alcyon-rt/src/txn.rs` +10/10<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +241/237 | unmodified model output |
 | 2026-11-17 | UNPUBLISH | Qwen3.8-27B | `6d22e64553` | 250 | 221 | `crates/alcyon-rt/src/applet.rs` +31/2<br>`crates/alcyon-rt/src/engine.rs` +113/113<br>`crates/alcyon-rt/src/stats.rs` +9/9<br>`crates/alcyon-rt/src/table.rs` +18/18<br>`crates/alcyon-rt/tests/it/cli_unpublish_del_backend.rs` +79/79 | unmodified model output |
 | 2026-11-18 | CLILEVELS | Qwen3.8-27B | `ac7aca8b88` | 187 | 187 | `crates/alcyon-rt/src/applet.rs` +12/12<br>`crates/alcyon-rt/tests/it/cli_levels.rs` +174/174<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
-| 2026-11-18 | CLISRCDST | Qwen3.8-27B | `4b9f65ae09` | 258 | 258 | `crates/alcyon-rt/src/engine.rs` +14/14<br>`crates/alcyon-rt/src/proxy.rs` +32/32<br>`crates/alcyon-rt/tests/it/cli_src_dst.rs` +204/204<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/struct_sizes.rs` +7/7 | unmodified model output |
+| 2026-11-18 | CLISRCDST | Qwen3.8-27B | `4b9f65ae09` | 258 | 227 | `crates/alcyon-rt/src/engine.rs` +14/6<br>`crates/alcyon-rt/src/proxy.rs` +32/16<br>`crates/alcyon-rt/tests/it/cli_src_dst.rs` +204/204<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/struct_sizes.rs` +7/0 | unmodified model output |
+| 2026-11-18 | REQTIMERHDR | Qwen3.8-27B | `5de17665d9` | 269 | 269 | `crates/alcyon-rt/src/engine.rs` +3/3<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/req_timer_hdr.rs` +238/238<br>`crates/alcyon-sample/src/registry.rs` +27/27 | unmodified model output |
