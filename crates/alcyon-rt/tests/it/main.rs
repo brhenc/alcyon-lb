@@ -185,6 +185,7 @@ mod h2_backend_dies_under_streams;
 mod h2_backend_reuse;
 mod h2_concurrent_streams;
 mod h2_rx_budget;
+mod h2_session_addr;
 mod h2_madeyoureset;
 mod h2_pending_connect_streams;
 mod h2_connection_end_log;
