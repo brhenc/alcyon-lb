@@ -33,7 +33,7 @@ How the code came in:
 | qwen3.8-flash-next | 1 | 569 | 235 |
 | Qwen3.8-Flash-Next | 1 | 201 | 194 |
 | Gemini 4 Hydrogen (medium), via Antigravity | 3 | 219 | 133 |
-| Qwen3.8-27B | 19 | 5463 | 5362 |
+| Qwen3.8-27B | 21 | 6711 | 6583 |
 
 ## Commits
 
@@ -91,6 +91,7 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-17 | BADCHUNK | Qwen3.8-27B | `c0337e4598` | 77 | 54 | `crates/alcyon-rt/src/proxy.rs` +6/6<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +71/48 | unmodified model output |
 | 2026-11-17 | BODYWAITFLAG | Qwen3.8-27B | `ee6b31a750` | 24 | 23 | `crates/alcyon-rt/src/engine.rs` +13/13<br>`crates/alcyon-rt/src/txn.rs` +5/5<br>`crates/alcyon-rt/tests/it/struct_sizes.rs` +6/5 | unmodified model output |
 | 2026-11-17 | CHUNK10 | Qwen3.8-27B | `4a997ff751` | 288 | 288 | `crates/alcyon-rt/src/engine.rs` +28/28<br>`crates/alcyon-rt/tests/it/chunked_resp_to_http10.rs` +254/254<br>`crates/alcyon-rt/tests/it/head_facts.rs` +5/5<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
+| 2026-11-17 | CLIFULLBUF | Qwen3.8-27B | `691b37f341` | 358 | 331 | `crates/alcyon-rt/src/applet.rs` +57/53<br>`crates/alcyon-rt/src/lib.rs` +1/1<br>`crates/alcyon-rt/src/ratelimit.rs` +44/25<br>`crates/alcyon-rt/src/stats.rs` +3/0<br>`crates/alcyon-rt/tests/it/cli_full_buffer.rs` +252/251<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-17 | CLIPAYLOAD | Qwen3.8-27B | `e8d29c7f60` | 513 | 513 | `crates/alcyon-rt/src/applet.rs` +73/73<br>`crates/alcyon-rt/tests/it/cli_payload_refill.rs` +361/361<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-sample/src/patref.rs` +78/78 | unmodified model output |
 | 2026-11-17 | CONNECTTGT | Qwen3.8-27B | `64f10ac83d` | 181 | 181 | `crates/alcyon-proto/src/authority.rs` +9/9<br>`crates/alcyon-rt/tests/it/connect_target_validation.rs` +171/171<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-17 | EARLYCLOSE | Qwen3.8-27B | `2b158a5633` | 183 | 182 | `crates/alcyon-rt/src/engine.rs` +29/29<br>`crates/alcyon-rt/src/proxy.rs` +47/46<br>`crates/alcyon-rt/tests/it/chunked_body_errors.rs` +107/107 | unmodified model output |
@@ -107,4 +108,5 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-18 | CLISRCDST | Qwen3.8-27B | `4b9f65ae09` | 258 | 227 | `crates/alcyon-rt/src/engine.rs` +14/6<br>`crates/alcyon-rt/src/proxy.rs` +32/16<br>`crates/alcyon-rt/tests/it/cli_src_dst.rs` +204/204<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/struct_sizes.rs` +7/0 | unmodified model output |
 | 2026-11-18 | CLRSRV | Qwen3.8-27B | `5815ba9478` | 280 | 280 | `crates/alcyon-rt/src/applet.rs` +1/1<br>`crates/alcyon-rt/src/engine.rs` +10/10<br>`crates/alcyon-rt/src/statcnt.rs` +60/60<br>`crates/alcyon-rt/tests/it/clear_counters_server.rs` +208/208<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-18 | MAPACTIONS | Qwen3.8-27B | `54c3bbb767` | 634 | 632 | `crates/alcyon-config/src/ast/rules_http.rs` +42/42<br>`crates/alcyon-config/src/parser/rules_http.rs` +67/67<br>`crates/alcyon-rt/src/engine.rs` +56/56<br>`crates/alcyon-rt/src/rule_compiled.rs` +55/53<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/map_actions.rs` +283/283<br>`crates/alcyon-sample/src/patref.rs` +100/100<br>`crates/alcyon-sample/src/pattable.rs` +30/30 | unmodified model output |
+| 2026-11-18 | RATELIMIT | Qwen3.8-27B | `3bb69ec288` | 890 | 890 | `crates/alcyon-config/src/ast/global.rs` +11/11<br>`crates/alcyon-config/src/parser/global.rs` +47/47<br>`crates/alcyon-rt/src/applet.rs` +6/6<br>`crates/alcyon-rt/src/bin/alcyon.rs` +1/1<br>`crates/alcyon-rt/src/engine.rs` +129/129<br>`crates/alcyon-rt/src/listener.rs` +7/7<br>`crates/alcyon-rt/src/ratelimit.rs` +59/59<br>`crates/alcyon-rt/src/stats.rs` +5/5<br>`crates/alcyon-rt/tests/it/cli_full_buffer.rs` +7/7<br>`crates/alcyon-rt/tests/it/main.rs` +2/2<br>`crates/alcyon-rt/tests/it/rate_limit.rs` +590/590<br>`docs/differences.md` +26/26 | unmodified model output |
 | 2026-11-18 | REQTIMERHDR | Qwen3.8-27B | `5de17665d9` | 269 | 269 | `crates/alcyon-rt/src/engine.rs` +3/3<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/req_timer_hdr.rs` +238/238<br>`crates/alcyon-sample/src/registry.rs` +27/27 | unmodified model output |
