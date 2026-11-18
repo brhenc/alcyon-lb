@@ -939,8 +939,17 @@ pub struct TcpSession {
     /// what each new request's stream inherits ([`Self::reset_for_next_request`],
     /// [`Self::h2_child_init`]). `None` until one of those sets it; until then the stream
     /// reads the connection's value (`fc_src`) through it.
-    pub sess_src: Option<SocketAddr>,
-    pub sess_dst: Option<SocketAddr>,
+    ///
+    /// Boxed, both addresses in one box: two plain `Option<SocketAddr>` cost every
+    /// connection 64 bytes (`struct_sizes`), and they are `None` unless a PROXY header or a
+    /// session-level set-src/dst arrived. This is `HAProxy`'s own shape (`sess->src` is a
+    /// pointer that stays NULL until set): 8 bytes and no allocation on a connection that
+    /// does not use it, one allocation on one that does. Not folded into `proxy_info`: a
+    /// `tcp-request session set-src` sets it without any PROXY header. Read through
+    /// [`Self::sess_src`]/[`Self::sess_dst`], written through [`Self::sess_addr_mut`];
+    /// an HTTP/2 stream reads its connection's ([`Self::h2_child_init`]), so the box is
+    /// never cloned per stream.
+    pub sess_addr: Option<Box<SessAddr>>,
     pub tcp_inspect_done: bool,
     pub inspect_exp: Option<Tick>,
     /// A `tcp-request content do-resolve` or an `http-request do-resolve` (with its
@@ -1038,7 +1047,33 @@ pub struct H2ReqBody {
     pub head_room: usize,
 }
 
+/// The session-level addresses (`HAProxy`'s `sess->src`/`sess->dst`), behind
+/// [`TcpSession::sess_addr`]'s one box. `None` in either is "not set at session level".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessAddr {
+    pub src: Option<SocketAddr>,
+    pub dst: Option<SocketAddr>,
+}
+
 impl TcpSession {
+    /// The session's source address (`sess->src`), `None` when not set at session level.
+    #[inline]
+    pub fn sess_src(&self) -> Option<SocketAddr> {
+        self.sess_addr.as_deref().and_then(|a| a.src)
+    }
+
+    /// The session's destination address (`sess->dst`), `None` when not set at session level.
+    #[inline]
+    pub fn sess_dst(&self) -> Option<SocketAddr> {
+        self.sess_addr.as_deref().and_then(|a| a.dst)
+    }
+
+    /// The session's addresses to write, boxed on first use (once per connection that sets
+    /// one: a PROXY header or a session-level set-src/dst).
+    pub fn sess_addr_mut(&mut self) -> &mut SessAddr {
+        self.sess_addr.get_or_insert_with(Box::default)
+    }
+
     /// The client's socket; `None` for a stream of an HTTP/2 connection, whose socket is
     /// its owner's (T280).
     #[must_use]
@@ -1294,8 +1329,6 @@ impl TcpSession {
         c.server_addr = owner.server_addr;
         c.fc_src = owner.fc_src;
         c.fc_dst = owner.fc_dst;
-        c.sess_src = owner.sess_src;
-        c.sess_dst = owner.sess_dst;
         c.bufsize = owner.bufsize;
         c.maxrewrite = owner.maxrewrite;
         c.h2_flood_config = owner.h2_flood_config;
@@ -1324,8 +1357,18 @@ impl TcpSession {
         // Each stream of the connection is a new stream in `HAProxy`, and its connector
         // starts at the session's value under the connection's: a previous stream's
         // stream-level set goes with that stream, not this one.
-        c.client_addr = c.sess_src.or(c.fc_src);
-        c.server_addr = c.sess_dst.or(c.fc_dst);
+        // The session's value is the connection's (`owner`): the stream reads it there, so
+        // its own session never holds (or allocates) a copy.
+        match owner.sess_addr.as_deref() {
+            None => {
+                c.client_addr = c.fc_src;
+                c.server_addr = c.fc_dst;
+            }
+            Some(a) => {
+                c.client_addr = a.src.or(c.fc_src);
+                c.server_addr = a.dst.or(c.fc_dst);
+            }
+        }
         c.close_client = owner.close_client;
         c.stopping = owner.stopping;
         c.bytes_in = owner.bytes_in;
@@ -1506,10 +1549,9 @@ impl TcpSession {
             pending_resp,
             fc_src: _,
             fc_dst: _,
-            // The connection's session value, copied once from the owner (`h2_child_of`);
-            // each stream's connector re-reads it at stream start (`h2_child_init`).
-            sess_src: _,
-            sess_dst: _,
+            // The connection's session value: a stream's session never holds one, each
+            // stream's connector reads the owner's at stream start (`h2_child_init`).
+            sess_addr: _,
             tcp_inspect_done: _,
             inspect_exp: _,
             dr_wait,
@@ -1828,8 +1870,7 @@ impl TcpSession {
             pending_resp: None,
             fc_src: None,
             fc_dst: None,
-            sess_src: None,
-            sess_dst: None,
+            sess_addr: None,
             tcp_inspect_done: true,
             inspect_exp: None,
             dr_wait: 0,
@@ -2660,8 +2701,17 @@ impl TcpSession {
         // which falls back to the connection). What the last request's rules set at stream
         // level goes with it; the session's own set (`tcp-request session set-src`) and the
         // PROXY header's survive the request.
-        self.client_addr = self.sess_src.or(self.fc_src);
-        self.server_addr = self.sess_dst.or(self.fc_dst);
+        // Unset (no PROXY header, no session set-src/dst): one null check.
+        match self.sess_addr.as_deref() {
+            None => {
+                self.client_addr = self.fc_src;
+                self.server_addr = self.fc_dst;
+            }
+            Some(a) => {
+                self.client_addr = a.src.or(self.fc_src);
+                self.server_addr = a.dst.or(self.fc_dst);
+            }
+        }
         self.stick_out_pending += self.strm.log.bytes_from_server;
         // The stream becomes the next request's in place (O1a): its transaction, log,
         // captures, `txn.`/`req.`/`res.` variables, stick keys and set timeouts go.
@@ -3101,11 +3151,11 @@ impl TcpSession {
             // The PROXY header sets the session's value (`conn_recv_proxy` writes
             // `sess->src`); the stream that has not materialized its own yet reads it
             // from there, and each new stream inherits it.
-            self.sess_src = Some(src);
+            self.sess_addr_mut().src = Some(src);
             self.client_addr = Some(src);
         }
         if let Some(dst) = info.dst_sockaddr() {
-            self.sess_dst = Some(dst);
+            self.sess_addr_mut().dst = Some(dst);
             self.server_addr = Some(dst);
         }
         self.proxy_info = Some(Box::new(info));
