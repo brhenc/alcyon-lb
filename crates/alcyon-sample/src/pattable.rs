@@ -212,6 +212,36 @@ impl PatTable {
         }
     }
 
+    /// Whether an entry with the key `key` is in the table.
+    #[must_use]
+    pub fn has_key(&self, key: &str) -> bool {
+        self.by_key.contains_key(key)
+    }
+
+    /// Changes the value of every entry with the key `key`; whether there was one. The
+    /// `set-map` action needs the key's entries without collecting their ids.
+    pub fn update_key(&mut self, key: &str, val: &str) -> bool {
+        let Some(ids) = self.by_key.get(key) else {
+            return false;
+        };
+        for &id in ids {
+            if let Some(e) = self.entries.get_mut(&id) {
+                e.val = val.into();
+            }
+        }
+        true
+    }
+
+    /// Removes every entry with the key `key`; how many there were.
+    pub fn remove_key(&mut self, key: &str) -> usize {
+        let mut n = 0;
+        while let Some(id) = self.by_key.get(key).and_then(|ids| ids.first().copied()) {
+            self.remove(id);
+            n += 1;
+        }
+        n
+    }
+
     fn hit(&self, id: u64) -> Option<(String, String)> {
         self.entries.get(&id).map(|e| (e.val.to_string(), e.key.to_string()))
     }

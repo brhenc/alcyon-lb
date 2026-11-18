@@ -305,6 +305,26 @@ impl Rules {
     }
 }
 
+/// What the pattern-file actions (`add-acl`, `del-acl`, `set-map`, `del-map`) do, resolved
+/// at load: the reference they change -- the same object the CLI's `add acl` / `set map` /
+/// `del acl` / `del map` commands change, from `alcyon_sample::patref` -- and the log-formats
+/// of their key and, for `set-map`, value.
+#[derive(Debug, Clone)]
+pub struct PatOp {
+    pub kind: PatOpKind,
+    pub ref_: std::sync::Arc<alcyon_sample::patref::PatRef>,
+    pub key: Format,
+    pub value: Option<Format>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatOpKind {
+    AddAcl,
+    DelAcl,
+    DelMap,
+    SetMap,
+}
+
 /// What one rule has compiled: its condition, its expression, its format.
 #[derive(Debug, Clone, Default)]
 pub struct Rule {
@@ -323,6 +343,13 @@ pub struct Rule {
     /// The target server index of a `use-server` rule, resolved at load (T632): the request path
     /// looks up no server name.
     pub server: Option<usize>,
+    /// What `add-acl`/`del-acl`/`set-map`/`del-map` changes, resolved at load (the reg-test
+    /// `http-rules/acl_map_updates.vtc`): the request path writes through it and looks up no
+    /// name. `None` when no reference by the rule's name is registered; as `HAProxy`, whose
+    /// `pat_ref_lookup` finds nothing, the action then does nothing.
+    /// Boxed: only these four actions set it, and the 192 bytes of a [`PatOp`] inline would
+    /// grow every compiled rule (624 to 816 bytes); boxed, it stays at 624.
+    pub pat: Option<Box<PatOp>>,
 }
 
 impl Rule {
@@ -352,6 +379,7 @@ impl Rule {
             page: None,
             var: None,
             server: None,
+            pat: None,
         }
     }
 
@@ -370,7 +398,28 @@ impl Rule {
         self.fmt2 = fmt.map(|f| Format::compile(f, true));
         self
     }
+
+    /// The rule with its pattern-file action resolved (`pat: None` keeps it a no-op).
+    fn with_pat(mut self, op: Option<PatOp>) -> Self {
+        self.pat = op.map(Box::new);
+        self
+    }
 }
+
+/// The [`PatOp`] of a pattern-file action rule, or `None` when no registered reference
+/// answers the file it names (`patref::lookup`, which strips `file@`/`opt@` as `HAProxy`'s
+/// `pat_ref_lookup` does): the rule keeps the condition it was given and does nothing, as
+/// `HAProxy`'s action does.
+fn pat_op(kind: PatOpKind, file: &str, key: &str, value: Option<&str>) -> Option<PatOp> {
+    use alcyon_sample::patref::RefKind;
+    let ref_ = match kind {
+        PatOpKind::AddAcl | PatOpKind::DelAcl => patref::lookup(RefKind::Acl, file),
+        PatOpKind::DelMap | PatOpKind::SetMap => patref::lookup(RefKind::Map, file),
+    }?;
+    Some(PatOp { kind, ref_, key: Format::compile(key, false), value: value.map(|v| Format::compile(v, false)) })
+}
+
+use alcyon_sample::patref;
 
 /// The `http-request` rules', in their order.
 #[must_use]
@@ -427,6 +476,10 @@ pub fn http_req(rules: &[alcyon_config::HttpReqRule], acls: &Acls) -> Vec<Rule> 
             let rule = Rule::new(r.cond.as_ref(), acls, expr, fmt).with_fmt2(cookie).with_reply(lf, page);
             match &r.action {
                 HttpReqAction::SetVar { var_name, .. } | HttpReqAction::SetVarFmt { var_name, .. } | HttpReqAction::UnsetVar { var_name } => rule.with_var(var_name),
+                HttpReqAction::AddAcl { file, key } => rule.with_pat(pat_op(PatOpKind::AddAcl, file, key, None)),
+                HttpReqAction::DelAcl { file, key } => rule.with_pat(pat_op(PatOpKind::DelAcl, file, key, None)),
+                HttpReqAction::DelMap { file, key } => rule.with_pat(pat_op(PatOpKind::DelMap, file, key, None)),
+                HttpReqAction::SetMap { file, key, value } => rule.with_pat(pat_op(PatOpKind::SetMap, file, key, Some(value))),
                 _ => rule,
             }
         })
@@ -483,6 +536,10 @@ pub fn http_after_res(rules: &[alcyon_config::HttpAfterResRule], acls: &Acls) ->
             HttpAfterResAction::SetHeader { name, fmt } | HttpAfterResAction::AddHeader { name, fmt } => res_header(r.cond.as_ref(), acls, name, fmt),
             HttpAfterResAction::Capture { expr, .. } => Rule::new(r.cond.as_ref(), acls, Some(expr), None),
             HttpAfterResAction::DelHeader { .. } => Rule::new(r.cond.as_ref(), acls, None, None),
+            // `HAProxy` lists `del-acl`, `set-map` and `del-map` for `http-after-response`.
+            HttpAfterResAction::SetMap { file, key, value } => Rule::new(r.cond.as_ref(), acls, None, None).with_pat(pat_op(PatOpKind::SetMap, file, key, Some(value))),
+            HttpAfterResAction::DelMap { file, key } => Rule::new(r.cond.as_ref(), acls, None, None).with_pat(pat_op(PatOpKind::DelMap, file, key, None)),
+            HttpAfterResAction::DelAcl { file, key } => Rule::new(r.cond.as_ref(), acls, None, None).with_pat(pat_op(PatOpKind::DelAcl, file, key, None)),
         })
         .collect()
 }

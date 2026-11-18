@@ -289,6 +289,32 @@ pub enum HttpReqAction {
         time_ms: u32,
         expr: Option<String>,
     },
+    /// `add-acl(<file>) <key>`: add `key` to the pattern file `file` when it is not already
+    /// in it (`http_action_set_map`, `src/http_act.c`). `file` may carry the `file@`, `opt@`
+    /// or `virt@` prefix of `doc/configuration.txt`.
+    AddAcl {
+        file: String,
+        key: String,
+    },
+    /// `del-acl(<file>) <key>`: remove `key` from the pattern file `file`; a no-op when it
+    /// is not there.
+    DelAcl {
+        file: String,
+        key: String,
+    },
+    /// `set-map(<file>) <key> <value>`: set the value of `key` in the map file `file`, or
+    /// add it.
+    SetMap {
+        file: String,
+        key: String,
+        value: String,
+    },
+    /// `del-map(<file>) <key>`: remove `key` from the map file `file`; a no-op when it is
+    /// not there.
+    DelMap {
+        file: String,
+        key: String,
+    },
 }
 
 /// The argument of `set-retries`: an integer from 0 to 100, or an expression evaluated per
@@ -398,6 +424,22 @@ pub enum HttpAfterResAction {
     DelHeader { name: String },
     /// `capture <sample> id <idx>`: a frontend response slot, as `http-response capture`.
     Capture { expr: String, id: usize },
+    /// `set-map(<file>) <key> <value>`, `del-map(<file>) <key>` and `del-acl(<file>) <key>`:
+    /// the same pattern-file changes as the `http-request` form, made once the response is
+    /// out (`HAProxy` lists these three for `http-after-response`, not `add-acl`).
+    SetMap {
+        file: String,
+        key: String,
+        value: String,
+    },
+    DelMap {
+        file: String,
+        key: String,
+    },
+    DelAcl {
+        file: String,
+        key: String,
+    },
 }
 
 /// Rule pairing an HTTP-after-response action with an optional condition.

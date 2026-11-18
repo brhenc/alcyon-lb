@@ -255,35 +255,95 @@ impl PatRef {
         self.changed();
         Ok(())
     }
+
+    /// The `add-acl(<file>) <key>` action, and what the CLI's `add acl` adds: the key goes
+    /// in when it is not already there (`HAProxy`'s `http_action_set_map` looks the entry up
+    /// first and calls `pat_ref_add` only when it is absent), and its value is what an ACL
+    /// entry's is.
+    pub fn add_acl(&self, key: &str) -> Result<(), String> {
+        self.check_key(key)?;
+        let mut t = write(&self.entries);
+        if !t.has_key(key) {
+            t.insert(next_entry_id(), key, "");
+        }
+        self.changed();
+        Ok(())
+    }
+
+    /// The `set-map(<file>) <key> <value>` action, and what the CLI's `set map` does: every
+    /// entry with the key gets the value, or the entry is added when the key is not there
+    /// (`pat_ref_set_elt_duplicate`, then `pat_ref_add`).
+    pub fn set_map(&self, key: &str, val: &str) -> Result<(), String> {
+        self.check_key(key)?;
+        if self.kind == RefKind::Map { self.check_val(val)?; }
+        let mut t = write(&self.entries);
+        if !t.update_key(key, val) {
+            t.insert(next_entry_id(), key, val);
+        }
+        self.changed();
+        Ok(())
+    }
+
+    /// The `del-acl(<file>) <key>` and `del-map(<file>) <key>` actions: every entry with the
+    /// key is removed, and when none is there `HAProxy`'s `pat_ref_delete` found nothing and
+    /// the action is a no-op, as this is.
+    pub fn del(&self, key: &str) -> Result<(), String> {
+        self.writable()?;
+        write(&self.entries).remove_key(key);
+        self.changed();
+        Ok(())
+    }
 }
 
-/// The reference of ACL file `path`, created (and read) when none is registered.
+/// The name a pattern file is registered under and the path on disk it reads, if it reads
+/// one (`HAProxy`'s `pat_ref_new`, `src/pattern.c`): a `virt@` reference keeps its prefix
+/// and has no file; `file@` and `opt@` are stripped, and a plain name is both.
+fn pat_file_name(path: &str) -> (String, Option<String>) {
+    if path.starts_with("virt@") {
+        (path.to_string(), None)
+    } else if let Some(p) = path.strip_prefix("file@").or_else(|| path.strip_prefix("opt@")) {
+        (p.to_string(), Some(p.to_string()))
+    } else {
+        (path.to_string(), Some(path.to_string()))
+    }
+}
+
+/// The reference of ACL file `path`, created (and read) when none is registered. A
+/// `virt@` reference has no file and is created empty.
 ///
 /// # Errors
 /// The file cannot be read.
 pub fn acl_file(path: &str) -> Result<Arc<PatRef>, String> {
+    let (name, on_disk) = pat_file_name(path);
     let failed = || format!("failed to open pattern file <{path}>");
     let mut refs = lock(&REFS);
-    let stamp = std::fs::metadata(path).map_err(|_| failed()).map(|m| (m.modified().ok(), m.len()))?;
-    if let Some(r) = refs.iter().find(|r| r.kind == RefKind::Acl && r.file == path) {
+    let stamp = match on_disk.as_ref() {
+        Some(p) => Some(std::fs::metadata(p).map_err(|_| failed()).map(|m| (m.modified().ok(), m.len()))?),
+        None => None,
+    };
+    if let Some(r) = refs.iter().find(|r| r.kind == RefKind::Acl && r.file == name) {
         // A file that changed on disk since it was read, and that the CLI has not touched,
         // is read again: parsing an ACL reads its file, as it always did.
-        let stale = *lock(&r.stamp) != Some(stamp);
+        let stale = *lock(&r.stamp) != stamp;
         if stale && r.version() == 1 {
-            let pairs = read_acl_file(path).ok_or_else(failed)?;
+            let Some(p) = on_disk.as_deref() else { return Ok(Arc::clone(r)) };
+            let pairs = read_acl_file(p).ok_or_else(failed)?;
             let mut t = write(&r.entries);
             t.clear();
             for (key, val) in pairs {
                 t.insert(next_entry_id(), &key, &val);
             }
             drop(t);
-            *lock(&r.stamp) = Some(stamp);
+            *lock(&r.stamp) = stamp;
         }
         return Ok(Arc::clone(r));
     }
-    let pairs = read_acl_file(path).ok_or_else(failed)?;
-    let r = Arc::new(PatRef::new(refs.len(), RefKind::Acl, path, pairs));
-    *lock(&r.stamp) = Some(stamp);
+    let pairs = match on_disk {
+        Some(ref p) => read_acl_file(p).ok_or_else(failed)?,
+        None => Vec::new(),
+    };
+    let r = Arc::new(PatRef::new(refs.len(), RefKind::Acl, &name, pairs));
+    *lock(&r.stamp) = stamp;
     refs.push(Arc::clone(&r));
     Ok(r)
 }
@@ -410,6 +470,9 @@ fn map_key_error(keys: MapKeys, key: &str, resolve: bool) -> Option<String> {
 pub fn map_file_error(path: &str, keys: MapKeys, vals: MapVals) -> Option<String> {
     // T343: a map file that cannot be read is refused (`pat_ref_read_from_file`), but for a
     // virtual (`virt@`) or optional (`opt@`) one, which `HAProxy` loads without a file.
+    // A `file@`-named file is read like a plain one; only the name it is registered under
+    // differs, and this is about the file, not the name.
+    let path = path.strip_prefix("file@").unwrap_or(path);
     if path.starts_with("virt@") || path.starts_with("opt@") {
         return None;
     }
@@ -439,16 +502,22 @@ pub fn map_file(path: &str, keys: MapKeys, user: Option<String>) -> Option<Arc<P
     map_file_typed(path, keys, MapVals::Str, user)
 }
 
-/// [`map_file`] for a converter whose output is of type `vals`.
+/// [`map_file`] for a converter whose output is of type `vals`. A `virt@` reference, and an
+/// `opt@` one whose file is not there, is created empty, as `HAProxy` loads them: neither
+/// has a file to read.
 #[must_use]
 pub fn map_file_typed(path: &str, keys: MapKeys, vals: MapVals, user: Option<String>) -> Option<Arc<PatRef>> {
+    let (name, on_disk) = pat_file_name(path);
     let mut refs = lock(&REFS);
-    let found = refs.iter().find(|r| r.kind == RefKind::Map && r.file == path).cloned();
+    let found = refs.iter().find(|r| r.kind == RefKind::Map && r.file == name).cloned();
     let r = if let Some(r) = found {
         r
     } else {
-        let text = std::fs::read_to_string(path).ok()?;
-        let r = Arc::new(PatRef::new(refs.len(), RefKind::Map, path, parse_lines(&text)));
+        let pairs = on_disk
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map_or_else(Vec::new, |c| parse_lines(&c));
+        let r = Arc::new(PatRef::new(refs.len(), RefKind::Map, &name, pairs));
         *lock(&r.map_keys) = keys;
         *lock(&r.map_vals) = vals;
         refs.push(Arc::clone(&r));
@@ -467,6 +536,17 @@ pub fn list(kind: RefKind) -> Vec<Arc<PatRef>> {
     lock(&REFS).iter().filter(|x| x.kind == kind).cloned().collect()
 }
 
+/// The registered reference named `ident`, by `file` or by `#<id>`; `None` when none
+/// answers it. The `file@` and `opt@` prefixes are stripped before the name is compared,
+/// as `HAProxy`'s `pat_ref_lookup` does (`virt@` names keep theirs, and are found as a
+/// whole). The rule actions look their reference up through this, and a reference no one
+/// registered answers with `None` as `HAProxy`'s does.
+#[must_use]
+pub fn lookup(kind: RefKind, ident: &str) -> Option<Arc<PatRef>> {
+    let name = ident.strip_prefix("file@").or_else(|| ident.strip_prefix("opt@")).unwrap_or(ident);
+    lock(&REFS).iter().find(|r| r.kind == kind && r.file == name).cloned()
+}
+
 fn find(kind: RefKind, ident: &str) -> Result<Arc<PatRef>, String> {
     let unknown = || format!("Unknown {} identifier. Please use #<id> or <file>.", if kind == RefKind::Map { "map" } else { "ACL" });
     let refs = list(kind);
@@ -474,7 +554,7 @@ fn find(kind: RefKind, ident: &str) -> Result<Arc<PatRef>, String> {
         let id: usize = id.parse().map_err(|_| unknown())?;
         refs.into_iter().find(|r| r.id == id).ok_or_else(unknown)
     } else {
-        refs.into_iter().find(|r| r.file == ident).ok_or_else(unknown)
+        lookup(kind, ident).ok_or_else(unknown)
     }
 }
 
@@ -515,13 +595,17 @@ pub fn scan_config(text: &str, locate: &dyn Fn(usize) -> (String, usize)) {
             let name = fetch.split('(').next().unwrap_or(fetch);
             acl_expr(format!("acl '{name}' file '{file}' line {fline}"));
         }
-        // `map(<file>,...)`, `map_beg(<file>,...)`, `set-map(<file>)`, `del-map(<file>)`.
+        // `map(<file>,...)`, `map_beg(<file>,...)`, ...: the sample converters register the
+        // files they read. The `set-map(<file>)` and `del-map(<file>)` actions do not: like
+        // `HAProxy`'s `http_action_set_map`, they look the reference up at run time and do
+        // nothing when no converter or `acl` line loaded it, so a `-` before `map` is no
+        // converter.
         let mut from = 0;
         while let Some(at) = line[from..].find("map") {
             let start = from + at;
             from = start + 3;
             let before = line[..start].chars().next_back();
-            if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+            if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
                 continue;
             }
             let rest = &line[start..];
