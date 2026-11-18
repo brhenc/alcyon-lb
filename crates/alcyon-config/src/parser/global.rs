@@ -928,6 +928,53 @@ pub(crate) fn parse_global_directive(
             global.maxconn = Some(val);
             Ok(())
         }
+        // `maxconnrate`, `maxsessrate`, `maxsslrate` (src/cfgparse-global.c,
+        // `cfg_parse_global_limits`): per-process per-second limits, read with `atol`,
+        // 0 = no limit. The oracle accepts any integer (measured: `maxconnrate 5000000000`
+        // loads and `show info` prints `ConnRateLimit: 705032704`, the 32-bit truncation
+        // of its `int`, unsigned), so the value is kept truncated like that. A second line
+        // only warns and the first value stays, but only when the stored value is not 0
+        // (`if (global.cps_lim != 0)`; a negative one is non-zero, measured).
+        "maxconnrate" | "maxsessrate" | "maxsslrate" => {
+            let slot = match kw.text.as_str() {
+                "maxconnrate" => &mut global.maxconnrate,
+                "maxsessrate" => &mut global.maxsessrate,
+                _ => &mut global.maxsslrate,
+            };
+            if let Some(extra) = tokens.get(2) {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    format!("'{}' cannot handle unexpected argument '{}'.", kw.text, extra.text),
+                ));
+            }
+            let Some(arg) = tokens.get(1) else {
+                return Err(ConfigError::new(
+                    kw.line,
+                    kw.col,
+                    format!("'{}' expects an integer argument.", kw.text),
+                ));
+            };
+            let v = super::server_keywords::atol(&arg.text) as i32;
+            if slot.is_some_and(|cur| cur != 0) {
+                global.load_warnings.push(LoadWarning {
+                    line: kw.line,
+                    alert: false,
+                    text: format!("'{}' already specified. Continuing.", kw.text),
+                    style: crate::ast::global::WarnStyle::Spaced,
+                });
+                return Ok(());
+            }
+            *slot = Some(v);
+            Ok(())
+        }
+        // `maxcomprate` sets a compression rate limit (in kb/s). Alcyon has no HTTP
+        // compression, so there is nothing to limit (see docs/differences.md).
+        "maxcomprate" => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "'maxcomprate' is not supported: Alcyon does not implement HTTP compression.",
+        )),
         // `cfg_parse_global` (src/cfgparse-global.c); reaches `show info` and the stats page
         // through `GlobalSection::node` / `description` (`alcyon-rt` `stats.rs`).
         "node" => {

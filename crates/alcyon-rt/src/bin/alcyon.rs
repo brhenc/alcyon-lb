@@ -947,6 +947,7 @@ fn main() {
         None => capacity,
     };
     alcyon_rt::engine::configure_maxconn(&config);
+    alcyon_rt::engine::configure_rate_limits(&config);
     let maxsock = alcyon_rt::engine::config_maxsock(&config, nbthread);
     match alcyon_rt::globalconn::apply_nofile_limit(u64::try_from(maxsock).unwrap_or(u64::MAX), strict) {
         Ok(None) => {}

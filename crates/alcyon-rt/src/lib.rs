@@ -40,6 +40,7 @@ pub mod cookie;
 pub mod cpu;
 pub mod crypto_provider;
 pub mod globalconn;
+pub mod ratelimit;
 pub mod dgram;
 pub mod engine;
 pub mod fdtab;

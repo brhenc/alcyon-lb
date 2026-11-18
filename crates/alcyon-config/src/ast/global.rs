@@ -368,6 +368,17 @@ pub struct GlobalSection {
     pub h2_glitches_threshold: Option<usize>,
     /// Global maximum connection limit.
     pub maxconn: Option<u32>,
+    /// `maxconnrate`: the per-process connection rate ceiling per second (`global.cps_lim`).
+    /// `HAProxy` accepts any integer (no range check) and keeps the 32-bit truncated value
+    /// in its `int`; a negative one reads huge through the unsigned `freq` of
+    /// `freq_ctr_remain` and is no limit. 0 (or unset) is no limit.
+    pub maxconnrate: Option<i32>,
+    /// `maxsessrate`: the per-process session rate ceiling per second (`global.sps_lim`);
+    /// stored and limited as `maxconnrate`.
+    pub maxsessrate: Option<i32>,
+    /// `maxsslrate`: the per-process SSL-session rate ceiling per second (`global.ssl_lim`);
+    /// it applies to `ssl` binds only, stored and limited as `maxconnrate`.
+    pub maxsslrate: Option<i32>,
     /// The memory budget in megabytes, `-m` on the command line (`global.rlimit_memmax`): it
     /// sizes `maxconn` and is what `Memmax_MB` shows; it is not a limit on the process.
     pub memmax_mb: Option<u32>,

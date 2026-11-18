@@ -121,6 +121,7 @@ mod cli_show_quic;
 mod cli_show_sess;
 mod cli_show_stat_end;
 mod cli_show_typed_json;
+mod cli_full_buffer;
 mod cli_unknown_command;
 mod cli_socket_prebind;
 mod cli_src_dst;
@@ -536,3 +537,5 @@ mod connection_flags;
 mod stats_json_page;
 mod stats_typed_page;
 mod res_caps_clone;
+
+mod rate_limit;
