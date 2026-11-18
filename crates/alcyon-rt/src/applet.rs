@@ -987,12 +987,16 @@ impl CliApplet {
     /// `cli_parse_unpublish_backend`, `src/proxy.c`): the flag the switching rules skip and
     /// `show stat` spells `(UNPUB)`, and the answer.
     ///
-    /// A backend the configuration `disabled` is not built at all (`init_proxies`), so
-    /// HAProxy's "No effect on a disabled backend." is answered as "No such backend." here,
-    /// the way every other command answers one.
     fn handle_be_publish(&mut self, target: &str, publish: bool, ctx: &mut AppletContext) {
         if !ctx.proxies.iter().any(|p| p.has_backend && p.name == target) {
-            self.finish_msg("No such backend.");
+            // A backend the configuration `disabled` is not built at all (`init_proxies`),
+            // but the name is still one: the flag the command would set cannot be reached,
+            // as in `HAProxy` (`cli_parse_unpublish_backend`, `src/cfgparse-cli.c`).
+            let disabled = ctx
+                .proxies
+                .iter()
+                .any(|p| p.disabled_backends.iter().any(|n| n == target));
+            self.finish_msg(if disabled { "No effect on a disabled backend." } else { "No such backend." });
             return;
         }
         for p in ctx.proxies.iter().filter(|p| p.has_backend && p.name == target) {

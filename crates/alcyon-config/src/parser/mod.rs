@@ -1505,17 +1505,9 @@ pub(crate) fn parse_use_backend(
             "<use_backend> expects <backend_name> as argument.",
         ));
     }
-    // HAProxy builds the name from a log-format string when it holds `%`; Alcyon looks the
-    // written text up as a name, never finds it and sends the request to the default
-    // backend, as if the rule had not matched.
-    if tokens[1].text.contains('%') {
-        return Err(ConfigError::new(
-            tokens[1].line,
-            tokens[1].col,
-            "'use_backend' with a log-format backend name is not implemented by Alcyon; \
-             the rule would never match",
-        ));
-    }
+    // The name may be a log-format expression: `HAProxy` builds it per request
+    // (`process_switching_rules`) and looks the result up by name. The written text is
+    // kept verbatim; the runtime decides whether it is a static name or a format.
     let backend = tokens[1].text.clone();
     let cond = if tokens.len() >= 3 {
         parse_acl_condition_from_tokens(&tokens[2..])?

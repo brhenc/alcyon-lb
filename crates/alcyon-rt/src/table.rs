@@ -214,6 +214,32 @@ impl Table {
         }
     }
 
+    /// What a `use_backend` rule with a log-format name names, with the name the rule built
+    /// per request (`process_switching_rules` builds it from the rule's expression): one
+    /// lookup of the name map, backends only -- a frontend that holds the name is no target,
+    /// as `proxy_be_by_name` finds no frontend -- with the same unpublished check as
+    /// [`Table::route`]. A name the configuration `disabled` is no backend of the table (it
+    /// is not built): `fe`'s list of disabled names answers it as a disabled target, as the
+    /// static rule `resolve_routes` resolved to [`Target::Disabled`].
+    #[must_use]
+    pub fn route_dyn(&self, fe: &Proxy, name: &str) -> Routed {
+        let Some(s) = self.slot_by_name(name) else {
+            return if fe.disabled_backends.iter().any(|n| n == name) {
+                Routed::Disabled
+            } else {
+                Routed::Miss
+            };
+        };
+        if !self[s].has_backend {
+            return Routed::Miss;
+        }
+        if self[s].unpublished.get() {
+            Routed::Unpublished(s)
+        } else {
+            Routed::Backend(s)
+        }
+    }
+
     /// The proxies back, for a unit test that writes into them as the load does.
     #[cfg(test)]
     pub(crate) fn into_vec(self) -> Vec<Proxy> {

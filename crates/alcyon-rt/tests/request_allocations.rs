@@ -832,7 +832,12 @@ fn start_keepalive_backend(listener: TcpListener, running: Arc<AtomicBool>, rsp:
 /// the engine afterwards (each idle `run_once` sleeps up to 100 ms), and it reads into a fixed
 /// buffer: nothing here allocates.
 fn drive_request_expecting(client: &mut TcpStream, engine: &mut Engine, status: &[u8], tail: &[u8]) {
-    client.write_all(b"GET /api/test HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("write req");
+    drive_request_bytes(client, engine, b"GET /api/test HTTP/1.1\r\nHost: localhost\r\n\r\n", status, tail);
+}
+
+/// [`drive_request_expecting`] with the request it sends.
+fn drive_request_bytes(client: &mut TcpStream, engine: &mut Engine, req: &[u8], status: &[u8], tail: &[u8]) {
+    client.write_all(req).expect("write req");
     let start = Instant::now();
     let mut response = [0u8; 512];
     let mut len = 0;
@@ -1487,4 +1492,49 @@ fn the_automatic_sni_allocates_nothing_per_request() {
     let none = growth(" no-sni-auto");
     println!("[MEASUREMENT sni-alloc] allocations for 1000 more TLS-backend requests: automatic SNI {auto}, no-sni-auto {none}");
     assert_eq!(auto, none, "1000 more requests with the automatic SNI: {auto} allocations, {none} with no-sni-auto");
+}
+
+/// T637 DYNUSEBE: a log-format `use_backend` rule builds its name per request into the
+/// thread's buffer and looks the result up in the table's name map: after the warm-up the
+/// requests allocate nothing, on a name that resolves as on one that does not.
+#[test]
+fn a_log_format_use_backend_allocates_nothing_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (srv, srv_addr) = loopback0();
+    let addr = common::reserve_addr();
+    let running = Arc::new(AtomicBool::new(true));
+    let be = start_keepalive_backend(srv, Arc::clone(&running), PLAIN_RSP);
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend f\n  bind {addr}\n  use_backend %[req.hdr(x-target)]\n  default_backend b\n\
+         backend b\n  server s1 {srv_addr}\n"
+    );
+    let mut engine = Engine::new(&alcyon_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut client = TcpStream::connect(addr).expect("connect to frontend");
+    client.set_nonblocking(true).expect("set_nonblocking");
+    // One shape resolves the built name to the backend, the other to nothing: warm both up.
+    let resolved = b"GET / HTTP/1.1\r\nHost: localhost\r\nx-target: b\r\n\r\n";
+    let missed = b"GET / HTTP/1.1\r\nHost: localhost\r\nx-target: nosuch\r\n\r\n";
+    for _ in 0..3 {
+        drive_request_bytes(&mut client, &mut engine, resolved, b"HTTP/1.1 200", b"\r\n\r\nok");
+        drive_request_bytes(&mut client, &mut engine, missed, b"HTTP/1.1 200", b"\r\n\r\nok");
+    }
+    let before = alcyon_alloc::alloc_counters();
+    for i in 0..250 {
+        let req: &[u8] = if i % 2 == 0 { &resolved[..] } else { &missed[..] };
+        drive_request_bytes(&mut client, &mut engine, req, b"HTTP/1.1 200", b"\r\n\r\nok");
+    }
+    let diff = before.diff(&alcyon_alloc::alloc_counters());
+    drop(client);
+    for _ in 0..5 {
+        let _ = engine.run_once();
+    }
+    running.store(false, Ordering::Relaxed);
+    let _ = be.join();
+    assert_eq!(
+        (diff.alloc_count, diff.realloc_count),
+        (0, 0),
+        "{:?} in 500 keep-alive requests through a log-format use_backend (250 resolving, 250 not)",
+        (diff.alloc_count, diff.realloc_count)
+    );
 }

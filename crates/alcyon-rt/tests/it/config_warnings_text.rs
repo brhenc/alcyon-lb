@@ -259,16 +259,12 @@ fn track_sc_finds_the_own_table_and_one_in_another_proxy() {
     ));
 }
 
-/// Alcyon only: HAProxy builds the backend name of a `use_backend` from a log-format string;
-/// Alcyon looks the written text up as a name, never finds it and sends the request to the
-/// default backend, so it refuses.
+/// A `use_backend` whose name is a log-format string is a rule that builds the name per
+/// request (`process_switching_rules`) and looks it up by name: there is no backend to find
+/// at load, so the configuration loads (T637 DYNUSEBE). `HAProxy` does the same.
 #[test]
-fn a_log_format_use_backend_is_refused_by_alcyon() {
-    if std::env::var("T273D_ORACLE").is_ok() {
-        return;
-    }
-    let (got, rc) = alerts(&fe("    use_backend %[req.hdr(x)]\n    default_backend b\n"));
-    assert_eq!(rc, 1, "{got:?}");
+fn a_log_format_use_backend_builds_its_name_per_request() {
+    accepts(&fe("    use_backend %[req.hdr(x)]\n    default_backend b\n"));
 }
 
 #[test]
