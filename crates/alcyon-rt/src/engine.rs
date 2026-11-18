@@ -7504,39 +7504,43 @@ fn eval_tcp_req_session_rules(
                 }
             }
             alcyon_config::TcpReqSessionAction::SetSrc { expr: _ } => {
+                // `tcp_action_req_set_src` with `ACT_F_TCP_REQ_SES`: it sets the session's
+                // value (`sess_get_src` first copies the connection's into it), which every
+                // later stream of the connection inherits; the stream now starting reads it.
+                // The sample must convert to an address (`SMP_T_ADDR`, `c_str2addr`): a
+                // string that is not a bare IP converts to nothing and the action does
+                // nothing (`sample_fetch_as_type` returns null).
                 let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp)).unwrap_or_default();
                 if let Ok(ip) = val.parse::<IpAddr>() {
-                    let port = sess.client_addr.map_or(0, |a| a.port());
+                    let port = sess.sess_src.or(sess.fc_src).map_or(0, |a| a.port());
                     let new_addr = SocketAddr::new(ip, port);
+                    sess.sess_src = Some(new_addr);
                     sess.client_addr = Some(new_addr);
                     ctx.client_addr = Some(new_addr);
-                } else if let Ok(sa) = val.parse::<SocketAddr>() {
-                    sess.client_addr = Some(sa);
-                    ctx.client_addr = Some(sa);
                 }
             }
             alcyon_config::TcpReqSessionAction::SetDst { expr: _ } => {
                 let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp)).unwrap_or_default();
                 if let Ok(ip) = val.parse::<IpAddr>() {
-                    let port = sess.server_addr.map_or(0, |a| a.port());
+                    let port = sess.sess_dst.or(sess.fc_dst).map_or(0, |a| a.port());
                     let new_addr = SocketAddr::new(ip, port);
+                    sess.sess_dst = Some(new_addr);
                     sess.server_addr = Some(new_addr);
                     ctx.server_addr = Some(new_addr);
-                } else if let Ok(sa) = val.parse::<SocketAddr>() {
-                    sess.server_addr = Some(sa);
-                    ctx.server_addr = Some(sa);
                 }
             }
             alcyon_config::TcpReqSessionAction::SetSrcPort { expr: _ } => {
                 if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
-                    let new_addr = with_port(sess.client_addr, port);
+                    let new_addr = with_port(sess.sess_src.or(sess.fc_src), port);
+                    sess.sess_src = Some(new_addr);
                     sess.client_addr = Some(new_addr);
                     ctx.client_addr = Some(new_addr);
                 }
             }
             alcyon_config::TcpReqSessionAction::SetDstPort { expr: _ } => {
                 if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
-                    let new_addr = with_port(sess.server_addr, port);
+                    let new_addr = with_port(sess.sess_dst.or(sess.fc_dst), port);
+                    sess.sess_dst = Some(new_addr);
                     sess.server_addr = Some(new_addr);
                     ctx.server_addr = Some(new_addr);
                 }

@@ -70,10 +70,16 @@ fn server_check_state_stays_small() {
 /// variant that `http-request disable-l7-retry` now sets costs the enum nothing -- it is 16
 /// bytes with or without it (its own tag, no niche in `Saved(L7Box)`;
 /// `l7_retry_stays_16_bytes`).
+/// The session's `src`/`dst` slots added 64: `TcpSession::sess_src`/`sess_dst`, the
+/// session-level values `HAProxy` keeps in `sess->src`/`sess->dst` (`tcp-request session
+/// set-src` writes them, a received PROXY header does, each new request's stream inherits
+/// from them in `reset_for_next_request`). Two plain `Option<SocketAddr>`, written once per
+/// connection and read once per request; boxing them would be two allocations per connection
+/// (the same trade `T515` made for `fc_src`/`fc_dst`).
 #[test]
 fn session_entry_stays_small() {
     let n = size_of::<alcyon_rt::engine::SessionEntry>();
-    assert!(n <= 1664, "SessionEntry grew to {n} bytes (bound 1664): one is held per client connection, box the new field");
+    assert!(n <= 1728, "SessionEntry grew to {n} bytes (bound 1728): one is held per client connection, box the new field");
 }
 
 /// `L7Retry` is 16 bytes: its own tag (the niche of `Saved(L7Box)`'s `Option` is inside the
