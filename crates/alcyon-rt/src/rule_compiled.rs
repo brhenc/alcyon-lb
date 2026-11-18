@@ -347,7 +347,9 @@ pub struct Rule {
     /// `http-rules/acl_map_updates.vtc`): the request path writes through it and looks up no
     /// name. `None` when no reference by the rule's name is registered; as `HAProxy`, whose
     /// `pat_ref_lookup` finds nothing, the action then does nothing.
-    pub pat: Option<PatOp>,
+    /// Boxed: only these four actions set it, and the 192 bytes of a [`PatOp`] inline would
+    /// grow every compiled rule (624 to 816 bytes); boxed, it stays at 624.
+    pub pat: Option<Box<PatOp>>,
 }
 
 impl Rule {
@@ -399,7 +401,7 @@ impl Rule {
 
     /// The rule with its pattern-file action resolved (`pat: None` keeps it a no-op).
     fn with_pat(mut self, op: Option<PatOp>) -> Self {
-        self.pat = op;
+        self.pat = op.map(Box::new);
         self
     }
 }
