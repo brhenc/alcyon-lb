@@ -118,6 +118,7 @@ mod cli_show_stat_end;
 mod cli_show_typed_json;
 mod cli_unknown_command;
 mod cli_socket_prebind;
+mod cli_src_dst;
 mod client_gone_while_blocked;
 mod client_keepalive;
 mod cmp_unset_var;

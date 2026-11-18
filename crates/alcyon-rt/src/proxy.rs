@@ -934,6 +934,13 @@ pub struct TcpSession {
     pub pending_resp: Option<Box<PendingOut>>,
     pub fc_src: Option<SocketAddr>,
     pub fc_dst: Option<SocketAddr>,
+    /// The client address as the session holds it (`HAProxy`'s `sess->src`/`sess->dst`):
+    /// what `tcp-request session set-src`/`set-dst` and a received PROXY header write, and
+    /// what each new request's stream inherits ([`Self::reset_for_next_request`],
+    /// [`Self::h2_child_init`]). `None` until one of those sets it; until then the stream
+    /// reads the connection's value (`fc_src`) through it.
+    pub sess_src: Option<SocketAddr>,
+    pub sess_dst: Option<SocketAddr>,
     pub tcp_inspect_done: bool,
     pub inspect_exp: Option<Tick>,
     /// A `tcp-request content do-resolve` or an `http-request do-resolve` (with its
@@ -1287,6 +1294,8 @@ impl TcpSession {
         c.server_addr = owner.server_addr;
         c.fc_src = owner.fc_src;
         c.fc_dst = owner.fc_dst;
+        c.sess_src = owner.sess_src;
+        c.sess_dst = owner.sess_dst;
         c.bufsize = owner.bufsize;
         c.maxrewrite = owner.maxrewrite;
         c.h2_flood_config = owner.h2_flood_config;
@@ -1312,6 +1321,11 @@ impl TcpSession {
     /// What a stream's session takes of its connection `owner` when its stream starts.
     fn h2_child_init(&mut self, owner: &mut TcpSession, owner_ref: (u32, alcyon_sched::TaskRef), stream: H2ActiveStream) {
         let c = self;
+        // Each stream of the connection is a new stream in `HAProxy`, and its connector
+        // starts at the session's value under the connection's: a previous stream's
+        // stream-level set goes with that stream, not this one.
+        c.client_addr = c.sess_src.or(c.fc_src);
+        c.server_addr = c.sess_dst.or(c.fc_dst);
         c.close_client = owner.close_client;
         c.stopping = owner.stopping;
         c.bytes_in = owner.bytes_in;
@@ -1492,6 +1506,10 @@ impl TcpSession {
             pending_resp,
             fc_src: _,
             fc_dst: _,
+            // The connection's session value, copied once from the owner (`h2_child_of`);
+            // each stream's connector re-reads it at stream start (`h2_child_init`).
+            sess_src: _,
+            sess_dst: _,
             tcp_inspect_done: _,
             inspect_exp: _,
             dr_wait,
@@ -1810,6 +1828,8 @@ impl TcpSession {
             pending_resp: None,
             fc_src: None,
             fc_dst: None,
+            sess_src: None,
+            sess_dst: None,
             tcp_inspect_done: true,
             inspect_exp: None,
             dr_wait: 0,
@@ -2635,6 +2655,13 @@ impl TcpSession {
     /// Clears what belonged to the transaction that just ended, so the next request on
     /// this connection starts from nothing. The one place that list lives.
     pub fn reset_for_next_request(&mut self) {
+        // A new request is a new stream in `HAProxy`: its connector starts unset and reads
+        // the session's value under the connection's (`sc_src` falls back to `sess_src`,
+        // which falls back to the connection). What the last request's rules set at stream
+        // level goes with it; the session's own set (`tcp-request session set-src`) and the
+        // PROXY header's survive the request.
+        self.client_addr = self.sess_src.or(self.fc_src);
+        self.server_addr = self.sess_dst.or(self.fc_dst);
         self.stick_out_pending += self.strm.log.bytes_from_server;
         // The stream becomes the next request's in place (O1a): its transaction, log,
         // captures, `txn.`/`req.`/`res.` variables, stick keys and set timeouts go.
@@ -3071,9 +3098,14 @@ impl TcpSession {
             return false;
         }
         if let Some(src) = info.src_sockaddr() {
+            // The PROXY header sets the session's value (`conn_recv_proxy` writes
+            // `sess->src`); the stream that has not materialized its own yet reads it
+            // from there, and each new stream inherits it.
+            self.sess_src = Some(src);
             self.client_addr = Some(src);
         }
         if let Some(dst) = info.dst_sockaddr() {
+            self.sess_dst = Some(dst);
             self.server_addr = Some(dst);
         }
         self.proxy_info = Some(Box::new(info));
