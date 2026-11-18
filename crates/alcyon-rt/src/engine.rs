@@ -13800,6 +13800,9 @@ impl EngineDispatcher<'_> {
                 be_id: be_name.and_then(|n| proxies.iter().find(|p| p.has_backend && p.name == n)).map(|p| p.ids.iid),
                 accept_date: Some(sess.strm.log.date()),
                 request_date: Some(request_date(&sess.strm.log)),
+                // The request's time to its first byte (`s->logs.t_idle`, `%Ti`), as
+                // `req.timer.idle` reads it in a request rule.
+                req_timer_idle: sess.strm.log.ms(sess.strm.log.first_byte),
                 be_max_retries: Some(be_retries),
                 acls: Some(acls),
                 act_conn,

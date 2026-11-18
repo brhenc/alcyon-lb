@@ -337,6 +337,9 @@ pub struct PhaseCtx<'a> {
     pub accept_date: Option<(i64, u32)>,
     /// When the first byte of the request was received, as unix seconds and milliseconds: `request_date`.
     pub request_date: Option<(i64, u32)>,
+    /// The request's time to its first byte, in milliseconds, as the http-request rules find it
+    /// (`s->logs.t_idle`, `%Ti`): what `req.timer.idle` reads. `0` where the phase has no stream.
+    pub req_timer_idle: i64,
     /// What `when()` reads of the stream; `None` is a stream that has done nothing yet.
     pub stream: Option<StreamFacts>,
     /// The proxy's ACLs, for `when(acl,<name>)`; `None` where the caller has none, and the
@@ -426,6 +429,7 @@ impl PhaseCtx<'_> {
         prio: (0, 0),
         accept_date: None,
         request_date: None,
+        req_timer_idle: 0,
         stream: None,
         acls: None,
         is_first_req: false,
@@ -2393,6 +2397,29 @@ impl Registry {
             name: "res.timer.hdr",
             out_type: SampleType::Sint,
             func: |_ctx, _args| Some(Sample::Sint(CURRENT_RES_TR.get())),
+        });
+        // T-reqtimerhdr: the `req.timer.*` family as the request rules find it. In `HAProxy`
+        // (`src/sample.c`, `smp_fetch_reX_timers`), `req.timer.hdr` is
+        // `t_request - logs->t_idle - logs->t_handshake` with `t_request = request_ts - accept_ts`,
+        // and `req.timer.idle` is `logs->t_idle`. A stream's `s->logs.request_ts` is stamped by
+        // `http_process_req_common` *after* the request rules ran (and by
+        // `http_wait_for_request_body` only on the analyser path, not by the `wait-for-body` rule),
+        // so `t_request` is `-1` for every `http-request` rule - the stamp follows the rules on a
+        // fresh connection and a kept one alike: `req.timer.hdr` answers `-1` there (measured on
+        // the oracle, 3.5-dev11, with and without `http-request wait-for-body`) and the header
+        // wait it names is the `%TR` the access log writes for the same stream. `req.timer.idle`
+        // answers the
+        // request's time to its first byte (`%Ti`): the engine gives it to the rules in
+        // `PhaseCtx::req_timer_idle`.
+        self.register_fetch(FetchDesc {
+            name: "req.timer.hdr",
+            out_type: SampleType::Sint,
+            func: |_ctx, _args| Some(Sample::Sint(-1)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "req.timer.idle",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(ctx.req_timer_idle)),
         });
 
         // `smp_fetch_proto_http` (`src/http_fetch.c`), registered as `req.proto_http` and, T326,
