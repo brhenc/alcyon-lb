@@ -863,6 +863,15 @@ impl LogFormat {
         *buf = out.0;
     }
 
+    /// Renders a value after what `buf` holds, like [`render_value`]: an expression that
+    /// yields nothing writes nothing. For the `set-proxy-v2-tlv-fmt` values, written into
+    /// the PROXY v2 header being built, not a separate buffer.
+    pub fn render_value_append(&self, buf: &mut Vec<u8>, d: &LogData, registry: &Registry, ctx: &SampleContext) {
+        let mut out = Out(std::mem::take(buf));
+        self.render_into(&mut out, d, registry, ctx, false);
+        *buf = out.0;
+    }
+
     /// Renders the format outside a log line, where an expression that yields nothing, or
     /// an empty string, writes nothing rather than `-`: what `HAProxy` sends for an
     /// `http-check send hdr x %[str()]` (no header at all, 3.5-dev8-885761-29, 2026-10-03).

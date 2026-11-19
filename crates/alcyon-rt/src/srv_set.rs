@@ -51,6 +51,14 @@ struct ServerCells {
     base: Box<[Cell]>,
 }
 
+/// A slot is named by a sample fetch, a `use-server` target, or another server's `track`.
+/// `set server <b>/<s> name` refuses to rename it and `del server` refuses to remove it
+/// (HAProxy `SRV_F_NAME_REFD`). Load-only: set once, never cleared.
+pub const NAME_REFD: u8 = 0x1;
+/// A `resolvers` section resolves the slot's address at run time (HAProxy
+/// `SRV_F_NON_PURGEABLE`). `del server` refuses it, but a rename is allowed. Load-only.
+pub const NON_PURGEABLE: u8 = 0x2;
+
 /// The per-server arrays of a [`Proxy`], private to this module (T637, section 4.2): the only
 /// way to a server is [`ServerSet`].
 #[derive(Debug, Clone)]
@@ -76,10 +84,14 @@ pub struct ServerArrays {
     /// `proxy-v2-options unique-id`, per server.
     server_pp_unique_id: Vec<bool>,
     server_backups: Vec<bool>,
-    /// The servers whose name a sample fetch's argument holds (`srv_is_up(be/s)` and the
-    /// other `srv_*`), which `set server <b>/<s> name` refuses to rename: the fetches look the
-    /// server up by name. Empty when no fetch names a server of this proxy.
-    server_name_refd: Box<[bool]>,
+    /// Each server's load-only "pointed to" flags, one byte per slot ([`NAME_REFD`],
+    /// [`NON_PURGEABLE`]): a sample fetch's argument (`srv_is_up(be/s)` and the other `srv_*`),
+    /// a `use-server` target, or another server's `track` names it, so `set server <b>/<s> name`
+    /// refuses to rename it and `del server` refuses to remove it; a `resolvers` section resolves
+    /// its address, so `del server` refuses it (a rename stays allowed). One byte per slot, not
+    /// two `bool` arrays, so the flags do not grow `Proxy`'s inline size (`struct_sizes.rs`).
+    /// Empty when no server has either flag.
+    server_name_flags: Box<[u8]>,
     /// Each server's `maxconn`, shared by every worker: `set maxconn server` changes it in
     /// place (T177).
     server_maxconn: crate::srv_rt::ServerMaxconns,
@@ -94,6 +106,24 @@ pub struct ServerArrays {
     /// Each server's health-check TLS (`check-ssl`, or `ssl` inherited), `None` for
     /// plaintext checks.
     server_check_tls: Vec<Option<Arc<crate::srv_tls::CheckTls>>>,
+}
+
+/// One server's `set-proxy-v2-tlv-fmt(<id>) [<fmt>]` TLVs (`srv->pp_tlvs`), compiled once
+/// and in the order `make_proxy_line_v2` sends them: the `default-server` ones first, then
+/// the server's own. `fmt` is `None` for a TLV without a format, whose value is empty.
+/// Per-server `observe` / `error-limit` / `on-error` runtime state.
+#[derive(Debug, Default)]
+pub struct ObserveSlot {
+    pub observe: alcyon_config::ObserveMode,
+    pub on_error: alcyon_config::OnErrorMode,
+    pub error_limit: u32,
+    pub consecutive_errors: std::sync::atomic::AtomicU32,
+    pub failed_hana: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SrvPpv2Tlvs {
+    pub tlvs: Vec<(u8, Option<Arc<crate::logfmt::LogFormat>>)>,
 }
 
 /// The per-server arrays of a [`ProxyIdInfo`], private to this module for the same reason.
@@ -132,6 +162,10 @@ pub struct ServerIdArrays {
     /// Each server's `port` (`check port`, `default-server port`): `srv_agent_port`, and
     /// `srv_check_port` of a server with no check; empty when no server has one.
     server_check_ports: Vec<u16>,
+    /// Each server's `addr` (`check addr`): empty when no server has one.
+    server_check_addrs: Vec<Option<std::net::IpAddr>>,
+    /// Per-server `observe` state; `None` when no server enables `observe`.
+    server_observe: Option<Arc<Vec<ObserveSlot>>>,
     /// `pool-max-conn`, `pool-low-conn` and `pool-purge-delay` per server; empty when every
     /// server has the defaults (read it with [`ProxyIdInfo::server_pool`]). Read when a
     /// server connection is released, so it lives here, off `Proxy`'s inline size
@@ -140,6 +174,10 @@ pub struct ServerIdArrays {
     /// What the server-state file gave each server (T490, [`crate::server_state`]): read
     /// by `init_checks` and by the `lastchg` columns; empty when no file was applied.
     server_restored: Vec<Option<crate::server_state::Restored>>,
+    /// Each server's `set-proxy-v2-tlv-fmt(<id>) [<fmt>]` TLVs, compiled; a `None` slot
+    /// has none and the outer `None` means no server of the proxy does, so a proxy without
+    /// the keyword pays nothing to look (read it with [`ServerSet::pp_tlv_fmts_at`]).
+    server_pp_tlv_fmts: Option<Arc<Vec<Option<Arc<SrvPpv2Tlvs>>>>>,
 }
 
 impl Default for ServerArrays {
@@ -156,7 +194,7 @@ impl Default for ServerArrays {
             server_send_proxy_v2: Vec::new(),
             server_pp_unique_id: Vec::new(),
             server_backups: Vec::new(),
-            server_name_refd: Box::default(),
+            server_name_flags: Box::default(),
             server_maxconn: std::iter::empty().collect(),
             server_retr: Arc::default(),
             server_check_configs: Vec::new(),
@@ -183,7 +221,7 @@ impl ServerArrays {
             server_send_proxy_v2: servers.iter().map(|s| s.send_proxy_v2).collect(),
             server_pp_unique_id: servers.iter().map(|s| s.proxy_v2_unique_id).collect(),
             server_backups: servers.iter().map(|s| s.backup).collect(),
-            server_name_refd: Box::default(),
+            server_name_flags: Box::default(),
             server_maxconn: servers.iter().map(|s| s.maxconn).collect(),
             server_retr: Arc::default(),
             server_check_configs: server_check_configs(servers, check_timeout),
@@ -206,10 +244,41 @@ impl ServerIdArrays {
             server_fqdn_changed: server_fqdn_changed(servers.len(), extras),
             server_srv: crate::resolvers::SrvSlots::new(servers.len(), extras),
             server_check_ports: server_check_ports(servers),
+            server_check_addrs: server_check_addrs(servers),
+            server_observe: server_observe(servers),
             server_pool: pool_cfgs(servers, mode_http),
             server_restored: Vec::new(),
+            server_pp_tlv_fmts: pp_tlv_fmts(servers.len(), extras),
         }
     }
+}
+
+/// The `set-proxy-v2-tlv-fmt` formats of [`ServerIdArrays`], compiled once; `None` when no
+/// server of the proxy has one.
+fn pp_tlv_fmts(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Option<Arc<Vec<Option<Arc<SrvPpv2Tlvs>>>>> {
+    if extras.ppv2_tlvs.is_empty() {
+        return None;
+    }
+    let mut slots = vec![None; count];
+    for (idx, tlvs) in &extras.ppv2_tlvs {
+        // A format the configuration passed: `validate_config` refused the proxy otherwise,
+        // as `HAProxy` does at load.
+        let compiled: Vec<(u8, Option<Arc<crate::logfmt::LogFormat>>)> = tlvs
+            .iter()
+            .map(|t| {
+                let fmt = (!t.fmt.is_empty())
+                    .then(|| crate::logfmt::LogFormat::compile_rule(&t.fmt, &crate::engine::sample_registry(), false).ok())
+                    .flatten()
+                    .map(Arc::new);
+                (t.id, fmt)
+            })
+            .collect();
+        let idx = *idx as usize;
+        if idx < count {
+            slots[idx] = Some(Arc::new(SrvPpv2Tlvs { tlvs: compiled }));
+        }
+    }
+    Some(Arc::new(slots))
 }
 
 /// The idle connection settings of each server of a proxy, and its `proto h2` in `mode http`
@@ -294,6 +363,41 @@ fn server_check_ports(servers: &[alcyon_config::ast::Server]) -> Vec<u16> {
     servers.iter().map(|s| s.check_port.unwrap_or(0)).collect()
 }
 
+fn server_check_addrs(servers: &[alcyon_config::ast::Server]) -> Vec<Option<std::net::IpAddr>> {
+    if servers.iter().all(|s| s.check_addr().is_none()) {
+        return Vec::new();
+    }
+    servers.iter().map(alcyon_config::ast::Server::check_addr).collect()
+}
+
+fn server_observe(servers: &[alcyon_config::ast::Server]) -> Option<Arc<Vec<ObserveSlot>>> {
+    if servers.iter().all(|s| !s.check || s.observe() == alcyon_config::ObserveMode::None) {
+        return None;
+    }
+    Some(Arc::new(
+        servers
+            .iter()
+            .map(|s| ObserveSlot {
+                observe: if s.check { s.observe() } else { alcyon_config::ObserveMode::None },
+                on_error: s.on_error(),
+                error_limit: s.error_limit(),
+                consecutive_errors: std::sync::atomic::AtomicU32::new(0),
+                failed_hana: std::sync::atomic::AtomicU64::new(0),
+            })
+            .collect(),
+    ))
+}
+
+impl ServerIdArrays {
+    /// The `observe` slot for server `idx`, or `None` if `observe` is disabled.
+    #[inline]
+    #[must_use]
+    pub fn observe_slot(&self, idx: usize) -> Option<&ObserveSlot> {
+        let slots = self.server_observe.as_deref()?;
+        slots.get(idx).filter(|s| s.observe != alcyon_config::ObserveMode::None)
+    }
+}
+
 /// The flags for [`Proxy::server_forced_ids`]: empty when none asked for an id.
 fn server_forced_ids(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Vec<bool> {
     let mut forced = Vec::new();
@@ -323,6 +427,7 @@ fn server_check_configs(servers: &[alcyon_config::ast::Server], check_timeout: O
                 cfg.inter = inter;
             }
             cfg.check_port = s.check_port;
+            cfg.check_addr = s.check_addr();
             cfg.h2 = s.check_proto.map_or(s.proto_h2, |p| p == "h2");
             cfg.fastinter_ms = s.fastinter_ms();
             cfg.downinter_ms = s.downinter_ms();
@@ -467,6 +572,10 @@ impl Proxy {
     #[must_use]
     pub fn server_check_port(&self, idx: usize) -> u16 {
         self.ids.srv.server_check_ports.get(idx).copied().unwrap_or(0)
+    }
+
+    pub fn server_check_addr(&self, idx: usize) -> Option<std::net::IpAddr> {
+        self.ids.srv.server_check_addrs.get(idx).copied().flatten()
     }
 
     /// Whether the server at `idx` has an `id` of its own (`SRV_F_FORCED_ID`).
@@ -623,10 +732,21 @@ impl<'a> ServerSet<'a> {
         self.0.srv.servers.get(i)
     }
 
-    /// The first slot whose address is `a`.
+    /// The first slot whose address is `a` and that is not gone. A slot is gone when its
+    /// state is `Retiring`: that is set when a `del server` closes the door and stays set
+    /// under the emptied name once the delete commits, so one load of the state byte
+    /// rejects both an in-flight and a committed delete (the request is load-balanced, not
+    /// assigned to the slot).
     #[must_use]
     pub fn slot_of_addr(&self, a: SocketAddr) -> Option<usize> {
-        self.0.srv.servers.iter().position(|s| s == a)
+        let mut i = 0;
+        while let Some(s) = self.0.srv.servers.get(i) {
+            if s == a && self.status_at(i) != Some(crate::check::RETIRING) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
     }
 
     /// Slot `i`'s TLS, `None` for a plaintext server.
@@ -664,6 +784,13 @@ impl<'a> ServerSet<'a> {
     #[must_use]
     pub fn pp_unique_id_at(&self, i: usize) -> bool {
         self.0.srv.server_pp_unique_id.get(i).copied().unwrap_or(false)
+    }
+
+    /// Slot `i`'s `set-proxy-v2-tlv-fmt(<id>) [<fmt>]` TLVs, in send order, `None` when
+    /// the server has none.
+    #[must_use]
+    pub fn pp_tlv_fmts_at(&self, i: usize) -> Option<&'a SrvPpv2Tlvs> {
+        self.0.ids.srv.server_pp_tlv_fmts.as_ref().and_then(|slots| slots.get(i)).and_then(Option::as_ref).map(Arc::as_ref)
     }
 
     /// Slot `i`'s session-rate counter.
@@ -848,6 +975,15 @@ impl<'a> Srv<'a> {
         }
     }
 
+    /// Stores `v` unless the current status is `RETIRING` (`del server` in flight).
+    pub fn store_status_unless_retiring(&self, v: u8) -> bool {
+        let Some(a) = self.status_cell() else { return false };
+        a.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            (cur != crate::check::RETIRING).then_some(v)
+        })
+        .is_ok()
+    }
+
     /// Its current weight.
     #[must_use]
     pub fn weight(&self) -> Option<u32> {
@@ -895,10 +1031,18 @@ impl<'a> Srv<'a> {
         self.px.srv.server_tls.get(self.i).is_some_and(Option::is_some)
     }
 
-    /// Whether a sample fetch names it, so it cannot be renamed.
+    /// Whether a sample fetch, a `use-server` target, or another server's `track` names it
+    /// ([`NAME_REFD`]), so it cannot be renamed or removed.
     #[must_use]
     pub fn name_refd(&self) -> bool {
-        self.px.srv.server_name_refd.get(self.i).copied().unwrap_or(false)
+        self.px.srv.server_name_flags.get(self.i).copied().unwrap_or(0) & NAME_REFD != 0
+    }
+
+    /// Whether it has a `resolvers` section ([`NON_PURGEABLE`]), so `del server` cannot remove it
+    /// at runtime (a rename is still allowed).
+    #[must_use]
+    pub fn non_purgeable(&self) -> bool {
+        self.px.srv.server_name_flags.get(self.i).copied().unwrap_or(0) & NON_PURGEABLE != 0
     }
 
     /// Its check configuration.
@@ -912,6 +1056,15 @@ impl<'a> Srv<'a> {
     pub fn rmaint(&self) -> bool {
         self.px.server_rmaint(self.i)
     }
+}
+
+/// Sets one bit of a slot's load-only name flags, allocating the per-slot byte array on the
+/// first mark.
+fn set_name_flag(flags: &mut Box<[u8]>, n: usize, i: usize, bit: u8) {
+    if flags.is_empty() {
+        *flags = vec![0; n].into_boxed_slice();
+    }
+    flags[i] |= bit;
 }
 
 /// What the load writes into a proxy's server arrays while it still owns the proxy.
@@ -947,14 +1100,15 @@ impl ServerSetMut<'_> {
     }
 
 
-    /// Marks slot `i` as named by a sample fetch, so it cannot be renamed.
+    /// Marks slot `i` as named by a sample fetch, a `use-server` target, or a `track`, so it
+    /// cannot be renamed or removed.
     pub fn mark_name_refd(&mut self, i: usize) {
-        let n = self.0.srv.server_ids.len();
-        let refd = &mut self.0.srv.server_name_refd;
-        if refd.is_empty() {
-            *refd = vec![false; n].into_boxed_slice();
-        }
-        refd[i] = true;
+        set_name_flag(&mut self.0.srv.server_name_flags, self.0.srv.server_ids.len(), i, NAME_REFD);
+    }
+
+    /// Marks slot `i` as addressed by a `resolvers` section, so `del server` refuses it.
+    pub fn mark_non_purgeable(&mut self, i: usize) {
+        set_name_flag(&mut self.0.srv.server_name_flags, self.0.srv.server_ids.len(), i, NON_PURGEABLE);
     }
 
     /// Gives each server what it tracks.
@@ -1160,5 +1314,10 @@ mod tests {
         assert!(p.srv_set().at(2).expect("s3").name_refd());
         assert_eq!(p.srv_set().checked_count(), 0);
         assert!(!p.srv_set().tfo_of(a2));
+        let s0 = p.srv_set().at(0).expect("s1");
+        s0.store_status(crate::check::RETIRING);
+        assert!(!s0.store_status_unless_retiring(crate::check::ServerStatus::Up as u8));
+        s0.store_status(crate::check::ServerStatus::Maint as u8);
+        assert!(s0.store_status_unless_retiring(crate::check::ServerStatus::Up as u8));
     }
 }

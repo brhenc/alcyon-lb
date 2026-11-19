@@ -77,7 +77,6 @@ const SENT: Unimplemented = Refuse("Alcyon does not implement it; the server wou
 /// Keywords `HAProxy` registers that the loops in `server.rs` do not handle.
 pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     // src/server.c
-    kw!("error-limit", Arg::Word, Ignore("the error count for 'observe' and 'on-error', which Alcyon refuses")),
     not_for_default!("guid", Arg::Word, Ignore("a global identifier for the CLI and stats")),
     kw!("ws", Arg::Word, Ignore("the protocol for WebSocket; Alcyon upgrades over HTTP/1.1")),
     kw!("hash-key", Arg::Word, ROUTE),
@@ -92,15 +91,12 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("minconn", Arg::Word, Ignore("the dynamic connection limit")),
     kw!("namespace", Arg::Word, ROUTE),
     kw!("non-stick", Arg::None, ROUTE),
-    kw!("observe", Arg::Word, CHECK),
-    kw!("on-error", Arg::Word, CHECK),
     kw!("on-marked-down", Arg::Word, Refuse("Alcyon does not implement it; sessions it should end would continue")),
     kw!("on-marked-up", Arg::Word, Refuse("Alcyon does not implement it; sessions it should end would continue")),
     kw!("pool-conn-name", Arg::Word, Refuse(
         "Alcyon does not implement it; requests it should keep apart would share server connections",
     )),
     kw!("redir", Arg::Word, ROUTE),
-    kw!("set-proxy-v2-tlv-fmt", Arg::Word, SENT),
     kw!("shard", Arg::Word, Ignore("peers only")),
     kw!("slowstart", Arg::Delay, Ignore("the warm-up of a server coming back up")),
     kw!("source", Arg::Word, ROUTE),
@@ -108,7 +104,6 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("socks4", Arg::Word, ROUTE),
     kw!("usesrc", Arg::None, ROUTE),
     // src/check.c
-    kw!("addr", Arg::Word, CHECK),
     kw!("agent-addr", Arg::Word, Ignore("agent checks, which need 'agent-check'; Alcyon refuses it")),
     kw!("agent-check", Arg::None, CHECK),
     kw!("agent-inter", Arg::Delay, Ignore("agent checks, which need 'agent-check'; Alcyon refuses it")),
@@ -147,9 +142,7 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
 ];
 
 fn find(word: &str) -> Option<&'static ServerKeyword> {
-    // `set-proxy-v2-tlv-fmt(<id>)` carries its argument in its name.
-    let name = word.split_once('(').map_or(word, |(n, _)| n);
-    UNIMPLEMENTED_SERVER_KEYWORDS.iter().find(|k| k.name == name)
+    UNIMPLEMENTED_SERVER_KEYWORDS.iter().find(|k| k.name == word)
 }
 
 /// `'server s1' : ` or, on a `default-server` line, nothing, as `HAProxy` prefixes it.

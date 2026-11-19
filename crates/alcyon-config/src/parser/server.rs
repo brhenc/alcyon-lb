@@ -2,6 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 use super::*;
+use crate::{ObserveMode, OnErrorMode};
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_server(
@@ -53,12 +54,19 @@ pub(crate) fn parse_server(
     let mut rise = default_server.and_then(|d| d.rise);
     let mut send_proxy = default_server.is_some_and(|d| d.send_proxy);
     let mut send_proxy_v2 = default_server.is_some_and(|d| d.send_proxy_v2);
+    // `srv_settings_cpy` copies `default-server`'s TLVs first; the server's own
+    // `set-proxy-v2-tlv-fmt` entries are appended, so the inherited ones are sent first.
+    let mut ppv2_tlvs = default_server.map(|d| d.ppv2_tlvs.clone()).unwrap_or_default();
     let mut maxconn = default_server.and_then(|d| d.maxconn);
     let mut pool_max_conn = default_server.and_then(|d| d.pool_max_conn).unwrap_or(-1);
     let mut max_reuse = default_server.and_then(|d| d.max_reuse).unwrap_or(-1);
     let mut pool_low_conn = default_server.and_then(|d| d.pool_low_conn).unwrap_or(0);
     let mut pool_purge_delay = default_server.and_then(|d| d.pool_purge_delay).unwrap_or(5000);
     let mut check_port = default_server.and_then(|d| d.check_port);
+    let mut check_addr = default_server.and_then(|d| d.check_addr);
+    let mut observe = default_server.map(|d| d.observe).unwrap_or_default();
+    let mut error_limit = default_server.and_then(|d| d.error_limit).unwrap_or(10);
+    let mut on_error = default_server.map(|d| d.on_error).unwrap_or_default();
     let mut check_proto = default_server.and_then(|d| d.check_proto);
     let mut proto_h2 = default_server.is_some_and(|d| d.proto_h2);
     let mut weight = default_server.and_then(|d| d.weight);
@@ -113,6 +121,15 @@ pub(crate) fn parse_server(
             "no-send-proxy" => send_proxy = false,
             "send-proxy-v2" => send_proxy_v2 = true,
             "no-send-proxy-v2" => send_proxy_v2 = false,
+            t if t.starts_with("set-proxy-v2-tlv-fmt") => {
+                // `srv_parse_set_proxy_v2_tlv_fmt`: the id is in the keyword's
+                // parentheses, the log format the following token when there is one.
+                let (id, fmt, consumed) = parse_ppv2_tlv_fmt(tokens, i, who)?;
+                ppv2_tlvs.push(ProxyV2Tlv { id, fmt });
+                if consumed {
+                    i += 1;
+                }
+            }
             "weight" => {
                 i += 1;
                 if i < tokens.len() {
@@ -143,6 +160,25 @@ pub(crate) fn parse_server(
             }
             "port" => {
                 check_port = Some(parse_u16(server_kw_arg(tokens, i, who, "expects a port number as argument.")?, "port")?);
+                i += 1;
+            }
+            "addr" => {
+                check_addr = Some(parse_check_addr(server_kw_arg(tokens, i, who, "expects <ipv4|ipv6> as argument.")?, who)?);
+                i += 1;
+            }
+            "observe" => {
+                observe = parse_observe(server_kw_arg(tokens, i, who, "expects <mode> as argument.")?, who)?;
+                i += 1;
+            }
+            "error-limit" => {
+                error_limit = parse_error_limit(server_kw_arg(tokens, i, who, "expects an integer argument.")?, who)?;
+                i += 1;
+            }
+            "on-error" => {
+                on_error = parse_on_error(
+                    server_kw_arg(tokens, i, who, "expects one of 'fastinter', 'fail-check', 'sudden-death' or 'mark-down' as argument.")?,
+                    who,
+                )?;
                 i += 1;
             }
             "check-proto" => {
@@ -237,6 +273,9 @@ pub(crate) fn parse_server(
     if puid != 0 {
         extras.puid.push((index, puid));
     }
+    if !ppv2_tlvs.is_empty() {
+        extras.ppv2_tlvs.push((index, ppv2_tlvs));
+    }
     if track.is_some() {
         extras.track_line.push((index, u32::try_from(kw.line).unwrap_or(u32::MAX)));
     }
@@ -284,6 +323,10 @@ pub(crate) fn parse_server(
                 fastinter_ms: fastinter.map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
                 downinter_ms: downinter.map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
                 max_reuse,
+                check_addr,
+                observe,
+                error_limit,
+                on_error,
             };
             (pool != crate::ast::server::ServerPool::default()).then(|| Box::new(pool))
         },
@@ -294,6 +337,63 @@ pub(crate) fn parse_server(
         track,
     });
     Ok(())
+}
+
+fn parse_check_addr(tok: &Token, who: Option<&str>) -> Result<std::net::IpAddr, ConfigError> {
+    tok.text.parse::<std::net::IpAddr>().map_err(|_| {
+        let prefix = server_keywords::server_prefix(who);
+        ConfigError::new(
+            tok.line,
+            tok.col,
+            format!("{prefix}'addr' : invalid address '{}'.", tok.text),
+        )
+    })
+}
+
+fn parse_observe(tok: &Token, who: Option<&str>) -> Result<ObserveMode, ConfigError> {
+    match tok.text.as_str() {
+        "none" => Ok(ObserveMode::None),
+        "layer4" => Ok(ObserveMode::Layer4),
+        "layer7" => Ok(ObserveMode::Layer7),
+        other => {
+            let prefix = server_keywords::server_prefix(who);
+            Err(ConfigError::new(
+                tok.line,
+                tok.col,
+                format!("{prefix}'observe' expects one of 'none', 'layer4', 'layer7' but got '{other}'"),
+            ))
+        }
+    }
+}
+
+fn parse_error_limit(tok: &Token, who: Option<&str>) -> Result<u32, ConfigError> {
+    let n = atoi(&tok.text);
+    if n <= 0 || n > i64::from(u32::MAX) {
+        let prefix = server_keywords::server_prefix(who);
+        return Err(ConfigError::new(
+            tok.line,
+            tok.col,
+            format!("{prefix}'error-limit' has to be > 0."),
+        ));
+    }
+    Ok(u32::try_from(n).unwrap_or(10))
+}
+
+fn parse_on_error(tok: &Token, who: Option<&str>) -> Result<OnErrorMode, ConfigError> {
+    match tok.text.as_str() {
+        "fastinter" => Ok(OnErrorMode::FastInter),
+        "fail-check" => Ok(OnErrorMode::FailCheck),
+        "sudden-death" => Ok(OnErrorMode::SuddenDeath),
+        "mark-down" => Ok(OnErrorMode::MarkDown),
+        other => {
+            let prefix = server_keywords::server_prefix(who);
+            Err(ConfigError::new(
+                tok.line,
+                tok.col,
+                format!("{prefix}'on-error' expects one of 'fastinter', 'fail-check', 'sudden-death' or 'mark-down' but got '{other}'"),
+            ))
+        }
+    }
 }
 
 /// `atoi`: the leading `[-]digits` of `s`, 0 when there are none.
@@ -839,6 +939,13 @@ pub(crate) fn parse_default_server(
             "no-send-proxy" => cfg.send_proxy = false,
             "send-proxy-v2" => cfg.send_proxy_v2 = true,
             "no-send-proxy-v2" => cfg.send_proxy_v2 = false,
+            t if t.starts_with("set-proxy-v2-tlv-fmt") => {
+                let (id, fmt, consumed) = parse_ppv2_tlv_fmt(tokens, i, None)?;
+                cfg.ppv2_tlvs.push(ProxyV2Tlv { id, fmt });
+                if consumed {
+                    i += 1;
+                }
+            }
             "weight" => {
                 i += 1;
                 if i < tokens.len() {
@@ -869,6 +976,25 @@ pub(crate) fn parse_default_server(
             }
             "port" => {
                 cfg.check_port = Some(parse_u16(server_kw_arg(tokens, i, None, "expects a port number as argument.")?, "port")?);
+                i += 1;
+            }
+            "addr" => {
+                cfg.check_addr = Some(parse_check_addr(server_kw_arg(tokens, i, None, "expects <ipv4|ipv6> as argument.")?, None)?);
+                i += 1;
+            }
+            "observe" => {
+                cfg.observe = parse_observe(server_kw_arg(tokens, i, None, "expects <mode> as argument.")?, None)?;
+                i += 1;
+            }
+            "error-limit" => {
+                cfg.error_limit = Some(parse_error_limit(server_kw_arg(tokens, i, None, "expects an integer argument.")?, None)?);
+                i += 1;
+            }
+            "on-error" => {
+                cfg.on_error = parse_on_error(
+                    server_kw_arg(tokens, i, None, "expects one of 'fastinter', 'fail-check', 'sudden-death' or 'mark-down' as argument.")?,
+                    None,
+                )?;
                 i += 1;
             }
             "check-proto" => {
@@ -1228,6 +1354,96 @@ fn parse_proxy_v2_options(arg: Option<&Token>, kw: &Token) -> Result<bool, Confi
         }
     }
     Ok(unique_id)
+}
+
+/// `set-proxy-v2-tlv-fmt(<id>) [<fmt>]` on the line of `server` (`None` for
+/// `default-server`), at `tokens[i]`. Returns the TLV id, the log format (the following
+/// token's text when there is one, else empty) and whether that token was consumed.
+/// `srv_parse_set_proxy_v2_tlv_fmt` reads the id from the keyword itself and the format
+/// from `args[*cur_arg + 1]`, unconditionally.
+fn parse_ppv2_tlv_fmt(
+    tokens: &[Token],
+    i: usize,
+    who: Option<&str>,
+) -> Result<(u8, Box<str>, bool), ConfigError> {
+    let tok = &tokens[i];
+    let token = tok.text.as_str();
+    let id = match token.strip_prefix("set-proxy-v2-tlv-fmt(") {
+        Some(inner) => parse_ppv2_tlv_id(inner, token, who, tok.line, tok.col)?,
+        None => 0, // `set-proxy-v2-tlv-fmt` with no parentheses: `*cmd` is not `'('`, id stays 0.
+    };
+    let (fmt, consumed) = match tokens.get(i + 1).filter(|t| !t.text.is_empty()) {
+        Some(next) => (next.text.clone().into_boxed_str(), true),
+        None => (Box::<str>::default(), false),
+    };
+    Ok((id, fmt, consumed))
+}
+
+/// The `<id>` of `set-proxy-v2-tlv-fmt(<id>)`, with C's `strtoul(, 0)` semantics
+/// (`srv_parse_set_proxy_v2_tlv_fmt`): an optional sign, then `0x` hex (only when a hex
+/// digit follows), `0b` binary (only when a `0`/`1` follows), a leading `0` octal (the `0`
+/// itself is the first digit), or decimal. `inner` is the token text after the `(`, so it
+/// ends with the closing `)` the scan must stop at. Measured on 3.5-dev11: `08`, `0x`, `0b`
+/// and `1e1` all stop mid-number ("expects ..."), `abc` and `()` convert nothing
+/// ("could not convert ..."), `0b100` is 4, `-1` is the maximum unsigned and trips the
+/// 255 limit.
+fn parse_ppv2_tlv_id(inner: &str, token: &str, who: Option<&str>, line: usize, col: usize) -> Result<u8, ConfigError> {
+    let reject = |reason: &str| {
+        ConfigError::new(line, col, format!("{}'{}' : {reason}", server_keywords::server_prefix(who), token))
+    };
+    let mut s = inner;
+    let neg = match s.as_bytes().first() {
+        Some(b'-') => {
+            s = &s[1..];
+            true
+        }
+        Some(b'+') => {
+            s = &s[1..];
+            false
+        }
+        _ => false,
+    };
+    let (base, digits) = if s.starts_with("0x") || s.starts_with("0X") {
+        let after = &s[2..];
+        if after.bytes().next().is_some_and(|c| (c as char).to_digit(16).is_some()) {
+            (16, after)
+        } else {
+            (8, s) // a `0x` with no hex digit is an octal `0` followed by junk.
+        }
+    } else if s.starts_with("0b") || s.starts_with("0B") {
+        let after = &s[2..];
+        if after.bytes().next().is_some_and(|c| matches!(c, b'0' | b'1')) {
+            (2, after)
+        } else {
+            (8, s)
+        }
+    } else if s.starts_with('0') {
+        (8, s)
+    } else {
+        (10, s)
+    };
+    let mut n = 0usize;
+    for c in digits.bytes() {
+        if (c as char).to_digit(base).is_some() {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    if n == 0 {
+        return Err(reject("could not convert TLV ID"));
+    }
+    // `*error` must be the closing parenthesis.
+    if digits[n..].as_bytes().first() != Some(&b')') {
+        return Err(reject("expects set-proxy-v2-tlv(<TLV ID>)"));
+    }
+    // The value, C's `ERANGE` included; the sign is applied afterwards, as unsigned.
+    let magnitude = u64::from_str_radix(&digits[..n], base).map_err(|_| reject("could not convert TLV ID"))?;
+    let value = if neg { magnitude.wrapping_neg() } else { magnitude };
+    if value > 0xFF {
+        return Err(reject("the maximum allowed TLV ID is 255"));
+    }
+    Ok(value as u8)
 }
 
 /// `fall`/`rise` are `int`s in HAProxy: one past `i32::MAX` reads negative and is refused

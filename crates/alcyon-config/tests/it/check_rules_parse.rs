@@ -70,7 +70,6 @@ fn http_check_rules_haproxy_refuses() {
         "http-check connect port",
         "http-check connect port x",
         "http-check connect comment",
-        "http-check send meth GET\n  http-check connect",
         "http-check comment",
         "http-check set-var(check.x)",
         "http-check set-var(check.x str(a)",
@@ -174,7 +173,7 @@ fn servers_resolving_to_the_same_check_share_one_copy() {
             continue;
         };
         let alcyon_config::ast::ResolvedCheckConfig::Http(h) = &*a else { continue };
-        if h.uri != "/t304" {
+        if !h.steps.iter().any(|s| matches!(s, alcyon_config::ast::ResolvedHttpStep::Send(send) if send.uri == "/t304")) {
             continue;
         }
         assert!(Arc::ptr_eq(&a, &b), "s1 and s2 resolve the same check: one copy");

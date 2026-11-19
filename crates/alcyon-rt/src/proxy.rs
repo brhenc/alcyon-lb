@@ -284,6 +284,13 @@ thread_local! {
     static QUEUED: std::cell::RefCell<Vec<(alcyon_sched::TaskRef, usize, Option<usize>)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// The requests this thread queued for server `srv` of backend `be` (T637 S4: one worker's
+/// part of `del server`'s `srv_in_use`).
+#[must_use]
+pub fn queued_on(be: usize, srv: usize) -> usize {
+    QUEUED.with(|q| q.borrow().iter().filter(|(_, b, s)| *b == be && *s == Some(srv)).count())
+}
+
 impl QueueWait {
     /// A box in no queue.
     fn blank() -> Box<QueueWait> {
@@ -527,6 +534,103 @@ pub fn ssl_fc<'a>(xprt: &'a ClientXprt, role: Option<&'a H2Role>) -> alcyon_samp
     match role {
         Some(H2Role::Child(H2Child { tls: Some(info), .. })) => crate::xprt::facts_of(info),
         _ => xprt.ssl_facts(),
+    }
+}
+
+/// Borrowed, read-only view of a stream's front connection (`HAProxy`'s `conn`),
+/// built without allocation or atomics on the worker thread.
+///
+/// For an HTTP/2 child stream, this borrows the connection's owner [`H2MuxContext`] from the
+/// same worker's [`crate::engine::SessionArena`] via its existing `owner` index. On HTTP/1,
+/// it answers `1` / `1` / `None` (no HTTP/1 glitch counter in Alcyon).
+#[derive(Clone, Copy)]
+pub enum ConnView<'a> {
+    /// HTTP/1 (or non-h2): 1 stream, max 1, no h1 glitch counter.
+    H1,
+    /// HTTP/2 connection: borrows the owner's `H2MuxContext`.
+    H2(&'a H2MuxContext),
+    /// HTTP/3 connection: borrows the owner's `H3MuxContext`.
+    H3(&'a alcyon_proto::mux_h3::H3MuxContext),
+}
+
+impl<'a> ConnView<'a> {
+    /// View for a stream whose `owner` (if any) was separately borrowed from `SessionArena`.
+    /// `sess` is only read to check whether it is a child whose owner is already gone.
+    #[must_use]
+    pub fn from_stream(sess: &TcpSession, owner: Option<&'a TcpSession>) -> Option<Self> {
+        if let Some(o) = owner {
+            return Self::from_conn(o);
+        }
+        if sess.is_h2() {
+            return None;
+        }
+        Some(Self::H1)
+    }
+
+    /// View for a connection's own [`TcpSession`] (owner or HTTP/1).
+    #[must_use]
+    pub fn from_conn(conn: &'a TcpSession) -> Option<Self> {
+        if let Some(h2) = conn.h2_ctx.as_deref() {
+            Some(Self::H2(h2))
+        } else if let Some(h3) = conn.h3_owner() {
+            Some(Self::H3(&h3.mux))
+        } else if matches!(conn.h2_role.as_deref(), Some(H2Role::Child(_))) {
+            None
+        } else {
+            Some(Self::H1)
+        }
+    }
+
+    /// Live stream count (`MUX_CTL_GET_NBSTRM`): `1` on HTTP/1, active streams on HTTP/2 / HTTP/3.
+    #[must_use]
+    pub fn nb_streams(&self) -> u32 {
+        match *self {
+            Self::H1 => 1,
+            Self::H2(h2) => {
+                use alcyon_proto::h2::H2StreamState::{HalfClosedLocal, HalfClosedRemote, Open};
+                let n = h2.streams.values().filter(|s| matches!(s.state, Open | HalfClosedRemote | HalfClosedLocal)).count();
+                u32::try_from(n).unwrap_or(u32::MAX)
+            }
+            Self::H3(h3) => u32::try_from(h3.streams.len()).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Advertised `SETTINGS_MAX_CONCURRENT_STREAMS` (`MUX_CTL_GET_MAXSTRM`): `1` on HTTP/1.
+    #[must_use]
+    pub fn max_concurrent_streams(&self) -> u32 {
+        match *self {
+            Self::H1 => 1,
+            Self::H2(h2) => h2.max_concurrent_streams,
+            Self::H3(_) => 100,
+        }
+    }
+
+    /// Protocol glitches counted on the connection (`MUX_CTL_GET_GLITCHES`): `None` on HTTP/1
+    /// (not counted in Alcyon), `Some(n)` on HTTP/2 / HTTP/3.
+    #[must_use]
+    pub fn glitches(&self) -> Option<u64> {
+        match *self {
+            Self::H1 => None,
+            Self::H2(h2) => Some(h2.glitch_count as u64),
+            Self::H3(h3) => Some(u64::from(h3.glitch_count)),
+        }
+    }
+}
+
+impl alcyon_sample::FrontConnState for ConnView<'_> {
+    #[inline]
+    fn nb_streams(&self) -> u32 {
+        ConnView::nb_streams(self)
+    }
+
+    #[inline]
+    fn max_concurrent_streams(&self) -> u32 {
+        ConnView::max_concurrent_streams(self)
+    }
+
+    #[inline]
+    fn glitches(&self) -> Option<u64> {
+        ConnView::glitches(self)
     }
 }
 
@@ -964,14 +1068,9 @@ pub struct TcpSession {
     /// The backend's `tcp-request content` rules are waiting (TCP mode): `inspect_exp` is
     /// their delay, and the backend is chosen again when it is over.
     pub be_inspect: bool,
-    /// TCP mode, `tcp-response content` rules still deciding: the response is held from
-    /// the client (no write, no shutdown) until they accept or reject it.
-    pub res_inspect_pending: bool,
-    /// When `tcp-response inspect-delay` runs out and the rules decide on what they have.
-    pub res_inspect_exp: Option<Tick>,
-    /// The backend has `tcp-response content` rules for this stream: they start, with
-    /// this inspect-delay, once the server connection is up (`server_connected`).
-    pub res_inspect_armed: Option<Option<u32>>,
+    /// TCP mode, `tcp-response content` inspection state (`ColdBox`: 8 bytes, `None` unless
+    /// the backend has `tcp-response content` rules).
+    pub res_inspect: alcyon_alloc::ColdBox<ResInspect>,
     /// The per-request state (O1a): the transaction, the log's measures and captures, the
     /// variables, the stick keys taken, the timeouts set. Made with the session, reset in
     /// place between the requests of a connection ([`crate::stream::Stream::reset`]).
@@ -1059,7 +1158,50 @@ pub struct SessAddr {
     pub dst: Option<SocketAddr>,
 }
 
+/// TCP mode `tcp-response content` inspection state, held in a [`alcyon_alloc::ColdBox`] on
+/// [`TcpSession`] so HTTP and uninspected TCP connections pay 8 bytes and 0 allocations.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResInspect {
+    /// Rules still deciding: the response is held from the client until they accept or reject.
+    pub pending: bool,
+    /// When `tcp-response inspect-delay` runs out and the rules decide on what they have.
+    pub exp: Option<Tick>,
+    /// The backend has `tcp-response content` rules for this stream: they start, with
+    /// this inspect-delay, once the server connection is up (`server_connected`).
+    pub armed: Option<Option<u32>>,
+}
+
+impl alcyon_alloc::Poolable for Box<ResInspect> {
+    fn footprint(&self) -> usize {
+        std::mem::size_of::<ResInspect>()
+    }
+    fn reset(&mut self, _wipe: bool) {
+        **self = ResInspect::default();
+    }
+    fn try_new() -> Option<Self> {
+        Some(Box::default())
+    }
+}
+
+alcyon_alloc::declare_pool!(
+    /// Pooled `ResInspect` boxes for TCP sessions with `tcp-response content` rules.
+    pub static RES_INSPECT_POOL: Pool<Box<ResInspect>> = alcyon_alloc::PoolSpec::new("res_inspect");
+);
+
+impl Drop for TcpSession {
+    fn drop(&mut self) {
+        self.res_inspect.reset(&RES_INSPECT_POOL);
+    }
+}
+
 impl TcpSession {
+    /// Whether `tcp-response content` rules are still holding the response.
+    #[inline]
+    #[must_use]
+    pub fn res_inspect_pending(&self) -> bool {
+        self.res_inspect.as_ref().is_some_and(|r| r.pending)
+    }
+
     /// The session's source address (`sess->src`), `None` when not set at session level.
     #[inline]
     pub fn sess_src(&self) -> Option<SocketAddr> {
@@ -1584,9 +1726,7 @@ impl TcpSession {
             inspect_exp: _,
             dr_wait,
             be_inspect,
-            res_inspect_pending,
-            res_inspect_exp,
-            res_inspect_armed,
+            res_inspect,
             strm,
             tracked_sc,
             bufsize: _,
@@ -1661,9 +1801,7 @@ impl TcpSession {
         *pending_resp = None;
         *dr_wait = 0;
         *be_inspect = false;
-        *res_inspect_pending = false;
-        *res_inspect_exp = None;
-        *res_inspect_armed = None;
+        res_inspect.reset(&RES_INSPECT_POOL);
         // `Stream::reset` but the log, which is the connection's next one, copied when the
         // next stream starts (`h2_child_init`), and the timeouts, the connection's then.
         let crate::stream::Stream { txn, log: _, vars, stick_stores, timeouts_set } = strm;
@@ -1904,9 +2042,7 @@ impl TcpSession {
             inspect_exp: None,
             dr_wait: 0,
             be_inspect: false,
-            res_inspect_pending: false,
-            res_inspect_exp: None,
-            res_inspect_armed: None,
+            res_inspect: alcyon_alloc::ColdBox::none(),
             strm: crate::stream::Stream::start(),
             tracked_sc: [None, None, None],
             h2_ctx: None,
@@ -2283,10 +2419,11 @@ impl TcpSession {
         }
         self.strm.log.connect = Some(crate::txnlog::loop_now());
         // `AN_RES_INSPECT` runs from here, before any of the response has arrived.
-        if let Some(delay) = self.res_inspect_armed.take() {
-            self.res_inspect_pending = true;
+        if let Some(r) = self.res_inspect.as_mut() {
+            let Some(delay) = r.armed.take() else { return };
+            r.pending = true;
             self.rare_armed = true;
-            self.res_inspect_exp = delay.map(|ms| now.add(ms));
+            r.exp = delay.map(|ms| now.add(ms));
         }
     }
 
@@ -3785,7 +3922,7 @@ impl TcpSession {
         // Write response data back to the client while writing is permitted: in HTTP, the
         // current response's bytes and no more.
         let window = self.rep_window();
-        if !self.is_h2() && self.cli_state.can_write() && window > 0 && !self.res_inspect_pending {
+        if !self.is_h2() && self.cli_state.can_write() && window > 0 && !self.res_inspect_pending() {
             match self.cli.send(&mut self.cli_xprt, &self.rep.readable()[..window])? {
                 Io::Done(n) if n > 0 => {
                     if self.mode == Mode::Http {
@@ -3824,7 +3961,7 @@ impl TcpSession {
                     self.srv_state,
                     ScState::ShutR | ScState::Closed | ScState::Error
                 );
-                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && !self.res_inspect_pending {
+                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && !self.res_inspect_pending() {
                     self.shutw_cli();
                     self.cli_state = ScState::ShutW;
                     self.ending
@@ -3851,7 +3988,7 @@ impl TcpSession {
                     self.srv_state,
                     ScState::ShutR | ScState::Closed | ScState::Error
                 );
-                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && !self.res_inspect_pending {
+                if srv_done_sending && self.rep.is_empty() && self.pending_resp.is_none() && !self.res_inspect_pending() {
                     self.shutw_cli();
                     self.cli_state = ScState::Closed;
                     self.srv_state = ScState::Closed;
@@ -4443,8 +4580,10 @@ impl TcpSession {
                 exp = exp.earliest(i_exp);
             }
         }
-        if let (true, Some(r_exp)) = (self.res_inspect_pending, self.res_inspect_exp) {
-            exp = exp.earliest(r_exp);
+        if let Some(r) = self.res_inspect.as_ref().filter(|r| r.pending) {
+            if let Some(r_exp) = r.exp {
+                exp = exp.earliest(r_exp);
+            }
         }
         // A request held for its body (`wait-for-body`) answers 408 when the time is up.
         if let Some(wait) = self.strm.txn.as_ref().and_then(|t| t.body_wait) {
@@ -5274,5 +5413,56 @@ mod tests {
         assert!(s.scrape().is_some() && s.has_pending_output());
         s.set_scrape(None);
         assert!(s.scrape().is_none());
+    }
+
+    #[test]
+    fn conn_view_reads_h1_h2_and_formats_debug() {
+        use super::ConnView;
+        use alcyon_sample::FrontConnState;
+        let h1 = ConnView::H1;
+        assert_eq!(h1.nb_streams(), 1);
+        assert_eq!(h1.max_concurrent_streams(), 1);
+        assert_eq!(h1.glitches(), None);
+        let mut h2_ctx = alcyon_proto::mux_h2::H2MuxContext::new(alcyon_proto::ConnId(1), true);
+        h2_ctx.max_concurrent_streams = 17;
+        h2_ctx.glitch_count = 3;
+        let mut st = alcyon_proto::mux_h2::H2StreamCtx::new(1, 65535, 65535);
+        st.state = alcyon_proto::h2::H2StreamState::Open;
+        h2_ctx.streams.insert(1, st);
+        let h2 = ConnView::H2(&h2_ctx);
+        assert_eq!(h2.nb_streams(), 1);
+        assert_eq!(h2.max_concurrent_streams(), 17);
+        assert_eq!(h2.glitches(), Some(3));
+        let fc_dyn: &dyn FrontConnState = &h2;
+        assert_eq!(fc_dyn.nb_streams(), 1);
+        assert!(format!("{fc_dyn:?}").contains("FrontConnState"));
+
+        let h3_ctx = alcyon_proto::mux_h3::H3MuxContext::new();
+        let h3 = ConnView::H3(&h3_ctx);
+        assert_eq!(h3.nb_streams(), 0);
+        assert_eq!(h3.max_concurrent_streams(), 100);
+        assert_eq!(h3.glitches(), Some(0));
+
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut s = super::TcpSession::new(std::os::fd::OwnedFd::from(a), Default::default(), 0, alcyon_sched::Tick::ETERNITY);
+        assert!(matches!(ConnView::from_conn(&s), Some(ConnView::H1)));
+        s.h2_role = Some(Box::new(super::H2Role::Child(super::H2Child {
+            owner: None,
+            stream: super::H2ActiveStream { id: 1, body: Default::default(), chunk_out: false },
+            late_trailers: None,
+            rsp_head: None,
+            reset: false,
+            finished: false,
+            conn_end: None,
+            owner_tx_pending: false,
+            rst: None,
+            goaway: None,
+            tls: None,
+            quic_ack: None,
+            req_abs: Default::default(),
+            sess_vars_at_start: Default::default(),
+            nb_streams: Default::default(),
+        })));
+        assert!(ConnView::from_conn(&s).is_none());
     }
 }

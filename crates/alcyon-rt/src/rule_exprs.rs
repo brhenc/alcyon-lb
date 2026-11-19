@@ -59,6 +59,37 @@ fn leading_name(s: &str) -> &str {
     &s[..end]
 }
 
+fn bind_is_h2_only(b: &alcyon_config::ast::BindConfig) -> bool {
+    b.proto.as_deref() == Some("h2")
+        || (b.ssl && !b.alpn.is_empty() && b.alpn.iter().all(|a| a == "h2"))
+}
+
+/// Rule 5: Alcyon counts no HTTP/1 glitches, so `fc_glitches` is refused on a frontend or
+/// listen section whose binds can accept HTTP/1.
+pub fn check_fc_glitches(config: &Config, section: SectionKind, proxy: Option<&str>, fetch: &str) -> Result<(), String> {
+    if fetch != "fc_glitches" {
+        return Ok(());
+    }
+    let h2_only = match (section, proxy) {
+        (SectionKind::Frontend, Some(name)) => config
+            .frontends
+            .iter()
+            .find(|f| f.name == name)
+            .is_some_and(|f| !f.binds.is_empty() && f.binds.iter().all(bind_is_h2_only)),
+        (SectionKind::Listen, Some(name)) => config
+            .listens
+            .iter()
+            .find(|l| l.name == name)
+            .is_some_and(|l| !l.binds.is_empty() && l.binds.iter().all(bind_is_h2_only)),
+        _ => return Ok(()),
+    };
+    if h2_only {
+        Ok(())
+    } else {
+        Err("'fc_glitches' : not implemented in Alcyon (Alcyon counts no HTTP/1 glitches; requires 'proto h2' on bind)".to_string())
+    }
+}
+
 /// Checks the fetch and every converter `expr` names, as `sample_parse_expr` resolves
 /// them: the fetch is the leading run of name characters, exactly as written (`hdr_beg`
 /// and `path_beg` are ACL keywords, not fetches, and names are case-sensitive), and
@@ -425,6 +456,10 @@ impl Section<'_> {
                 // request headers left, and a `tcp-response` no request at all. `HAProxy`
                 // names the action for `set-var`, the expression for the others.
                 let fetch = leading_fetch(expr);
+                check_fc_glitches(config, self.at.section, self.at.proxy, fetch).map_err(|e| {
+                    let stop = if kw.starts_with("http-") && !e.ends_with('.') { "." } else { "" };
+                    format!("error detected in {} while parsing '{kw} {action}' rule : {e}{stop}", self.what)
+                })?;
                 let part = match *kw {
                     "http-request" | "tcp-request content" | "tcp-request session" | "tcp-request connection" => {
                         response_part(fetch).or_else(|| server_part(fetch))
@@ -628,6 +663,28 @@ pub fn validate_formats(config: &Config, registry: &Registry) -> Result<(), Stri
     for b in &config.backends {
         if let Some(fmt) = &b.unique_id_format {
             check("backend", &b.name, "unique-id", fmt)?;
+        }
+    }
+    // `set-proxy-v2-tlv-fmt`: each server's TLV formats are compiled when the server is
+    // finalised, inherited `default-server` formats included: a bad one is fatal,
+    // `'server <proxy>/<srv>' : <error>`. A section's `default-server` alone is never
+    // compiled (no server to finalise), matching HAProxy.
+    let tlv_sections = config
+        .listens
+        .iter()
+        .map(|l| (&l.name, &l.servers, &l.server_extras))
+        .chain(config.backends.iter().map(|b| (&b.name, &b.servers, &b.server_extras)));
+    for (name, servers, extras) in tlv_sections {
+        for (idx, tlvs) in &extras.ppv2_tlvs {
+            let srv = &servers[*idx as usize].id;
+            for tlv in tlvs {
+                if tlv.fmt.is_empty() {
+                    continue;
+                }
+                LogFormat::compile_rule(&tlv.fmt, registry, false)
+                    .map(|_| ())
+                    .map_err(|e| format!("'server {name}/{srv}' : {e}"))?;
+            }
         }
     }
     // `http-request capture ... id <n>` fills an existing request slot: a `declare
