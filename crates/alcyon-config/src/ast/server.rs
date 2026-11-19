@@ -5,6 +5,15 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// One `set-proxy-v2-tlv-fmt(<id>) [<fmt>]`: a TLV of type `<id>` added to the PROXY v2
+/// header the server connection sends, its value the log-format `<fmt>` rendered per
+/// connection (`make_proxy_line_v2`); an empty format gives an empty TLV.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyV2Tlv {
+    pub id: u8,
+    pub fmt: Box<str>,
+}
+
 /// Default server options applied to all servers in a backend.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DefaultServerConfig {
@@ -35,6 +44,8 @@ pub struct DefaultServerConfig {
     pub ssl: ServerSsl,
     /// `proxy-v2-options unique-id`.
     pub proxy_v2_unique_id: bool,
+    /// `set-proxy-v2-tlv-fmt(<id>) [<fmt>]`, in line order.
+    pub ppv2_tlvs: Vec<ProxyV2Tlv>,
     pub weight: Option<u32>,
     pub backup: bool,
     /// `tfo` / `no-tfo`: TCP Fast Open on the connection to the server.
@@ -325,6 +336,10 @@ pub struct ServerExtras {
     /// `id <n>` (`SRV_F_FORCED_ID`): the server's explicit numeric id, what `srv_id` and
     /// the `sid` column of `show stat` report.
     pub puid: Vec<(u32, u32)>,
+    /// The servers with `set-proxy-v2-tlv-fmt(<id>) [<fmt>]` (`default-server` ones
+    /// inherited, then the server's own, in line order: HAProxy's `srv->pp_tlvs`); sparse
+    /// because most servers have none.
+    pub ppv2_tlvs: Vec<(u32, Vec<ProxyV2Tlv>)>,
     /// What `show servers state` reports as `srv_check_health` while no check runs on the
     /// server, when that is not 0; see `parse_server`.
     pub init_health: Vec<(u32, u32)>,
