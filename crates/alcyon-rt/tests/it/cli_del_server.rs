@@ -482,12 +482,10 @@ fn del_server_branches() {
     has!("ch2 still listed", &st, " ch2 ");
 
     if !bad.is_empty() {
-        eprintln!("proxy.err:\n{}", std::fs::read_to_string(dir.join("proxy.err")).unwrap_or_default());
         panic!("{} row(s) off:\n{}", bad.len(), bad.join("\n"));
     }
 }
 
-#[test]
 fn del_server_in_flight_and_keepalive() {
     let fe = common::reserve_addr();
     let li = common::reserve_addr();
@@ -628,7 +626,119 @@ fn del_server_in_flight_and_keepalive() {
     drop(cli_conn);
 
     if !bad.is_empty() {
-        eprintln!("proxy.err:\n{}", std::fs::read_to_string(dir.join("proxy.err")).unwrap_or_default());
         panic!("{} row(s) off:\n{}", bad.len(), bad.join("\n"));
+    }
+}
+
+#[test]
+fn del_server_concurrent_busy() {
+    let fe = common::reserve_addr();
+    let li = common::reserve_addr();
+    let (o1, _c1) = count_origin("O1\n");
+    let (o2, _c2) = count_origin("O2\n");
+    let (o3, _c3) = count_origin("O3\n");
+    let (held, _ready_rx) = held_origin();
+    let keep = keepalive_origin();
+    let dns = common::reserve_port();
+    let dir = std::env::temp_dir().join(format!("delsrv-conc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("cli.sock").display().to_string();
+    let _p = start(
+        &dir,
+        &sock,
+        &[
+            ("sock", &sock),
+            ("fe", &fe.to_string()),
+            ("li", &li.to_string()),
+            ("o1", &o1.to_string()),
+            ("o2", &o2.to_string()),
+            ("o3", &o3.to_string()),
+            ("held", &held.to_string()),
+            ("keep", &keep.to_string()),
+            ("dns", &dns.to_string()),
+        ],
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !std::path::Path::new(&sock).exists() {
+        assert!(Instant::now() < deadline, "no stats socket");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(cli(&sock, "disable server be/s1"), "\n");
+    assert_eq!(cli(&sock, "disable server be/s2"), "\n");
+
+    let sock1 = sock.clone();
+    let sock2 = sock.clone();
+    let t1 = std::thread::spawn(move || cli(&sock1, "del server be/s1"));
+    let t2 = std::thread::spawn(move || cli(&sock2, "del server be/s2"));
+    let r1 = t1.join().expect("t1");
+    let r2 = t2.join().expect("t2");
+
+    for r in [&r1, &r2] {
+        assert!(
+            r == "Server deleted.\n\n" || r == "Another server deletion is in progress.\n\n",
+            "unexpected concurrent del server answer: {r:?}"
+        );
+    }
+    if r1 != "Server deleted.\n\n" {
+        assert_eq!(cli(&sock, "del server be/s1"), "Server deleted.\n\n");
+    }
+    if r2 != "Server deleted.\n\n" {
+        assert_eq!(cli(&sock, "del server be/s2"), "Server deleted.\n\n");
+    }
+}
+
+#[test]
+fn del_server_client_disconnect_mid_delete() {
+    let fe = common::reserve_addr();
+    let li = common::reserve_addr();
+    let (o1, _c1) = count_origin("O1\n");
+    let (o2, _c2) = count_origin("O2\n");
+    let (o3, _c3) = count_origin("O3\n");
+    let (held, _ready_rx) = held_origin();
+    let keep = keepalive_origin();
+    let dns = common::reserve_port();
+    let dir = std::env::temp_dir().join(format!("delsrv-disc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("cli.sock").display().to_string();
+    let _p = start(
+        &dir,
+        &sock,
+        &[
+            ("sock", &sock),
+            ("fe", &fe.to_string()),
+            ("li", &li.to_string()),
+            ("o1", &o1.to_string()),
+            ("o2", &o2.to_string()),
+            ("o3", &o3.to_string()),
+            ("held", &held.to_string()),
+            ("keep", &keep.to_string()),
+            ("dns", &dns.to_string()),
+        ],
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !std::path::Path::new(&sock).exists() {
+        assert!(Instant::now() < deadline, "no stats socket");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(cli(&sock, "disable server be/s1"), "\n");
+    {
+        let mut s = UnixStream::connect(&sock).unwrap();
+        s.write_all(b"del server be/s1\n").unwrap();
+        s.flush().unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    let r = cli(&sock, "enable server be/s1");
+    assert!(
+        r == "\n" || r == "No such server.\n\n",
+        "server stuck in RETIRING or unexpected answer after client disconnect: {r:?}"
+    );
+    if r == "\n" {
+        assert_eq!(cli(&sock, "disable server be/s1"), "\n");
+        assert_eq!(cli(&sock, "del server be/s1"), "Server deleted.\n\n");
     }
 }

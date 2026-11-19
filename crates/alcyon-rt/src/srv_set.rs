@@ -871,6 +871,15 @@ impl<'a> Srv<'a> {
         }
     }
 
+    /// Stores `v` unless the current status is `RETIRING` (`del server` in flight).
+    pub fn store_status_unless_retiring(&self, v: u8) -> bool {
+        let Some(a) = self.status_cell() else { return false };
+        a.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            (cur != crate::check::RETIRING).then_some(v)
+        })
+        .is_ok()
+    }
+
     /// Its current weight.
     #[must_use]
     pub fn weight(&self) -> Option<u32> {
@@ -1201,5 +1210,10 @@ mod tests {
         assert!(p.srv_set().at(2).expect("s3").name_refd());
         assert_eq!(p.srv_set().checked_count(), 0);
         assert!(!p.srv_set().tfo_of(a2));
+        let s0 = p.srv_set().at(0).expect("s1");
+        s0.store_status(crate::check::RETIRING);
+        assert!(!s0.store_status_unless_retiring(crate::check::ServerStatus::Up as u8));
+        s0.store_status(crate::check::ServerStatus::Maint as u8);
+        assert!(s0.store_status_unless_retiring(crate::check::ServerStatus::Up as u8));
     }
 }

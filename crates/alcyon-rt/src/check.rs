@@ -1440,7 +1440,7 @@ pub fn step_check(
     // index) so a check driven without the table it belongs to (unit tests) is a no-op here.
     // The disabled path below does the socket cleanup and rescheduling.
     if let Some(px) = proxies.get(check.proxy()) {
-        if px.srv_set().name_at(check.server()).is_none_or(str::is_empty) {
+        if px.srv_set().at(check.server()).is_none() {
             check.enabled = false;
         }
     }

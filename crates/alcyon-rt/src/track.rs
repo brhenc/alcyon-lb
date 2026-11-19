@@ -66,7 +66,7 @@ fn propagate(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize, s: usi
             // state no longer exists, so it is out of the chain.
             let Some(tkr) = px.srv_set().at(t) else { continue };
             let own = ServerStatus::from(tr.own.load(Ordering::Relaxed));
-            tkr.store_status(combine(own, state) as u8);
+            tkr.store_status_unless_retiring(combine(own, state) as u8);
             px.fwrr.changed();
             px.chash.changed();
             propagate(proxies, q, t);

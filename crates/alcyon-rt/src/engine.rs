@@ -1805,6 +1805,14 @@ pub struct ProxyIdInfo {
 pub struct Proxies(Arc<crate::table::Table>);
 
 impl Proxies {
+    /// Clones the underlying `Arc<Table>`.
+    #[must_use]
+    pub fn arc(&self) -> Arc<crate::table::Table> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl Proxies {
     #[must_use]
     pub fn new(proxies: Vec<Proxy>) -> Self {
         Self(Arc::new(crate::table::Table::new(proxies)))

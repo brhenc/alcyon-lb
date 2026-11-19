@@ -58,12 +58,62 @@ pub struct AppletContext<'a> {
     pub task: TaskRef,
 }
 
-/// The `change` mutex (T637 S4, design section 4.3): the one lock in the state every CLI
-/// connection shares, held by a command that changes the server or backend set across its
-/// whole check-and-commit, so that two such commands from two connections cannot pass the
-/// checks for one server at once (C5). `del server` holds it from its first refusal check
-/// until its answer goes out; it is never taken on the request path.
-static CHANGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Non-blocking in-progress flag (T637 S4): held by `del server` across its
+/// check-and-commit so that two `del server` commands from two connections cannot pass the
+/// checks for one server at once (C5) without ever blocking a worker thread.
+static CHANGE_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Guard for an in-flight `del server` (C4, C5): releases `CHANGE_IN_PROGRESS` on drop and,
+/// if armed and not disarmed before drop (e.g. client disconnected mid-delete), restores
+/// `prev` on the server slot if it is still `RETIRING`.
+struct RetireGuard {
+    table: Option<Arc<crate::table::Table>>,
+    be: usize,
+    srv: usize,
+    prev: u8,
+    armed: bool,
+}
+
+impl RetireGuard {
+    fn try_acquire() -> Option<Self> {
+        CHANGE_IN_PROGRESS
+            .compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+            .ok()
+            .map(|_| Self { table: None, be: 0, srv: 0, prev: 0, armed: false })
+    }
+
+    fn arm(&mut self, table: Arc<crate::table::Table>, be: usize, srv: usize, prev: u8) {
+        self.table = Some(table);
+        self.be = be;
+        self.srv = srv;
+        self.prev = prev;
+        self.armed = true;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RetireGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(table) = &self.table {
+                if let Some(px) = table.get(self.be) {
+                    if let Some(cell) = px.srv_set().status_cell(self.srv) {
+                        let _ = cell.compare_exchange(
+                            crate::check::RETIRING,
+                            self.prev,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                }
+            }
+        }
+        CHANGE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
 
 /// A command waiting for every worker's answer (`crate::mailbox`). The connection reads no
 /// further command until it is answered.
@@ -75,13 +125,14 @@ enum Pending {
     Shut(Arc<Gather<usize>>, bool),
     /// T637 S4, `del server`: every worker's count of the server's streams and queued
     /// requests, asked after the server went [`crate::check::RETIRING`]; `prev` is the state
-    /// a refusal restores (C4); `change` is held until the answer goes out (C5).
+    /// a refusal restores (C4); `guard` holds `CHANGE_IN_PROGRESS` and restores `prev` if
+    /// the CLI connection closes mid-delete.
     Retire {
         counts: Arc<Gather<u64>>,
         be: usize,
         srv: usize,
         prev: u8,
-        change: std::sync::MutexGuard<'static, ()>,
+        guard: RetireGuard,
     },
 }
 
@@ -1071,11 +1122,10 @@ impl CliApplet {
             self.finish_msg("Require 'backend/server'.");
             return;
         };
-        // `change`: held until the answer goes out, across the whole check-and-commit, so a
-        // second `del server` or an `enable server` from another connection cannot pass the
-        // checks for one server at once (C5). Taking it before the lookups also means no
-        // other `del server` can empty the slot between this one's lookup and its commit.
-        let change = CHANGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(mut guard) = RetireGuard::try_acquire() else {
+            self.finish_msg("Another server deletion is in progress.");
+            return;
+        };
         // `proxy_be_by_name`: a backend (or a `listen` section); a frontend is not one.
         let Some((be, px)) = ctx.proxies.iter().enumerate().find(|(_, p)| p.has_backend && p.name == be_name) else {
             self.finish_msg("No such backend.");
@@ -1105,13 +1155,14 @@ impl CliApplet {
         // operator's `enable` and `set server ... state` refuse to leave this state. Its
         // state before the door is what a refusal restores (C4).
         let prev = srv.swap_status(crate::check::RETIRING).unwrap_or(raw);
+        guard.arm(ctx.proxies.arc(), be, srv_idx, prev);
         let counts = crate::mailbox::Gather::new(ctx.mailboxes, ctx.worker_id, ctx.task);
         ctx.mailboxes.broadcast(|| crate::mailbox::Msg::Retire {
             be,
             srv: srv_idx,
             gather: std::sync::Arc::clone(&counts),
         });
-        self.pending = Some(Pending::Retire { counts, be, srv: srv_idx, prev, change });
+        self.pending = Some(Pending::Retire { counts, be, srv: srv_idx, prev, guard });
     }
 
     /// `vars_parse_cli_get_var` (src/vars.c): the CLI has no stream, so only the `proc`
@@ -1881,13 +1932,13 @@ impl CliApplet {
                 self.finish_msg("");
                 true
             }
-            Pending::Retire { counts, be, srv, prev, change } => {
+            Pending::Retire { counts, be, srv, prev, mut guard } => {
                 let Some(counts) = counts.take() else {
-                    self.pending = Some(Pending::Retire { counts, be, srv, prev, change });
+                    self.pending = Some(Pending::Retire { counts, be, srv, prev, guard });
                     return false;
                 };
                 let held: u64 = counts.iter().sum();
-                // The slot is still ours: nothing else could change it while `change` was
+                // The slot is still ours: nothing else could change it while `guard` was
                 // held, and only this command empties a slot.
                 let s = ctx.proxies[be].srv_set().at(srv).expect("the server waited for is still there");
                 if held == 0 {
@@ -1904,7 +1955,8 @@ impl CliApplet {
                     s.store_status(prev);
                     self.finish_msg("Server still has connections attached to it, cannot remove it.");
                 }
-                // `change` is dropped here, with the answer already in the buffer.
+                guard.disarm();
+                // `guard` is dropped here, releasing `CHANGE_IN_PROGRESS`.
                 true
             }
         }
@@ -2769,5 +2821,14 @@ mod rv_d_tests {
         let mut applet = CliApplet::new(a, Tick::ETERNITY);
         applet.run_patref("show\\ map", None);
         assert!(CliApplet::is_patref_command("show map"));
+    }
+
+    #[test]
+    fn retire_guard_restores_prev_on_drop_when_armed() {
+        let table = crate::table::Table::new(Vec::new());
+        let mut guard = RetireGuard::try_acquire().expect("acquire");
+        guard.arm(Arc::new(table), 0, 0, crate::check::ServerStatus::Maint as u8);
+        drop(guard);
+        assert!(!CHANGE_IN_PROGRESS.load(std::sync::atomic::Ordering::Acquire));
     }
 }
