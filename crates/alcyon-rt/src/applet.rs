@@ -97,19 +97,19 @@ impl RetireGuard {
 
 impl Drop for RetireGuard {
     fn drop(&mut self) {
-        if self.armed {
-            if let Some(table) = &self.table {
-                if let Some(px) = table.get(self.be) {
-                    if let Some(cell) = px.srv_set().status_cell(self.srv) {
-                        let _ = cell.compare_exchange(
-                            crate::check::RETIRING,
-                            self.prev,
-                            std::sync::atomic::Ordering::AcqRel,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                    }
-                }
-            }
+        if let Some(cell) = self
+            .armed
+            .then_some(())
+            .and(self.table.as_ref())
+            .and_then(|t| t.get(self.be))
+            .and_then(|px| px.srv_set().status_cell(self.srv))
+        {
+            let _ = cell.compare_exchange(
+                crate::check::RETIRING,
+                self.prev,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         CHANGE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
     }
@@ -2825,10 +2825,90 @@ mod rv_d_tests {
 
     #[test]
     fn retire_guard_restores_prev_on_drop_when_armed() {
-        let table = crate::table::Table::new(Vec::new());
+        let cfg = alcyon_config::parse_str("defaults\n  mode http\nbackend be\n  server s1 127.0.0.1:80\n").expect("parse");
+        let table = crate::engine::Engine::build_shared_state(&cfg).expect("proxies").arc();
+        table[0].srv_set().at(0).expect("s1").store_status(crate::check::RETIRING);
         let mut guard = RetireGuard::try_acquire().expect("acquire");
-        guard.arm(Arc::new(table), 0, 0, crate::check::ServerStatus::Maint as u8);
+        guard.arm(Arc::clone(&table), 0, 0, crate::check::ServerStatus::Maint as u8);
         drop(guard);
+        assert_eq!(table[0].srv_set().status_at(0), Some(crate::check::ServerStatus::Maint as u8));
         assert!(!CHANGE_IN_PROGRESS.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn retiring_refuses_enable_disable_and_set_server_state() {
+        let cfg = alcyon_config::parse_str("defaults\n  mode http\nbackend be\n  server s1 127.0.0.1:80\n").expect("parse");
+        let mut proxies = crate::engine::Engine::build_shared_state(&cfg).expect("proxies");
+        proxies[0].srv_set().at(0).expect("s1").store_status(crate::check::RETIRING);
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mailboxes = crate::mailbox::Mailboxes::new(1).expect("eventfd");
+        let mut applet = CliApplet::new(a, Tick::ETERNITY);
+        let mut ctx = AppletContext {
+            proxies: &mut proxies,
+            checks: &mut [],
+            sessions: None,
+            wake_queue: None,
+            start_time: Instant::now(),
+            pid: 0,
+            total_tasks: 0,
+            run_queue_len: 0,
+            now: Tick::ETERNITY,
+            mailboxes: &mailboxes,
+            worker_id: 0,
+            task: TaskRef::NONE,
+        };
+        for step in [
+            |a: &mut CliApplet, c: &mut AppletContext| a.handle_enable_server("be/s1", c),
+            |a: &mut CliApplet, c: &mut AppletContext| a.handle_disable_server("be/s1", c),
+            |a: &mut CliApplet, c: &mut AppletContext| a.handle_set_server("be/s1 state ready", c),
+        ] {
+            applet.out_buf.clear();
+            step(&mut applet, &mut ctx);
+            let out = std::str::from_utf8(&applet.out_buf).expect("utf8");
+            assert_eq!(out, "The server is being deleted; its state cannot be changed.\n\n");
+            assert_eq!(ctx.proxies[0].srv_set().status_at(0), Some(crate::check::RETIRING));
+        }
+    }
+
+    #[test]
+    fn resume_pending_retire_waits_and_restores_on_held() {
+        let cfg = alcyon_config::parse_str("defaults\n  mode http\nbackend be\n  server s1 127.0.0.1:80\n").expect("parse");
+        let mut proxies = crate::engine::Engine::build_shared_state(&cfg).expect("proxies");
+        proxies[0].srv_set().at(0).expect("s1").store_status(crate::check::RETIRING);
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mailboxes = crate::mailbox::Mailboxes::new(2).expect("eventfd");
+        let mut applet = CliApplet::new(a, Tick::ETERNITY);
+        let counts = crate::mailbox::Gather::new(&mailboxes, 0, TaskRef::NONE);
+        let mut guard = RetireGuard::try_acquire().expect("acquire");
+        guard.arm(proxies.arc(), 0, 0, crate::check::ServerStatus::Maint as u8);
+        let pending = Pending::Retire {
+            counts: Arc::clone(&counts),
+            be: 0,
+            srv: 0,
+            prev: crate::check::ServerStatus::Maint as u8,
+            guard,
+        };
+        let ctx = AppletContext {
+            proxies: &mut proxies,
+            checks: &mut [],
+            sessions: None,
+            wake_queue: None,
+            start_time: Instant::now(),
+            pid: 0,
+            total_tasks: 0,
+            run_queue_len: 0,
+            now: Tick::ETERNITY,
+            mailboxes: &mailboxes,
+            worker_id: 0,
+            task: TaskRef::NONE,
+        };
+        assert!(!applet.resume_pending(pending, &ctx));
+        counts.reply(0, 1);
+        counts.reply(1, 0);
+        let pending = applet.pending.take().expect("pending");
+        assert!(applet.resume_pending(pending, &ctx));
+        let out = std::str::from_utf8(&applet.out_buf).expect("utf8");
+        assert_eq!(out, "Server still has connections attached to it, cannot remove it.\n\n");
+        assert_eq!(ctx.proxies[0].srv_set().status_at(0), Some(crate::check::ServerStatus::Maint as u8));
     }
 }

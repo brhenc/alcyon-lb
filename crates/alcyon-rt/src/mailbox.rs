@@ -435,4 +435,18 @@ mod tests {
         }
         assert_eq!(g.take(), Some(vec![1, 1]), "worker 1 stopped: its answer is the epoch, as it would read it");
     }
+
+    #[test]
+    fn a_retire_posted_to_a_stopped_worker_is_answered_with_zero() {
+        let boxes = Mailboxes::new(2).expect("eventfd");
+        boxes.close(1);
+        let g = Gather::new(&boxes, 0, TaskRef::NONE);
+        boxes.broadcast(|| Msg::Retire { be: 0, srv: 0, gather: Arc::clone(&g) });
+        for m in boxes.take(0) {
+            if let Msg::Retire { gather, .. } = m {
+                gather.reply(0, 0);
+            }
+        }
+        assert_eq!(g.take(), Some(vec![0, 0]));
+    }
 }

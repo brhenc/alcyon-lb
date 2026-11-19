@@ -117,11 +117,11 @@ fn set_status_inner(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize,
         tr.own.store(st as u8, Ordering::Relaxed);
         let (tp, ts) = tr.target;
         let eff = combine(st, load(proxies, tp, ts));
-        proxies[p].srv_set().at(s).expect("tracking server").store_status(eff as u8);
+        proxies[p].srv_set().at(s).expect("tracking server").store_status_unless_retiring(eff as u8);
         proxies[p].fwrr.changed();
         proxies[p].chash.changed();
     } else if let Some(v) = proxies.get(p).and_then(|px| px.srv_set().at(s)) {
-        v.store_status(raw);
+        v.store_status_unless_retiring(raw);
         proxies[p].fwrr.changed();
         proxies[p].chash.changed();
     }

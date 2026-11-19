@@ -619,7 +619,7 @@ fn del_server_in_flight_and_keepalive() {
     has!("ka1 answers", &r, "KA1");
     // Past the park release: the ka1 connection is now idle in the worker's pool.
     std::thread::sleep(Duration::from_millis(300));
-    check!("disable ka1", &cli(&sock, "disable server be_ka/ka1"), "\n");
+    check!("set ka1 maint", &cli(&sock, "set server be_ka/ka1 state maint"), "\n");
     check!("del over the idle connection", &cli(&sock, "del server be_ka/ka1"), "Server deleted.\n\n");
     let st = cli(&sock, "show servers state be_ka");
     lacks!("ka1 is gone", &st, " ka1 ");
