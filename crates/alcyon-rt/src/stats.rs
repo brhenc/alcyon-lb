@@ -1278,6 +1278,11 @@ impl StatCursor {
                         continue;
                     }
                     self.s += 1;
+                    // T637 S4: a deleted slot (its name is `""`) is no server: no row, as in
+                    // HAProxy, where `srv_unregister` took it out of the listings.
+                    if p.srv_set().name_at(s).is_none_or(str::is_empty) {
+                        continue;
+                    }
                     let sid = p.server_puid(s);
                     if self.sid.is_some_and(|f| f != -1 && u32::try_from(f).ok() != Some(sid)) {
                         continue;
