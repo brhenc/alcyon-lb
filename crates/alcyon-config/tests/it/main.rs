@@ -21,6 +21,7 @@ mod acl_condition_syntax;
 mod acl_must_exist;
 mod address_forms;
 mod balance_options;
+mod be_unpublished;
 mod bind_keywords;
 mod check_rules_parse;
 mod cond_enabled;

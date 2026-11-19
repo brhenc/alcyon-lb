@@ -72,6 +72,7 @@ pub(crate) fn parse_listen_header(
         binds: Vec::new(),
         mode,
         disabled: false,
+        be_unpublished: false,
         id: None,
         description: None,
         cookie: defaults.and_then(|d| d.cookie.clone()),
@@ -297,6 +298,7 @@ pub(crate) fn parse_backend_header(
         checkcache: defaults.is_some_and(|d| d.checkcache),
         mode,
         disabled: false,
+        be_unpublished: false,
         id: None,
         description: None,
         balance: defaults.and_then(|d| d.balance).unwrap_or(BalanceAlgorithm::RoundRobin),
@@ -372,6 +374,10 @@ pub(crate) fn parse_listen_directive(
         }
         "disabled" => {
             proxy.disabled = true;
+            Ok(())
+        }
+        "be-unpublished" => {
+            proxy.be_unpublished = true;
             Ok(())
         }
         "id" => parse_proxy_id(&mut proxy.id, tokens, kw),
@@ -577,6 +583,11 @@ pub(crate) fn parse_frontend_directive(
             fe.disabled = true;
             Ok(())
         }
+        "be-unpublished" => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            "'be-unpublished' only available in backend or listen section.",
+        )),
         "option" => parse_option_frontend(fe, tokens, kw),
         "no" => parse_no_frontend(fe, tokens, kw),
         "declare" if tokens.get(1).is_some_and(|t| t.text == "capture") => {
@@ -683,6 +694,10 @@ pub(crate) fn parse_backend_directive(
         "id" => parse_proxy_id(&mut be.id, tokens, kw),
         "disabled" => {
             be.disabled = true;
+            Ok(())
+        }
+        "be-unpublished" => {
+            be.be_unpublished = true;
             Ok(())
         }
         "use-server" => parse_use_server(&mut be.use_servers, tokens, kw),

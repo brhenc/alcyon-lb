@@ -1860,6 +1860,12 @@ pub struct SharedFlag {
 }
 
 impl SharedFlag {
+    /// The flag starting at `v`: a `be-unpublished` proxy is born with it set.
+    #[must_use]
+    pub const fn new(v: bool) -> Self {
+        Self { flag: AtomicBool::new(v) }
+    }
+
     #[must_use]
     pub fn get(&self) -> bool {
         self.flag.load(Ordering::Acquire)
@@ -4488,7 +4494,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         tcp_req_content: crate::rule_compiled::tcp_req_content(&tcp_req_content_rules, &acls),
         tcp_res_content: crate::rule_compiled::tcp_res_content(&listen.tcp_res_content_rules, &acls),
         stick: crate::rule_compiled::stick(&listen.stick_rules, &acls),
-        use_backend: crate::rule_compiled::use_backend(&listen.use_backends, &acls),
+        use_backend: crate::rule_compiled::use_backend(&listen.use_backends, &acls)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
         use_server: crate::rule_compiled::use_server(&listen.use_servers, &acls, &listen.servers, "proxy", &listen.name)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
         force_be: crate::rule_compiled::force_be(&listen.force_be_switch, &acls),
@@ -4531,7 +4538,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         srvexp,
         srv: ServerArrays::build(&listen.servers, &listen.server_extras, listen.timeouts.check),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
-        unpublished: SharedFlag::default(),
+        // `be-unpublished` (T637 DYNUSEBE): the flag the `publish backend` command clears.
+        unpublished: SharedFlag::new(listen.be_unpublished),
         stats: Arc::new(vec![ProxyStats::default()]),
         desc: listen.description.as_deref().map(Box::from),
         stats_config: {
@@ -4592,10 +4600,12 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
 /// A proxy with no frontend, no backend and no servers: what an unused slot of a
 /// [`crate::table::Table`] holds, so a stale number reads nothing (T637 S2).
 pub(crate) fn empty_proxy() -> Proxy {
+    // A default section has no `use_backend` rule, the only line that can fail.
     init_proxy_from_frontend(0, alcyon_config::ast::ProxyId::default(), &alcyon_config::FrontendSection::default())
+        .expect("no use_backend rules")
 }
 
-fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, fe: &alcyon_config::FrontendSection) -> Proxy {
+fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, fe: &alcyon_config::FrontendSection) -> io::Result<Proxy> {
     let mut http_req_rules = fe.http_req_rules.clone();
     with_buffered_request(&mut http_req_rules, fe.buffer_request);
     let mut tcp_req_content_rules = fe.tcp_req_content_rules.clone();
@@ -4624,13 +4634,14 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         tcp_req_content: crate::rule_compiled::tcp_req_content(&tcp_req_content_rules, &acls),
         tcp_res_content: crate::rule_compiled::tcp_res_content(&[], &acls),
         stick: crate::rule_compiled::stick(&fe.stick_rules, &acls),
-        use_backend: crate::rule_compiled::use_backend(&fe.use_backends, &acls),
+        use_backend: crate::rule_compiled::use_backend(&fe.use_backends, &acls)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
         use_server: Vec::new(),
         force_be: crate::rule_compiled::force_be(&fe.force_be_switch, &acls),
         reply_pages: crate::rule_compiled::reply_pages(&fe.error_replies),
         res_stream: false,
     }.finish());
-    Proxy {
+    Ok(Proxy {
         id: usize_to_u32(proxy_idx),
         ids: Box::new(ProxyIdInfo {
             timeout_ms: timeouts_ms(&fe.timeouts),
@@ -4720,7 +4731,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         hash_preserve_affinity: alcyon_config::HashPreserveAffinity::default(),
         chash: Arc::default(),
         fwrr: Arc::default(),
-    }
+    })
 }
 
 fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, be: &alcyon_config::BackendSection) -> io::Result<Proxy> {
@@ -4753,7 +4764,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         tcp_req_content: crate::rule_compiled::tcp_req_content(&be.tcp_req_content_rules, &acls),
         tcp_res_content: crate::rule_compiled::tcp_res_content(&be.tcp_res_content_rules, &acls),
         stick: crate::rule_compiled::stick(&be.stick_rules, &acls),
-        use_backend: crate::rule_compiled::use_backend(&[], &acls),
+        use_backend: crate::rule_compiled::use_backend(&[], &acls).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
         use_server: crate::rule_compiled::use_server(&be.use_servers, &acls, &be.servers, "backend", &be.name)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
         force_be: crate::rule_compiled::force_be(&[], &acls),
@@ -4796,7 +4807,8 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         srvexp,
         srv: ServerArrays::build(&be.servers, &be.server_extras, be.timeouts.check),
         next_server_idx: Arc::new(AtomicUsize::new(0)),
-        unpublished: SharedFlag::default(),
+        // `be-unpublished` (T637 DYNUSEBE): the flag the `publish backend` command clears.
+        unpublished: SharedFlag::new(be.be_unpublished),
         stats: Arc::new(vec![ProxyStats::default()]),
         desc: be.description.as_deref().map(Box::from),
         stats_config: {
@@ -5077,7 +5089,7 @@ impl Engine {
         }
     }
     for (i, frontend) in config.frontends.iter().enumerate() {
-        if !frontend.disabled { proxies.push(init_proxy_from_frontend(proxies.len(), ids.frontends[i], frontend)); }
+        if !frontend.disabled { proxies.push(init_proxy_from_frontend(proxies.len(), ids.frontends[i], frontend)?); }
     }
     // T490: the servers start where the server-state file says, before any check or request.
     crate::server_state::apply(config, &mut proxies);
@@ -10189,17 +10201,31 @@ impl EngineDispatcher<'_> {
 
         for (i, rc) in proxy.rules.use_backend.iter().enumerate() {
             let matches = rc.cond.as_ref().is_none_or(|cond| cond.eval(&ctx.as_ctx(), &proxy.acls, registry));
-            if matches {
-                match proxies.route(proxy, Some(i)) {
-                    Routed::Backend(idx) => return Some(idx),
-                    // `force-be-switch` overrides an unpublished target (`be_is_eligible` and
-                    // `lookup_fe_persist_rules`, `src/stream.c`); without it the rule is
-                    // skipped for the next one.
-                    Routed::Disabled if forced() => return None,
-                    Routed::Unpublished(idx) if forced() => return Some(idx),
-                    Routed::Disabled | Routed::Miss => {}
-                    Routed::Unpublished(_) => {}
-                }
+            if !matches {
+                continue;
+            }
+            // A rule with a log-format name builds it per request (T637 DYNUSEBE) into the
+            // thread's buffer and looks the result up by name, as `process_switching_rules`
+            // does, in a `scratch_str` pool string (rule 8); a static rule costs what it costs on `main`.
+            let routed = match &rc.fmt {
+                Some(fmt) => crate::reuse::with_string(|name| {
+                    fmt.render_into(name, &ctx.as_ctx(), registry, None);
+                    proxies.route_dyn(proxy, name)
+                }),
+                None => proxies.route(proxy, Some(i)),
+            };
+            match routed {
+                Routed::Backend(idx) => return Some(idx),
+                // `force-be-switch` overrides a disabled or unpublished target
+                // (`be_is_eligible` and `lookup_fe_persist_rules`, `src/stream.c`);
+                // without it the rule is skipped for the next one.
+                Routed::Disabled if forced() => return None,
+                Routed::Unpublished(idx) if forced() => return Some(idx),
+                Routed::Disabled | Routed::Unpublished(_) => {}
+                // The built name was no backend: the loop ends here and the default takes
+                // over, as the break in `process_switching_rules`; the remaining rules are
+                // not tried.
+                Routed::Miss => break,
             }
         }
 

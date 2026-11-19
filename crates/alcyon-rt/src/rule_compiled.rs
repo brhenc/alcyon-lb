@@ -120,6 +120,18 @@ fn no_data() -> &'static LogData<'static> {
 }
 
 impl Format {
+    /// [`Format::compile`] that reports what would not render: the `use_backend` names it
+    /// compiles refuse the load when they fail to parse, as `HAProxy` does.
+    pub fn compile_checked(fmt: &str, http: bool) -> Result<Self, String> {
+        let lf = LogFormat::compile_rule(fmt, crate::engine::sample_registry(), http)?;
+        let literal = lf.literal();
+        let alias = lf.has_alias();
+        let stream = lf.needs_stream();
+        let line = lf.uses_request_line();
+        let parts = lf.parts().filter(|_| literal.is_none());
+        Ok(Self { lf: Some(lf), literal, parts, http, alias, stream, line })
+    }
+
     /// `fmt` compiled; `http` is whether a sample is written `%XX`-encoded, as a header's or a
     /// path's value wants (`LOG_OPT_HTTP`). A format that does not compile renders nothing: the
     /// load refused it before.
@@ -545,9 +557,18 @@ pub fn http_after_res(rules: &[alcyon_config::HttpAfterResRule], acls: &Acls) ->
 }
 
 /// The `use_backend` rules', in their order: the condition.
-#[must_use]
-pub fn use_backend(rules: &[alcyon_config::UseBackendRule], acls: &Acls) -> Vec<Rule> {
-    rules.iter().map(|r| Rule::new(r.cond.as_ref(), acls, None, None)).collect()
+pub fn use_backend(rules: &[alcyon_config::UseBackendRule], acls: &Acls) -> Result<Vec<Rule>, String> {
+    let mut out = Vec::with_capacity(rules.len());
+    for r in rules {
+        // A name `HAProxy` builds per request (`process_switching_rules`, `src/stream.c`)
+        // when it is a log-format: the rule renders it and looks the result up by name.
+        // It must parse at load, as the expression `HAProxy` parses there.
+        let fmt = r.backend.contains('%').then(|| Format::compile_checked(&r.backend, false)).transpose()?;
+        let mut rule = Rule::new(r.cond.as_ref(), acls, None, None);
+        rule.fmt = fmt;
+        out.push(rule);
+    }
+    Ok(out)
 }
 
 thread_local! {

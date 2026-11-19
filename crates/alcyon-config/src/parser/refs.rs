@@ -166,7 +166,7 @@ pub(crate) fn validate_references(
         if let Some(d) = v.default_backend.filter(|d| !backend_exists(d)) {
             proxy_alerts.push((0, format!("Proxy '{}': unable to find required default_backend: '{d}'.", v.name)));
         }
-        for r in v.use_backends.iter().filter(|r| !backend_exists(&r.backend)) {
+        for r in v.use_backends.iter().filter(|r| !r.backend.contains('%') && !backend_exists(&r.backend)) {
             proxy_alerts.push((0, format!("Proxy '{}': unable to find required use_backend: '{}'.", v.name, r.backend)));
         }
         for &(n, table, line) in &v.tracks {

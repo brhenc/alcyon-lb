@@ -256,6 +256,9 @@ pub struct ListenSection {
     pub mode: Mode,
     /// Whether this proxy is disabled.
     pub disabled: bool,
+    /// `be-unpublished`: the listen proxy starts with its `unpublished` flag set, as a
+    /// `publish backend` on the stats socket would clear it (`PR_FL_BE_UNPUBLISHED`).
+    pub be_unpublished: bool,
     /// `description <text>`: free text shown on the stats page above the proxy's table (`px->desc`).
     pub description: Option<String>,
     /// `id <n>`: the proxy's explicit numeric id (`HAProxy` `PR_O_FORCED_ID`); `None` takes the next free one.
@@ -527,6 +530,7 @@ impl Default for ListenSection {
             binds: Vec::new(),
             mode: Mode::Tcp,
             disabled: false,
+            be_unpublished: false,
             id: None,
             description: None,
             cookie: None,
@@ -824,6 +828,9 @@ pub struct BackendSection {
     pub mode: Mode,
     /// Whether this backend is disabled.
     pub disabled: bool,
+    /// `be-unpublished`: the backend starts with its `unpublished` flag set, as a
+    /// `publish backend` on the stats socket would clear it (`PR_FL_BE_UNPUBLISHED`).
+    pub be_unpublished: bool,
     /// `description <text>`: free text shown on the stats page above the proxy's table (`px->desc`).
     pub description: Option<String>,
     /// `id <n>`: the proxy's explicit numeric id (`HAProxy` `PR_O_FORCED_ID`); `None` takes the next free one.
@@ -944,6 +951,7 @@ impl Default for BackendSection {
             checkcache: false,
             mode: Mode::Tcp,
             disabled: false,
+            be_unpublished: false,
             id: None,
             description: None,
             balance: BalanceAlgorithm::RoundRobin,
