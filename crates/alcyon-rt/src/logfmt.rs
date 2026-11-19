@@ -1394,12 +1394,6 @@ pub fn recycle_line(line: Vec<u8>) {
 
 #[allow(clippy::too_many_lines)]
 fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData, origin: Option<&'static str>) {
-    if matches!(a, Alias::Orig) {
-        // `%OG`: the name the line's log step is logged from (`log_origin`), empty where
-        // there is none. It is text, so the usual `O`/`Q` options do not apply.
-        out.push_str(origin.unwrap_or(""));
-        return;
-    }
     let int = |out: &mut Out, v: i64| {
         let _ = write!(out, "{v}");
     };
@@ -1409,7 +1403,9 @@ fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData, origin: Option<&'static 
         out.push('+');
     }
     match a {
-        Alias::Orig => {} // handled before the match, from the line's `log_origin`.
+        // `%OG`: the name the line's log step is logged from (`log_origin`), empty where
+        // there is none. It is text, so the usual `O`/`Q` options do not apply.
+        Alias::Orig => out.push_str(origin.unwrap_or("")),
         Alias::Bytes => int(out, i64::try_from(d.bytes_out).unwrap_or(i64::MAX)),
         Alias::BytesUp => int(out, i64::try_from(d.bytes_in).unwrap_or(i64::MAX)),
         // Alcyon has no `capture cookie`, so there is never a cookie to show.

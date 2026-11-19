@@ -256,3 +256,18 @@ pub enum LogLevel {
     Debug,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::LogProfileStepKind;
+
+    #[test]
+    fn every_step_kind_has_non_empty_name_and_og_name() {
+        for kind in LogProfileStepKind::ALL {
+            assert!(!kind.name().is_empty());
+            assert!(!kind.og_name().is_empty());
+        }
+        assert_eq!(LogProfileStepKind::Any.og_name(), "any");
+        assert_eq!(LogProfileStepKind::TcpResCont.og_name(), "tcp-res-cont");
+    }
+}
+

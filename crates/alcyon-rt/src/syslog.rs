@@ -244,13 +244,12 @@ impl ResolvedProfile {
             .find(|s| s.step == origin)
             .or_else(|| self.steps.iter().find(|s| s.step == K::Any));
         match step {
-            None => StepResolution::Normal,
             Some(s) if s.drop => StepResolution::Drop,
             Some(s) if s.format.is_some() || s.sd.is_some() => StepResolution::Override {
                 format: s.format.as_deref(),
                 sd: s.sd.as_deref(),
             },
-            Some(_) => StepResolution::Normal,
+            _ => StepResolution::Normal,
         }
     }
 }

@@ -602,3 +602,130 @@ backend be
     expect("fe_sd_only", &lines[2], &["<134>1 TS - haproxy PID - sdonly 200"]);
     expect("fe_plain_dolog", &lines[3], &[&format!("{L}http-req"), &format!("{L}txn_close")]);
 }
+
+#[test]
+fn profile_edge_cases_and_sampling_match_oracle() {
+    let be = responder();
+    let mut socks = Vec::new();
+    for _ in 0..5 {
+        socks.push(UdpSocket::bind("127.0.0.1:0").expect("collector bind"));
+    }
+    let c: Vec<SocketAddr> = socks.iter().map(|s| s.local_addr().expect("addr")).collect();
+    let f: Vec<SocketAddr> = (0..5).map(|_| common::reserve_addr()).collect();
+
+    let cfg = format!(
+        r#"defaults
+  mode http
+  timeout connect 5s
+  timeout client 5s
+  timeout server 5s
+  log-tag "haproxy"
+
+frontend fe_no_log
+  bind {f0}
+  log-steps accept
+  http-request do-log
+  default_backend be
+
+frontend fe_no_fmt
+  bind {f1}
+  log-steps accept
+  log udp@{c0} format rfc5424 local0
+  default_backend be
+
+frontend fe_prof_no_fmt
+  bind {f2}
+  log-steps accept,close
+  log udp@{c1} format rfc5424 profile p_sd_only local0
+  default_backend be
+
+frontend fe_prof_fallthrough
+  bind {f3}
+  log-format "%OG"
+  log-steps accept,close
+  log udp@{c2} format rfc5424 profile p_accept_drop local0
+  default_backend be
+
+frontend fe_sample_err
+  bind {f4}
+  log-format "%OG"
+  log-steps close
+  log udp@{c3} format rfc5424 profile p_any local0 err
+  log udp@{c4} format rfc5424 sample 1:2 profile p_any local0
+  default_backend be
+
+log-profile p_sd_only
+  on accept sd "s"
+
+log-profile p_accept_drop
+  on accept drop
+
+log-profile p_any
+  on any format "%OG"
+
+backend be
+  mode http
+  server app1 {be}
+"#,
+        f0 = f[0],
+        f1 = f[1],
+        f2 = f[2],
+        f3 = f[3],
+        f4 = f[4],
+        c0 = c[0],
+        c1 = c[1],
+        c2 = c[2],
+        c3 = c[3],
+        c4 = c[4],
+        be = be,
+    );
+
+    let mut cfg_file = tempfile::NamedTempFile::new().expect("tempfile");
+    cfg_file.write_all(cfg.as_bytes()).expect("write cfg");
+    let mut child = common::alcyon_command(bin())
+        .arg("-f")
+        .arg(cfg_file.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+
+    let stop = Instant::now() + Duration::from_secs(5);
+    let mut holders = Vec::new();
+    for sock in socks {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        holders.push(lines.clone());
+        thread::spawn(move || drain(sock, stop, lines));
+    }
+
+    get_wait(f[0]);
+    get(f[1]);
+    get(f[2]);
+    get(f[3]);
+    get(f[4]);
+    get(f[4]);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let count = holders[2].lock().unwrap().len() + holders[4].lock().unwrap().len();
+        if count >= 2 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(200));
+
+    let lines: Vec<Vec<String>> = holders
+        .iter()
+        .map(|h| h.lock().unwrap().iter().map(|s| normalize(s)).collect())
+        .collect();
+
+    common::stop(&mut child);
+
+    const L: &str = "<134>1 TS - haproxy PID - - ";
+    expect("fe_no_fmt", &lines[0], &[]);
+    expect("fe_prof_no_fmt", &lines[1], &[]);
+    expect("fe_prof_fallthrough", &lines[2], &[&format!("{L}txn_close")]);
+    expect("fe_sample_err/err", &lines[3], &[]);
+    expect("fe_sample_err/sample", &lines[4], &[&format!("{L}txn_close")]);
+}

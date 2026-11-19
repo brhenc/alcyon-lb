@@ -94,3 +94,40 @@ fn a_udp_prefixed_log_target_is_the_plain_address() {
         alcyon_config::LogTarget::Udp("127.0.0.1:1514".parse().expect("addr"))
     );
 }
+
+#[test]
+fn log_profile_and_log_steps_errors_and_overrides_are_handled() {
+    let ok = parse_str(
+        "log-profile p\n\
+           log-tag pt\n\
+           on accept drop\n\
+           on accept format %o\n\
+         frontend f\n\
+           log-steps accept,,connect\n\
+           log 127.0.0.1:514 profile p local0\n",
+    )
+    .expect("valid log-profile redefinition and trailing/empty log-steps");
+    assert_eq!(ok.log_profiles[0].log_tag.as_deref(), Some("pt"));
+    assert_eq!(ok.log_profiles[0].steps.len(), 1);
+    assert!(!ok.log_profiles[0].steps[0].drop);
+    assert_eq!(ok.log_profiles[0].steps[0].format.as_deref(), Some("%o"));
+
+    for bad in [
+        "log-profile\n",
+        "log-profile bad$name\n",
+        "log-profile p\n  log-tag\n",
+        "log-profile p\n  bogus\n",
+        "log-profile p\n  on\n",
+        "log-profile p\n  on accept\n",
+        "log-profile p\n  on accept bogus\n",
+        "log-profile p\n  on accept format %o drop\n",
+        "log-profile p\n  on accept format\n",
+        "log-profile p\n  on accept sd\n",
+        "frontend f\n  log-steps\n",
+        "frontend f\n  log-steps bogus\n",
+        "frontend f\n  log 127.0.0.1:514\n",
+        "frontend f\n  log 127.0.0.1:514 profile p\n",
+    ] {
+        assert!(parse_str(bad).is_err(), "expected error for:\n{bad}");
+    }
+}
