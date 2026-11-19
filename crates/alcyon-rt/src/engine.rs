@@ -3291,6 +3291,8 @@ fn stream_facts(sess: &TcpSession, status: Option<u16>, timers: bool) -> alcyon_
         redispatched: sess.redispatched,
         // Only for a rule whose format prints them: five clock reads are not free (T455).
         timers: timers.then(|| [log.ms(log.first_byte), log.ms(log.request), log.ms(log.queue), log.ms(log.connect), log.ms(log.data)]),
+        be_queue: if log.queue_is_srv { 0 } else { log.be_queue },
+        srv_queue: if log.queue_is_srv { log.be_queue } else { 0 },
     }
 }
 
@@ -3346,6 +3348,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         term_state: Some(sess_term_state(s)),
         bc_dst: s.bc_dst(),
         bc_src: s.bc_src(),
+        stream: Some(stream_facts(s, None, false)),
         ..Default::default()
     }
 }
@@ -3622,7 +3625,8 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         retries: i64::from(s.max_retries.saturating_sub(s.conn_retries)),
         redispatched: s.strm.log.redispatched,
         uniq_id: l.uniq_id,
-        be_queue: u64::from(l.be_queue),
+        be_queue: u64::from(if l.queue_is_srv { 0 } else { l.be_queue }),
+        srv_queue: u64::from(if l.queue_is_srv { l.be_queue } else { 0 }),
         log_counter: fe.log_count.load(Ordering::Relaxed),
         pid,
         hostname: log_hostname(),
@@ -11776,7 +11780,7 @@ impl EngineDispatcher<'_> {
             return out;
         }
         let mut connect_line: Option<(usize, String)> = None;
-        let mut owner_wake: Option<TaskRef> = None;
+        let mut owner_ref: Option<(u32, TaskRef)> = None;
         {
             let Some(entry) = self.sessions.get_mut(session_idx) else {
                 return Outcome::Done;
@@ -12116,8 +12120,8 @@ impl EngineDispatcher<'_> {
             // what it produced (its response, room for more of its request) and sees how it
             // ended (T280).
             // An HTTP/3 owner too (L2): its second run in a pass sends what this one moved.
-            if let Some((_, owner_task)) = entry.sess.h2_child().and_then(|c| c.owner) {
-                owner_wake = Some(owner_task);
+            if let Some(o) = entry.sess.h2_child().and_then(|c| c.owner) {
+                owner_ref = Some(o);
             }
 
             // Step 5: Update timer. Not for a stream that has ended: its task is freed when
@@ -12137,10 +12141,25 @@ impl EngineDispatcher<'_> {
             (entry.sess.is_done(), pending_admin, log_line, checkcache_alert)
         };
 
-        if let Some(owner_task) = owner_wake {
+        if let Some((owner_idx, owner_task)) = owner_ref {
             #[cfg(debug_assertions)]
-            if self.sessions.get(session_idx).and_then(|e| e.sess.h2_child()).and_then(|c| c.owner).and_then(|(i, _)| self.sessions.get(i)).is_some_and(|o| o.sess.h3_owner().is_some()) {
+            if self.sessions.get(owner_idx).is_some_and(|o| o.sess.h3_owner().is_some()) {
                 alcyon_sample::work::note(alcyon_sample::work::Op::H3OwnerWakeNow, 1);
+            }
+            // Frame a ready response into the owner's h2 mux right away so sibling streams in
+            // the same pass see the live stream count drop as each finishes, matching HAProxy's
+            // synchronous mux send (`h2_snd_buf` -> `h2s_close`).
+            if !is_done {
+                if let Some((o, c)) = self
+                    .sessions
+                    .get2_mut(owner_idx, session_idx)
+                    .filter(|(o, _)| o.task == owner_task && o.sess.h2_ctx.is_some())
+                {
+                    if !c.sess.rep.is_empty() && h2_bridge_moves(o, c, now) {
+                        let pending = o.sess.h2_ctx.as_deref().is_some_and(|h| h.tx_consumed < h.tx_buf.len());
+                        if let Some(ch) = c.sess.h2_child_mut() { ch.owner_tx_pending = pending; }
+                    }
+                }
             }
             self.wake_now.push(owner_task);
         }
@@ -15613,6 +15632,7 @@ impl EngineDispatcher<'_> {
         let ms = entry.sess.queue_ms();
         let deadline = if ms == 0 { Tick::ETERNITY } else { now.add(ms) };
         entry.sess.strm.log.be_queue = entry.sess.queue.enter(entry.task, be_idx, srv, proxies[be_idx].stats.clone(), deadline);
+        entry.sess.strm.log.queue_is_srv = srv.is_some();
         None
     }
 

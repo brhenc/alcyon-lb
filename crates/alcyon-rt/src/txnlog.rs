@@ -76,9 +76,11 @@ pub struct StreamLog {
     pub redispatched: bool,
     /// The stream was answered by an applet (the stats page): `when(toapplet)`.
     pub applet: bool,
-    /// How many requests were in the backend's queue, this one among them, when it joined
-    /// it (`%bq`); 0 for one that never queued.
+    /// How many requests were in the queue, this one among them, when it joined it
+    /// (`%bq` or `%sq`); 0 for one that never queued. `queue_is_srv` distinguishes
+    /// the server queue (`%sq` / `bc_srv_queue`) from the backend queue (`%bq` / `bc_be_queue`).
     pub be_queue: u32,
+    pub queue_is_srv: bool,
     /// `option logasap`: the line went out with the response head; none follows.
     pub asap_done: bool,
     /// The status of the response a server sent for this stream (`txn->server_status`), 0 when
@@ -247,6 +249,7 @@ impl StreamLog {
             asap_done: false,
             srv_status: 0,
             be_queue: 0,
+            queue_is_srv: false,
         }
     }
 
@@ -282,6 +285,7 @@ impl StreamLog {
             redispatched,
             applet,
             be_queue,
+            queue_is_srv,
             asap_done,
             srv_status,
         } = self;
@@ -310,6 +314,7 @@ impl StreamLog {
         *redispatched = false;
         *applet = false;
         *be_queue = 0;
+        *queue_is_srv = false;
         *asap_done = false;
         *srv_status = 0;
     }
@@ -346,6 +351,7 @@ impl StreamLog {
             redispatched,
             applet,
             be_queue,
+            queue_is_srv,
             asap_done,
             srv_status,
         } = self;
@@ -360,7 +366,7 @@ impl StreamLog {
         unique_id.clone_from(&src.unique_id);
         (*last_rule, *prio_class, *prio_offset, *uniq_id) = (src.last_rule, src.prio_class, src.prio_offset, src.uniq_id);
         (*term, *status) = (src.term, src.status);
-        (*redispatched, *applet, *be_queue, *asap_done, *srv_status) = (src.redispatched, src.applet, src.be_queue, src.asap_done, src.srv_status);
+        (*redispatched, *applet, *be_queue, *queue_is_srv, *asap_done, *srv_status) = (src.redispatched, src.applet, src.be_queue, src.queue_is_srv, src.asap_done, src.srv_status);
     }
 
     /// Milliseconds from the stream's start to `t`, -1 if it never happened.
