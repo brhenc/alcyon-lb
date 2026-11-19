@@ -558,8 +558,8 @@ fn insert_header_raw(
     tail_addr: &mut usize,
     num_blocks: &mut usize,
     insert_idx: usize,
-    name: &str,
-    value: &str,
+    name: &[u8],
+    value: &[u8],
 ) -> Result<(), HtxError> {
     if name.len() > HTX_HDR_NAME_MAX_LEN || value.len() > HTX_HDR_VALUE_MAX_LEN {
         return Err(HtxError::LimitExceeded);
@@ -570,9 +570,9 @@ fn insert_header_raw(
     }
 
     let addr = *tail_addr as u32;
-    buf[*tail_addr..*tail_addr + name.len()].copy_from_slice(name.as_bytes());
+    buf[*tail_addr..*tail_addr + name.len()].copy_from_slice(name);
     *tail_addr += name.len();
-    buf[*tail_addr..*tail_addr + value.len()].copy_from_slice(value.as_bytes());
+    buf[*tail_addr..*tail_addr + value.len()].copy_from_slice(value);
     *tail_addr += value.len();
 
     let desc = HtxBlockDesc {
@@ -2150,7 +2150,7 @@ impl<'a> HtxSlice<'a> {
 
 
     pub fn insert_header(&mut self, index: usize, name: &str, value: &str) -> Result<(), HtxError> {
-        insert_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, index, name, value)?;
+        insert_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, index, name.as_bytes(), value.as_bytes())?;
         self.flag_escaped(index.min(self.num_blocks - 1), value);
         Ok(())
     }
@@ -2165,10 +2165,22 @@ impl<'a> HtxSlice<'a> {
             &mut self.tail_addr,
             &mut self.num_blocks,
             insert_idx,
-            name,
-            value,
+            name.as_bytes(),
+            value.as_bytes(),
         )?;
         self.flag_escaped(insert_idx, value);
+        Ok(())
+    }
+
+    /// [`Self::add_header`] for a name and a value held as bytes: the same block at the same
+    /// place, no `String` made of them (the persistence cookie, COOKIEALLOC).
+    pub fn add_header_bytes(&mut self, name: &[u8], value: &[u8]) -> Result<(), HtxError> {
+        let insert_idx = (0..self.num_blocks)
+            .find(|&i| matches!(read_desc_at(self.buf, self.num_blocks, i).blk_type, HtxBlockType::Eoh | HtxBlockType::Eot | HtxBlockType::Eom))
+            .unwrap_or(self.num_blocks);
+
+        insert_header_raw(self.buf, &mut self.tail_addr, &mut self.num_blocks, insert_idx, name, value)?;
+        self.flag_escaped_bytes(insert_idx, value);
         Ok(())
     }
 
@@ -2177,6 +2189,17 @@ impl<'a> HtxSlice<'a> {
     /// [`replace_block_value_raw`] does for a value it replaces.
     fn flag_escaped(&mut self, index: usize, value: &str) {
         if !value.is_ascii() && alcyon_regex::bytetext::has_escapes(value) {
+            let mut desc = read_desc_at(self.buf, self.num_blocks, index);
+            if desc.blk_type == HtxBlockType::Header {
+                desc.flags |= HTX_BLK_FL_LATIN1;
+                write_desc_at(self.buf, self.num_blocks, index, &desc);
+            }
+        }
+    }
+
+    /// [`Self::flag_escaped`] on the value's bytes, with [`replace_block_value_raw`]'s test.
+    fn flag_escaped_bytes(&mut self, index: usize, value: &[u8]) {
+        if !value.is_ascii() && utf8(value).is_ok_and(alcyon_regex::bytetext::has_escapes) {
             let mut desc = read_desc_at(self.buf, self.num_blocks, index);
             if desc.blk_type == HtxBlockType::Header {
                 desc.flags |= HTX_BLK_FL_LATIN1;
@@ -3365,6 +3388,24 @@ mod tests {
         let vals: Vec<String> = htx.as_ref().headers().map(|(_, v)| v.to_string()).collect();
         assert_ne!(vals[0], vals[1]);
         assert_ne!(vals[0], vals[2]);
+    }
+
+    /// `add_header_bytes` takes a value a rule built as bytes (the persistence cookie,
+    /// COOKIEALLOC): an escaped byte in it is flagged the way `replace_block_value_raw`
+    /// flags one, and a plain non-ASCII byte is left as its UTF-8 bytes.
+    #[test]
+    fn an_added_bytes_value_is_flagged_like_a_replaced_one() {
+        let wire = |value: &str| {
+            let mut buf = [0u8; 1024];
+            let mut htx = HtxSlice::new(&mut buf);
+            htx.push_res_line("HTTP/1.1", 200, "OK").unwrap();
+            htx.add_header_bytes(b"x-a", value.as_bytes()).unwrap();
+            htx.push_eoh().unwrap();
+            htx.as_ref().to_h1_wire()
+        };
+        assert_eq!(wire("caf\u{f7e9}"), b"HTTP/1.1 200 OK\r\nx-a: caf\xe9\r\n\r\n");
+        assert_eq!(wire("caf\u{e9}"), "HTTP/1.1 200 OK\r\nx-a: caf\u{e9}\r\n\r\n".as_bytes());
+        assert_eq!(wire("\u{20ac}"), "HTTP/1.1 200 OK\r\nx-a: \u{20ac}\r\n\r\n".as_bytes());
     }
 
     #[test]
