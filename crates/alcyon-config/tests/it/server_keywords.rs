@@ -112,7 +112,7 @@ const KEYWORDS: &[(&str, Alcyon)] = &[
     // src/check.c
     ("addr 127.0.0.2", Accepts),
     ("agent-addr 127.0.0.2", Accepts),
-    ("agent-check", Refuses),
+    ("agent-check", Accepts),
     ("agent-inter 5s", Accepts),
     ("agent-port 9000", Accepts),
     ("agent-send foo", Accepts),

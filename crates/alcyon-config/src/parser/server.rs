@@ -2,6 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 use super::*;
+use crate::ast::AgentCheckConfig;
 use crate::{ObserveMode, OnErrorMode};
 
 #[allow(clippy::too_many_lines)]
@@ -77,6 +78,7 @@ pub(crate) fn parse_server(
     let mut ssl = default_server.map(|d| d.ssl.clone()).unwrap_or_default();
     let mut disabled = default_server.is_some_and(|d| d.disabled);
     let mut track = default_server.and_then(|d| d.track.clone());
+    let mut agent = default_server.map(|d| d.agent.clone()).unwrap_or_default();
     let mut puid = 0u32;
     let index = u32::try_from(servers.len()).unwrap_or(u32::MAX);
     // `srv_check_health` of a server nothing checks: the last `rise` given (`srv_settings_cpy`
@@ -89,6 +91,10 @@ pub(crate) fn parse_server(
     let mut i = 3;
     while i < tokens.len() {
         if let Some(last) = parse_server_ssl_keyword(&mut ssl, tokens, i, who)? {
+            i = last + 1;
+            continue;
+        }
+        if let Some(last) = parse_agent_keyword(&mut agent, tokens, i, who)? {
             i = last + 1;
             continue;
         }
@@ -250,7 +256,7 @@ pub(crate) fn parse_server(
                 i += 1;
             }
             // What these turn on, Alcyon never does: they leave the server as Alcyon runs it.
-            "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool"
+            "stick" | "no-check-send-proxy" | "no-check-reuse-pool"
             | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" => {}
             _ => i = unimplemented_server_keyword(tokens, i, who)?,
         }
@@ -278,6 +284,9 @@ pub(crate) fn parse_server(
     }
     if track.is_some() {
         extras.track_line.push((index, u32::try_from(kw.line).unwrap_or(u32::MAX)));
+    }
+    if agent != AgentCheckConfig::default() {
+        extras.agent_checks.push((index, agent));
     }
     if let Some(sec) = &resolvers {
         extras.resolvers_refs.push((index, u32::try_from(kw.line).unwrap_or(u32::MAX), sec.clone()));
@@ -912,6 +921,10 @@ pub(crate) fn parse_default_server(
             i = last + 1;
             continue;
         }
+        if let Some(last) = parse_agent_keyword(&mut cfg.agent, tokens, i, None)? {
+            i = last + 1;
+            continue;
+        }
         match tokens[i].text.as_str() {
             "check" => cfg.check = true,
             "no-check" => cfg.check = false,
@@ -1036,7 +1049,7 @@ pub(crate) fn parse_default_server(
                 cfg.resolvers = Some(server_kw_arg(tokens, i, None, "expects <resolvers_id> as argument.")?.text.as_str().into());
                 i += 1;
             }
-            "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool"
+            "stick" | "no-check-send-proxy" | "no-check-reuse-pool"
             | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" => {}
             _ => i = unimplemented_server_keyword(tokens, i, None)?,
         }
@@ -1044,6 +1057,42 @@ pub(crate) fn parse_default_server(
     }
     *def = Some(cfg);
     Ok(())
+}
+
+pub(crate) fn parse_agent_keyword(
+    agent: &mut AgentCheckConfig,
+    tokens: &[Token],
+    i: usize,
+    who: Option<&str>,
+) -> Result<Option<usize>, ConfigError> {
+    let last = match tokens[i].text.as_str() {
+        "agent-check" => {
+            agent.enabled = true;
+            i
+        }
+        "no-agent-check" => {
+            agent.enabled = false;
+            i
+        }
+        "agent-addr" => {
+            agent.addr = Some(parse_check_addr(server_kw_arg(tokens, i, who, "expects an address as argument.")?, who)?);
+            i + 1
+        }
+        "agent-port" => {
+            agent.port = Some(parse_u16(server_kw_arg(tokens, i, who, "expects a port number as argument.")?, "agent-port")?);
+            i + 1
+        }
+        "agent-send" => {
+            agent.send = Some(server_kw_arg(tokens, i, who, "expects a string as argument.")?.text.as_str().into());
+            i + 1
+        }
+        "agent-inter" => {
+            agent.inter = Some(parse_server_delay(server_kw_arg(tokens, i, who, "expects a delay as argument.")?, "agent-inter", who)?);
+            i + 1
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(last))
 }
 
 pub(crate) fn parse_balance(

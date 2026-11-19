@@ -978,6 +978,7 @@ pub(crate) fn write_server_row(
         }
     }
     let rmaint = proxy.server_rmaint(s_idx);
+    let agent_view = crate::track::agent_view(proxy, s_idx);
     let status_str = if rmaint {
         Word(None, "MAINT (resolution)", "")
     } else if let Some(c) = &check_state {
@@ -985,10 +986,13 @@ pub(crate) fn write_server_row(
     } else {
         let s = srv.and_then(|s| s.raw_status()).map_or(ServerStatus::Up, ServerStatus::from);
         let tracker = !crate::track::tracked_label(proxy, s_idx).is_empty();
+        let has_agent = agent_view.as_ref().is_some_and(|a| a.enabled);
         match s {
             ServerStatus::Up if tracker => Word(None, "UP", ""),
             ServerStatus::Up => Word(None, "no check", ""),
+            ServerStatus::Down if has_agent => Word(None, "DOWN (agent)", ""),
             ServerStatus::Down => Word(None, "DOWN", ""),
+            ServerStatus::Drain if has_agent => Word(None, "DRAIN (agent)", ""),
             ServerStatus::Drain => Word(None, "DRAIN", ""),
             // The maintenance of a tracker's target says where it comes from.
             ServerStatus::Maint if crate::track::inherited(proxy, s_idx) => Word(None, "", crate::track::tracked_label(proxy, s_idx)),
@@ -1063,6 +1067,17 @@ pub(crate) fn write_server_row(
         r.set("check_duration", check_duration);
         r.set("last_chk", last_chk);
         r.set("check_desc", check_desc);
+    }
+    if let Some(a) = &agent_view {
+        r.set("agent_status", Star(a.in_progress, a.last_status_code));
+        if a.last_status_code != "INI" {
+            r.set("agent_duration", a.duration_ms);
+        }
+        r.set("last_agt", a.last_status_info.as_deref().unwrap_or(""));
+        r.set("agent_desc", a.last_status_desc);
+        r.set("agent_rise", 1);
+        r.set("agent_fall", 1);
+        r.set("agent_health", a.health);
     }
     // No address: the column is empty, as `HAProxy`'s for `AF_UNSPEC`.
     // The stats page gives the address only under `stats show-legends` (`STAT_F_SHLGNDS`);
