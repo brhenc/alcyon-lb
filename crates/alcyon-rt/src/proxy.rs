@@ -583,18 +583,8 @@ impl<'a> ConnView<'a> {
         match *self {
             Self::H1 => 1,
             Self::H2(h2) => {
-                let n = h2
-                    .streams
-                    .values()
-                    .filter(|s| {
-                        matches!(
-                            s.state,
-                            alcyon_proto::h2::H2StreamState::Open
-                                | alcyon_proto::h2::H2StreamState::HalfClosedRemote
-                                | alcyon_proto::h2::H2StreamState::HalfClosedLocal
-                        )
-                    })
-                    .count();
+                use alcyon_proto::h2::H2StreamState::{HalfClosedLocal, HalfClosedRemote, Open};
+                let n = h2.streams.values().filter(|s| matches!(s.state, Open | HalfClosedRemote | HalfClosedLocal)).count();
                 u32::try_from(n).unwrap_or(u32::MAX)
             }
             Self::H3(h3) => u32::try_from(h3.streams.len()).unwrap_or(u32::MAX),
