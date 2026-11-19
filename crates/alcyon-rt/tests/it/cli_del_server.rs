@@ -221,12 +221,14 @@ fn get_keepalive(addr: SocketAddr, path: &str) -> (String, TcpStream) {
 
 /// An origin that answers `200` and keeps the connection open: the proxy's released
 /// connection to it waits idle in its pool.
-fn keepalive_origin() -> u16 {
+fn keepalive_origin() -> (u16, mpsc::Receiver<()>) {
     let l = TcpListener::bind("127.0.0.1:0").expect("ka origin");
     let port = l.local_addr().expect("ka addr").port();
+    let (eof_tx, eof_rx) = mpsc::channel();
     let h = std::thread::spawn(move || {
         for conn in l.incoming() {
             let Ok(mut conn) = conn else { break };
+            let eof_tx = eof_tx.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 1024];
                 let mut got = Vec::new();
@@ -246,11 +248,12 @@ fn keepalive_origin() -> u16 {
                         Err(_) => break,
                     }
                 }
+                let _ = eof_tx.send(());
             });
         }
     });
     let _ = h;
-    port
+    (port, eof_rx)
 }
 
 fn start(dir: &std::path::Path, sock: &str, ports: &[(&str, &str)]) -> Proc {
@@ -291,7 +294,7 @@ fn del_server_branches() {
     let (o2, _c2) = count_origin("O2\n");
     let (o3, c3) = count_origin("O3\n");
     let (held, _ready) = held_origin();
-    let keep = keepalive_origin();
+    let keep = keepalive_origin().0;
     let dns = common::reserve_port();
     let dir = std::env::temp_dir().join(format!("delsrv-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -493,7 +496,7 @@ fn del_server_in_flight_and_keepalive() {
     let (o2, _c2) = count_origin("O2\n");
     let (o3, _c3) = count_origin("O3\n");
     let (held, ready_rx) = held_origin();
-    let keep = keepalive_origin();
+    let (keep, ka_eof) = keepalive_origin();
     let dns = common::reserve_port();
     let dir = std::env::temp_dir().join(format!("delsrv-if-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -619,8 +622,11 @@ fn del_server_in_flight_and_keepalive() {
     has!("ka1 answers", &r, "KA1");
     // Past the park release: the ka1 connection is now idle in the worker's pool.
     std::thread::sleep(Duration::from_millis(300));
-    check!("set ka1 maint", &cli(&sock, "set server be_ka/ka1 state maint"), "\n");
+    check!("disable ka1", &cli(&sock, "disable server be_ka/ka1"), "\n");
     check!("del over the idle connection", &cli(&sock, "del server be_ka/ka1"), "Server deleted.\n\n");
+    if ka_eof.recv_timeout(Duration::from_secs(2)).is_err() {
+        bad.push("ka1 idle connection was not closed (no EOF at origin)".to_string());
+    }
     let st = cli(&sock, "show servers state be_ka");
     lacks!("ka1 is gone", &st, " ka1 ");
     drop(cli_conn);
@@ -638,7 +644,7 @@ fn del_server_concurrent_busy() {
     let (o2, _c2) = count_origin("O2\n");
     let (o3, _c3) = count_origin("O3\n");
     let (held, _ready_rx) = held_origin();
-    let keep = keepalive_origin();
+    let keep = keepalive_origin().0;
     let dns = common::reserve_port();
     let dir = std::env::temp_dir().join(format!("delsrv-conc-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -697,7 +703,7 @@ fn del_server_client_disconnect_mid_delete() {
     let (o2, _c2) = count_origin("O2\n");
     let (o3, _c3) = count_origin("O3\n");
     let (held, _ready_rx) = held_origin();
-    let keep = keepalive_origin();
+    let keep = keepalive_origin().0;
     let dns = common::reserve_port();
     let dir = std::env::temp_dir().join(format!("delsrv-disc-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
