@@ -89,13 +89,8 @@ pub(crate) fn parse_log(
 
     let Some(fac_tok) = tokens.get(i) else {
         // Nothing after the optional keywords: `HAProxy` parses an empty string there and
-        // refuses it as a facility, so only a bare `log <target>` gets the "expects" error.
-        let msg = if i > 2 {
-            "unknown log facility ''"
-        } else {
-            "<log> expects <address> and <facility> as arguments."
-        };
-        return Err(ConfigError::new(kw.line, kw.col, msg));
+        // refuses it as a facility (`tokens.len() < 3` is already handled above).
+        return Err(ConfigError::new(kw.line, kw.col, "unknown log facility ''"));
     };
     let facility = parse_facility(fac_tok)?;
     let level = match tokens.get(i + 1) {
