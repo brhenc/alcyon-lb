@@ -415,3 +415,9 @@ fn check_refuses_octal_above_255() {
 fn check_refuses_unknown_fetch_in_tlv_fmt() {
     check_refused("set-proxy-v2-tlv-fmt(1) %[nosuchfetch]", "unknown fetch method 'nosuchfetch'");
 }
+
+/// A dynamic sample fetch other than `str()` (`%[src]`) is evaluated per connection.
+#[test]
+fn dynamic_fetch_src() {
+    wire_case("", "send-proxy-v2 set-proxy-v2-tlv-fmt(0xE1) %[src]", "OK 1 e1 3132372e302e302e31");
+}
