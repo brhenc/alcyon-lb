@@ -31,6 +31,7 @@ pub mod cli_unknown;
 pub mod buf;
 pub mod buf_wait;
 pub mod prealloc;
+pub mod agent_check;
 pub mod check;
 pub mod cli_listener;
 pub mod crash;

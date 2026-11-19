@@ -14,6 +14,37 @@ pub struct ProxyV2Tlv {
     pub fmt: Box<str>,
 }
 
+/// `observe <mode>` (`HANA_OBS_*` in `include/haproxy/check-t.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum ObserveMode {
+    #[default]
+    None = 0,
+    Layer4 = 1,
+    Layer7 = 2,
+}
+
+/// `on-error <mode>` (`HANA_ONERR_*` in `include/haproxy/check-t.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum OnErrorMode {
+    FastInter = 0,
+    #[default]
+    FailCheck = 1,
+    SuddenDeath = 2,
+    MarkDown = 3,
+}
+
+/// Agent check configuration (`agent-check`, `agent-addr`, `agent-port`, `agent-send`, `agent-inter`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentCheckConfig {
+    pub enabled: bool,
+    pub addr: Option<std::net::IpAddr>,
+    pub port: Option<u16>,
+    pub send: Option<Box<str>>,
+    pub inter: Option<Duration>,
+}
+
 /// Default server options applied to all servers in a backend.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DefaultServerConfig {
@@ -37,6 +68,10 @@ pub struct DefaultServerConfig {
     /// `pool-purge-delay`, in milliseconds.
     pub pool_purge_delay: Option<u32>,
     pub check_port: Option<u16>,
+    pub check_addr: Option<std::net::IpAddr>,
+    pub observe: ObserveMode,
+    pub error_limit: Option<u32>,
+    pub on_error: OnErrorMode,
     pub check_proto: Option<&'static str>,
     /// `proto h2` (T540).
     pub proto_h2: bool,
@@ -61,6 +96,8 @@ pub struct DefaultServerConfig {
     pub resolvers: Option<Box<str>>,
     /// `resolve-prefer`, `resolve-net`, `resolve-opts`.
     pub resolve: ResolveOpts,
+    /// `agent-check` and its companions.
+    pub agent: AgentCheckConfig,
 }
 
 /// `resolve-prefer`, `resolve-net` and `resolve-opts` (`struct resolv_options`): how a server
@@ -358,6 +395,8 @@ pub struct ServerExtras {
     /// The line of the `server` line of each server, by name: a second server of one name is
     /// refused (`another server named ... was already defined at line N`, T513).
     pub name_lines: std::collections::HashMap<Box<str>, u32>,
+    /// Servers with `agent-check` (or `agent-*` options) configured.
+    pub agent_checks: Vec<(u32, AgentCheckConfig)>,
 }
 
 impl ServerExtras {
@@ -518,11 +557,30 @@ pub struct ServerPool {
     /// `max-reuse`: how many times an h2 connection is reused (it carries one stream more);
     /// -1, the default, is no limit. Ignored on HTTP/1.1, as `HAProxy` ignores it there (T540).
     pub max_reuse: i32,
+    /// `addr <ipv4|ipv6>`: IP address to send health checks to instead of the server's.
+    pub check_addr: Option<std::net::IpAddr>,
+    /// `observe <none|layer4|layer7>`: health adjusting from traffic.
+    pub observe: ObserveMode,
+    /// `error-limit <count>`: consecutive errors before `on-error` triggers (default 10).
+    pub error_limit: u32,
+    /// `on-error <mode>`: action when `error-limit` is reached (default `fail-check`).
+    pub on_error: OnErrorMode,
 }
 
 impl Default for ServerPool {
     fn default() -> Self {
-        Self { max_conn: -1, low_conn: 0, purge_delay: 5000, fastinter_ms: 0, downinter_ms: 0, max_reuse: -1 }
+        Self {
+            max_conn: -1,
+            low_conn: 0,
+            purge_delay: 5000,
+            fastinter_ms: 0,
+            downinter_ms: 0,
+            max_reuse: -1,
+            check_addr: None,
+            observe: ObserveMode::None,
+            error_limit: 10,
+            on_error: OnErrorMode::FailCheck,
+        }
     }
 }
 
@@ -537,6 +595,30 @@ impl Server {
     #[must_use]
     pub fn downinter_ms(&self) -> u32 {
         self.pool.as_ref().map_or(0, |p| p.downinter_ms)
+    }
+
+    /// `addr`, `None` when unset.
+    #[must_use]
+    pub fn check_addr(&self) -> Option<std::net::IpAddr> {
+        self.pool.as_ref().and_then(|p| p.check_addr)
+    }
+
+    /// `observe`, `ObserveMode::None` when unset.
+    #[must_use]
+    pub fn observe(&self) -> ObserveMode {
+        self.pool.as_ref().map_or(ObserveMode::None, |p| p.observe)
+    }
+
+    /// `error-limit`, 10 when unset.
+    #[must_use]
+    pub fn error_limit(&self) -> u32 {
+        self.pool.as_ref().map_or(10, |p| p.error_limit)
+    }
+
+    /// `on-error`, `OnErrorMode::FailCheck` when unset.
+    #[must_use]
+    pub fn on_error(&self) -> OnErrorMode {
+        self.pool.as_ref().map_or(OnErrorMode::FailCheck, |p| p.on_error)
     }
 
     #[must_use]

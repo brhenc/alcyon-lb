@@ -19,7 +19,7 @@ use crate::ast::{LogForwardSection, LogProfileSection, RingSection, ProxyKind, S
     HttpChkConfig, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule, HttpReuse, RedirectCookie, RedirectKind, RedirectRule, RetriesValue,
     HeaderCapture, ListenSection, LogConfig, LogFacility, LogFormatSpec, LogLevel, LogTarget, MatchType, Mode,
     MysqlCheckVersion, ProtoCheckConfig, ResolvedCheckConfig, ResolvedHttpCheck,
-    HdrPattern, ResolvedHttpExpectRule, ResolvedHttpRule, ResolvedTcpStep, SampleRef, SectionKind, Server, ServerSsl,
+    HdrPattern, ResolvedHttpExpectRule, ResolvedHttpSend, ResolvedHttpStep, ResolvedTcpStep, SampleRef, SectionKind, Server, ServerSsl,
     SslVerify, StatsConfig, TlsVersion,
     StickRule, StickRuleType, StickTableConfigAst, TcpCheckAction, TcpCheckExpectPattern,
     TcpReqConnAction, TcpReqConnRule, TcpReqContentAction, TcpReqContentRule, TcpResAction, TcpResContentRule,
@@ -1721,6 +1721,26 @@ pub(crate) fn validate_config(
     }
     if !quic_alerts.is_empty() {
         return Err(ConfigError::alerts(quic_alerts));
+    }
+    for l in listens.iter().filter(|l| l.mode != Mode::Http) {
+        for s in l.servers.iter().filter(|s| s.observe() == crate::ObserveMode::Layer7) {
+            let line = l.server_extras.name_lines.get(s.id.as_str()).copied().unwrap_or(1) as usize;
+            return Err(ConfigError::new(
+                line,
+                1,
+                format!("'server {}/{}' : 'layer7' can only be used in http proxies.", l.name, s.id),
+            ));
+        }
+    }
+    for b in backends.iter().filter(|b| b.mode != Mode::Http) {
+        for s in b.servers.iter().filter(|s| s.observe() == crate::ObserveMode::Layer7) {
+            let line = b.server_extras.name_lines.get(s.id.as_str()).copied().unwrap_or(1) as usize;
+            return Err(ConfigError::new(
+                line,
+                1,
+                format!("'server {}/{}' : 'layer7' can only be used in http proxies.", b.name, s.id),
+            ));
+        }
     }
     let bufsize = global.and_then(|g| g.bufsize).unwrap_or(16384);
     if bufsize < 16384 {

@@ -77,7 +77,6 @@ const SENT: Unimplemented = Refuse("Alcyon does not implement it; the server wou
 /// Keywords `HAProxy` registers that the loops in `server.rs` do not handle.
 pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     // src/server.c
-    kw!("error-limit", Arg::Word, Ignore("the error count for 'observe' and 'on-error', which Alcyon refuses")),
     not_for_default!("guid", Arg::Word, Ignore("a global identifier for the CLI and stats")),
     kw!("ws", Arg::Word, Ignore("the protocol for WebSocket; Alcyon upgrades over HTTP/1.1")),
     kw!("hash-key", Arg::Word, ROUTE),
@@ -92,8 +91,6 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("minconn", Arg::Word, Ignore("the dynamic connection limit")),
     kw!("namespace", Arg::Word, ROUTE),
     kw!("non-stick", Arg::None, ROUTE),
-    kw!("observe", Arg::Word, CHECK),
-    kw!("on-error", Arg::Word, CHECK),
     kw!("on-marked-down", Arg::Word, Refuse("Alcyon does not implement it; sessions it should end would continue")),
     kw!("on-marked-up", Arg::Word, Refuse("Alcyon does not implement it; sessions it should end would continue")),
     kw!("pool-conn-name", Arg::Word, Refuse(
@@ -107,12 +104,11 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("socks4", Arg::Word, ROUTE),
     kw!("usesrc", Arg::None, ROUTE),
     // src/check.c
-    kw!("addr", Arg::Word, CHECK),
-    kw!("agent-addr", Arg::Word, Ignore("agent checks, which need 'agent-check'; Alcyon refuses it")),
+    kw!("agent-addr", Arg::Word, CHECK),
     kw!("agent-check", Arg::None, CHECK),
-    kw!("agent-inter", Arg::Delay, Ignore("agent checks, which need 'agent-check'; Alcyon refuses it")),
-    kw!("agent-port", Arg::Word, Ignore("agent checks, which need 'agent-check'; Alcyon refuses it")),
-    kw!("agent-send", Arg::Word, Ignore("agent checks, which need 'agent-check'; Alcyon refuses it")),
+    kw!("agent-inter", Arg::Delay, CHECK),
+    kw!("agent-port", Arg::Word, CHECK),
+    kw!("agent-send", Arg::Word, CHECK),
     kw!("check-pool-conn-name", Arg::Word, Ignore("health checks reusing idle connections")),
     kw!("check-reuse-pool", Arg::None, Ignore("health checks reusing idle connections")),
     kw!("check-send-proxy", Arg::None, CHECK),

@@ -2,6 +2,8 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 use super::*;
+use crate::ast::AgentCheckConfig;
+use crate::{ObserveMode, OnErrorMode};
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_server(
@@ -62,6 +64,10 @@ pub(crate) fn parse_server(
     let mut pool_low_conn = default_server.and_then(|d| d.pool_low_conn).unwrap_or(0);
     let mut pool_purge_delay = default_server.and_then(|d| d.pool_purge_delay).unwrap_or(5000);
     let mut check_port = default_server.and_then(|d| d.check_port);
+    let mut check_addr = default_server.and_then(|d| d.check_addr);
+    let mut observe = default_server.map(|d| d.observe).unwrap_or_default();
+    let mut error_limit = default_server.and_then(|d| d.error_limit).unwrap_or(10);
+    let mut on_error = default_server.map(|d| d.on_error).unwrap_or_default();
     let mut check_proto = default_server.and_then(|d| d.check_proto);
     let mut proto_h2 = default_server.is_some_and(|d| d.proto_h2);
     let mut weight = default_server.and_then(|d| d.weight);
@@ -72,6 +78,7 @@ pub(crate) fn parse_server(
     let mut ssl = default_server.map(|d| d.ssl.clone()).unwrap_or_default();
     let mut disabled = default_server.is_some_and(|d| d.disabled);
     let mut track = default_server.and_then(|d| d.track.clone());
+    let mut agent = default_server.map(|d| d.agent.clone()).unwrap_or_default();
     let mut puid = 0u32;
     let index = u32::try_from(servers.len()).unwrap_or(u32::MAX);
     // `srv_check_health` of a server nothing checks: the last `rise` given (`srv_settings_cpy`
@@ -84,6 +91,10 @@ pub(crate) fn parse_server(
     let mut i = 3;
     while i < tokens.len() {
         if let Some(last) = parse_server_ssl_keyword(&mut ssl, tokens, i, who)? {
+            i = last + 1;
+            continue;
+        }
+        if let Some(last) = parse_agent_keyword(&mut agent, tokens, i, who)? {
             i = last + 1;
             continue;
         }
@@ -157,6 +168,25 @@ pub(crate) fn parse_server(
                 check_port = Some(parse_u16(server_kw_arg(tokens, i, who, "expects a port number as argument.")?, "port")?);
                 i += 1;
             }
+            "addr" => {
+                check_addr = Some(parse_check_addr(server_kw_arg(tokens, i, who, "expects <ipv4|ipv6> as argument.")?, who)?);
+                i += 1;
+            }
+            "observe" => {
+                observe = parse_observe(server_kw_arg(tokens, i, who, "expects <mode> as argument.")?, who)?;
+                i += 1;
+            }
+            "error-limit" => {
+                error_limit = parse_error_limit(server_kw_arg(tokens, i, who, "expects an integer argument.")?, who)?;
+                i += 1;
+            }
+            "on-error" => {
+                on_error = parse_on_error(
+                    server_kw_arg(tokens, i, who, "expects one of 'fastinter', 'fail-check', 'sudden-death' or 'mark-down' as argument.")?,
+                    who,
+                )?;
+                i += 1;
+            }
             "check-proto" => {
                 check_proto = Some(parse_server_proto(tokens, i, who)?);
                 i += 1;
@@ -226,7 +256,7 @@ pub(crate) fn parse_server(
                 i += 1;
             }
             // What these turn on, Alcyon never does: they leave the server as Alcyon runs it.
-            "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool"
+            "stick" | "no-check-send-proxy" | "no-check-reuse-pool"
             | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" => {}
             _ => i = unimplemented_server_keyword(tokens, i, who)?,
         }
@@ -254,6 +284,9 @@ pub(crate) fn parse_server(
     }
     if track.is_some() {
         extras.track_line.push((index, u32::try_from(kw.line).unwrap_or(u32::MAX)));
+    }
+    if agent != AgentCheckConfig::default() {
+        extras.agent_checks.push((index, agent));
     }
     if let Some(sec) = &resolvers {
         extras.resolvers_refs.push((index, u32::try_from(kw.line).unwrap_or(u32::MAX), sec.clone()));
@@ -299,6 +332,10 @@ pub(crate) fn parse_server(
                 fastinter_ms: fastinter.map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
                 downinter_ms: downinter.map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
                 max_reuse,
+                check_addr,
+                observe,
+                error_limit,
+                on_error,
             };
             (pool != crate::ast::server::ServerPool::default()).then(|| Box::new(pool))
         },
@@ -309,6 +346,63 @@ pub(crate) fn parse_server(
         track,
     });
     Ok(())
+}
+
+fn parse_check_addr(tok: &Token, who: Option<&str>) -> Result<std::net::IpAddr, ConfigError> {
+    tok.text.parse::<std::net::IpAddr>().map_err(|_| {
+        let prefix = server_keywords::server_prefix(who);
+        ConfigError::new(
+            tok.line,
+            tok.col,
+            format!("{prefix}'addr' : invalid address '{}'.", tok.text),
+        )
+    })
+}
+
+fn parse_observe(tok: &Token, who: Option<&str>) -> Result<ObserveMode, ConfigError> {
+    match tok.text.as_str() {
+        "none" => Ok(ObserveMode::None),
+        "layer4" => Ok(ObserveMode::Layer4),
+        "layer7" => Ok(ObserveMode::Layer7),
+        other => {
+            let prefix = server_keywords::server_prefix(who);
+            Err(ConfigError::new(
+                tok.line,
+                tok.col,
+                format!("{prefix}'observe' expects one of 'none', 'layer4', 'layer7' but got '{other}'"),
+            ))
+        }
+    }
+}
+
+fn parse_error_limit(tok: &Token, who: Option<&str>) -> Result<u32, ConfigError> {
+    let n = atoi(&tok.text);
+    if n <= 0 || n > i64::from(u32::MAX) {
+        let prefix = server_keywords::server_prefix(who);
+        return Err(ConfigError::new(
+            tok.line,
+            tok.col,
+            format!("{prefix}'error-limit' has to be > 0."),
+        ));
+    }
+    Ok(u32::try_from(n).unwrap_or(10))
+}
+
+fn parse_on_error(tok: &Token, who: Option<&str>) -> Result<OnErrorMode, ConfigError> {
+    match tok.text.as_str() {
+        "fastinter" => Ok(OnErrorMode::FastInter),
+        "fail-check" => Ok(OnErrorMode::FailCheck),
+        "sudden-death" => Ok(OnErrorMode::SuddenDeath),
+        "mark-down" => Ok(OnErrorMode::MarkDown),
+        other => {
+            let prefix = server_keywords::server_prefix(who);
+            Err(ConfigError::new(
+                tok.line,
+                tok.col,
+                format!("{prefix}'on-error' expects one of 'fastinter', 'fail-check', 'sudden-death' or 'mark-down' but got '{other}'"),
+            ))
+        }
+    }
 }
 
 /// `atoi`: the leading `[-]digits` of `s`, 0 when there are none.
@@ -827,6 +921,10 @@ pub(crate) fn parse_default_server(
             i = last + 1;
             continue;
         }
+        if let Some(last) = parse_agent_keyword(&mut cfg.agent, tokens, i, None)? {
+            i = last + 1;
+            continue;
+        }
         match tokens[i].text.as_str() {
             "check" => cfg.check = true,
             "no-check" => cfg.check = false,
@@ -893,6 +991,25 @@ pub(crate) fn parse_default_server(
                 cfg.check_port = Some(parse_u16(server_kw_arg(tokens, i, None, "expects a port number as argument.")?, "port")?);
                 i += 1;
             }
+            "addr" => {
+                cfg.check_addr = Some(parse_check_addr(server_kw_arg(tokens, i, None, "expects <ipv4|ipv6> as argument.")?, None)?);
+                i += 1;
+            }
+            "observe" => {
+                cfg.observe = parse_observe(server_kw_arg(tokens, i, None, "expects <mode> as argument.")?, None)?;
+                i += 1;
+            }
+            "error-limit" => {
+                cfg.error_limit = Some(parse_error_limit(server_kw_arg(tokens, i, None, "expects an integer argument.")?, None)?);
+                i += 1;
+            }
+            "on-error" => {
+                cfg.on_error = parse_on_error(
+                    server_kw_arg(tokens, i, None, "expects one of 'fastinter', 'fail-check', 'sudden-death' or 'mark-down' as argument.")?,
+                    None,
+                )?;
+                i += 1;
+            }
             "check-proto" => {
                 cfg.check_proto = Some(parse_server_proto(tokens, i, None)?);
                 i += 1;
@@ -932,7 +1049,7 @@ pub(crate) fn parse_default_server(
                 cfg.resolvers = Some(server_kw_arg(tokens, i, None, "expects <resolvers_id> as argument.")?.text.as_str().into());
                 i += 1;
             }
-            "stick" | "no-agent-check" | "no-check-send-proxy" | "no-check-reuse-pool"
+            "stick" | "no-check-send-proxy" | "no-check-reuse-pool"
             | "no-send-proxy-v2-ssl" | "no-send-proxy-v2-ssl-cn" => {}
             _ => i = unimplemented_server_keyword(tokens, i, None)?,
         }
@@ -940,6 +1057,42 @@ pub(crate) fn parse_default_server(
     }
     *def = Some(cfg);
     Ok(())
+}
+
+pub(crate) fn parse_agent_keyword(
+    agent: &mut AgentCheckConfig,
+    tokens: &[Token],
+    i: usize,
+    who: Option<&str>,
+) -> Result<Option<usize>, ConfigError> {
+    let last = match tokens[i].text.as_str() {
+        "agent-check" => {
+            agent.enabled = true;
+            i
+        }
+        "no-agent-check" => {
+            agent.enabled = false;
+            i
+        }
+        "agent-addr" => {
+            agent.addr = Some(parse_check_addr(server_kw_arg(tokens, i, who, "expects an address as argument.")?, who)?);
+            i + 1
+        }
+        "agent-port" => {
+            agent.port = Some(parse_u16(server_kw_arg(tokens, i, who, "expects a port number as argument.")?, "agent-port")?);
+            i + 1
+        }
+        "agent-send" => {
+            agent.send = Some(server_kw_arg(tokens, i, who, "expects a string as argument.")?.text.as_str().into());
+            i + 1
+        }
+        "agent-inter" => {
+            agent.inter = Some(parse_server_delay(server_kw_arg(tokens, i, who, "expects a delay as argument.")?, "agent-inter", who)?);
+            i + 1
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(last))
 }
 
 pub(crate) fn parse_balance(

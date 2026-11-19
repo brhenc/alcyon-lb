@@ -1337,7 +1337,8 @@ fn attach_server_to(
     let (fe, be) = (&proxies[fe_idx], &proxies[be_idx]);
     let stick = StickView::new(proxies, &sess.tracked_sc);
     let ip = s_idx.and_then(|i| be.srv_set().addr_get(i)).map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |a| a.ip());
-    let mut xprt = tls.with_sni(sample_registry(), &stream_sample_ctx(sess, fe, be, &ProxiesView(proxies), &stick).as_ctx(), |sni| {
+    let fc = crate::proxy::ConnView::from_conn(sess);
+    let mut xprt = tls.with_sni(sample_registry(), &stream_sample_ctx(sess, fe, be, &ProxiesView(proxies), &stick, fc.as_ref()).as_ctx(), |sni| {
         tls.connect(&srv_fd, sni, ip)
     });
     // A PROXY header (`send-proxy*`) was put at the head of the request; to a TLS
@@ -1439,7 +1440,8 @@ fn with_server_sni<R>(
         return f(None);
     };
     let stick = StickView::new(proxies, &sess.tracked_sc);
-    tls.with_sni(sample_registry(), &stream_sample_ctx(sess, &proxies[fe_idx], &proxies[be_idx], &ProxiesView(proxies), &stick).as_ctx(), f)
+    let fc = crate::proxy::ConnView::from_conn(sess);
+    tls.with_sni(sample_registry(), &stream_sample_ctx(sess, &proxies[fe_idx], &proxies[be_idx], &ProxiesView(proxies), &stick, fc.as_ref()).as_ctx(), f)
 }
 
 /// The pool key of a connection to `addr` for server `s_idx` of backend `be_idx`, opened
@@ -2411,6 +2413,34 @@ impl SessionArena {
         self.entries.get_mut(idx as usize)?.as_mut().filter(|e| !e.parked)
     }
 
+    /// Borrows `idx` mutably and, if it is an HTTP/2 child whose owner is a different live slot
+    /// in this arena, borrows that owner immutably (`split_at_mut`, no allocation or atomics).
+    pub fn get_mut_with_owner(&mut self, idx: u32) -> Option<(&mut SessionEntry, Option<&SessionEntry>)> {
+        let owner_ref = {
+            let e = self.entries.get(idx as usize)?.as_ref().filter(|e| !e.parked)?;
+            match e.sess.h2_role.as_deref() {
+                Some(crate::proxy::H2Role::Child(c)) => c.owner.filter(|&(oi, _)| oi != idx),
+                _ => None,
+            }
+        };
+        if let Some((owner_idx, owner_task)) = owner_ref
+            .filter(|&(oi, ot)| self.entries.get(oi as usize).and_then(|s| s.as_ref()).is_some_and(|o| !o.parked && o.task == ot))
+        {
+            let (a, b) = (idx as usize, owner_idx as usize);
+            if a < b {
+                let (lo, hi) = self.entries.split_at_mut(b);
+                let entry = lo[a].as_mut()?;
+                let owner = hi[0].as_ref()?;
+                return Some((entry, Some(owner)));
+            }
+            let (lo, hi) = self.entries.split_at_mut(a);
+            let owner = lo[b].as_ref()?;
+            let entry = hi[0].as_mut()?;
+            return Some((entry, Some(owner)));
+        }
+        Some((self.entries.get_mut(idx as usize)?.as_mut().filter(|e| !e.parked)?, None))
+    }
+
     /// The entry that [`EngineDispatcher::reset_parked`] marked parked, in its slot (O1b, CP3), is
     /// counted so: the session of an HTTP/2 stream that is over, which its connection keeps for
     /// its next stream ([`Self::unpark`]). Not seen by `get`, `iter` or `live`.
@@ -2555,6 +2585,7 @@ pub struct Engine {
     /// inside each `Proxy` (T177).
     pub proxies: Proxies,
     pub checks: Vec<ServerCheckState>,
+    pub agent_checks: Vec<crate::agent_check::AgentCheckState>,
     /// The `resolvers` sections the servers use, on worker 0 with the checks they change
     /// (`crate::resolvers`); empty elsewhere.
     resolvers: Vec<crate::resolvers::Section>,
@@ -3217,7 +3248,7 @@ fn begin_http_stream(entry: &mut SessionEntry, proxies: &crate::table::Table, fe
             let data = stream_log_data(entry, std::slice::from_ref(fe), 0, pid);
             let view = ProxiesView(proxies);
             let stick = StickView::new(proxies, &entry.sess.tracked_sc);
-            let ctx = stream_sample_ctx(&entry.sess, fe, fe, &view, &stick);
+            let ctx = stream_sample_ctx(&entry.sess, fe, fe, &view, &stick, None);
             fmt.render(&data, sample_registry(), &ctx.as_ctx())
         };
         if let Some(h) = fe.unique_id_header.as_deref() {
@@ -3268,6 +3299,8 @@ fn stream_facts(sess: &TcpSession, status: Option<u16>, timers: bool) -> alcyon_
         redispatched: sess.redispatched,
         // Only for a rule whose format prints them: five clock reads are not free (T455).
         timers: timers.then(|| [log.ms(log.first_byte), log.ms(log.request), log.ms(log.queue), log.ms(log.connect), log.ms(log.data)]),
+        be_queue: if log.queue_is_srv { 0 } else { log.be_queue },
+        srv_queue: if log.queue_is_srv { log.be_queue } else { 0 },
     }
 }
 
@@ -3284,10 +3317,11 @@ fn request_date(log: &crate::txnlog::StreamLog) -> (i64, u32) {
 }
 
 /// The sample context a log line's `%[...]` reads.
-fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>) -> alcyon_sample::PhaseCtx<'a> {
+fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>, fc: Option<&'a crate::proxy::ConnView<'a>>) -> alcyon_sample::PhaseCtx<'a> {
     alcyon_sample::PhaseCtx {
         proxies: Some(view),
         stick: Some(stick),
+        fc: fc.map(|c| c as &dyn alcyon_sample::FrontConnState),
         client_addr: s.client_addr,
         server_addr: s.server_addr,
         fc_src: s.fc_src(),
@@ -3322,6 +3356,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         term_state: Some(sess_term_state(s)),
         bc_dst: s.bc_dst(),
         bc_src: s.bc_src(),
+        stream: Some(stream_facts(s, None, false)),
         ..Default::default()
     }
 }
@@ -3598,7 +3633,8 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         retries: i64::from(s.max_retries.saturating_sub(s.conn_retries)),
         redispatched: s.strm.log.redispatched,
         uniq_id: l.uniq_id,
-        be_queue: u64::from(l.be_queue),
+        be_queue: u64::from(if l.queue_is_srv { 0 } else { l.be_queue }),
+        srv_queue: u64::from(if l.queue_is_srv { l.be_queue } else { 0 }),
         log_counter: fe.log_count.load(Ordering::Relaxed),
         pid,
         hostname: log_hostname(),
@@ -3863,7 +3899,7 @@ fn stream_log_line(entry: &SessionEntry, proxies: &crate::table::Table, pid: u32
     CURRENT_SRV_STATUS.set(entry.sess.strm.log.srv_status);
     let tr = entry.sess.strm.log.data.zip(entry.sess.strm.log.connect).map(|(d, c)| d.saturating_duration_since(c).as_millis());
     CURRENT_RES_TR.set(tr.map_or(-1, |ms| i64::try_from(ms).unwrap_or(i64::MAX)));
-    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, res_status: txn_status, ..stream_sample_ctx(&entry.sess, fe, be, &view, &stick) }, live: None };
+    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, res_status: txn_status, ..stream_sample_ctx(&entry.sess, fe, be, &view, &stick, None) }, live: None };
     let (line, sd) = with_sd(fe.log_format_sd(), fmt, &data, &ctx);
     fe.log_count.fetch_add(1, Ordering::Relaxed);
     Some((line, sd, err))
@@ -4046,7 +4082,8 @@ fn proxy_header_error_line(entry: &SessionEntry, proxies: &crate::table::Table, 
     };
     let (view, stick) = (ProxiesView(proxies), StickView::new(proxies, &s.tracked_sc));
     // No stream, so no backend either: `be_name` has no value in `HAProxy`'s line.
-    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, conn_err: Some(failure.conn_err()), be_name: None, be_id: None, ..stream_sample_ctx(s, fe, fe, &view, &stick) }, live: None };
+    let fc = crate::proxy::ConnView::from_conn(s);
+    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, conn_err: Some(failure.conn_err()), be_name: None, be_id: None, ..stream_sample_ctx(s, fe, fe, &view, &stick, fc.as_ref()) }, live: None };
     let line = match fe.error_log_format() {
         Some(elf) => with_sd(fe.log_format_sd(), elf, &data, &ctx),
         None => {
@@ -4915,6 +4952,31 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
     })
 }
 
+fn init_agent_checks(
+    proxies: &crate::table::Table,
+    scheduler: &mut Scheduler,
+    now: Tick,
+) -> Vec<crate::agent_check::AgentCheckState> {
+    let mut agent_checks = Vec::new();
+    for (proxy_idx, proxy) in proxies.iter().enumerate() {
+        for (server_idx, srv_addr) in proxy.srv_set().addrs().enumerate() {
+            let Some(cfg) = proxy.server_agent_config(server_idx).filter(|a| a.enabled).cloned() else {
+                continue;
+            };
+            let mut agent = crate::agent_check::AgentCheckState::new(proxy_idx, server_idx, srv_addr, cfg, now);
+            let idx = usize_to_u32(agent_checks.len());
+            if let Some(task_ref) = scheduler.create(WorkKind::new(Kind::AgentCheck, idx)) {
+                agent.task = task_ref;
+                let initial_delay = 50u32.saturating_add(idx.saturating_mul(50));
+                scheduler.queue_timer(task_ref, now.add(initial_delay));
+            }
+            crate::track::publish_agent_view(proxy, &agent);
+            agent_checks.push(agent);
+        }
+    }
+    agent_checks
+}
+
 fn init_checks(proxies: &crate::table::Table, scheduler: &mut Scheduler, now: Tick) -> Vec<ServerCheckState> {
     let mut checks = Vec::with_capacity(proxies.iter().map(|p| p.srv_set().checked_count()).sum());
     // One task and one timer per check.
@@ -5414,6 +5476,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         } else {
             Vec::new()
         };
+        let agent_checks = if worker_id == 0 {
+            init_agent_checks(&proxies, &mut scheduler, now)
+        } else {
+            Vec::new()
+        };
         // Where a server's `resolvers` reaches the data path: its section's task and sockets.
         let resolvers = if worker_id == 0 {
             crate::resolvers::build(config, &proxies, &mut scheduler, &mut fdtab, &poller, now)?
@@ -5448,6 +5515,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             listeners,
             proxies,
             checks,
+            agent_checks,
             resolvers,
             sessions,
             applets,
@@ -6553,6 +6621,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             lb_snap: &mut self.lb_snap,
             proxies: &mut self.proxies,
             checks: &mut self.checks,
+            agent_checks: &mut self.agent_checks,
             resolvers: &mut self.resolvers,
             fdtab: &mut self.fdtab,
             poller: &mut self.poller,
@@ -8194,7 +8263,7 @@ fn res_sample_may_change(expr: &Expr, rep: &[u8]) -> bool {
 /// `tcp-response inspect-delay` runs out, when they decide on what is there.
 fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &crate::table::Table, registry: &Registry, sess: &mut TcpSession, now: Tick) -> ContentEvalResult {
     let server_closed = matches!(sess.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
-    let expired = sess.res_inspect_exp.is_none_or(|exp| exp.is_expired(now));
+    let expired = sess.res_inspect.as_ref().and_then(|r| r.exp).is_none_or(|exp| exp.is_expired(now));
     let final_ = server_closed || sess.rep.is_full() || expired;
     let rep_bytes = sess.rep.readable();
     let stick = StickView::new(proxies, &sess.tracked_sc);
@@ -8444,8 +8513,10 @@ fn stream_timeouts_enter(proxies: &crate::table::Table, fe_idx: usize, be_idx: u
 /// Readies a TCP-mode stream for `proxy`'s `tcp-response content` rules, if it has any
 /// (`AN_RES_INSPECT`, set with the backend); they start when the server connects.
 fn arm_res_inspect(proxy: &Proxy, sess: &mut TcpSession) {
-    sess.res_inspect_armed = (sess.mode == Mode::Tcp && !proxy.tcp_res_content_rules.is_empty())
-        .then(|| proxy.tcp_res_inspect_delay.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
+    if sess.mode == Mode::Tcp && !proxy.tcp_res_content_rules.is_empty() {
+        let Some(r) = sess.res_inspect.get_or_init(&crate::proxy::RES_INSPECT_POOL) else { return };
+        r.armed = Some(proxy.tcp_res_inspect_delay.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
+    }
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -8736,7 +8807,8 @@ fn proxy_header(fe: &Proxy, proxy: &Proxy, proxies: &crate::table::Table, sess: 
             if tlvs.tlvs.iter().any(|(_, fmt)| fmt.is_some()) {
                 let view = ProxiesView(proxies);
                 let stick = StickView::new(proxies, &sess.tracked_sc);
-                let phase = stream_sample_ctx(sess, fe, proxy, &view, &stick);
+                let fc = crate::proxy::ConnView::from_conn(sess);
+                let phase = stream_sample_ctx(sess, fe, proxy, &view, &stick, fc.as_ref());
                 let ctx = phase.as_ctx();
                 let data = session_log_data(sess, fe, proxy, std::process::id());
                 append_tlvs(Some((&data, &ctx)));
@@ -8750,7 +8822,8 @@ fn proxy_header(fe: &Proxy, proxy: &Proxy, proxies: &crate::table::Table, sess: 
             // (`stream_generate_unique_id`, `make_proxy_line_v2`).
             if sess.strm.log.unique_id.is_none() {
                 if let Some(fmt) = fe.unique_id_format.as_ref() {
-                    let id = fmt.render(&session_log_data(sess, fe, proxy, std::process::id()), sample_registry(), &stream_sample_ctx(sess, fe, proxy, &ProxiesView(proxies), &StickView::new(proxies, &sess.tracked_sc)).as_ctx());
+                    let fc = crate::proxy::ConnView::from_conn(sess);
+                    let id = fmt.render(&session_log_data(sess, fe, proxy, std::process::id()), sample_registry(), &stream_sample_ctx(sess, fe, proxy, &ProxiesView(proxies), &StickView::new(proxies, &sess.tracked_sc), fc.as_ref()).as_ctx());
                     sess.strm.log.unique_id = Some(id);
                 }
             }
@@ -8961,6 +9034,7 @@ fn init_client_session(
                 proxy.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
                 if let Some(i) = proxy.srv_set().slot_of_addr(target) {
                     proxy.srv_set().bump_retr(i, (0, 0, 1));
+                    crate::check::health_adjust(proxies, proxy_idx, i, crate::check::HanaStatus::L4Err);
                 }
                 sess.srv_state = ScState::Error;
             }
@@ -9159,6 +9233,7 @@ struct EngineDispatcher<'a> {
     lb_snap: &'a mut crate::lb::LbSnapCache,
     proxies: &'a mut Proxies,
     checks: &'a mut [ServerCheckState],
+    agent_checks: &'a mut [crate::agent_check::AgentCheckState],
     resolvers: &'a mut [crate::resolvers::Section],
     fdtab: &'a mut FdTab,
     poller: &'a mut Poller,
@@ -9793,6 +9868,23 @@ fn count_redispatch_pick_on<'a, R: crate::statcnt::Rows<'a>>(rows: R, be: &'a Pr
 /// A connect attempt to the stream's server failed (`back_handle_st_cer`): while retries
 /// remain, connect again -- after the turnaround (`SC_ST_TAR`) when `wait`, an asynchronous
 /// connect error, and the server is the same one; at once after a connect refused at once.
+fn observe_http(entry: &SessionEntry, proxies: &crate::table::Table, status: crate::check::HanaStatus) {
+    observe_http_ids(proxies, entry.srv_backend_idx, entry.target_server_idx, status);
+}
+
+fn observe_http_ids(proxies: &crate::table::Table, srv_backend_idx: usize, target_server_idx: Option<usize>, status: crate::check::HanaStatus) {
+    if let Some(i) = target_server_idx {
+        crate::check::health_adjust(proxies, srv_backend_idx, i, status);
+    }
+}
+
+fn mark_server_connected(entry: &mut SessionEntry, proxies: &crate::table::Table, now: Tick) {
+    entry.sess.server_connected(now);
+    if let Some(i) = entry.target_server_idx {
+        crate::check::health_adjust(proxies, entry.srv_backend_idx, i, crate::check::HanaStatus::L4Ok);
+    }
+}
+
 /// Out of retries, the failure counts in `econ` on the backend and on the server tried
 /// last (once per stream, not per attempt: measured on `HAProxy`, `retries 2` shows
 /// `wretr` 2, `econ` 1) and the stream ends, with a 503 in HTTP.
@@ -9816,6 +9908,7 @@ fn server_connect_failed(
             be.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
             if let Some(i) = entry.target_server_idx {
                 be.srv_set().bump_retr(i, (0, 0, 1));
+                crate::check::health_adjust(proxies, entry.srv_backend_idx, i, crate::check::HanaStatus::L4Err);
             }
             entry.sess.srv_state = ScState::Error;
             if entry.sess.mode == Mode::Http {
@@ -10065,7 +10158,7 @@ fn check_srv_connect(
                 );
 
                 if let Ok(None) = conn_err {
-                    entry.sess.server_connected(now);
+                    mark_server_connected(entry, proxies, now);
                     let (_, srv_want) = entry.sess.interests();
                     let new_interest = Interest {
                         readable: srv_want.read,
@@ -10097,7 +10190,7 @@ fn check_srv_connect(
 /// Whether one of the checks behind [`TcpSession::rare_armed`] is armed (T599).
 fn rare_check_armed(entry: &SessionEntry) -> bool {
     let s = &entry.sess;
-    entry.connect_log_due || entry.rate_max_due || s.session_rules_pending || !s.tcp_inspect_done || s.res_inspect_pending
+    entry.connect_log_due || entry.rate_max_due || s.session_rules_pending || !s.tcp_inspect_done || s.res_inspect_pending()
 }
 
 fn update_interests(entry: &mut SessionEntry, fdtab: &mut FdTab, poller: &mut Poller) {
@@ -10480,6 +10573,7 @@ impl EngineDispatcher<'_> {
     /// for an unparsable request, request rules and routing (once per transaction), the
     /// response head, how each side ended, and the end of the transaction.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn http_step(
         entry: &mut SessionEntry,
         proxies: &mut Proxies,
@@ -10493,6 +10587,7 @@ impl EngineDispatcher<'_> {
         lb_snap: &mut crate::lb::LbSnapCache,
         log_targets: &[crate::syslog::SyslogTarget],
         log_tag: &str,
+        fc: Option<crate::proxy::ConnView<'_>>,
     ) -> Option<crate::stats_html::AdminAction> {
         // An HTTP/2 connection serving a stream is not between requests: the stream is its
         // child's, which ends it (T280).
@@ -10631,7 +10726,7 @@ impl EngineDispatcher<'_> {
             if let Some(t) = entry.sess.strm.txn.as_mut() {
                 t.req_rules_done = true;
             }
-            admin = Self::connect_http_backend(entry, proxies, checks, pid, fdtab, poller, idle_pool, now, lb_snap);
+            admin = Self::connect_http_backend(entry, proxies, checks, pid, fdtab, poller, idle_pool, now, lb_snap, fc);
             let sess = &mut entry.sess;
             if let Some(t) = sess.strm.txn.as_mut() {
                 if t.body_wait.is_some() {
@@ -10664,7 +10759,7 @@ impl EngineDispatcher<'_> {
                 if Self::l7_retry(entry, proxies, fdtab, poller, now, lb_snap) {
                     continue;
                 }
-                if !Self::apply_http_response_rules(entry, proxies, now, pid, log_targets, log_tag) {
+                if !Self::apply_http_response_rules(entry, proxies, now, pid, log_targets, log_tag, fc) {
                     Self::write_response_head_names(entry, proxies);
                 }
             }
@@ -11056,6 +11151,8 @@ impl EngineDispatcher<'_> {
         let srv_eof = matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed);
         let srv_err = entry.sess.srv_state == ScState::Error;
         let h2_child = entry.sess.is_h2_child();
+        let srv_be_idx = entry.srv_backend_idx;
+        let target_srv_idx = entry.target_server_idx;
         let Some(txn) = entry.sess.strm.txn.as_mut() else {
             return;
         };
@@ -11113,6 +11210,7 @@ impl EngineDispatcher<'_> {
                 crate::txn::BodyCheck::Fine => false,
             };
             if refused {
+                observe_http_ids(proxies, srv_be_idx, target_srv_idx, crate::check::HanaStatus::HttpRsp);
                 txn.srv_reusable = false;
                 entry.sess.rep.clear();
                 entry.sess.strm.log.term = Some(*b"PH");
@@ -11126,6 +11224,7 @@ impl EngineDispatcher<'_> {
         if !(srv_eof || srv_err) && !txn.local && !txn.aborted && matches!(txn.rsp, MsgState::Body(_)) && !h2_child {
             let check = txn.rsp.check_body(entry.sess.rep.readable());
             if check.stuck(entry.sess.rep.len(), entry.sess.bufsize) {
+                observe_http_ids(proxies, srv_be_idx, target_srv_idx, crate::check::HanaStatus::HttpRsp);
                 txn.srv_reusable = false;
                 txn.close_after = true;
                 txn.aborted = true;
@@ -11160,6 +11259,14 @@ impl EngineDispatcher<'_> {
                 // An h2 server's malformed response is the server's fault, not a lost
                 // connection: `PH--` whether or not it was reused (T540).
                 let bad = entry.sess.srv_xprt.bad_response();
+                let hana = if status == 504 {
+                    crate::check::HanaStatus::HttpReadTimeout
+                } else if bad {
+                    crate::check::HanaStatus::HttpHdrRsp
+                } else {
+                    crate::check::HanaStatus::HttpBrokenPipe
+                };
+                observe_http_ids(proxies, srv_be_idx, target_srv_idx, hana);
                 if status == 502 && txn.srv_reused && entry.sess.rep.is_empty() && !bad {
                     // `abort_keep_alive`: a keep-alive request lost to a network error,
                     // nothing of a response received. The client retries only if it
@@ -11716,7 +11823,7 @@ impl EngineDispatcher<'_> {
             return out;
         }
         let mut connect_line: Option<(usize, String)> = None;
-        let mut owner_wake: Option<TaskRef> = None;
+        let mut owner_ref: Option<(u32, TaskRef)> = None;
         {
             let Some(entry) = self.sessions.get_mut(session_idx) else {
                 return Outcome::Done;
@@ -11821,7 +11928,8 @@ impl EngineDispatcher<'_> {
             self.h2_owner_pass(session_idx, now);
         }
         let (is_done, pending_admin, log_line, checkcache_alert) = {
-            let Some(entry) = self.sessions.get_mut(session_idx) else { return Outcome::Done };
+            let Some((entry, owner)) = self.sessions.get_mut_with_owner(session_idx) else { return Outcome::Done };
+            let fc = crate::proxy::ConnView::from_stream(&entry.sess, owner.map(|o| &o.sess));
             // The glitches the HTTP/2 connection counted since the last pass go to the entries
             // its stream counters track (`glitch_cnt`, `glitch_rate`); while a stream is served,
             // the owner pass credits them, to the counters as the stream tracks them.
@@ -11909,12 +12017,11 @@ impl EngineDispatcher<'_> {
                 }
 
                 // Step 3.45: TCP mode, `tcp-response content` rules over the response so far.
-                if entry.sess.res_inspect_pending && !entry.sess.is_done() {
+                if entry.sess.res_inspect_pending() && !entry.sess.is_done() {
                     let be_idx = entry.backend_idx;
                     let res = eval_tcp_res_content_rules(&self.proxies[be_idx], &self.proxies, sample_registry(), &mut entry.sess, now);
                     if res != ContentEvalResult::Waiting {
-                        entry.sess.res_inspect_pending = false;
-                        entry.sess.res_inspect_exp = None;
+                        entry.sess.res_inspect.reset(&crate::proxy::RES_INSPECT_POOL);
                     }
                     match res {
                         ContentEvalResult::Waiting => {}
@@ -11990,6 +12097,7 @@ impl EngineDispatcher<'_> {
                     self.lb_snap,
                     &self.log_targets,
                     &self.log_tag,
+                    fc,
                 );
             }
 
@@ -12057,8 +12165,8 @@ impl EngineDispatcher<'_> {
             // what it produced (its response, room for more of its request) and sees how it
             // ended (T280).
             // An HTTP/3 owner too (L2): its second run in a pass sends what this one moved.
-            if let Some((_, owner_task)) = entry.sess.h2_child().and_then(|c| c.owner) {
-                owner_wake = Some(owner_task);
+            if let Some(o) = entry.sess.h2_child().and_then(|c| c.owner) {
+                owner_ref = Some(o);
             }
 
             // Step 5: Update timer. Not for a stream that has ended: its task is freed when
@@ -12078,10 +12186,25 @@ impl EngineDispatcher<'_> {
             (entry.sess.is_done(), pending_admin, log_line, checkcache_alert)
         };
 
-        if let Some(owner_task) = owner_wake {
+        if let Some((owner_idx, owner_task)) = owner_ref {
             #[cfg(debug_assertions)]
-            if self.sessions.get(session_idx).and_then(|e| e.sess.h2_child()).and_then(|c| c.owner).and_then(|(i, _)| self.sessions.get(i)).is_some_and(|o| o.sess.h3_owner().is_some()) {
+            if self.sessions.get(owner_idx).is_some_and(|o| o.sess.h3_owner().is_some()) {
                 alcyon_sample::work::note(alcyon_sample::work::Op::H3OwnerWakeNow, 1);
+            }
+            // Frame a ready response into the owner's h2 mux right away so sibling streams in
+            // the same pass see the live stream count drop as each finishes, matching HAProxy's
+            // synchronous mux send (`h2_snd_buf` -> `h2s_close`).
+            if !is_done {
+                if let Some((o, c)) = self
+                    .sessions
+                    .get2_mut(owner_idx, session_idx)
+                    .filter(|(o, _)| o.task == owner_task && o.sess.h2_ctx.is_some())
+                {
+                    if !c.sess.rep.is_empty() && h2_bridge_moves(o, c, now) {
+                        let pending = o.sess.h2_ctx.as_deref().is_some_and(|h| h.tx_consumed < h.tx_buf.len());
+                        if let Some(ch) = c.sess.h2_child_mut() { ch.owner_tx_pending = pending; }
+                    }
+                }
             }
             self.wake_now.push(owner_task);
         }
@@ -12460,6 +12583,7 @@ impl EngineDispatcher<'_> {
         pid: u32,
         log_targets: &[crate::syslog::SyslogTarget],
         log_tag: &str,
+        fc: Option<crate::proxy::ConnView<'_>>,
     ) -> bool {
         if let Some(c) = entry.sess.h2_child_mut() {
             c.rsp_head = None;
@@ -12467,7 +12591,7 @@ impl EngineDispatcher<'_> {
         let mut lowered = false;
         let mut do_log_res = false;
         let mut do_log_after = false;
-        Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered, pid, &mut do_log_res, &mut do_log_after);
+        Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered, pid, &mut do_log_res, &mut do_log_after, fc);
         // A `do-log` at `http-response`/`http-after-response` sends the stream's line for its
         // step. The response head is borrowed by the rules' context inside the `_in` function,
         // so the send runs here, once that context is gone.
@@ -12492,9 +12616,10 @@ impl EngineDispatcher<'_> {
         proxies: &crate::table::Table,
         now: Tick,
         lowered: &mut bool,
-        pid: u32,
+        _pid: u32,
         do_log_res: &mut bool,
         do_log_after: &mut bool,
+        fc: Option<crate::proxy::ConnView<'_>>,
     ) {
         let threshold = entry.sess.bufsize.saturating_sub(entry.sess.maxrewrite);
         // Empty lines ahead of a status line are skipped (`H1_MSG_RPBEFORE`), so that the
@@ -12511,6 +12636,7 @@ impl EngineDispatcher<'_> {
             // No end of head and no room for more: as for a request, from `bufsize - 56`
             // (T265).
             if entry.sess.rep.readable().len() > threshold || entry.sess.rep.readable().len() + 56 >= entry.sess.bufsize {
+                observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
                 entry.sess.rep.clear();
                 reply_error(entry, proxies, 502);
             }
@@ -12560,6 +12686,7 @@ impl EngineDispatcher<'_> {
             }
             match checked {
                 alcyon_proto::response_head::ResponseHead::Invalid => {
+                    observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
                     entry.sess.rep.clear();
                     entry.sess.strm.log.term.get_or_insert(*b"PH");
                     entry.sess.strm.log.bytes_from_server = 0;
@@ -12567,6 +12694,12 @@ impl EngineDispatcher<'_> {
                     return;
                 }
                 alcyon_proto::response_head::ResponseHead::Valid { status, rewrite, close_server: close, index: ix } => {
+                    let hana = if status >= 100 && (status < 500 || status == 501 || status == 505) {
+                        crate::check::HanaStatus::HttpOk
+                    } else {
+                        crate::check::HanaStatus::HttpSts
+                    };
+                    observe_http(entry, proxies, hana);
                     close_server = close;
                     index = ix;
                     if let Some(r) = rewrite {
@@ -12592,6 +12725,7 @@ impl EngineDispatcher<'_> {
                     match verdict {
                         crate::websocket::Verdict::Keep => {}
                         crate::websocket::Verdict::Refuse => {
+                            observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
                             entry.sess.rep.clear();
                             entry.sess.strm.log.term.get_or_insert(*b"PH");
                             entry.sess.strm.log.bytes_from_server = 0;
@@ -13105,6 +13239,7 @@ impl EngineDispatcher<'_> {
         let mut ctx = alcyon_sample::PhaseCtx {
             proxies: Some(&ProxiesView(proxies)),
             stick: Some(&stick),
+            fc: fc.as_ref().map(|c| c as &dyn alcyon_sample::FrontConnState),
             client_addr: entry.sess.client_addr,
             server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src(),
@@ -13590,9 +13725,10 @@ impl EngineDispatcher<'_> {
                         trimmed_uri
                     };
                     if base == "/" {
-                        req_uri == "/"
-                            || req_uri.starts_with("/;csv")
-                            || req_uri.starts_with("/api/data")
+                        // `http_stats_check_uri` compares the prefix against the request's
+                        // *path*: with the prefix `/`, every path holds it, so the applet
+                        // takes every request of the section (`/?;csv;scope=b1`, `/api/data`).
+                        req_uri.starts_with('/')
                     } else {
                         req_uri == base
                             || req_uri.starts_with(&format!("{base}/"))
@@ -13724,6 +13860,38 @@ impl EngineDispatcher<'_> {
         link
     }
 
+    /// The `scope=` text of the part of the request URI after the section's prefix, as
+    /// `http_handle_stats` keeps it (`STAT_SCOPE_INPUT_NAME`): at most 20 bytes, to the next
+    /// `;`, `&` or space, and none at all when one of those bytes is one `HAProxy` refuses
+    /// (`invalid_char`, `[A-Za-z0-9_:.-]`) or the `scope=` sits within the URI's last 8
+    /// bytes (the scan's `h <= end - 8`). Borrowed from `rest`, no copy.
+    fn stats_scope(rest: &str) -> &str {
+        let Some(at) = rest.find("scope=") else {
+            return "";
+        };
+        // `http_handle_stats` scans `for (h = lookup; h <= end - 8; h++)`: a `scope=` that
+        // starts fewer than 8 bytes before the end of the URI is never found (measured on
+        // the oracle: `GET /;scope=a` unscoped, `GET /;scope=ab` scoped).
+        if at + 8 > rest.len() {
+            return "";
+        }
+        let text = &rest[at + 6..];
+        let end = text.find(|c| c == ';' || c == '&' || c == ' ').unwrap_or(text.len());
+        // `STAT_SCOPE_TXT_MAXLEN` (20): the oracle keeps the first 20 *bytes* and validates
+        // exactly those (`memcpy(scope_txt, h2, itx)`). Work in bytes, where no cut can land
+        // mid-character: a byte the allowed set refuses clears the scope, as the oracle's
+        // `invalid_char` does (`isalnum` in the C locale, i.e. ASCII).
+        let bytes = &text.as_bytes()[..end.min(20)];
+        if bytes
+            .iter()
+            .any(|c| !matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b':' | b'.' | b'-'))
+        {
+            return "";
+        }
+        // The allowed set is ASCII, so the kept bytes are valid UTF-8.
+        std::str::from_utf8(bytes).unwrap()
+    }
+
     /// `stats_send_http_redirect`: the answer to an admin POST, whatever came of it.
     fn stats_redirect(entry: &mut SessionEntry, proxies: &Proxies, serving: usize, code: crate::stats_post::StCode) {
         let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
@@ -13737,8 +13905,17 @@ impl EngineDispatcher<'_> {
         if cfg.refresh.is_some() && rest.contains(";norefresh") {
             loc.push_str(";norefresh");
         }
+        // The page the browser lands on keeps the request's search text (`?scope=`), as the
+        // redirect the applet sends.
+        let scope = Self::stats_scope(rest);
+        if !scope.is_empty() {
+            loc.push_str("?scope=");
+            loc.push_str(scope);
+        }
+        // No `Connection: close`: the applet answers like any other HTTP response and the
+        // browser's next request rides the same connection (`stats_send_http_redirect`).
         let resp = format!(
-            "HTTP/1.1 303 See Other\r\ncache-control: no-cache\r\ncontent-type: text/plain\r\ncontent-length: 0\r\nlocation: {loc}\r\nconnection: close\r\n\r\n"
+            "HTTP/1.1 303 See Other\r\ncache-control: no-cache\r\ncontent-type: text/plain\r\ncontent-length: 0\r\nlocation: {loc}\r\n\r\n"
         );
         stats_write_reply(entry, proxies, resp.as_bytes());
     }
@@ -13778,7 +13955,20 @@ impl EngineDispatcher<'_> {
         if !crate::stats_post::fits_buffer(entry.sess.bufsize, head_len, nhdr, body.len().max(declared)) {
             return StCode::Excd;
         }
-        let mut backend = |name: &str| proxies.iter().position(|p| p.has_backend && p.name == name);
+        // The form's `b`: the backend's name or `#<id>` (`proxy_be_by_name`, the id being the
+        // proxy's `iid`, the sections numbered from 2).
+        let mut backend = |name: &str| {
+            let found = if let Some(digits) = name.strip_prefix('#') {
+                let id = digits
+                    .bytes()
+                    .take_while(|c| c.is_ascii_digit())
+                    .fold(0u32, |a, c| a.saturating_mul(10).saturating_add((c - b'0') as u32));
+                proxies.iter().position(|p| p.has_backend && p.ids.iid == id)
+            } else {
+                proxies.iter().position(|p| p.has_backend && p.name == name)
+            };
+            found
+        };
         let mut apply = |p: usize, verb: Verb, name: &str| -> Option<bool> {
             let s = proxies[p].srv_set().find(name).map(|s| s.index())?;
             let cur = proxies[p].srv_set().status_cell(s).map_or(0, |a| a.load(Ordering::Relaxed));
@@ -13896,21 +14086,30 @@ impl EngineDispatcher<'_> {
             return None;
         }
         if req_uri.contains(";json") {
-            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(crate::stats::StatFormat::Json, proxies[serving].stats_config.show_legends));
+            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(
+                crate::stats::StatFormat::Json,
+                proxies[serving].stats_config.show_legends,
+                Self::stats_scope(req_uri.get(proxies[serving].stats_config.uri.as_deref().unwrap_or("/haproxy?stats").len()..).unwrap_or(""))));
             stats_stream_page(entry, proxies, checks, pid, serving, "application/json", &refresh, page);
             return None;
         }
 
         // `;typed` (`stats-html.c`): the CLI's `show stat typed` rows; after `;json`, before `;csv`.
         if req_uri.contains(";typed") {
-            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(crate::stats::StatFormat::Typed, proxies[serving].stats_config.show_legends));
+            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(
+                crate::stats::StatFormat::Typed,
+                proxies[serving].stats_config.show_legends,
+                Self::stats_scope(req_uri.get(proxies[serving].stats_config.uri.as_deref().unwrap_or("/haproxy?stats").len()..).unwrap_or(""))));
             stats_stream_page(entry, proxies, checks, pid, serving, "text/plain", &refresh, page);
             return None;
         }
 
         // 1. CSV telemetry
         if req_uri.contains(";csv") || req_uri.ends_with("/csv") {
-            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(crate::stats::StatFormat::Csv, proxies[serving].stats_config.show_legends));
+            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(
+                crate::stats::StatFormat::Csv,
+                proxies[serving].stats_config.show_legends,
+                Self::stats_scope(req_uri.get(proxies[serving].stats_config.uri.as_deref().unwrap_or("/haproxy?stats").len()..).unwrap_or(""))));
             stats_stream_page(entry, proxies, checks, pid, serving, "text/plain", &refresh, page);
             return None;
         }
@@ -14046,6 +14245,7 @@ impl EngineDispatcher<'_> {
         idle_pool: &mut IdlePool,
         now: Tick,
         lb_snap: &mut crate::lb::LbSnapCache,
+        fc: Option<crate::proxy::ConnView<'_>>,
     ) -> Option<crate::stats_html::AdminAction> {
         let proxy_idx = entry.proxy_idx;
         // A request held for its body (`wait-for-body`) comes back here when the body is
@@ -14159,6 +14359,7 @@ impl EngineDispatcher<'_> {
             // context is this and the live session, read at the fetch (`LiveReq`).
             let phase = alcyon_sample::PhaseCtx {
                 proxies: Some(&ProxiesView(proxies)),
+                fc: fc.as_ref().map(|c| c as &dyn alcyon_sample::FrontConnState),
                 fc_src: sess.fc_src(),
                 so_id: sess.so_id,
                 fc_dst: sess.fc_dst(),
@@ -15187,7 +15388,7 @@ impl EngineDispatcher<'_> {
         // at the end of the last `Forwarded` header.
         if let Some(fwd) = proxies[be_idx].stats_config.forwarded.clone() {
             let stick = StickView::new(proxies, &entry.sess.tracked_sc);
-            let element = forwarded_element(&fwd, &entry.sess, &stream_sample_ctx(&entry.sess, &proxies[proxy_idx], &proxies[be_idx], &ProxiesView(proxies), &stick).as_ctx());
+            let element = forwarded_element(&fwd, &entry.sess, &stream_sample_ctx(&entry.sess, &proxies[proxy_idx], &proxies[be_idx], &ProxiesView(proxies), &stick, None).as_ctx());
             if !append_forwarded_element(&mut entry.sess, &element) {
                 return Self::request_no_room(entry, proxies);
             }
@@ -15355,7 +15556,7 @@ impl EngineDispatcher<'_> {
                 if !counted {
                     server_actconn_add(entry, proxies, true);
                 }
-                entry.sess.server_connected(now);
+                mark_server_connected(entry, proxies, now);
                 entry.sess.bc_idle = false;
                 if let Some(txn) = entry.sess.strm.txn.as_mut() {
                     txn.srv_reused = true;
@@ -15417,7 +15618,7 @@ impl EngineDispatcher<'_> {
             let sfd = srv_fd.as_raw_fd();
             entry.srv_raw_fd = Some(sfd);
             entry.sess.attach_server_from(srv_fd, xprt, src, now);
-            entry.sess.server_connected(now);
+            mark_server_connected(entry, proxies, now);
             if let Some(txn) = entry.sess.strm.txn.as_mut() {
                 txn.srv_reused = true;
             }
@@ -15517,6 +15718,7 @@ impl EngineDispatcher<'_> {
         let ms = entry.sess.queue_ms();
         let deadline = if ms == 0 { Tick::ETERNITY } else { now.add(ms) };
         entry.sess.strm.log.be_queue = entry.sess.queue.enter(entry.task, be_idx, srv, proxies[be_idx].stats.clone(), deadline);
+        entry.sess.strm.log.queue_is_srv = srv.is_some();
         None
     }
 
@@ -15702,6 +15904,23 @@ impl EngineDispatcher<'_> {
         } else {
             Outcome::Done
         }
+    }
+
+    fn step_agent_check(&mut self, idx: usize) -> Outcome {
+        let Some(agent) = self.agent_checks.get_mut(idx) else { return Outcome::Done };
+        let next = crate::agent_check::step_agent_check(
+            agent,
+            self.fdtab,
+            self.poller,
+            self.now,
+            self.proxies,
+            self.checks,
+        );
+        if let Some(px) = self.proxies.get(agent.proxy()) {
+            crate::track::publish_agent_view(px, agent);
+        }
+        self.timer_updates.push((agent.task, next));
+        Outcome::Keep
     }
 
     /// Runs `resolvers` section `idx` (`crate::resolvers`): its log lines go to the servers'
@@ -15994,6 +16213,10 @@ impl EngineDispatcher<'_> {
             Some(Kind::Check) => {
                 let check_idx = kind.index() as usize;
                 self.step_check(check_idx)
+            }
+            Some(Kind::AgentCheck) => {
+                let idx = kind.index() as usize;
+                self.step_agent_check(idx)
             }
             Some(Kind::Resolver) => self.step_resolver(kind.index() as usize),
             // Its timer fired: the engine runs the concern after the pass (L1).
@@ -19070,6 +19293,82 @@ mod arena_tests {
         let mut a = SessionArena::with_capacity(2);
         assert!(a.get2_mut(0, 0).is_none());
         assert!(a.get2_mut(0, 1).is_none());
+    }
+
+    /// `get_mut_with_owner` works whether the child's slot index is below or above the owner's.
+    #[test]
+    fn get_mut_with_owner_handles_both_index_orders() {
+        use std::os::fd::OwnedFd;
+        let make = |task_idx: u32, role: Option<crate::proxy::H2Role>| {
+            let (x, _y) = std::os::unix::net::UnixStream::pair().expect("pair");
+            let mut sess = crate::proxy::TcpSession::new(OwnedFd::from(x), Default::default(), 0, alcyon_sched::Tick::ETERNITY);
+            sess.h2_role = role.map(Box::new);
+            super::SessionEntry {
+                sess,
+                task: alcyon_sched::TaskRef(task_idx),
+                proxy_idx: 0,
+                backend_idx: 0,
+                srv_backend_idx: 0,
+                target_server_idx: None,
+                cli_raw_fd: -1,
+                srv_raw_fd: None,
+                cli_interest: super::Interest::NONE,
+                srv_interest: super::Interest::NONE,
+                actconn_reclaimed: false,
+                stats_done: false,
+                be_counted: std::cell::Cell::new(u32::MAX),
+                connect_log_due: false,
+                rate_max_due: false,
+                srv_served: 0,
+                log_line: None,
+                log_err: false,
+                log_sd: 0,
+                buf_wait: crate::buf_wait::WaitState::default(),
+                parked: false,
+            }
+        };
+        let mut arena = SessionArena::with_capacity(4);
+        let child_role = |oi: u32, ot: u32| {
+            crate::proxy::H2Role::Child(crate::proxy::H2Child {
+                owner: Some((oi, alcyon_sched::TaskRef(ot))),
+                stream: crate::proxy::H2ActiveStream { id: 1, body: Default::default(), chunk_out: false },
+                late_trailers: None,
+                rsp_head: None,
+                reset: false,
+                finished: false,
+                conn_end: None,
+                owner_tx_pending: false,
+                rst: None,
+                goaway: None,
+                tls: None,
+                quic_ack: None,
+                req_abs: Default::default(),
+                sess_vars_at_start: Default::default(),
+            })
+        };
+        // Slot 0 = child pointing to owner at slot 1 (a < b), slot 1 = owner.
+        let i0 = arena.alloc(make(10, Some(child_role(1, 20)))).unwrap();
+        let i1 = arena.alloc(make(20, Some(crate::proxy::H2Role::Owner(Default::default())))).unwrap();
+        assert_eq!((i0, i1), (0, 1));
+        {
+            let (c, o) = arena.get_mut_with_owner(0).unwrap();
+            assert_eq!(c.task, alcyon_sched::TaskRef(10));
+            assert_eq!(o.unwrap().task, alcyon_sched::TaskRef(20));
+        }
+        // Slot 2 = child pointing to owner at slot 1 (a > b).
+        let i2 = arena.alloc(make(30, Some(child_role(1, 20)))).unwrap();
+        assert_eq!(i2, 2);
+        {
+            let (c, o) = arena.get_mut_with_owner(2).unwrap();
+            assert_eq!(c.task, alcyon_sched::TaskRef(30));
+            assert_eq!(o.unwrap().task, alcyon_sched::TaskRef(20));
+        }
+        // Slot 3 = child with a stale owner task ref -> returns owner as None.
+        let i3 = arena.alloc(make(40, Some(child_role(1, 999)))).unwrap();
+        assert_eq!(i3, 3);
+        let (c, o) = arena.get_mut_with_owner(3).unwrap();
+        assert_eq!(c.task, alcyon_sched::TaskRef(40));
+        assert!(o.is_none());
     }
 }
 

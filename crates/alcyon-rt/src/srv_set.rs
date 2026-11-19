@@ -111,6 +111,16 @@ pub struct ServerArrays {
 /// One server's `set-proxy-v2-tlv-fmt(<id>) [<fmt>]` TLVs (`srv->pp_tlvs`), compiled once
 /// and in the order `make_proxy_line_v2` sends them: the `default-server` ones first, then
 /// the server's own. `fmt` is `None` for a TLV without a format, whose value is empty.
+/// Per-server `observe` / `error-limit` / `on-error` runtime state.
+#[derive(Debug, Default)]
+pub struct ObserveSlot {
+    pub observe: alcyon_config::ObserveMode,
+    pub on_error: alcyon_config::OnErrorMode,
+    pub error_limit: u32,
+    pub consecutive_errors: std::sync::atomic::AtomicU32,
+    pub failed_hana: std::sync::atomic::AtomicU64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SrvPpv2Tlvs {
     pub tlvs: Vec<(u8, Option<Arc<crate::logfmt::LogFormat>>)>,
@@ -152,6 +162,12 @@ pub struct ServerIdArrays {
     /// Each server's `port` (`check port`, `default-server port`): `srv_agent_port`, and
     /// `srv_check_port` of a server with no check; empty when no server has one.
     server_check_ports: Vec<u16>,
+    /// Each server's `addr` (`check addr`): empty when no server has one.
+    server_check_addrs: Vec<Option<std::net::IpAddr>>,
+    /// Per-server `observe` state; `None` when no server enables `observe`.
+    server_observe: Option<Arc<Vec<ObserveSlot>>>,
+    /// Servers with `agent-check` (or `agent-*` options) configured.
+    server_agent_checks: Vec<(u32, alcyon_config::ast::AgentCheckConfig)>,
     /// `pool-max-conn`, `pool-low-conn` and `pool-purge-delay` per server; empty when every
     /// server has the defaults (read it with [`ProxyIdInfo::server_pool`]). Read when a
     /// server connection is released, so it lives here, off `Proxy`'s inline size
@@ -230,6 +246,9 @@ impl ServerIdArrays {
             server_fqdn_changed: server_fqdn_changed(servers.len(), extras),
             server_srv: crate::resolvers::SrvSlots::new(servers.len(), extras),
             server_check_ports: server_check_ports(servers),
+            server_check_addrs: server_check_addrs(servers),
+            server_observe: server_observe(servers),
+            server_agent_checks: extras.agent_checks.clone(),
             server_pool: pool_cfgs(servers, mode_http),
             server_restored: Vec::new(),
             server_pp_tlv_fmts: pp_tlv_fmts(servers.len(), extras),
@@ -347,6 +366,41 @@ fn server_check_ports(servers: &[alcyon_config::ast::Server]) -> Vec<u16> {
     servers.iter().map(|s| s.check_port.unwrap_or(0)).collect()
 }
 
+fn server_check_addrs(servers: &[alcyon_config::ast::Server]) -> Vec<Option<std::net::IpAddr>> {
+    if servers.iter().all(|s| s.check_addr().is_none()) {
+        return Vec::new();
+    }
+    servers.iter().map(alcyon_config::ast::Server::check_addr).collect()
+}
+
+fn server_observe(servers: &[alcyon_config::ast::Server]) -> Option<Arc<Vec<ObserveSlot>>> {
+    if servers.iter().all(|s| !s.check || s.observe() == alcyon_config::ObserveMode::None) {
+        return None;
+    }
+    Some(Arc::new(
+        servers
+            .iter()
+            .map(|s| ObserveSlot {
+                observe: if s.check { s.observe() } else { alcyon_config::ObserveMode::None },
+                on_error: s.on_error(),
+                error_limit: s.error_limit(),
+                consecutive_errors: std::sync::atomic::AtomicU32::new(0),
+                failed_hana: std::sync::atomic::AtomicU64::new(0),
+            })
+            .collect(),
+    ))
+}
+
+impl ServerIdArrays {
+    /// The `observe` slot for server `idx`, or `None` if `observe` is disabled.
+    #[inline]
+    #[must_use]
+    pub fn observe_slot(&self, idx: usize) -> Option<&ObserveSlot> {
+        let slots = self.server_observe.as_deref()?;
+        slots.get(idx).filter(|s| s.observe != alcyon_config::ObserveMode::None)
+    }
+}
+
 /// The flags for [`Proxy::server_forced_ids`]: empty when none asked for an id.
 fn server_forced_ids(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Vec<bool> {
     let mut forced = Vec::new();
@@ -376,6 +430,7 @@ fn server_check_configs(servers: &[alcyon_config::ast::Server], check_timeout: O
                 cfg.inter = inter;
             }
             cfg.check_port = s.check_port;
+            cfg.check_addr = s.check_addr();
             cfg.h2 = s.check_proto.map_or(s.proto_h2, |p| p == "h2");
             cfg.fastinter_ms = s.fastinter_ms();
             cfg.downinter_ms = s.downinter_ms();
@@ -520,6 +575,21 @@ impl Proxy {
     #[must_use]
     pub fn server_check_port(&self, idx: usize) -> u16 {
         self.ids.srv.server_check_ports.get(idx).copied().unwrap_or(0)
+    }
+
+    pub fn server_check_addr(&self, idx: usize) -> Option<std::net::IpAddr> {
+        self.ids.srv.server_check_addrs.get(idx).copied().flatten()
+    }
+
+    /// Agent check configuration for server `idx`, if any.
+    #[must_use]
+    pub fn server_agent_config(&self, idx: usize) -> Option<&alcyon_config::ast::AgentCheckConfig> {
+        self.ids
+            .srv
+            .server_agent_checks
+            .iter()
+            .find(|(i, _)| *i as usize == idx)
+            .map(|(_, a)| a)
     }
 
     /// Whether the server at `idx` has an `id` of its own (`SRV_F_FORCED_ID`).
