@@ -2401,11 +2401,10 @@ impl TcpSession {
         self.strm.log.connect = Some(crate::txnlog::loop_now());
         // `AN_RES_INSPECT` runs from here, before any of the response has arrived.
         if let Some(r) = self.res_inspect.as_mut() {
-            if let Some(delay) = r.armed.take() {
-                r.pending = true;
-                self.rare_armed = true;
-                r.exp = delay.map(|ms| now.add(ms));
-            }
+            let Some(delay) = r.armed.take() else { return };
+            r.pending = true;
+            self.rare_armed = true;
+            r.exp = delay.map(|ms| now.add(ms));
         }
     }
 
@@ -5408,13 +5407,22 @@ mod tests {
         let mut h2_ctx = alcyon_proto::mux_h2::H2MuxContext::new(alcyon_proto::ConnId(1), true);
         h2_ctx.max_concurrent_streams = 17;
         h2_ctx.glitch_count = 3;
+        let mut st = alcyon_proto::mux_h2::H2StreamCtx::new(1, 65535, 65535);
+        st.state = alcyon_proto::h2::H2StreamState::Open;
+        h2_ctx.streams.insert(1, st);
         let h2 = ConnView::H2(&h2_ctx);
-        assert_eq!(h2.nb_streams(), 0);
+        assert_eq!(h2.nb_streams(), 1);
         assert_eq!(h2.max_concurrent_streams(), 17);
         assert_eq!(h2.glitches(), Some(3));
         let fc_dyn: &dyn FrontConnState = &h2;
-        assert_eq!(fc_dyn.nb_streams(), 0);
+        assert_eq!(fc_dyn.nb_streams(), 1);
         assert!(format!("{fc_dyn:?}").contains("FrontConnState"));
+
+        let h3_ctx = alcyon_proto::mux_h3::H3MuxContext::new();
+        let h3 = ConnView::H3(&h3_ctx);
+        assert_eq!(h3.nb_streams(), 0);
+        assert_eq!(h3.max_concurrent_streams(), 100);
+        assert_eq!(h3.glitches(), Some(0));
 
         let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
         let mut s = super::TcpSession::new(std::os::fd::OwnedFd::from(a), Default::default(), 0, alcyon_sched::Tick::ETERNITY);
