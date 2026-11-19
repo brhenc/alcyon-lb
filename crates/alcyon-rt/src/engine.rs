@@ -19693,4 +19693,26 @@ mod unpublished_tests {
         assert_eq!(EngineDispatcher::resolve_backend(&entry(g), &t), Some(b), "and an unpublished default_backend");
         assert_eq!(EngineDispatcher::resolve_backend(&entry(h), &t), Some(k), "without force the rule is skipped for the default");
     }
+
+    #[test]
+    fn retire_server_drains_idle_connections_and_replies_zero() {
+        let cfg = alcyon_config::parse_str("defaults\n  mode http\nbackend be\n  server s1 127.0.0.1:80\n").expect("parse");
+        let mut engine = Engine::new(&cfg, 16).expect("engine");
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = l.local_addr().expect("addr");
+        let stream = std::net::TcpStream::connect(addr).expect("connect");
+        let conn = IdleConn { fd: std::os::fd::OwnedFd::from(stream), xprt: crate::xprt::ServerXprt::Plain, src: None };
+        {
+            let slot = engine.idle_backend_pool.slot();
+            let mut pool = IdlePools::lock(slot);
+            pool.srv_entry((0, 0)).expect("entry").conns.push_back(Pooled { addr, name: None, safe: false, conn });
+            pool.conns = 1;
+        }
+        let gather = crate::mailbox::Gather::new(&engine.mailboxes, engine.mailbox_wid, TaskRef::NONE);
+        engine.retire_server(0, 0, &gather);
+        assert_eq!(gather.take(), Some(vec![0]));
+        let slot = engine.idle_backend_pool.slot();
+        let mut pool = IdlePools::lock(slot);
+        assert!(pool.srv_mut((0, 0)).is_none_or(|si| si.conns.is_empty()));
+    }
 }
