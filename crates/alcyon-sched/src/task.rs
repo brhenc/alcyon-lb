@@ -85,6 +85,8 @@ pub enum Kind {
     /// trim, stick-table expiry, the pools' publish), run when its timer expires as
     /// `HAProxy`'s `srv_cleanup_idle_conns` and `process_table_expire` tasks are.
     Housekeeping = 7,
+    /// An auxiliary agent check (`agent-check`).
+    AgentCheck = 8,
 }
 
 impl Kind {
@@ -100,6 +102,7 @@ impl Kind {
             5 => Some(Kind::Synthetic),
             6 => Some(Kind::Resolver),
             7 => Some(Kind::Housekeeping),
+            8 => Some(Kind::AgentCheck),
             _ => None,
         }
     }

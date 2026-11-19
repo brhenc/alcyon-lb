@@ -2577,6 +2577,7 @@ pub struct Engine {
     /// inside each `Proxy` (T177).
     pub proxies: Proxies,
     pub checks: Vec<ServerCheckState>,
+    pub agent_checks: Vec<crate::agent_check::AgentCheckState>,
     /// The `resolvers` sections the servers use, on worker 0 with the checks they change
     /// (`crate::resolvers`); empty elsewhere.
     resolvers: Vec<crate::resolvers::Section>,
@@ -4906,6 +4907,31 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
     })
 }
 
+fn init_agent_checks(
+    proxies: &crate::table::Table,
+    scheduler: &mut Scheduler,
+    now: Tick,
+) -> Vec<crate::agent_check::AgentCheckState> {
+    let mut agent_checks = Vec::new();
+    for (proxy_idx, proxy) in proxies.iter().enumerate() {
+        for (server_idx, srv_addr) in proxy.srv_set().addrs().enumerate() {
+            let Some(cfg) = proxy.server_agent_config(server_idx).filter(|a| a.enabled).cloned() else {
+                continue;
+            };
+            let mut agent = crate::agent_check::AgentCheckState::new(proxy_idx, server_idx, srv_addr, cfg, now);
+            let idx = usize_to_u32(agent_checks.len());
+            if let Some(task_ref) = scheduler.create(WorkKind::new(Kind::AgentCheck, idx)) {
+                agent.task = task_ref;
+                let initial_delay = 50u32.saturating_add(idx.saturating_mul(50));
+                scheduler.queue_timer(task_ref, now.add(initial_delay));
+            }
+            crate::track::publish_agent_view(proxy, &agent);
+            agent_checks.push(agent);
+        }
+    }
+    agent_checks
+}
+
 fn init_checks(proxies: &crate::table::Table, scheduler: &mut Scheduler, now: Tick) -> Vec<ServerCheckState> {
     let mut checks = Vec::with_capacity(proxies.iter().map(|p| p.srv_set().checked_count()).sum());
     // One task and one timer per check.
@@ -5405,6 +5431,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         } else {
             Vec::new()
         };
+        let agent_checks = if worker_id == 0 {
+            init_agent_checks(&proxies, &mut scheduler, now)
+        } else {
+            Vec::new()
+        };
         // Where a server's `resolvers` reaches the data path: its section's task and sockets.
         let resolvers = if worker_id == 0 {
             crate::resolvers::build(config, &proxies, &mut scheduler, &mut fdtab, &poller, now)?
@@ -5439,6 +5470,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             listeners,
             proxies,
             checks,
+            agent_checks,
             resolvers,
             sessions,
             applets,
@@ -6544,6 +6576,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             lb_snap: &mut self.lb_snap,
             proxies: &mut self.proxies,
             checks: &mut self.checks,
+            agent_checks: &mut self.agent_checks,
             resolvers: &mut self.resolvers,
             fdtab: &mut self.fdtab,
             poller: &mut self.poller,
@@ -9155,6 +9188,7 @@ struct EngineDispatcher<'a> {
     lb_snap: &'a mut crate::lb::LbSnapCache,
     proxies: &'a mut Proxies,
     checks: &'a mut [ServerCheckState],
+    agent_checks: &'a mut [crate::agent_check::AgentCheckState],
     resolvers: &'a mut [crate::resolvers::Section],
     fdtab: &'a mut FdTab,
     poller: &'a mut Poller,
@@ -15766,6 +15800,23 @@ impl EngineDispatcher<'_> {
         }
     }
 
+    fn step_agent_check(&mut self, idx: usize) -> Outcome {
+        let Some(agent) = self.agent_checks.get_mut(idx) else { return Outcome::Done };
+        let next = crate::agent_check::step_agent_check(
+            agent,
+            self.fdtab,
+            self.poller,
+            self.now,
+            self.proxies,
+            self.checks,
+        );
+        if let Some(px) = self.proxies.get(agent.proxy()) {
+            crate::track::publish_agent_view(px, agent);
+        }
+        self.timer_updates.push((agent.task, next));
+        Outcome::Keep
+    }
+
     /// Runs `resolvers` section `idx` (`crate::resolvers`): its log lines go to the servers'
     /// proxies and to stderr, as `HAProxy`'s `send_log` and `ha_warning`. Out of line: kept off
     /// the stream path's code.
@@ -15964,6 +16015,10 @@ impl EngineDispatcher<'_> {
             Some(Kind::Check) => {
                 let check_idx = kind.index() as usize;
                 self.step_check(check_idx)
+            }
+            Some(Kind::AgentCheck) => {
+                let idx = kind.index() as usize;
+                self.step_agent_check(idx)
             }
             Some(Kind::Resolver) => self.step_resolver(kind.index() as usize),
             // Its timer fired: the engine runs the concern after the pass (L1).
