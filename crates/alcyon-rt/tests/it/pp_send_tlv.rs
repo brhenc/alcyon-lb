@@ -421,3 +421,9 @@ fn check_refuses_unknown_fetch_in_tlv_fmt() {
 fn dynamic_fetch_src() {
     wire_case("", "send-proxy-v2 set-proxy-v2-tlv-fmt(0xE1) %[src]", "OK 1 e1 3132372e302e302e31");
 }
+
+/// A server with only a format-less TLV sends an empty TLV.
+#[test]
+fn empty_tlv_only() {
+    wire_case("", "send-proxy-v2 set-proxy-v2-tlv-fmt(0xE2)", "OK 1 e2");
+}
