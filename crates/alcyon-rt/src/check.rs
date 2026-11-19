@@ -21,7 +21,8 @@ use crate::xprt::ServerXprt;
 use std::sync::Arc;
 use alcyon_config::ast::{
     get_resolved_check_config, HttpCheckExpectPattern, MatchType, MysqlCheckVersion, ResolvedCheckConfig,
-    ResolvedHttpCheck, ResolvedHttpExpectRule, ResolvedHttpRule, ResolvedTcpExpectPattern, ResolvedTcpStep,
+    ResolvedHttpCheck, ResolvedHttpExpectRule, ResolvedHttpSend, ResolvedHttpStep, ResolvedTcpExpectPattern,
+    ResolvedTcpStep,
 };
 use alcyon_sched::task::TaskRef;
 use alcyon_sched::Tick;
@@ -152,6 +153,15 @@ impl Default for ServerCheckConfig {
     }
 }
 
+/// Phase within an [`CheckSubState::HttpRunning`] step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpStepPhase {
+    Dispatch,
+    Connecting,
+    Sending,
+    Receiving,
+}
+
 /// Sub-state for health checks progressing through multiple phases or steps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckSubState {
@@ -160,16 +170,10 @@ pub enum CheckSubState {
     ProtoConnecting {
         target_addr: SocketAddr,
     },
-    HttpConnecting {
-        req_buf: Vec<u8>,
+    HttpRunning {
+        step_idx: usize,
+        phase: HttpStepPhase,
         send_offset: usize,
-    },
-    HttpSending {
-        req_buf: Vec<u8>,
-        send_offset: usize,
-    },
-    HttpReceiving {
-        recv_buf: Vec<u8>,
     },
     TcpRunning {
         step_idx: usize,
@@ -279,6 +283,16 @@ pub struct CheckRun {
     pub vars: alcyon_sample::VarStore,
     /// When the check started, for its duration.
     pub start_tick: Tick,
+    /// Reusable request buffer for `http-check send` (kept across steps and pooled runs).
+    pub req_buf: Vec<u8>,
+    /// Reusable response buffer for `http-check expect` (kept across steps and pooled runs).
+    pub recv_buf: Vec<u8>,
+    /// Reusable scratch string for `http-check` log-format rendering.
+    pub scratch: String,
+    /// Target address of the current `http-check connect` step (for `send-proxy`).
+    pub http_target_addr: SocketAddr,
+    /// Whether the current `http-check connect` step must prepend a `PROXY` line.
+    pub pending_send_proxy: bool,
 }
 
 impl CheckRun {
@@ -289,6 +303,11 @@ impl CheckRun {
             sub_state: CheckSubState::Idle,
             vars: alcyon_sample::VarStore::new(),
             start_tick: Tick(0),
+            req_buf: Vec::new(),
+            recv_buf: Vec::new(),
+            scratch: String::new(),
+            http_target_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            pending_send_proxy: false,
         }
     }
 }
@@ -316,12 +335,16 @@ impl alcyon_alloc::Poolable for Box<CheckRun> {
         std::mem::size_of::<CheckRun>()
     }
 
-    /// A finished check's state is dropped; its variables are emptied (their slots kept).
+    /// A finished check's state is dropped; its variables and buffers are emptied (their capacity kept).
     fn reset(&mut self, _wipe: bool) {
         self.vars.clear();
+        self.req_buf.clear();
+        self.recv_buf.clear();
+        self.scratch.clear();
         self.sub_state = CheckSubState::Idle;
         self.tcp_connect_step = None;
         self.check_fd = None;
+        self.pending_send_proxy = false;
     }
 
     fn try_new() -> Option<Self> {
@@ -768,15 +791,20 @@ impl CheckStep {
     }
 }
 
-/// The log-formats of an `http-check send`: its `hdr` values, and `uri-lf` and
-/// `body-lf`, compiled when the check is set up. The configuration was refused at load if
-/// one did not compile ([`crate::rule_exprs::validate_formats`]).
+/// Compiled log-formats for one `http-check send` step.
 #[derive(Debug, Clone)]
-pub struct HttpSendFormats {
+pub struct HttpSendStepFormats {
     uri: Option<LogFormat>,
     body: Option<LogFormat>,
     /// One per `hdr`, in order.
     hdrs: Vec<Option<LogFormat>>,
+}
+
+/// The log-formats of every `http-check send` step in a resolved HTTP check, indexed by
+/// step index in `ResolvedHttpCheck::steps`.
+#[derive(Debug, Clone)]
+pub struct HttpSendFormats {
+    steps: Vec<Option<HttpSendStepFormats>>,
 }
 
 impl HttpSendFormats {
@@ -803,28 +831,20 @@ impl HttpSendFormats {
         let Some(ResolvedCheckConfig::Http(chk)) = cfg else { return None };
         let reg = crate::engine::sample_registry();
         let compile = |f: &str| LogFormat::compile(f, reg).ok();
-        Some(HttpSendFormats {
-            uri: chk.uri_lf.then(|| compile(&chk.uri)).flatten(),
-            body: chk.body.as_deref().filter(|_| chk.body_lf).and_then(compile),
-            hdrs: chk.headers.iter().map(|(_, v)| compile(v)).collect(),
-        })
+        let steps = chk
+            .steps
+            .iter()
+            .map(|step| match step {
+                ResolvedHttpStep::Send(send) => Some(HttpSendStepFormats {
+                    uri: send.uri_lf.then(|| compile(&send.uri)).flatten(),
+                    body: send.body.as_deref().filter(|_| send.body_lf).and_then(compile),
+                    hdrs: send.headers.iter().map(|(_, v)| compile(v)).collect(),
+                }),
+                _ => None,
+            })
+            .collect();
+        Some(HttpSendFormats { steps })
     }
-}
-
-/// The check's view of itself for its log-formats, as `HAProxy`'s check session has it:
-/// the backend as both frontend and backend, the server, and the unique ID the backend's
-/// `unique-id-format` gives (`sess_build_logline` on `check->sess`).
-fn render_check_formats(
-    fmts: &HttpSendFormats,
-    check: &ServerCheckState,
-    px: &Proxy,
-    proxies: &crate::table::Table,
-) -> RenderedSend {
-    let reg = crate::engine::sample_registry();
-    with_check_ctx(check, px, proxies, &check.run.vars, None, |data, ctx| {
-        let render = |f: &LogFormat| f.render_value(data, reg, ctx);
-        (fmts.uri.as_ref().map(render), fmts.body.as_ref().map(render), fmts.hdrs.iter().map(|h| h.as_ref().map(render)).collect())
-    })
 }
 
 /// Runs `f` with the log data and sample context of a check: the backend as both frontend
@@ -873,37 +893,30 @@ fn with_check_ctx<R>(
     f(&data, &ctx.as_ctx())
 }
 
-/// Runs the `set-var` / `unset-var` rules among `rules` in order on `vars`; a `set-var`
-/// sees the response `resp` when there is one.
-fn run_var_rules(
+/// Evaluates one `set-var` / `unset-var` step on `vars`; a `set-var` sees `resp` when there is one.
+fn run_var_step(
     check: &ServerCheckState,
     proxies: &crate::table::Table,
-    rules: &[ResolvedHttpRule],
+    step: &ResolvedHttpStep,
     vars: &mut alcyon_sample::VarStore,
     resp: Option<&HttpResp>,
 ) {
     let Some(px) = proxies.get(check.proxy()) else { return };
     let reg = crate::engine::sample_registry();
-    for rule in rules {
-        if let ResolvedHttpRule::SetVar { var_name, expr } = rule {
-            let val = with_check_ctx(check, px, proxies, vars, resp, |_, ctx| {
-                alcyon_sample::Expr::cached(expr)
-                    .ok()
-                    .and_then(|e| e.eval_sample(reg, ctx))
-            });
-            // An expression that gives no sample leaves the variable as it was.
-            if let Some(v) = val {
-                alcyon_sample::vars::set_in(vars, var_name, alcyon_sample::vars::In::Owned(v));
-            }
-        } else if let ResolvedHttpRule::UnsetVar { var_name } = rule {
-            vars.remove(var_name);
+    if let ResolvedHttpStep::SetVar { var_name, expr } = step {
+        let val = with_check_ctx(check, px, proxies, vars, resp, |_, ctx| {
+            alcyon_sample::Expr::cached(expr)
+                .ok()
+                .and_then(|e| e.eval_sample(reg, ctx))
+        });
+        // An expression that gives no sample leaves the variable as it was.
+        if let Some(v) = val {
+            alcyon_sample::vars::set_in(vars, var_name, alcyon_sample::vars::In::Owned(v));
         }
+    } else if let ResolvedHttpStep::UnsetVar { var_name } = step {
+        vars.remove(var_name);
     }
 }
-
-/// `uri-lf`, `body-lf` and each `hdr` as rendered for one check; `None` where the request
-/// uses the configured text.
-type RenderedSend = (Option<String>, Option<String>, Vec<Option<String>>);
 
 /// `srv_check_result` of `show servers state` for a check status code: the `result` column
 /// of `check_statuses` in `src/check.c` (`CHK_RES_*`: UNKNOWN 0, NEUTRAL 1, FAILED 2,
@@ -1088,103 +1101,136 @@ fn server_state_header(check: &ServerCheckState, proxies: &crate::table::Table) 
     out
 }
 
-/// Builds the HTTP request payload for a health check, as `tcpcheck_eval_send` sends it:
-/// the request line, the `hdr` headers (one whose value renders empty is left out), the
-/// server state, `content-length` when there is a body, `connection: close`.
-fn build_http_request_payload(chk: &ResolvedHttpCheck, target_addr: SocketAddr, check: &ServerCheckState, proxies: &crate::table::Table) -> Vec<u8> {
-    let mut payload = Vec::new();
+/// Builds the HTTP request payload for one `http-check send` step into `payload`,
+/// using `scratch` for log-format rendering (avoiding per-check heap allocations).
+#[allow(clippy::too_many_arguments)]
+fn build_http_request_payload_into(
+    chk: &ResolvedHttpCheck,
+    send: &ResolvedHttpSend,
+    step_idx: usize,
+    target_addr: SocketAddr,
+    send_proxy: bool,
+    check: &ServerCheckState,
+    proxies: &crate::table::Table,
+    payload: &mut Vec<u8>,
+    scratch: &mut String,
+) {
+    use std::io::Write as _;
 
-    if chk.send_proxy {
-        let line = format!(
-            "PROXY TCP4 {} {} {} {}\r\n",
-            target_addr.ip(),
-            target_addr.ip(),
-            0,
-            target_addr.port()
-        );
-        payload.extend_from_slice(line.as_bytes());
+    payload.clear();
+
+    if send_proxy {
+        let _ = write!(payload, "PROXY TCP4 {} {} 0 {}\r\n", target_addr.ip(), target_addr.ip(), target_addr.port());
     }
 
-    // A rule set without a `send` (a backend with `http-check expect` rules only) connects
-    // and sends nothing, as `HAProxy` does.
-    if !chk.has_send {
-        return payload;
-    }
+    let step_fmts = check
+        .http_send
+        .as_ref()
+        .and_then(|f| f.steps.get(step_idx))
+        .and_then(Option::as_ref);
+    let px = proxies.get(check.proxy());
+    let reg = crate::engine::sample_registry();
 
-    let rendered = check.http_send.as_ref().zip(proxies.get(check.proxy()));
-    let (uri, body, hdr_values) = rendered.map(|(fmts, px)| render_check_formats(fmts, check, px, proxies)).unwrap_or_default();
-    // An `uri-lf` that renders empty sends `/`.
-    let uri = match uri {
-        Some(u) if u.is_empty() => "/".to_string(),
-        Some(u) => u,
-        None => chk.uri.clone(),
+    // Render `uri-lf` into `scratch` (an empty result sends `/`), or use the literal `uri`.
+    let uri_fmt = step_fmts.zip(px).and_then(|(f, p)| f.uri.as_ref().map(|u| (u, p)));
+    let uri_str: &str = if let Some((uf, px)) = uri_fmt {
+        scratch.clear();
+        with_check_ctx(check, px, proxies, &check.run.vars, None, |data, ctx| {
+            uf.render_value_into(scratch, data, reg, ctx);
+        });
+        if scratch.is_empty() { "/" } else { scratch.as_str() }
+    } else {
+        &send.uri
     };
-    let body = body.or_else(|| chk.body.clone());
 
-    // The headers, names in lower case as the HTX the request is built in keeps them; one
-    // whose value renders empty is left out.
-    let mut headers: Vec<(String, String)> = Vec::new();
-    for (i, (name, val)) in chk.headers.iter().enumerate() {
-        let val = hdr_values.get(i).and_then(Option::as_deref).unwrap_or(val);
-        if !val.is_empty() {
-            headers.push((name.to_ascii_lowercase(), val.to_string()));
+    // Write the request line. If `uri_str` is an absolute-form URI and there is a `Host`
+    // header, `replace_authority` updates its authority first.
+    let host_idx = send.headers.iter().position(|(n, _)| n.eq_ignore_ascii_case("host"));
+    let _ = write!(payload, "{} ", send.method);
+    let mut wrote_uri = false;
+    if let Some(hi) = host_idx.filter(|_| uri_str.starts_with("http://") || uri_str.starts_with("https://")) {
+        let host_fmt = step_fmts.zip(px).and_then(|(f, p)| f.hdrs.get(hi).and_then(Option::as_ref).map(|hf| (hf, p)));
+        let rendered_host = host_fmt.map(|(hf, px)| {
+            with_check_ctx(check, px, proxies, &check.run.vars, None, |data, ctx| {
+                hf.render_value(data, reg, ctx)
+            })
+        });
+        let hv = rendered_host.as_deref().unwrap_or(&send.headers[hi].1);
+        if let Some(replaced) = (!hv.is_empty()).then(|| replace_authority(uri_str, hv)).flatten() {
+            payload.extend_from_slice(replaced.as_bytes());
+            wrote_uri = true;
         }
     }
-    let host_hdr = headers.iter().find(|(n, _)| n == "host").map(|(_, v)| v.clone());
-    // An absolute-form target takes the authority of the Host header, once there is one
-    // (`http_update_authority`).
-    let uri = match host_hdr {
-        Some(host) => replace_authority(&uri, &host).unwrap_or(uri),
-        None => uri,
-    };
-
-    let req_line = format!("{} {} {}\r\n", chk.method, uri, chk.version);
-    payload.extend_from_slice(req_line.as_bytes());
+    if !wrote_uri {
+        payload.extend_from_slice(uri_str.as_bytes());
+    }
+    let _ = write!(payload, " {}\r\n", send.version);
 
     let mut has_host = false;
     let mut has_connection = false;
 
-    for (name, val) in &headers {
-        if name == "host" {
-            has_host = true;
+    for (i, (name, val)) in send.headers.iter().enumerate() {
+        let hdr_fmt = step_fmts.zip(px).and_then(|(f, p)| f.hdrs.get(i).and_then(Option::as_ref).map(|hf| (hf, p)));
+        let rendered_val: &str = if let Some((hf, px)) = hdr_fmt {
+            scratch.clear();
+            with_check_ctx(check, px, proxies, &check.run.vars, None, |data, ctx| {
+                hf.render_value_into(scratch, data, reg, ctx);
+            });
+            scratch.as_str()
+        } else {
+            val.as_str()
+        };
+
+        if !rendered_val.is_empty() {
+            if name.eq_ignore_ascii_case("host") {
+                has_host = true;
+            }
+            if name.eq_ignore_ascii_case("connection") {
+                has_connection = true;
+            }
+            for b in name.bytes() {
+                payload.push(b.to_ascii_lowercase());
+            }
+            payload.extend_from_slice(b": ");
+            payload.extend_from_slice(rendered_val.as_bytes());
+            payload.extend_from_slice(b"\r\n");
         }
-        if name == "connection" {
-            has_connection = true;
-        }
-        let hdr_line = format!("{name}: {val}\r\n");
-        payload.extend_from_slice(hdr_line.as_bytes());
     }
 
     if !has_host {
-        if let Some(ref host) = chk.host {
-            let host_line = format!("host: {host}\r\n");
-            payload.extend_from_slice(host_line.as_bytes());
+        if let Some(ref host) = send.host {
+            let _ = write!(payload, "host: {host}\r\n");
         }
     }
 
     if chk.send_state {
-        let state_line = format!("x-haproxy-server-state: {}\r\n", server_state_header(check, proxies));
-        payload.extend_from_slice(state_line.as_bytes());
+        let _ = write!(payload, "x-haproxy-server-state: {}\r\n", server_state_header(check, proxies));
     }
+
+    let body_fmt = step_fmts.zip(px).and_then(|(f, p)| f.body.as_ref().map(|b| (b, p)));
+    let body_bytes: &[u8] = if let Some((bf, px)) = body_fmt {
+        scratch.clear();
+        with_check_ctx(check, px, proxies, &check.run.vars, None, |data, ctx| {
+            bf.render_value_into(scratch, data, reg, ctx);
+        });
+        scratch.as_bytes()
+    } else {
+        send.body.as_deref().map_or(&[], str::as_bytes)
+    };
 
     // A body, or a method that has one by default: the length is always sent (`0` for
     // an empty `POST`).
-    let body_len = body.as_ref().map_or(0, String::len);
-    if body_len > 0 || !matches!(chk.method.as_str(), "OPTIONS" | "GET" | "HEAD" | "DELETE") {
-        let cl_line = format!("content-length: {body_len}\r\n");
-        payload.extend_from_slice(cl_line.as_bytes());
+    let body_len = body_bytes.len();
+    if body_len > 0 || !matches!(send.method.as_str(), "OPTIONS" | "GET" | "HEAD" | "DELETE") {
+        let _ = write!(payload, "content-length: {body_len}\r\n");
     }
 
-    if http_version_at_least_11(&chk.version) && !has_connection {
+    if http_version_at_least_11(&send.version) && !has_connection {
         payload.extend_from_slice(b"connection: close\r\n");
     }
 
     payload.extend_from_slice(b"\r\n");
-    if let Some(ref body) = body {
-        payload.extend_from_slice(body.as_bytes());
-    }
-
-    payload
+    payload.extend_from_slice(body_bytes);
 }
 
 /// `HTTP/1.1` and later (`HTTP/2` included): where a request carries `connection: close`.
@@ -1488,46 +1534,63 @@ fn http_expect(rule: &ResolvedHttpExpectRule, resp: &HttpResp, last_read: bool, 
     }
 }
 
-/// What the rules of an HTTP check say of the bytes received so far (`last_read`: no more
-/// are coming).
-fn http_verdict(check: &ServerCheckState, chk: &ResolvedHttpCheck, buf: &[u8], last_read: bool, proxies: &crate::table::Table) -> HttpVerdict {
+/// Evaluates consecutive `Expect` (and interleaved `SetVar`/`UnsetVar`) steps starting at
+/// `steps[0]` against `buf`. Returns `(verdict, consumed_steps, updated_vars)`.
+fn http_verdict_slice(
+    check: &ServerCheckState,
+    steps: &[ResolvedHttpStep],
+    buf: &[u8],
+    last_read: bool,
+    proxies: &crate::table::Table,
+) -> (HttpVerdict, usize, Option<alcyon_sample::VarStore>) {
     let resp = match parse_http_response(buf) {
         Ok(Some(r)) => r,
-        Ok(None) if !last_read => return HttpVerdict::Wait,
+        Ok(None) if !last_read => return (HttpVerdict::Wait, 0, None),
         Ok(None) | Err(()) => {
             // `HAProxy` calls both an HTTP response that never came and one that is not
             // HTTP a socket error.
-            return HttpVerdict::Fail { code: "SOCKERR", desc: "Socket error", status: None, info: None };
+            return (
+                HttpVerdict::Fail { code: "SOCKERR", desc: "Socket error", status: None, info: None },
+                0,
+                None,
+            );
         }
     };
-    // The first rule is an `expect`: the parser holds `set-var` and `unset-var` ahead of it
-    // apart, and adds one to a check that has none.
-    if let Some(ResolvedHttpRule::Expect(rule)) = chk.rules.first().filter(|_| resp.parse_error) {
-        return unparsed_reply_failure(rule, &resp);
+    if let Some(ResolvedHttpStep::Expect(rule)) = steps.first().filter(|_| resp.parse_error) {
+        return (unparsed_reply_failure(rule, &resp), 0, None);
     }
+
+    let group_len = steps.iter().take_while(|s| matches!(s, ResolvedHttpStep::Expect(_) | ResolvedHttpStep::SetVar { .. } | ResolvedHttpStep::UnsetVar { .. })).count();
+    let group = &steps[..group_len];
+    let has_vars = group
+        .iter()
+        .any(|s| matches!(s, ResolvedHttpStep::SetVar { .. } | ResolvedHttpStep::UnsetVar { .. }));
+
     let px = &proxies[check.proxy()];
     let reg = crate::engine::sample_registry();
-    // The rules run in order from the same starting variables each time more of the
-    // response is in; what one sets is for the ones after it.
-    let mut vars = check.run.vars.clone();
-    for rule in &chk.rules {
-        match rule {
-            ResolvedHttpRule::Expect(e) => {
-                let render = |fmt: &str| {
-                    // Every format was compiled when the configuration was read.
-                    LogFormat::compile(fmt, reg)
-                        .map(|f| with_check_ctx(check, px, proxies, &vars, Some(&resp), |data, ctx| f.render_value(data, reg, ctx)))
-                        .unwrap_or_default()
-                };
-                match http_expect(e, &resp, last_read, &render) {
-                    HttpVerdict::Pass { .. } => {}
-                    other => return other,
-                }
+    let mut local_vars = has_vars.then(|| check.run.vars.clone());
+
+    for step in group {
+        if let ResolvedHttpStep::Expect(e) = step {
+            let vars_ref = local_vars.as_ref().unwrap_or(&check.run.vars);
+            let render = |fmt: &str| {
+                LogFormat::compile(fmt, reg)
+                    .map(|f| {
+                        with_check_ctx(check, px, proxies, vars_ref, Some(&resp), |data, ctx| {
+                            f.render_value(data, reg, ctx)
+                        })
+                    })
+                    .unwrap_or_default()
+            };
+            match http_expect(e, &resp, last_read, &render) {
+                HttpVerdict::Pass { .. } => {}
+                other => return (other, 0, None),
             }
-            other => run_var_rules(check, proxies, std::slice::from_ref(other), &mut vars, Some(&resp)),
+        } else if let Some(ref mut vars) = local_vars {
+            run_var_step(check, proxies, step, vars, Some(&resp));
         }
     }
-    HttpVerdict::Pass { status: resp.status }
+    (HttpVerdict::Pass { status: resp.status }, group_len, local_vars)
 }
 
 /// The bare `strerror(errno)` text, without the `" (os error N)"` that Rust's
@@ -1608,11 +1671,10 @@ pub fn step_check(
             let (code, desc, info) = match &check.run.sub_state {
                 _ if handshaking => ("L6TOUT", "Layer6 timeout", None),
                 CheckSubState::TcpConnecting
-                | CheckSubState::HttpConnecting { .. }
+                | CheckSubState::HttpRunning { phase: HttpStepPhase::Connecting, .. }
                 | CheckSubState::ProtoConnecting { .. }
                 | CheckSubState::Idle => ("L4TOUT", "Layer4 timeout", None),
-                CheckSubState::HttpSending { .. }
-                | CheckSubState::HttpReceiving { .. }
+                CheckSubState::HttpRunning { .. }
                 | CheckSubState::RedisRunning { .. }
                 | CheckSubState::SmtpRunning { .. }
                 | CheckSubState::LdapRunning { .. }
@@ -1799,58 +1861,7 @@ pub fn step_check(
                     })
                 }
             }
-            CheckSubState::HttpConnecting {
-                req_buf,
-                send_offset,
-            } => {
-                if !ready.writable && !ready.readable {
-                    return Ok(CheckStep::pending(Some(check.exp)));
-                }
-                fdtab.clear_ready(raw_fd, true, true);
-                let connect_res = if let Some(sock) = check.sock.as_ref() {
-                    raw::check_connect_error(sock.as_fd())
-                } else {
-                    Ok(Some(io::Error::from(io::ErrorKind::NotConnected)))
-                };
-
-                if let Ok(None) = connect_res {
-                    match drive_check_handshake(check, fdtab, poller, raw_fd) {
-                        Handshake::Ready => {}
-                        Handshake::Pending => return Ok(CheckStep::pending(Some(check.exp))),
-                        Handshake::Failed(info) => return Ok(fail_check_l6(check, fdtab, poller, now, duration, info)),
-                    }
-                    fdtab.set_interest(raw_fd, Interest::WRITE);
-                    if let Some(sock) = check.sock.as_ref() {
-                        let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
-                    }
-                    check.run.sub_state = CheckSubState::HttpSending {
-                        req_buf,
-                        send_offset,
-                    };
-                    progress_http_check(check, fdtab, poller, now, duration, proxies)
-                } else {
-                    cleanup_check_socket(check, fdtab, poller);
-                    let info = match connect_res {
-                        Ok(Some(ref err)) => Some(format_l4_connect_error(err)),
-                        Err(ref e) => Some(format!("General socket error ({})", strerror(e))),
-                        _ => None,
-                    };
-                    let event = check.on_failure_full(
-                        "L4CON",
-                        "Layer4 connection problem",
-                        duration,
-                        None,
-                        info,
-                    );
-                    let next = check.schedule_next(now);
-                    check.next_check = next;
-                    Ok(CheckStep {
-                        next: Some(next),
-                        event,
-                    })
-                }
-            }
-            CheckSubState::HttpSending { .. } | CheckSubState::HttpReceiving { .. } => {
+            CheckSubState::HttpRunning { .. } => {
                 progress_http_check(check, fdtab, poller, now, duration, proxies)
             }
             CheckSubState::TcpRunning { .. } => {
@@ -1895,65 +1906,22 @@ pub fn step_check(
         let resolved = check.resolved_config.clone();
 
         match resolved.as_deref().unwrap_or(&ResolvedCheckConfig::TcpConnect) {
-            ResolvedCheckConfig::Http(chk) => {
-                let base = chk.connect_addr.map_or_else(|| check.config.check_addr.unwrap_or(check.addr.ip()), |a| a.ip());
-                let target_addr = SocketAddr::new(base, chk.check_port.unwrap_or(check.addr.port()));
-                // The variables of this run: the rules before the request set them.
-                let mut vars = alcyon_sample::VarStore::new();
-                run_var_rules(check, proxies, &chk.pre_rules, &mut vars, None);
-                check.run.vars = vars;
-                let payload = build_http_request_payload(chk, target_addr, check, proxies);
-
-                match connect_check(check, Some(target_addr)) {
-                    Ok((sock, _)) => {
-                        let raw_fd = sock.as_raw_fd();
-                        check.run.check_fd = Some(raw_fd);
-                        let timeout_ms =
-                            u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
-                        check.exp = now.add(timeout_ms);
-                        check.in_progress = true;
-
-                        fdtab.insert(
-                            raw_fd,
-                            FdState::Conn {
-                                task: check.task,
-                                conn: 0,
-                            },
-                            Interest::WRITE,
-                        );
-                        let _ = poller.add(
-                            sock.as_fd(),
-                            u64::try_from(raw_fd).unwrap_or(0),
-                            false,
-                            true,
-                        );
-                        check.sock = Some(sock);
-
-                        // Even a connection that is already up is waited for: the poller
-                        // reports its socket writable at once.
-                        check.run.sub_state = CheckSubState::HttpConnecting {
-                            req_buf: payload,
-                            send_offset: 0,
-                        };
-                        Ok(CheckStep::pending(Some(check.exp)))
-                    }
-                    Err(e) => {
-                        let info = Some(format_l4_connect_error(&e));
-                        let event = check.on_failure_full(
-                            "L4CON",
-                            "Layer4 connection problem",
-                            0,
-                            None,
-                            info,
-                        );
-                        let next = check.schedule_next(now);
-                        check.next_check = next;
-                        Ok(CheckStep {
-                            next: Some(next),
-                            event,
-                        })
-                    }
-                }
+            ResolvedCheckConfig::Http(_) => {
+                check.run.vars.clear();
+                check.run.req_buf.clear();
+                check.run.recv_buf.clear();
+                check.run.pending_send_proxy = false;
+                check.run.http_target_addr = check.addr;
+                let timeout_ms =
+                    u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                check.exp = now.add(timeout_ms);
+                check.in_progress = true;
+                check.run.sub_state = CheckSubState::HttpRunning {
+                    step_idx: 0,
+                    phase: HttpStepPhase::Dispatch,
+                    send_offset: 0,
+                };
+                progress_http_check(check, fdtab, poller, now, 0, proxies)
             }
             ResolvedCheckConfig::TcpSteps(_) => {
                 check.run.sub_state = CheckSubState::TcpRunning {
@@ -2060,6 +2028,26 @@ pub fn step_check(
 
 /// Progresses an HTTP check during send or receive phase.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
+fn fail_http_step(
+    check: &mut ServerCheckState,
+    fdtab: &mut FdTab,
+    poller: &mut Poller,
+    now: Tick,
+    duration: u32,
+    code: &'static str,
+    desc: &'static str,
+    status: Option<u16>,
+    info: Option<String>,
+) -> CheckStep {
+    cleanup_check_socket(check, fdtab, poller);
+    let event = check.on_failure_full(code, desc, duration, status, info);
+    let next = check.schedule_next(now);
+    check.next_check = next;
+    CheckStep { next: Some(next), event }
+}
+
+#[allow(clippy::too_many_lines)]
 fn progress_http_check(
     check: &mut ServerCheckState,
     fdtab: &mut FdTab,
@@ -2068,128 +2056,198 @@ fn progress_http_check(
     duration: u32,
     proxies: &crate::table::Table,
 ) -> io::Result<CheckStep> {
-    let Some(raw_fd) = check.run.check_fd else {
-        cleanup_check_socket(check, fdtab, poller);
-        let next = check.schedule_next(now);
-        return Ok(CheckStep::pending(Some(next)));
-    };
-
     let resolved = check.resolved_config.clone();
-    let Some(ResolvedCheckConfig::Http(chk)) = resolved.as_deref() else {
+    let (
+        Some(ResolvedCheckConfig::Http(chk)),
+        CheckSubState::HttpRunning { mut step_idx, mut phase, mut send_offset },
+    ) = (resolved.as_deref(), check.run.sub_state.clone())
+    else {
         cleanup_check_socket(check, fdtab, poller);
         let next = check.schedule_next(now);
         return Ok(CheckStep::pending(Some(next)));
     };
 
-    match check.run.sub_state.clone() {
-        CheckSubState::HttpSending {
-            req_buf,
-            mut send_offset,
-        } => {
-            let Some(sock) = check.sock.as_ref() else {
-                cleanup_check_socket(check, fdtab, poller);
-                let next = check.schedule_next(now);
-                return Ok(CheckStep::pending(Some(next)));
-            };
-
-            while send_offset < req_buf.len() {
-                match check.xprt.send(sock.as_fd(), &req_buf[send_offset..]) {
-                    Ok(Io::Done(n)) => {
-                        send_offset += n;
+    while step_idx < chk.steps.len() {
+        match &chk.steps[step_idx] {
+            ResolvedHttpStep::Connect { addr, port, send_proxy } => {
+                if phase == HttpStepPhase::Connecting {
+                    let (Some(raw_fd), Some(sock)) = (check.run.check_fd, check.sock.as_ref()) else {
+                        cleanup_check_socket(check, fdtab, poller);
+                        return Ok(CheckStep::pending(Some(check.schedule_next(now))));
+                    };
+                    let ready = fdtab.ready(raw_fd);
+                    if !ready.writable && !ready.readable {
+                        check.run.sub_state = CheckSubState::HttpRunning { step_idx, phase, send_offset };
+                        return Ok(CheckStep::pending(Some(check.exp)));
                     }
-                    Ok(Io::WouldBlock) => {
-                        fdtab.clear_ready(raw_fd, false, true);
-                        check.run.sub_state = CheckSubState::HttpSending {
-                            req_buf,
+                    fdtab.clear_ready(raw_fd, true, true);
+                    let connect_res = raw::check_connect_error(sock.as_fd());
+
+                    if let Ok(None) = connect_res {
+                        match drive_check_handshake(check, fdtab, poller, raw_fd) {
+                            Handshake::Ready => {}
+                            Handshake::Pending => {
+                                check.run.sub_state = CheckSubState::HttpRunning { step_idx, phase, send_offset };
+                                return Ok(CheckStep::pending(Some(check.exp)));
+                            }
+                            Handshake::Failed(info) => return Ok(fail_check_l6(check, fdtab, poller, now, duration, info)),
+                        }
+                        check.run.pending_send_proxy = *send_proxy;
+                        step_idx += 1;
+                        phase = HttpStepPhase::Dispatch;
+                        continue;
+                    }
+
+                    let info = connect_res.ok().flatten().map(|e| format_l4_connect_error(&e));
+                    return Ok(fail_http_step(check, fdtab, poller, now, duration, "L4CON", "Layer4 connection problem", None, info));
+                }
+
+                // New connect step (initial or mid-sequence): close any previous connection.
+                cleanup_check_socket(check, fdtab, poller);
+                check.in_progress = true;
+                let timeout_ms = u32::try_from(check.config.timeout.as_millis()).unwrap_or(u32::MAX);
+                check.exp = now.add(timeout_ms);
+                check.run.recv_buf.clear();
+                check.run.req_buf.clear();
+                send_offset = 0;
+
+                let base = addr.map_or_else(|| check.config.check_addr.unwrap_or(check.addr.ip()), |a| a.ip());
+                let target_addr = SocketAddr::new(base, port.unwrap_or(check.addr.port()));
+                check.run.http_target_addr = target_addr;
+
+                match connect_check(check, Some(target_addr)) {
+                    Ok((sock, _)) => {
+                        let raw_fd = sock.as_raw_fd();
+                        check.run.check_fd = Some(raw_fd);
+                        fdtab.insert(raw_fd, FdState::Conn { task: check.task, conn: 0 }, Interest::WRITE);
+                        let _ = poller.add(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+                        check.sock = Some(sock);
+                        check.run.sub_state = CheckSubState::HttpRunning {
+                            step_idx,
+                            phase: HttpStepPhase::Connecting,
+                            send_offset: 0,
+                        };
+                        return Ok(CheckStep::pending(Some(check.exp)));
+                    }
+                    Err(e) => {
+                        let info = Some(format_l4_connect_error(&e));
+                        return Ok(fail_http_step(check, fdtab, poller, now, duration, "L4CON", "Layer4 connection problem", None, info));
+                    }
+                }
+            }
+            step @ (ResolvedHttpStep::SetVar { .. } | ResolvedHttpStep::UnsetVar { .. }) => {
+                let mut vars = std::mem::take(&mut check.run.vars);
+                run_var_step(check, proxies, step, &mut vars, None);
+                check.run.vars = vars;
+                step_idx += 1;
+            }
+            ResolvedHttpStep::Send(send) => {
+                let (Some(raw_fd), Some(sock)) = (check.run.check_fd, check.sock.as_ref()) else {
+                    cleanup_check_socket(check, fdtab, poller);
+                    return Ok(CheckStep::pending(Some(check.schedule_next(now))));
+                };
+                if phase != HttpStepPhase::Sending {
+                    check.run.recv_buf.clear();
+                    let send_proxy = std::mem::take(&mut check.run.pending_send_proxy);
+                    let target_addr = check.run.http_target_addr;
+                    let mut req_buf = std::mem::take(&mut check.run.req_buf);
+                    let mut scratch = std::mem::take(&mut check.run.scratch);
+                    build_http_request_payload_into(
+                        chk, send, step_idx, target_addr, send_proxy, check, proxies, &mut req_buf, &mut scratch,
+                    );
+                    check.run.req_buf = req_buf;
+                    check.run.scratch = scratch;
+                    send_offset = 0;
+                    fdtab.set_interest(raw_fd, Interest::WRITE);
+                    let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), false, true);
+                }
+
+                while send_offset < check.run.req_buf.len() {
+                    match check.xprt.send(sock.as_fd(), &check.run.req_buf[send_offset..]) {
+                        Ok(Io::Done(n)) => send_offset += n,
+                        Ok(Io::WouldBlock) => {
+                            fdtab.clear_ready(raw_fd, false, true);
+                            check.run.sub_state = CheckSubState::HttpRunning {
+                                step_idx,
+                                phase: HttpStepPhase::Sending,
+                                send_offset,
+                            };
+                            return Ok(CheckStep::pending(Some(check.exp)));
+                        }
+                        Ok(Io::Closed | Io::Eof) | Err(_) => {
+                            return Ok(fail_http_step(check, fdtab, poller, now, duration, "L7RSP", "Connection closed by server", None, None));
+                        }
+                    }
+                }
+
+                step_idx += 1;
+                phase = HttpStepPhase::Dispatch;
+                send_offset = 0;
+            }
+            ResolvedHttpStep::Expect(_) => {
+                let (Some(raw_fd), Some(sock)) = (check.run.check_fd, check.sock.as_ref()) else {
+                    cleanup_check_socket(check, fdtab, poller);
+                    return Ok(CheckStep::pending(Some(check.schedule_next(now))));
+                };
+                if phase != HttpStepPhase::Receiving {
+                    fdtab.set_interest(raw_fd, Interest::READ);
+                    let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
+                }
+
+                let mut recv_buf = std::mem::take(&mut check.run.recv_buf);
+                let mut buf = [0u8; 4096];
+                let mut eof = false;
+                let mut broken = false;
+                while recv_buf.len() < TCP_CHECK_BUFSIZE {
+                    let room = (TCP_CHECK_BUFSIZE - recv_buf.len()).min(buf.len());
+                    match check.xprt.recv(sock.as_fd(), &mut buf[..room]) {
+                        Ok(Io::Done(n)) => recv_buf.extend_from_slice(&buf[..n]),
+                        Ok(Io::WouldBlock) => break,
+                        Ok(Io::Eof) => { eof = true; break; }
+                        Ok(Io::Closed) | Err(_) => { broken = true; break; }
+                    }
+                }
+                let last_read = eof || (broken && !recv_buf.is_empty()) || recv_buf.len() >= TCP_CHECK_BUFSIZE;
+                let (verdict, consumed, updated_vars) = if broken && recv_buf.is_empty() {
+                    (HttpVerdict::Fail { code: "SOCKERR", desc: "Socket error", status: None, info: None }, 0, None)
+                } else {
+                    http_verdict_slice(check, &chk.steps[step_idx..], &recv_buf, last_read, proxies)
+                };
+                check.run.recv_buf = recv_buf;
+
+                match verdict {
+                    HttpVerdict::Wait => {
+                        fdtab.clear_ready(raw_fd, true, false);
+                        check.run.sub_state = CheckSubState::HttpRunning {
+                            step_idx,
+                            phase: HttpStepPhase::Receiving,
                             send_offset,
                         };
                         return Ok(CheckStep::pending(Some(check.exp)));
                     }
-                    Ok(Io::Closed | Io::Eof) | Err(_) => {
-                        cleanup_check_socket(check, fdtab, poller);
-                        let event = check.on_failure_full(
-                            "L7RSP",
-                            "Connection closed by server",
-                            duration,
-                            None,
-                            None,
-                        );
-                        let next = check.schedule_next(now);
-                        check.next_check = next;
-                        return Ok(CheckStep {
-                            next: Some(next),
-                            event,
-                        });
+                    HttpVerdict::Pass { status } => {
+                        check.http_code = Some(status);
+                        if let Some(vars) = updated_vars {
+                            check.run.vars = vars;
+                        }
+                        step_idx += consumed;
+                        phase = HttpStepPhase::Dispatch;
+                    }
+                    HttpVerdict::Fail { code, desc, status, info } => {
+                        check.http_code = status;
+                        return Ok(fail_http_step(check, fdtab, poller, now, duration, code, desc, status, info));
                     }
                 }
             }
-
-            fdtab.set_interest(raw_fd, Interest::READ);
-            let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), true, false);
-            check.run.sub_state = CheckSubState::HttpReceiving {
-                recv_buf: Vec::new(),
-            };
-            progress_http_check(check, fdtab, poller, now, duration, proxies)
-        }
-        // The receiving state; `step_check` runs this only in a sending or receiving one.
-        other => {
-            let mut recv_buf = if let CheckSubState::HttpReceiving { recv_buf } = other { recv_buf } else { Vec::new() };
-            let Some(sock) = check.sock.as_ref() else {
-                cleanup_check_socket(check, fdtab, poller);
-                let next = check.schedule_next(now);
-                return Ok(CheckStep::pending(Some(next)));
-            };
-
-            // One buffer, as `HAProxy` reads: once it is full the response is judged on what
-            // it holds (T238; it used to grow with the response, re-parsed on every read).
-            let mut buf = [0u8; 4096];
-            let mut eof = false;
-            let mut broken = false;
-            while recv_buf.len() < TCP_CHECK_BUFSIZE {
-                let room = (TCP_CHECK_BUFSIZE - recv_buf.len()).min(buf.len());
-                match check.xprt.recv(sock.as_fd(), &mut buf[..room]) {
-                    Ok(Io::Done(n)) => recv_buf.extend_from_slice(&buf[..n]),
-                    Ok(Io::WouldBlock) => break,
-                    Ok(Io::Eof) => {
-                        eof = true;
-                        break;
-                    }
-                    Ok(Io::Closed) | Err(_) => {
-                        broken = true;
-                        break;
-                    }
-                }
-            }
-            // A connection that fails with nothing received is an invalid response; one
-            // that fails after some data is the end of what there is, as is a full buffer.
-            let last_read = eof || (broken && !recv_buf.is_empty()) || recv_buf.len() >= TCP_CHECK_BUFSIZE;
-            let verdict = if broken && recv_buf.is_empty() {
-                HttpVerdict::Fail { code: "SOCKERR", desc: "Socket error", status: None, info: None }
-            } else {
-                http_verdict(check, &chk, &recv_buf, last_read, proxies)
-            };
-            let event = match verdict {
-                HttpVerdict::Wait => {
-                    fdtab.clear_ready(raw_fd, true, false);
-                    check.run.sub_state = CheckSubState::HttpReceiving { recv_buf };
-                    return Ok(CheckStep::pending(Some(check.exp)));
-                }
-                HttpVerdict::Pass { status } => {
-                    check.http_code = Some(status);
-                    cleanup_check_socket(check, fdtab, poller);
-                    check.on_success_full("L7OK", "Layer7 check passed", duration, Some(status), None)
-                }
-                HttpVerdict::Fail { code, desc, status, info } => {
-                    check.http_code = status;
-                    cleanup_check_socket(check, fdtab, poller);
-                    check.on_failure_full(code, desc, duration, status, info)
-                }
-            };
-            let next = check.schedule_next(now);
-            check.next_check = next;
-            Ok(CheckStep { next: Some(next), event })
         }
     }
+
+    let status = check.http_code;
+    cleanup_check_socket(check, fdtab, poller);
+    let event = check.on_success_full("L7OK", "Layer7 check passed", duration, status, None);
+    let next = check.schedule_next(now);
+    check.next_check = next;
+    Ok(CheckStep { next: Some(next), event })
 }
 
 /// The status of a timeout while rule `idx` of a script was running: while it was
@@ -2644,11 +2702,15 @@ fn connect_check(check: &mut ServerCheckState, addr: Option<SocketAddr>) -> io::
 /// (`tcpcheck_connect_auto_sni`). A log-format value is taken as written.
 fn check_host(check: &ServerCheckState) -> Option<String> {
     let Some(ResolvedCheckConfig::Http(chk)) = check.resolved_config.as_deref() else { return None };
-    chk.headers
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case("host"))
-        .map(|(_, v)| v.clone())
-        .or_else(|| chk.host.clone())
+    chk.steps.iter().find_map(|step| match step {
+        ResolvedHttpStep::Send(send) => send
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("host"))
+            .map(|(_, v)| v.clone())
+            .or_else(|| send.host.clone()),
+        _ => None,
+    })
 }
 
 /// Where a check's TLS handshake stands.
@@ -4133,21 +4195,17 @@ mod tests {
         let config = ServerCheckConfig::default();
         let mut s = ServerCheckState::new(0, 0, "127.0.0.1:1".parse().unwrap(), config, Tick(0));
         s.resolved_config = Some(Arc::new(ResolvedCheckConfig::Http(Box::new(ResolvedHttpCheck {
-            method: "GET".into(),
-            uri: "/".into(),
-            uri_lf: false,
-            version: "HTTP/1.0".into(),
-            host: None,
-            headers: Vec::new(),
-            body: None,
-            body_lf: false,
-            has_send: true,
             send_state: false,
-            pre_rules: Vec::new(),
-            rules: Vec::new(),
-            check_port: None,
-            send_proxy: false,
-            connect_addr: None,
+            steps: vec![ResolvedHttpStep::Send(ResolvedHttpSend {
+                method: "GET".into(),
+                uri: "/".into(),
+                uri_lf: false,
+                version: "HTTP/1.0".into(),
+                host: None,
+                headers: Vec::new(),
+                body: None,
+                body_lf: false,
+            })],
         }))));
         let mut fdtab = FdTab::with_capacity(16);
         let mut poller = Poller::new(4).unwrap();
@@ -4158,13 +4216,135 @@ mod tests {
         s.in_progress = true;
         s.exp = Tick(10_000);
         let len = 16 << 20;
-        s.run.sub_state = CheckSubState::HttpSending { req_buf: vec![b'x'; len], send_offset: 0 };
+        s.run.req_buf = vec![b'x'; len];
+        s.run.sub_state = CheckSubState::HttpRunning {
+            step_idx: 0,
+            phase: HttpStepPhase::Sending,
+            send_offset: 0,
+        };
         let step = progress_http_check(&mut s, &mut fdtab, &mut poller, Tick(1), 0, &crate::table::Table::new(Vec::new())).unwrap();
         assert_eq!(step.next, Some(Tick(10_000)), "pending until the check's expiry");
-        let CheckSubState::HttpSending { send_offset, .. } = &s.run.sub_state else { panic!("{:?}", s.run.sub_state) };
+        let CheckSubState::HttpRunning { send_offset, .. } = &s.run.sub_state else { panic!("{:?}", s.run.sub_state) };
         assert!(*send_offset > 0 && *send_offset < len, "sent {send_offset} of {len}");
         cleanup_check_socket(&mut s, &mut fdtab, &mut poller);
         assert!(!s.run.is_held());
+    }
+
+    #[test]
+    fn http_check_payload_and_connect_edge_cases() {
+        let config = ServerCheckConfig::default();
+        let mut s = ServerCheckState::new(0, 0, "255.255.255.255:9".parse().unwrap(), config, Tick(0));
+        let send = ResolvedHttpSend {
+            method: "GET".into(),
+            uri: "/health".into(),
+            uri_lf: false,
+            version: "HTTP/1.1".into(),
+            host: Some("example.com".into()),
+            headers: vec![("X-Lit".into(), "1".into())],
+            body: None,
+            body_lf: false,
+        };
+        let chk = ResolvedHttpCheck {
+            send_state: false,
+            steps: vec![
+                ResolvedHttpStep::Connect { addr: None, port: None, send_proxy: true },
+                ResolvedHttpStep::Send(send.clone()),
+                ResolvedHttpStep::Expect(ResolvedHttpExpectRule {
+                    pattern: HttpCheckExpectPattern::Status(vec![(200, 299)]),
+                    negate: false,
+                    min_recv: -1,
+                    comment: None,
+                    step: 1,
+                }),
+            ],
+        };
+        let proxies = crate::table::Table::new(Vec::new());
+        let mut payload = Vec::new();
+        let mut scratch = String::new();
+        build_http_request_payload_into(
+            &chk,
+            &send,
+            1,
+            "127.0.0.1:8080".parse().unwrap(),
+            true,
+            &s,
+            &proxies,
+            &mut payload,
+            &mut scratch,
+        );
+        let text = String::from_utf8_lossy(&payload);
+        assert!(text.starts_with("PROXY TCP4 127.0.0.1 127.0.0.1 0 8080\r\n"));
+        assert!(text.contains("x-lit: 1\r\n"));
+        assert!(text.contains("host: example.com\r\n"));
+
+        // Unreachable immediate connect failure in progress_http_check.
+        s.resolved_config = Some(Arc::new(ResolvedCheckConfig::Http(Box::new(chk))));
+        let mut fdtab = FdTab::with_capacity(16);
+        let mut poller = Poller::new(4).unwrap();
+        s.in_progress = true;
+        s.run.sub_state = CheckSubState::HttpRunning {
+            step_idx: 0,
+            phase: HttpStepPhase::Dispatch,
+            send_offset: 0,
+        };
+        let step = progress_http_check(&mut s, &mut fdtab, &mut poller, Tick(1), 0, &proxies).unwrap();
+        assert!(step.event.is_some());
+        assert_eq!(s.last_status_code, "L4CON");
+
+        // Woken before connection is up waits; missing check_fd reschedules cleanly.
+        let (_listener, fd) = stalled_socket();
+        let raw_fd = fd.as_raw_fd();
+        fdtab.insert(raw_fd, FdState::Conn { task: TaskRef::NONE, conn: 0 }, Interest::WRITE);
+        s.run.check_fd = Some(raw_fd);
+        s.sock = Some(fd);
+        s.in_progress = true;
+        s.exp = Tick(10_000);
+        s.run.sub_state = CheckSubState::HttpRunning {
+            step_idx: 0,
+            phase: HttpStepPhase::Connecting,
+            send_offset: 0,
+        };
+        let step = progress_http_check(&mut s, &mut fdtab, &mut poller, Tick(1), 0, &proxies).unwrap();
+        assert_eq!(step.next, Some(Tick(10_000)));
+        cleanup_check_socket(&mut s, &mut fdtab, &mut poller);
+
+        s.run.sub_state = CheckSubState::HttpRunning {
+            step_idx: 0,
+            phase: HttpStepPhase::Connecting,
+            send_offset: 0,
+        };
+        let _ = progress_http_check(&mut s, &mut fdtab, &mut poller, Tick(2), 0, &proxies).unwrap();
+
+        // Missing check_fd in Send and Expect reschedules cleanly.
+        for step_idx in [1, 2] {
+            s.run.sub_state = CheckSubState::HttpRunning {
+                step_idx,
+                phase: HttpStepPhase::Dispatch,
+                send_offset: 0,
+            };
+            let _ = progress_http_check(&mut s, &mut fdtab, &mut poller, Tick(3), 0, &proxies).unwrap();
+        }
+
+        // Send on a closed/unconnected socket fails with L7RSP.
+        let sock = rustix::net::socket(
+            rustix::net::AddressFamily::INET,
+            rustix::net::SocketType::STREAM,
+            None,
+        ).unwrap();
+        let bad_fd = sock.as_raw_fd();
+        fdtab.insert(bad_fd, FdState::Conn { task: TaskRef::NONE, conn: 0 }, Interest::WRITE);
+        s.run.check_fd = Some(bad_fd);
+        s.sock = Some(sock);
+        s.in_progress = true;
+        s.run.req_buf = b"GET / HTTP/1.0\r\n\r\n".to_vec();
+        s.run.sub_state = CheckSubState::HttpRunning {
+            step_idx: 1,
+            phase: HttpStepPhase::Sending,
+            send_offset: 0,
+        };
+        let step = progress_http_check(&mut s, &mut fdtab, &mut poller, Tick(4), 0, &proxies).unwrap();
+        assert!(step.event.is_some());
+        assert_eq!(s.last_status_code, "L7RSP");
     }
 
     /// A `tcp-check` woken before its connection is up waits on, its place in the script kept.

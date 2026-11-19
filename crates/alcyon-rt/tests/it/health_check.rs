@@ -375,25 +375,21 @@ fn the_servers_of_a_backend_share_their_check_parameters() {
 /// log-formats too. Registered under proxy indexes no configuration in this process has.
 #[test]
 fn the_servers_that_share_a_resolved_check_share_its_send_formats() {
-    use alcyon_config::ast::{register_resolved_check, ResolvedCheckConfig, ResolvedHttpCheck};
+    use alcyon_config::ast::{register_resolved_check, ResolvedCheckConfig, ResolvedHttpCheck, ResolvedHttpSend, ResolvedHttpStep};
     use alcyon_rt::{ServerCheckConfig, ServerCheckState};
     let http = |uri: &str| {
         Arc::new(ResolvedCheckConfig::Http(Box::new(ResolvedHttpCheck {
-            method: "GET".into(),
-            uri: uri.into(),
-            uri_lf: false,
-            version: "HTTP/1.0".into(),
-            host: None,
-            headers: vec![("x-lf".into(), "%[str(a)]".into())],
-            body: None,
-            body_lf: false,
-            has_send: true,
             send_state: false,
-            pre_rules: Vec::new(),
-            rules: Vec::new(),
-            check_port: None,
-            send_proxy: false,
-            connect_addr: None,
+            steps: vec![ResolvedHttpStep::Send(ResolvedHttpSend {
+                method: "GET".into(),
+                uri: uri.into(),
+                uri_lf: false,
+                version: "HTTP/1.0".into(),
+                host: None,
+                headers: vec![("x-lf".into(), "%[str(a)]".into())],
+                body: None,
+                body_lf: false,
+            })],
         })))
     };
     let (shared, other) = (http("/a"), http("/b"));
