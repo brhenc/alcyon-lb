@@ -1049,6 +1049,9 @@ pub(crate) fn write_server_row(
         r.set("chkdown", chkdown);
         r.set("downtime", c.downtime_secs());
     }
+    if let Some(slot) = proxy.ids.srv.observe_slot(s_idx) {
+        r.set("hanafail", slot.failed_hana.load(std::sync::atomic::Ordering::Relaxed));
+    }
     r.set("pid", PROCESS_NUM);
     r.set("iid", iid);
     r.set("sid", sid);

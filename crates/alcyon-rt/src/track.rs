@@ -263,6 +263,11 @@ pub enum CheckOp {
     Admin(ServerStatus),
     Health(bool),
     Enabled(bool),
+    HealthAdjust {
+        on_error: alcyon_config::OnErrorMode,
+        status: crate::check::HanaStatus,
+        consecutive: u32,
+    },
 }
 
 /// The [`CheckOp`]s of one proxy waiting for the owner of the checks, a field of the proxy's
@@ -338,6 +343,9 @@ fn adopt(ops: &mut Vec<(u32, CheckOp)>, p: usize, checks: &mut [crate::check::Se
             CheckOp::Admin(to) => c.set_admin_status(to),
             CheckOp::Health(up) => c.set_health(up),
             CheckOp::Enabled(on) => c.enabled = on,
+            CheckOp::HealthAdjust { on_error, status, consecutive } => {
+                c.on_health_adjust(on_error, status, consecutive);
+            }
         }
         false
     });
@@ -370,6 +378,9 @@ pub fn adopt_pending(proxies: &(impl crate::table::ProxyList + ?Sized), checks: 
             if had {
                 for c in checks.iter().filter(|c| c.proxy() == p) {
                     publish_view(px, c);
+                    if c.enabled && px.srv_set().at(c.server()).is_some() {
+                        set_raw(proxies, p, c.server(), c.published(), Kind::Op, Cause::Check(c));
+                    }
                 }
             }
             // Every check is here: what is left has none (a server added since), nothing
@@ -434,6 +445,27 @@ pub fn apply_health(proxies: &(impl crate::table::ProxyList + ?Sized), checks: &
     } else if let Some(cur) = px.srv_set().at(s).and_then(|v| v.raw_status()) {
         queue(&mut ops, px, s, CheckOp::Health(up));
         set_raw(proxies, p, s, crate::check::health_transition(cur, up), Kind::Op, cause);
+    }
+}
+
+/// Applies an observed-traffic `health_adjust` trigger (`error-limit` reached) from a worker
+/// thread: queues [`CheckOp::HealthAdjust`] for the check owner, and for `mark-down` also
+/// immediately marks the server down in `Proxy::server_statuses`.
+pub fn apply_health_adjust(
+    proxies: &(impl crate::table::ProxyList + ?Sized),
+    p: usize,
+    s: usize,
+    on_error: alcyon_config::OnErrorMode,
+    status: crate::check::HanaStatus,
+    consecutive: u32,
+) {
+    let Some(px) = proxies.get(p) else { return };
+    let mut ops = lock_ops(px);
+    queue(&mut ops, px, s, CheckOp::HealthAdjust { on_error, status, consecutive });
+    if on_error == alcyon_config::OnErrorMode::MarkDown {
+        if let Some(cur) = px.srv_set().at(s).and_then(|v| v.raw_status()) {
+            set_raw(proxies, p, s, crate::check::health_transition(cur, false), Kind::Op, Cause::Cli);
+        }
     }
 }
 

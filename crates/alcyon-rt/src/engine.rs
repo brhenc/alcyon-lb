@@ -8920,6 +8920,7 @@ fn init_client_session(
                 proxy.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
                 if let Some(i) = proxy.srv_set().slot_of_addr(target) {
                     proxy.srv_set().bump_retr(i, (0, 0, 1));
+                    crate::check::health_adjust(proxies, proxy_idx, i, crate::check::HanaStatus::L4Err);
                 }
                 sess.srv_state = ScState::Error;
             }
@@ -9752,6 +9753,23 @@ fn count_redispatch_pick_on<'a, R: crate::statcnt::Rows<'a>>(rows: R, be: &'a Pr
 /// A connect attempt to the stream's server failed (`back_handle_st_cer`): while retries
 /// remain, connect again -- after the turnaround (`SC_ST_TAR`) when `wait`, an asynchronous
 /// connect error, and the server is the same one; at once after a connect refused at once.
+fn observe_http(entry: &SessionEntry, proxies: &crate::table::Table, status: crate::check::HanaStatus) {
+    observe_http_ids(proxies, entry.srv_backend_idx, entry.target_server_idx, status);
+}
+
+fn observe_http_ids(proxies: &crate::table::Table, srv_backend_idx: usize, target_server_idx: Option<usize>, status: crate::check::HanaStatus) {
+    if let Some(i) = target_server_idx {
+        crate::check::health_adjust(proxies, srv_backend_idx, i, status);
+    }
+}
+
+fn mark_server_connected(entry: &mut SessionEntry, proxies: &crate::table::Table, now: Tick) {
+    entry.sess.server_connected(now);
+    if let Some(i) = entry.target_server_idx {
+        crate::check::health_adjust(proxies, entry.srv_backend_idx, i, crate::check::HanaStatus::L4Ok);
+    }
+}
+
 /// Out of retries, the failure counts in `econ` on the backend and on the server tried
 /// last (once per stream, not per attempt: measured on `HAProxy`, `retries 2` shows
 /// `wretr` 2, `econ` 1) and the stream ends, with a 503 in HTTP.
@@ -9775,6 +9793,7 @@ fn server_connect_failed(
             be.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
             if let Some(i) = entry.target_server_idx {
                 be.srv_set().bump_retr(i, (0, 0, 1));
+                crate::check::health_adjust(proxies, entry.srv_backend_idx, i, crate::check::HanaStatus::L4Err);
             }
             entry.sess.srv_state = ScState::Error;
             if entry.sess.mode == Mode::Http {
@@ -10024,7 +10043,7 @@ fn check_srv_connect(
                 );
 
                 if let Ok(None) = conn_err {
-                    entry.sess.server_connected(now);
+                    mark_server_connected(entry, proxies, now);
                     let (_, srv_want) = entry.sess.interests();
                     let new_interest = Interest {
                         readable: srv_want.read,
@@ -11013,6 +11032,8 @@ impl EngineDispatcher<'_> {
         let srv_eof = matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed);
         let srv_err = entry.sess.srv_state == ScState::Error;
         let h2_child = entry.sess.is_h2_child();
+        let srv_be_idx = entry.srv_backend_idx;
+        let target_srv_idx = entry.target_server_idx;
         let Some(txn) = entry.sess.strm.txn.as_mut() else {
             return;
         };
@@ -11070,6 +11091,7 @@ impl EngineDispatcher<'_> {
                 crate::txn::BodyCheck::Fine => false,
             };
             if refused {
+                observe_http_ids(proxies, srv_be_idx, target_srv_idx, crate::check::HanaStatus::HttpRsp);
                 txn.srv_reusable = false;
                 entry.sess.rep.clear();
                 entry.sess.strm.log.term = Some(*b"PH");
@@ -11083,6 +11105,7 @@ impl EngineDispatcher<'_> {
         if !(srv_eof || srv_err) && !txn.local && !txn.aborted && matches!(txn.rsp, MsgState::Body(_)) && !h2_child {
             let check = txn.rsp.check_body(entry.sess.rep.readable());
             if check.stuck(entry.sess.rep.len(), entry.sess.bufsize) {
+                observe_http_ids(proxies, srv_be_idx, target_srv_idx, crate::check::HanaStatus::HttpRsp);
                 txn.srv_reusable = false;
                 txn.close_after = true;
                 txn.aborted = true;
@@ -11117,6 +11140,14 @@ impl EngineDispatcher<'_> {
                 // An h2 server's malformed response is the server's fault, not a lost
                 // connection: `PH--` whether or not it was reused (T540).
                 let bad = entry.sess.srv_xprt.bad_response();
+                let hana = if status == 504 {
+                    crate::check::HanaStatus::HttpReadTimeout
+                } else if bad {
+                    crate::check::HanaStatus::HttpHdrRsp
+                } else {
+                    crate::check::HanaStatus::HttpBrokenPipe
+                };
+                observe_http_ids(proxies, srv_be_idx, target_srv_idx, hana);
                 if status == 502 && txn.srv_reused && entry.sess.rep.is_empty() && !bad {
                     // `abort_keep_alive`: a keep-alive request lost to a network error,
                     // nothing of a response received. The client retries only if it
@@ -12429,6 +12460,7 @@ impl EngineDispatcher<'_> {
             // No end of head and no room for more: as for a request, from `bufsize - 56`
             // (T265).
             if entry.sess.rep.readable().len() > threshold || entry.sess.rep.readable().len() + 56 >= entry.sess.bufsize {
+                observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
                 entry.sess.rep.clear();
                 reply_error(entry, proxies, 502);
             }
@@ -12478,6 +12510,7 @@ impl EngineDispatcher<'_> {
             }
             match checked {
                 alcyon_proto::response_head::ResponseHead::Invalid => {
+                    observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
                     entry.sess.rep.clear();
                     entry.sess.strm.log.term.get_or_insert(*b"PH");
                     entry.sess.strm.log.bytes_from_server = 0;
@@ -12485,6 +12518,12 @@ impl EngineDispatcher<'_> {
                     return;
                 }
                 alcyon_proto::response_head::ResponseHead::Valid { status, rewrite, close_server: close, index: ix } => {
+                    let hana = if status >= 100 && (status < 500 || status == 501 || status == 505) {
+                        crate::check::HanaStatus::HttpOk
+                    } else {
+                        crate::check::HanaStatus::HttpSts
+                    };
+                    observe_http(entry, proxies, hana);
                     close_server = close;
                     index = ix;
                     if let Some(r) = rewrite {
@@ -12510,6 +12549,7 @@ impl EngineDispatcher<'_> {
                     match verdict {
                         crate::websocket::Verdict::Keep => {}
                         crate::websocket::Verdict::Refuse => {
+                            observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
                             entry.sess.rep.clear();
                             entry.sess.strm.log.term.get_or_insert(*b"PH");
                             entry.sess.strm.log.bytes_from_server = 0;
@@ -15271,7 +15311,7 @@ impl EngineDispatcher<'_> {
                 if !counted {
                     server_actconn_add(entry, proxies, true);
                 }
-                entry.sess.server_connected(now);
+                mark_server_connected(entry, proxies, now);
                 entry.sess.bc_idle = false;
                 if let Some(txn) = entry.sess.strm.txn.as_mut() {
                     txn.srv_reused = true;
@@ -15333,7 +15373,7 @@ impl EngineDispatcher<'_> {
             let sfd = srv_fd.as_raw_fd();
             entry.srv_raw_fd = Some(sfd);
             entry.sess.attach_server_from(srv_fd, xprt, src, now);
-            entry.sess.server_connected(now);
+            mark_server_connected(entry, proxies, now);
             if let Some(txn) = entry.sess.strm.txn.as_mut() {
                 txn.srv_reused = true;
             }

@@ -2,6 +2,7 @@
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
 use super::*;
+use crate::{ObserveMode, OnErrorMode};
 
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_server(
@@ -62,6 +63,10 @@ pub(crate) fn parse_server(
     let mut pool_low_conn = default_server.and_then(|d| d.pool_low_conn).unwrap_or(0);
     let mut pool_purge_delay = default_server.and_then(|d| d.pool_purge_delay).unwrap_or(5000);
     let mut check_port = default_server.and_then(|d| d.check_port);
+    let mut check_addr = default_server.and_then(|d| d.check_addr);
+    let mut observe = default_server.map(|d| d.observe).unwrap_or_default();
+    let mut error_limit = default_server.and_then(|d| d.error_limit).unwrap_or(10);
+    let mut on_error = default_server.map(|d| d.on_error).unwrap_or_default();
     let mut check_proto = default_server.and_then(|d| d.check_proto);
     let mut proto_h2 = default_server.is_some_and(|d| d.proto_h2);
     let mut weight = default_server.and_then(|d| d.weight);
@@ -155,6 +160,25 @@ pub(crate) fn parse_server(
             }
             "port" => {
                 check_port = Some(parse_u16(server_kw_arg(tokens, i, who, "expects a port number as argument.")?, "port")?);
+                i += 1;
+            }
+            "addr" => {
+                check_addr = Some(parse_check_addr(server_kw_arg(tokens, i, who, "expects <ipv4|ipv6> as argument.")?, who)?);
+                i += 1;
+            }
+            "observe" => {
+                observe = parse_observe(server_kw_arg(tokens, i, who, "expects <mode> as argument.")?, who)?;
+                i += 1;
+            }
+            "error-limit" => {
+                error_limit = parse_error_limit(server_kw_arg(tokens, i, who, "expects an integer argument.")?, who)?;
+                i += 1;
+            }
+            "on-error" => {
+                on_error = parse_on_error(
+                    server_kw_arg(tokens, i, who, "expects one of 'fastinter', 'fail-check', 'sudden-death' or 'mark-down' as argument.")?,
+                    who,
+                )?;
                 i += 1;
             }
             "check-proto" => {
@@ -299,6 +323,10 @@ pub(crate) fn parse_server(
                 fastinter_ms: fastinter.map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
                 downinter_ms: downinter.map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
                 max_reuse,
+                check_addr,
+                observe,
+                error_limit,
+                on_error,
             };
             (pool != crate::ast::server::ServerPool::default()).then(|| Box::new(pool))
         },
@@ -309,6 +337,63 @@ pub(crate) fn parse_server(
         track,
     });
     Ok(())
+}
+
+fn parse_check_addr(tok: &Token, who: Option<&str>) -> Result<std::net::IpAddr, ConfigError> {
+    tok.text.parse::<std::net::IpAddr>().map_err(|_| {
+        let prefix = server_keywords::server_prefix(who);
+        ConfigError::new(
+            tok.line,
+            tok.col,
+            format!("{prefix}'addr' : invalid address '{}'.", tok.text),
+        )
+    })
+}
+
+fn parse_observe(tok: &Token, who: Option<&str>) -> Result<ObserveMode, ConfigError> {
+    match tok.text.as_str() {
+        "none" => Ok(ObserveMode::None),
+        "layer4" => Ok(ObserveMode::Layer4),
+        "layer7" => Ok(ObserveMode::Layer7),
+        other => {
+            let prefix = server_keywords::server_prefix(who);
+            Err(ConfigError::new(
+                tok.line,
+                tok.col,
+                format!("{prefix}'observe' expects one of 'none', 'layer4', 'layer7' but got '{other}'"),
+            ))
+        }
+    }
+}
+
+fn parse_error_limit(tok: &Token, who: Option<&str>) -> Result<u32, ConfigError> {
+    let n = atoi(&tok.text);
+    if n <= 0 || n > i64::from(u32::MAX) {
+        let prefix = server_keywords::server_prefix(who);
+        return Err(ConfigError::new(
+            tok.line,
+            tok.col,
+            format!("{prefix}'error-limit' has to be > 0."),
+        ));
+    }
+    Ok(u32::try_from(n).unwrap_or(10))
+}
+
+fn parse_on_error(tok: &Token, who: Option<&str>) -> Result<OnErrorMode, ConfigError> {
+    match tok.text.as_str() {
+        "fastinter" => Ok(OnErrorMode::FastInter),
+        "fail-check" => Ok(OnErrorMode::FailCheck),
+        "sudden-death" => Ok(OnErrorMode::SuddenDeath),
+        "mark-down" => Ok(OnErrorMode::MarkDown),
+        other => {
+            let prefix = server_keywords::server_prefix(who);
+            Err(ConfigError::new(
+                tok.line,
+                tok.col,
+                format!("{prefix}'on-error' expects one of 'fastinter', 'fail-check', 'sudden-death' or 'mark-down' but got '{other}'"),
+            ))
+        }
+    }
 }
 
 /// `atoi`: the leading `[-]digits` of `s`, 0 when there are none.
@@ -891,6 +976,25 @@ pub(crate) fn parse_default_server(
             }
             "port" => {
                 cfg.check_port = Some(parse_u16(server_kw_arg(tokens, i, None, "expects a port number as argument.")?, "port")?);
+                i += 1;
+            }
+            "addr" => {
+                cfg.check_addr = Some(parse_check_addr(server_kw_arg(tokens, i, None, "expects <ipv4|ipv6> as argument.")?, None)?);
+                i += 1;
+            }
+            "observe" => {
+                cfg.observe = parse_observe(server_kw_arg(tokens, i, None, "expects <mode> as argument.")?, None)?;
+                i += 1;
+            }
+            "error-limit" => {
+                cfg.error_limit = Some(parse_error_limit(server_kw_arg(tokens, i, None, "expects an integer argument.")?, None)?);
+                i += 1;
+            }
+            "on-error" => {
+                cfg.on_error = parse_on_error(
+                    server_kw_arg(tokens, i, None, "expects one of 'fastinter', 'fail-check', 'sudden-death' or 'mark-down' as argument.")?,
+                    None,
+                )?;
                 i += 1;
             }
             "check-proto" => {

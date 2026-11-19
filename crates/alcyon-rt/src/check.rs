@@ -129,6 +129,8 @@ pub struct ServerCheckConfig {
     pub timeout: Duration,
     /// `check port` / `port`: the port the checks connect to instead of the traffic port.
     pub check_port: Option<u16>,
+    /// `check addr` / `addr`: the IP address the checks connect to instead of the server's.
+    pub check_addr: Option<std::net::IpAddr>,
     /// An HTTP check goes as an h2 stream: `check-proto h2`, or the server's `proto h2`
     /// without a `check-proto` (T540; over TLS, `h2` selected in ALPN does it too).
     pub h2: bool,
@@ -144,6 +146,7 @@ impl Default for ServerCheckConfig {
             fall: 3,
             timeout: Duration::from_millis(2000),
             check_port: None,
+            check_addr: None,
             h2: false,
         }
     }
@@ -705,6 +708,50 @@ impl ServerCheckState {
             if self.config.fastinter_ms == 0 { inter } else { Duration::from_millis(u64::from(self.config.fastinter_ms)) }
         }
     }
+
+    /// Applies an observed-traffic `on-error` event (`__health_adjust` in `src/check.c`).
+    pub fn on_health_adjust(
+        &mut self,
+        on_error: alcyon_config::OnErrorMode,
+        status: HanaStatus,
+        consecutive: u32,
+    ) -> Option<CheckEvent> {
+        if on_error == alcyon_config::OnErrorMode::FastInter {
+            return None;
+        }
+        let info = format!("Detected {consecutive} consecutive errors, last one was: {}", status.desc());
+        self.last_status_code = "HANA";
+        self.last_status_desc = "Health analyze";
+        self.http_code = None;
+        self.last_status_info = Some(cut_check_desc(info).into_boxed_str());
+        match on_error {
+            alcyon_config::OnErrorMode::SuddenDeath => {
+                if self.health > self.config.rise {
+                    self.health = self.config.rise + 1;
+                }
+            }
+            alcyon_config::OnErrorMode::MarkDown => {
+                self.health = self.config.rise;
+            }
+            alcyon_config::OnErrorMode::FailCheck | alcyon_config::OnErrorMode::FastInter => {}
+        }
+        self.notify_hana_failure()
+    }
+
+    /// `check_notify_failure` for `HANA` without touching check counters (`total_checks`/`failed_checks`).
+    fn notify_hana_failure(&mut self) -> Option<CheckEvent> {
+        if self.health == 0 || self.health - 1 < self.config.rise {
+            self.health = 0;
+            if matches!(self.status, ServerStatus::Up | ServerStatus::Drain) {
+                self.status = ServerStatus::Down;
+                self.down_transitions += 1;
+                return Some(CheckEvent::WentDown);
+            }
+        } else {
+            self.health -= 1;
+        }
+        Some(CheckEvent::Failed)
+    }
 }
 
 /// The outcome of one step: when to run next, and what happened if anything did.
@@ -915,6 +962,87 @@ pub fn check_status_number(code: &str) -> u8 {
 #[must_use]
 pub fn check_status_of(n: i64) -> Option<(&'static str, &'static str)> {
     usize::try_from(n).ok().and_then(|i| CHECK_STATUSES.get(i)).copied().filter(|&(_, desc)| !desc.is_empty())
+}
+
+/// Observed traffic event (`HANA_STATUS_*` in `include/haproxy/check-t.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HanaStatus {
+    L4Ok,
+    L4Err,
+    HttpOk,
+    HttpSts,
+    HttpHdrRsp,
+    HttpRsp,
+    HttpReadError,
+    HttpReadTimeout,
+    HttpBrokenPipe,
+}
+
+impl HanaStatus {
+    /// Description string (`analyze_statuses[].desc` in `src/check.c`).
+    #[must_use]
+    pub const fn desc(self) -> &'static str {
+        match self {
+            Self::L4Err => "L4 unsuccessful connection",
+            Self::HttpSts => "Wrong http response",
+            Self::HttpHdrRsp => "Invalid http response (headers)",
+            Self::HttpRsp => "Invalid http response",
+            Self::HttpReadError => "Read error (http)",
+            Self::HttpReadTimeout => "Read timeout (http)",
+            Self::HttpBrokenPipe => "Close from server (http)",
+            Self::L4Ok | Self::HttpOk => "OK",
+        }
+    }
+
+    /// `analyze_statuses[status].lr[observe - 1]` (`0` = ignore, `1` = error, `2` = OK).
+    #[must_use]
+    const fn classify(self, observe: alcyon_config::ObserveMode) -> u8 {
+        match (observe, self) {
+            (alcyon_config::ObserveMode::Layer4, Self::L4Ok) => 2,
+            (alcyon_config::ObserveMode::Layer4, Self::L4Err) => 1,
+            (alcyon_config::ObserveMode::Layer7, Self::HttpOk) => 2,
+            (
+                alcyon_config::ObserveMode::Layer7,
+                Self::L4Err
+                | Self::HttpSts
+                | Self::HttpHdrRsp
+                | Self::HttpRsp
+                | Self::HttpReadError
+                | Self::HttpReadTimeout
+                | Self::HttpBrokenPipe,
+            ) => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// `health_adjust()` (`src/check.c`): observes a backend traffic outcome for server `s` of
+/// proxy `p`, resetting or incrementing its consecutive error counter and triggering `on-error`
+/// when `error-limit` is reached.
+pub fn health_adjust(
+    proxies: &(impl crate::table::ProxyList + ?Sized),
+    p: usize,
+    s: usize,
+    status: HanaStatus,
+) {
+    let Some(px) = proxies.get(p) else { return };
+    let Some(slot) = px.ids.srv.observe_slot(s) else { return };
+    let kind = status.classify(slot.observe);
+    if kind == 0 {
+        return;
+    }
+    if kind == 2 {
+        slot.consecutive_errors.store(0, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let errs = slot.consecutive_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if errs < slot.error_limit {
+        return;
+    }
+    slot.consecutive_errors.store(0, std::sync::atomic::Ordering::Relaxed);
+    slot.failed_hana.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::track::apply_health_adjust(proxies, p, s, slot.on_error, status, errs);
 }
 
 /// `httpchk_build_status_header` (`src/check.c`): the value of `X-Haproxy-Server-State`.
@@ -1768,7 +1896,7 @@ pub fn step_check(
 
         match resolved.as_deref().unwrap_or(&ResolvedCheckConfig::TcpConnect) {
             ResolvedCheckConfig::Http(chk) => {
-                let base = chk.connect_addr.map_or(check.addr.ip(), |a| a.ip());
+                let base = chk.connect_addr.map_or_else(|| check.config.check_addr.unwrap_or(check.addr.ip()), |a| a.ip());
                 let target_addr = SocketAddr::new(base, chk.check_port.unwrap_or(check.addr.port()));
                 // The variables of this run: the rules before the request set them.
                 let mut vars = alcyon_sample::VarStore::new();
@@ -2234,7 +2362,7 @@ fn progress_tcp_check(
         match &steps[step_idx] {
             ResolvedTcpStep::Connect { port, .. } => {
                 let target_addr =
-                    SocketAddr::new(check.addr.ip(), port.unwrap_or(check.addr.port()));
+                    SocketAddr::new(check.config.check_addr.unwrap_or(check.addr.ip()), port.unwrap_or(check.addr.port()));
                 // The socket in hand is this step's own connection only for the first
                 // step (opened by `progress_tcp_steps_start`) or when this step's connect
                 // is the one in flight. Otherwise it is the previous step's, and a
@@ -2486,7 +2614,10 @@ fn finish_reply(
 /// Where the plain TCP and protocol checks connect: the server's address, on `check port`
 /// when it has one (T495).
 fn check_target(check: &ServerCheckState) -> SocketAddr {
-    SocketAddr::new(check.addr.ip(), check.config.check_port.unwrap_or(check.addr.port()))
+    SocketAddr::new(
+        check.config.check_addr.unwrap_or(check.addr.ip()),
+        check.config.check_port.unwrap_or(check.addr.port()),
+    )
 }
 
 /// Connects a check to `addr` (the server's unless given) and, when the server line asks
@@ -4188,5 +4319,31 @@ impl std::fmt::Display for StatusWord<'_> {
             st @ (ServerStatus::Up | ServerStatus::Drain) if full => f.write_str(st.as_str()),
             st => write!(f, "{} {}/{fall}", st.as_str(), health - rise + 1),
         }
+    }
+}
+
+#[cfg(test)]
+mod hana_tests {
+    use super::*;
+
+    #[test]
+    fn hana_status_descriptions_and_fastinter() {
+        for st in [
+            HanaStatus::L4Ok,
+            HanaStatus::L4Err,
+            HanaStatus::HttpOk,
+            HanaStatus::HttpSts,
+            HanaStatus::HttpHdrRsp,
+            HanaStatus::HttpRsp,
+            HanaStatus::HttpReadError,
+            HanaStatus::HttpReadTimeout,
+            HanaStatus::HttpBrokenPipe,
+        ] {
+            assert!(!st.desc().is_empty());
+        }
+        let mut s = ServerCheckState::new(0, 0, "127.0.0.1:1".parse().unwrap(), ServerCheckConfig::default(), Tick(0));
+        assert!(s.on_health_adjust(alcyon_config::OnErrorMode::FastInter, HanaStatus::L4Err, 1).is_none());
+        assert_eq!(s.on_health_adjust(alcyon_config::OnErrorMode::FailCheck, HanaStatus::L4Err, 1), Some(CheckEvent::WentDown));
+        assert_eq!(s.on_health_adjust(alcyon_config::OnErrorMode::FailCheck, HanaStatus::L4Err, 1), Some(CheckEvent::Failed));
     }
 }
