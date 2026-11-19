@@ -489,6 +489,7 @@ fn del_server_branches() {
     }
 }
 
+#[test]
 fn del_server_in_flight_and_keepalive() {
     let fe = common::reserve_addr();
     let li = common::reserve_addr();
