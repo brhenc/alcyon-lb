@@ -1337,7 +1337,8 @@ fn attach_server_to(
     let (fe, be) = (&proxies[fe_idx], &proxies[be_idx]);
     let stick = StickView::new(proxies, &sess.tracked_sc);
     let ip = s_idx.and_then(|i| be.srv_set().addr_get(i)).map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |a| a.ip());
-    let mut xprt = tls.with_sni(sample_registry(), &stream_sample_ctx(sess, fe, be, &ProxiesView(proxies), &stick).as_ctx(), |sni| {
+    let fc = crate::proxy::ConnView::from_conn(sess);
+    let mut xprt = tls.with_sni(sample_registry(), &stream_sample_ctx(sess, fe, be, &ProxiesView(proxies), &stick, fc.as_ref()).as_ctx(), |sni| {
         tls.connect(&srv_fd, sni, ip)
     });
     // A PROXY header (`send-proxy*`) was put at the head of the request; to a TLS
@@ -1439,7 +1440,8 @@ fn with_server_sni<R>(
         return f(None);
     };
     let stick = StickView::new(proxies, &sess.tracked_sc);
-    tls.with_sni(sample_registry(), &stream_sample_ctx(sess, &proxies[fe_idx], &proxies[be_idx], &ProxiesView(proxies), &stick).as_ctx(), f)
+    let fc = crate::proxy::ConnView::from_conn(sess);
+    tls.with_sni(sample_registry(), &stream_sample_ctx(sess, &proxies[fe_idx], &proxies[be_idx], &ProxiesView(proxies), &stick, fc.as_ref()).as_ctx(), f)
 }
 
 /// The pool key of a connection to `addr` for server `s_idx` of backend `be_idx`, opened
@@ -2403,6 +2405,36 @@ impl SessionArena {
         self.entries.get_mut(idx as usize)?.as_mut().filter(|e| !e.parked)
     }
 
+    /// Borrows `idx` mutably and, if it is an HTTP/2 child whose owner is a different live slot
+    /// in this arena, borrows that owner immutably (`split_at_mut`, no allocation or atomics).
+    pub fn get_mut_with_owner(&mut self, idx: u32) -> Option<(&mut SessionEntry, Option<&SessionEntry>)> {
+        let owner_ref = {
+            let e = self.entries.get(idx as usize)?.as_ref().filter(|e| !e.parked)?;
+            match e.sess.h2_role.as_deref() {
+                Some(crate::proxy::H2Role::Child(c)) => c.owner.filter(|&(oi, _)| oi != idx),
+                _ => None,
+            }
+        };
+        if let Some((owner_idx, owner_task)) = owner_ref {
+            if let Some(o) = self.entries.get(owner_idx as usize).and_then(|s| s.as_ref()) {
+                if !o.parked && o.task == owner_task {
+                    let (a, b) = (idx as usize, owner_idx as usize);
+                    if a < b {
+                        let (lo, hi) = self.entries.split_at_mut(b);
+                        let entry = lo[a].as_mut()?;
+                        let owner = hi[0].as_ref()?;
+                        return Some((entry, Some(owner)));
+                    }
+                    let (lo, hi) = self.entries.split_at_mut(a);
+                    let owner = lo[b].as_ref()?;
+                    let entry = hi[0].as_mut()?;
+                    return Some((entry, Some(owner)));
+                }
+            }
+        }
+        Some((self.entries.get_mut(idx as usize)?.as_mut().filter(|e| !e.parked)?, None))
+    }
+
     /// The entry that [`EngineDispatcher::reset_parked`] marked parked, in its slot (O1b, CP3), is
     /// counted so: the session of an HTTP/2 stream that is over, which its connection keeps for
     /// its next stream ([`Self::unpark`]). Not seen by `get`, `iter` or `live`.
@@ -3209,7 +3241,7 @@ fn begin_http_stream(entry: &mut SessionEntry, proxies: &crate::table::Table, fe
             let data = stream_log_data(entry, std::slice::from_ref(fe), 0, pid);
             let view = ProxiesView(proxies);
             let stick = StickView::new(proxies, &entry.sess.tracked_sc);
-            let ctx = stream_sample_ctx(&entry.sess, fe, fe, &view, &stick);
+            let ctx = stream_sample_ctx(&entry.sess, fe, fe, &view, &stick, None);
             fmt.render(&data, sample_registry(), &ctx.as_ctx())
         };
         if let Some(h) = fe.unique_id_header.as_deref() {
@@ -3276,10 +3308,11 @@ fn request_date(log: &crate::txnlog::StreamLog) -> (i64, u32) {
 }
 
 /// The sample context a log line's `%[...]` reads.
-fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>) -> alcyon_sample::PhaseCtx<'a> {
+fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>, fc: Option<&'a crate::proxy::ConnView<'a>>) -> alcyon_sample::PhaseCtx<'a> {
     alcyon_sample::PhaseCtx {
         proxies: Some(view),
         stick: Some(stick),
+        fc: fc.map(|c| c as &dyn alcyon_sample::FrontConnState),
         client_addr: s.client_addr,
         server_addr: s.server_addr,
         fc_src: s.fc_src(),
@@ -3855,7 +3888,7 @@ fn stream_log_line(entry: &SessionEntry, proxies: &crate::table::Table, pid: u32
     CURRENT_SRV_STATUS.set(entry.sess.strm.log.srv_status);
     let tr = entry.sess.strm.log.data.zip(entry.sess.strm.log.connect).map(|(d, c)| d.saturating_duration_since(c).as_millis());
     CURRENT_RES_TR.set(tr.map_or(-1, |ms| i64::try_from(ms).unwrap_or(i64::MAX)));
-    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, res_status: txn_status, ..stream_sample_ctx(&entry.sess, fe, be, &view, &stick) }, live: None };
+    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, res_status: txn_status, ..stream_sample_ctx(&entry.sess, fe, be, &view, &stick, None) }, live: None };
     let (line, sd) = with_sd(fe.log_format_sd(), fmt, &data, &ctx);
     fe.log_count.fetch_add(1, Ordering::Relaxed);
     Some((line, sd, err))
@@ -4020,7 +4053,8 @@ fn proxy_header_error_line(entry: &SessionEntry, proxies: &crate::table::Table, 
     };
     let (view, stick) = (ProxiesView(proxies), StickView::new(proxies, &s.tracked_sc));
     // No stream, so no backend either: `be_name` has no value in `HAProxy`'s line.
-    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, conn_err: Some(failure.conn_err()), be_name: None, be_id: None, ..stream_sample_ctx(s, fe, fe, &view, &stick) }, live: None };
+    let fc = crate::proxy::ConnView::from_conn(s);
+    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, conn_err: Some(failure.conn_err()), be_name: None, be_id: None, ..stream_sample_ctx(s, fe, fe, &view, &stick, fc.as_ref()) }, live: None };
     let line = match fe.error_log_format() {
         Some(elf) => with_sd(fe.log_format_sd(), elf, &data, &ctx),
         None => {
@@ -8153,7 +8187,7 @@ fn res_sample_may_change(expr: &Expr, rep: &[u8]) -> bool {
 /// `tcp-response inspect-delay` runs out, when they decide on what is there.
 fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &crate::table::Table, registry: &Registry, sess: &mut TcpSession, now: Tick) -> ContentEvalResult {
     let server_closed = matches!(sess.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
-    let expired = sess.res_inspect_exp.is_none_or(|exp| exp.is_expired(now));
+    let expired = sess.res_inspect.as_ref().and_then(|r| r.exp).is_none_or(|exp| exp.is_expired(now));
     let final_ = server_closed || sess.rep.is_full() || expired;
     let rep_bytes = sess.rep.readable();
     let stick = StickView::new(proxies, &sess.tracked_sc);
@@ -8403,8 +8437,11 @@ fn stream_timeouts_enter(proxies: &crate::table::Table, fe_idx: usize, be_idx: u
 /// Readies a TCP-mode stream for `proxy`'s `tcp-response content` rules, if it has any
 /// (`AN_RES_INSPECT`, set with the backend); they start when the server connects.
 fn arm_res_inspect(proxy: &Proxy, sess: &mut TcpSession) {
-    sess.res_inspect_armed = (sess.mode == Mode::Tcp && !proxy.tcp_res_content_rules.is_empty())
-        .then(|| proxy.tcp_res_inspect_delay.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
+    if sess.mode == Mode::Tcp && !proxy.tcp_res_content_rules.is_empty() {
+        if let Some(r) = sess.res_inspect.get_or_init(&crate::proxy::RES_INSPECT_POOL) {
+            r.armed = Some(proxy.tcp_res_inspect_delay.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -8695,7 +8732,8 @@ fn proxy_header(fe: &Proxy, proxy: &Proxy, proxies: &crate::table::Table, sess: 
             if tlvs.tlvs.iter().any(|(_, fmt)| fmt.is_some()) {
                 let view = ProxiesView(proxies);
                 let stick = StickView::new(proxies, &sess.tracked_sc);
-                let phase = stream_sample_ctx(sess, fe, proxy, &view, &stick);
+                let fc = crate::proxy::ConnView::from_conn(sess);
+                let phase = stream_sample_ctx(sess, fe, proxy, &view, &stick, fc.as_ref());
                 let ctx = phase.as_ctx();
                 let data = session_log_data(sess, fe, proxy, std::process::id());
                 append_tlvs(Some((&data, &ctx)));
@@ -8709,7 +8747,8 @@ fn proxy_header(fe: &Proxy, proxy: &Proxy, proxies: &crate::table::Table, sess: 
             // (`stream_generate_unique_id`, `make_proxy_line_v2`).
             if sess.strm.log.unique_id.is_none() {
                 if let Some(fmt) = fe.unique_id_format.as_ref() {
-                    let id = fmt.render(&session_log_data(sess, fe, proxy, std::process::id()), sample_registry(), &stream_sample_ctx(sess, fe, proxy, &ProxiesView(proxies), &StickView::new(proxies, &sess.tracked_sc)).as_ctx());
+                    let fc = crate::proxy::ConnView::from_conn(sess);
+                    let id = fmt.render(&session_log_data(sess, fe, proxy, std::process::id()), sample_registry(), &stream_sample_ctx(sess, fe, proxy, &ProxiesView(proxies), &StickView::new(proxies, &sess.tracked_sc), fc.as_ref()).as_ctx());
                     sess.strm.log.unique_id = Some(id);
                 }
             }
@@ -10056,7 +10095,7 @@ fn check_srv_connect(
 /// Whether one of the checks behind [`TcpSession::rare_armed`] is armed (T599).
 fn rare_check_armed(entry: &SessionEntry) -> bool {
     let s = &entry.sess;
-    entry.connect_log_due || entry.rate_max_due || s.session_rules_pending || !s.tcp_inspect_done || s.res_inspect_pending
+    entry.connect_log_due || entry.rate_max_due || s.session_rules_pending || !s.tcp_inspect_done || s.res_inspect_pending()
 }
 
 fn update_interests(entry: &mut SessionEntry, fdtab: &mut FdTab, poller: &mut Poller) {
@@ -10439,6 +10478,7 @@ impl EngineDispatcher<'_> {
     /// for an unparsable request, request rules and routing (once per transaction), the
     /// response head, how each side ended, and the end of the transaction.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn http_step(
         entry: &mut SessionEntry,
         proxies: &mut Proxies,
@@ -10450,6 +10490,7 @@ impl EngineDispatcher<'_> {
         wake_queue: &mut Vec<TaskRef>,
         now: Tick,
         lb_snap: &mut crate::lb::LbSnapCache,
+        fc: Option<crate::proxy::ConnView<'_>>,
     ) -> Option<crate::stats_html::AdminAction> {
         // An HTTP/2 connection serving a stream is not between requests: the stream is its
         // child's, which ends it (T280).
@@ -10588,7 +10629,7 @@ impl EngineDispatcher<'_> {
             if let Some(t) = entry.sess.strm.txn.as_mut() {
                 t.req_rules_done = true;
             }
-            admin = Self::connect_http_backend(entry, proxies, checks, pid, fdtab, poller, idle_pool, now, lb_snap);
+            admin = Self::connect_http_backend(entry, proxies, checks, pid, fdtab, poller, idle_pool, now, lb_snap, fc);
             let sess = &mut entry.sess;
             if let Some(t) = sess.strm.txn.as_mut() {
                 if t.body_wait.is_some() {
@@ -10621,7 +10662,7 @@ impl EngineDispatcher<'_> {
                 if Self::l7_retry(entry, proxies, fdtab, poller, now, lb_snap) {
                     continue;
                 }
-                if !Self::apply_http_response_rules(entry, proxies, now) {
+                if !Self::apply_http_response_rules(entry, proxies, now, fc) {
                     Self::write_response_head_names(entry, proxies);
                 }
             }
@@ -11778,7 +11819,8 @@ impl EngineDispatcher<'_> {
             self.h2_owner_pass(session_idx, now);
         }
         let (is_done, pending_admin, log_line, checkcache_alert) = {
-            let Some(entry) = self.sessions.get_mut(session_idx) else { return Outcome::Done };
+            let Some((entry, owner)) = self.sessions.get_mut_with_owner(session_idx) else { return Outcome::Done };
+            let fc = crate::proxy::ConnView::from_stream(&entry.sess, owner.map(|o| &o.sess));
             // The glitches the HTTP/2 connection counted since the last pass go to the entries
             // its stream counters track (`glitch_cnt`, `glitch_rate`); while a stream is served,
             // the owner pass credits them, to the counters as the stream tracks them.
@@ -11866,12 +11908,11 @@ impl EngineDispatcher<'_> {
                 }
 
                 // Step 3.45: TCP mode, `tcp-response content` rules over the response so far.
-                if entry.sess.res_inspect_pending && !entry.sess.is_done() {
+                if entry.sess.res_inspect_pending() && !entry.sess.is_done() {
                     let be_idx = entry.backend_idx;
                     let res = eval_tcp_res_content_rules(&self.proxies[be_idx], &self.proxies, sample_registry(), &mut entry.sess, now);
                     if res != ContentEvalResult::Waiting {
-                        entry.sess.res_inspect_pending = false;
-                        entry.sess.res_inspect_exp = None;
+                        entry.sess.res_inspect.reset(&crate::proxy::RES_INSPECT_POOL);
                     }
                     match res {
                         ContentEvalResult::Waiting => {}
@@ -11945,6 +11986,7 @@ impl EngineDispatcher<'_> {
                     &mut self.wake_queue,
                     now,
                     self.lb_snap,
+                    fc,
                 );
             }
 
@@ -12403,17 +12445,17 @@ impl EngineDispatcher<'_> {
     /// The response head's rules, framing and `Connection`. True when the head's names are
     /// in lower case already, from its index (E2), and [`Self::write_response_head_names`]
     /// has nothing to do.
-    fn apply_http_response_rules(entry: &mut SessionEntry, proxies: &crate::table::Table, now: Tick) -> bool {
+    fn apply_http_response_rules(entry: &mut SessionEntry, proxies: &crate::table::Table, now: Tick, fc: Option<crate::proxy::ConnView<'_>>) -> bool {
         if let Some(c) = entry.sess.h2_child_mut() {
             c.rsp_head = None;
         }
         let mut lowered = false;
-        Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered);
+        Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered, fc);
         lowered
     }
 
     #[allow(clippy::too_many_lines)]
-    fn apply_http_response_rules_in(entry: &mut SessionEntry, proxies: &crate::table::Table, now: Tick, lowered: &mut bool) {
+    fn apply_http_response_rules_in(entry: &mut SessionEntry, proxies: &crate::table::Table, now: Tick, lowered: &mut bool, fc: Option<crate::proxy::ConnView<'_>>) {
         let threshold = entry.sess.bufsize.saturating_sub(entry.sess.maxrewrite);
         // Empty lines ahead of a status line are skipped (`H1_MSG_RPBEFORE`), so that the
         // end of the head is not looked for in them (T275).
@@ -13023,6 +13065,7 @@ impl EngineDispatcher<'_> {
         let mut ctx = alcyon_sample::PhaseCtx {
             proxies: Some(&ProxiesView(proxies)),
             stick: Some(&stick),
+            fc: fc.as_ref().map(|c| c as &dyn alcyon_sample::FrontConnState),
             client_addr: entry.sess.client_addr,
             server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src(),
@@ -14026,6 +14069,7 @@ impl EngineDispatcher<'_> {
         idle_pool: &mut IdlePool,
         now: Tick,
         lb_snap: &mut crate::lb::LbSnapCache,
+        fc: Option<crate::proxy::ConnView<'_>>,
     ) -> Option<crate::stats_html::AdminAction> {
         let proxy_idx = entry.proxy_idx;
         // A request held for its body (`wait-for-body`) comes back here when the body is
@@ -14139,6 +14183,7 @@ impl EngineDispatcher<'_> {
             // context is this and the live session, read at the fetch (`LiveReq`).
             let phase = alcyon_sample::PhaseCtx {
                 proxies: Some(&ProxiesView(proxies)),
+                fc: fc.as_ref().map(|c| c as &dyn alcyon_sample::FrontConnState),
                 fc_src: sess.fc_src(),
                 so_id: sess.so_id,
                 fc_dst: sess.fc_dst(),
@@ -15167,7 +15212,7 @@ impl EngineDispatcher<'_> {
         // at the end of the last `Forwarded` header.
         if let Some(fwd) = proxies[be_idx].stats_config.forwarded.clone() {
             let stick = StickView::new(proxies, &entry.sess.tracked_sc);
-            let element = forwarded_element(&fwd, &entry.sess, &stream_sample_ctx(&entry.sess, &proxies[proxy_idx], &proxies[be_idx], &ProxiesView(proxies), &stick).as_ctx());
+            let element = forwarded_element(&fwd, &entry.sess, &stream_sample_ctx(&entry.sess, &proxies[proxy_idx], &proxies[be_idx], &ProxiesView(proxies), &stick, None).as_ctx());
             if !append_forwarded_element(&mut entry.sess, &element) {
                 return Self::request_no_room(entry, proxies);
             }
@@ -18943,6 +18988,74 @@ mod arena_tests {
         let mut a = SessionArena::with_capacity(2);
         assert!(a.get2_mut(0, 0).is_none());
         assert!(a.get2_mut(0, 1).is_none());
+    }
+
+    /// `get_mut_with_owner` works whether the child's slot index is below or above the owner's.
+    #[test]
+    fn get_mut_with_owner_handles_both_index_orders() {
+        use std::os::fd::OwnedFd;
+        let make = |task_idx: u32, role: Option<crate::proxy::H2Role>| {
+            let (x, _y) = std::os::unix::net::UnixStream::pair().expect("pair");
+            let mut sess = crate::proxy::TcpSession::new(OwnedFd::from(x), Default::default(), 0, alcyon_sched::Tick::ETERNITY);
+            sess.h2_role = role.map(Box::new);
+            super::SessionEntry {
+                sess,
+                task: alcyon_sched::TaskRef(task_idx),
+                proxy_idx: 0,
+                backend_idx: 0,
+                srv_backend_idx: 0,
+                target_server_idx: None,
+                cli_raw_fd: -1,
+                srv_raw_fd: None,
+                cli_interest: super::Interest::NONE,
+                srv_interest: super::Interest::NONE,
+                actconn_reclaimed: false,
+                stats_done: false,
+                be_counted: std::cell::Cell::new(u32::MAX),
+                connect_log_due: false,
+                rate_max_due: false,
+                srv_served: 0,
+                log_line: None,
+                log_err: false,
+                log_sd: 0,
+                buf_wait: crate::buf_wait::WaitState::default(),
+                parked: false,
+            }
+        };
+        let mut arena = SessionArena::with_capacity(4);
+        let child_role = |oi: u32, ot: u32| {
+            crate::proxy::H2Role::Child(crate::proxy::H2Child {
+                owner: Some((oi, alcyon_sched::TaskRef(ot))),
+                stream: crate::proxy::H2ActiveStream { id: 1, body: Default::default(), chunk_out: false },
+                late_trailers: None,
+                rsp_head: None,
+                reset: false,
+                finished: false,
+                conn_end: None,
+                owner_tx_pending: false,
+                rst: None,
+                goaway: None,
+                tls: None,
+                quic_ack: None,
+                req_abs: Default::default(),
+                sess_vars_at_start: Default::default(),
+            })
+        };
+        // Slot 0 = child pointing to owner at slot 1 (a < b), slot 1 = owner.
+        let i0 = arena.alloc(make(10, Some(child_role(1, 20)))).unwrap();
+        let i1 = arena.alloc(make(20, Some(crate::proxy::H2Role::Owner(Default::default())))).unwrap();
+        assert_eq!((i0, i1), (0, 1));
+        {
+            let (c, o) = arena.get_mut_with_owner(0).unwrap();
+            assert_eq!(c.task, alcyon_sched::TaskRef(10));
+            assert_eq!(o.unwrap().task, alcyon_sched::TaskRef(20));
+        }
+        // Slot 2 = child pointing to owner at slot 1 (a > b).
+        let i2 = arena.alloc(make(30, Some(child_role(1, 20)))).unwrap();
+        assert_eq!(i2, 2);
+        let (c, o) = arena.get_mut_with_owner(2).unwrap();
+        assert_eq!(c.task, alcyon_sched::TaskRef(30));
+        assert_eq!(o.unwrap().task, alcyon_sched::TaskRef(20));
     }
 }
 
