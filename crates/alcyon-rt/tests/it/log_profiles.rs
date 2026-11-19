@@ -393,13 +393,11 @@ backend be_tcp
 
     let mut f2 = tempfile::NamedTempFile::new().expect("tempfile");
     f2.write_all(cfg.as_bytes()).expect("write cfg");
-    let stderr_file = tempfile::NamedTempFile::new().expect("stderr file");
-    let stderr = std::fs::File::create("/tmp/lp_test_stderr.log").expect("stderr log");
     let mut child = common::alcyon_command(bin())
         .arg("-f")
         .arg(f2.path())
         .stdout(std::process::Stdio::null())
-        .stderr(stderr)
+        .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn");
 
@@ -446,8 +444,7 @@ backend be_tcp
         lines.push(h.lock().unwrap().clone().iter().map(|s| normalize(s)).collect());
     }
 
-    let mut child2 = child;
-    common::stop(&mut child2);
+    common::stop(&mut child);
 
     const L: &str = "<134>1 TS - haproxy PID - - ";
     expect("fe1/no-profile", &lines[0], &[
@@ -479,4 +476,129 @@ backend be_tcp
         &format!("{L}http-after-res"),
         &format!("{L}txn_close"),
     ]);
+}
+
+#[test]
+fn extra_steps_sd_only_and_tcp_do_log_match_oracle() {
+    let be = responder();
+    let mut socks = Vec::new();
+    for _ in 0..4 {
+        socks.push(UdpSocket::bind("127.0.0.1:0").expect("collector bind"));
+    }
+    let c: Vec<SocketAddr> = socks.iter().map(|s| s.local_addr().expect("addr")).collect();
+    let f: Vec<SocketAddr> = (0..4).map(|_| common::reserve_addr()).collect();
+
+    let cfg = format!(
+        r#"defaults
+  mode http
+  timeout connect 5s
+  timeout client 5s
+  timeout server 5s
+  log-tag "haproxy"
+
+frontend fe_tcp_dolog
+  bind {f0}
+  mode http
+  log-format "dummy"
+  log-steps close
+  log udp@{c0} format rfc5424 profile p_any local0
+  tcp-request session do-log
+  tcp-request content do-log
+  default_backend be
+
+frontend fe_connect_only
+  bind {f1}
+  mode http
+  log-format "%OG"
+  log-steps connect
+  log udp@{c1} format rfc5424 local0
+  default_backend be
+
+frontend fe_sd_only
+  bind {f2}
+  mode http
+  log-format "%ST"
+  log-steps close
+  log udp@{c2} format rfc5424 profile p_sd local0
+  default_backend be
+
+frontend fe_plain_dolog
+  bind {f3}
+  mode http
+  log-format "%OG"
+  log-steps close
+  http-request do-log
+  log udp@{c3} format rfc5424 local0
+  default_backend be
+
+log-profile p_any
+  on any format "%OG"
+
+log-profile p_sd
+  on close sd "sdonly"
+
+backend be
+  mode http
+  server app1 {be}
+"#,
+        f0 = f[0],
+        f1 = f[1],
+        f2 = f[2],
+        f3 = f[3],
+        c0 = c[0],
+        c1 = c[1],
+        c2 = c[2],
+        c3 = c[3],
+        be = be,
+    );
+
+    let mut cfg_file = tempfile::NamedTempFile::new().expect("tempfile");
+    cfg_file.write_all(cfg.as_bytes()).expect("write cfg");
+    let mut child = common::alcyon_command(bin())
+        .arg("-f")
+        .arg(cfg_file.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+
+    let stop = Instant::now() + Duration::from_secs(5);
+    let mut holders = Vec::new();
+    for sock in socks {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        holders.push(lines.clone());
+        thread::spawn(move || drain(sock, stop, lines));
+    }
+
+    get_wait(f[0]);
+    get(f[1]);
+    get(f[2]);
+    get(f[3]);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let total: usize = holders.iter().map(|h| h.lock().unwrap().len()).sum();
+        if total >= 7 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(200));
+
+    let lines: Vec<Vec<String>> = holders
+        .iter()
+        .map(|h| h.lock().unwrap().iter().map(|s| normalize(s)).collect())
+        .collect();
+
+    common::stop(&mut child);
+
+    const L: &str = "<134>1 TS - haproxy PID - - ";
+    expect("fe_tcp_dolog", &lines[0], &[
+        &format!("{L}tcp-req-sess"),
+        &format!("{L}tcp-req-cont"),
+        &format!("{L}txn_close"),
+    ]);
+    expect("fe_connect_only", &lines[1], &[&format!("{L}txn_connect")]);
+    expect("fe_sd_only", &lines[2], &["<134>1 TS - haproxy PID - sdonly 200"]);
+    expect("fe_plain_dolog", &lines[3], &[&format!("{L}http-req"), &format!("{L}txn_close")]);
 }

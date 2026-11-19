@@ -221,13 +221,17 @@ pub struct ResolvedStep {
 
 /// How a profile resolves a log step.
 pub enum StepResolution<'p> {
-    /// No profile, no matching step (and no `on any`), or a step with no `format`: the
-    /// proxy's own line stands.
+    /// No profile, no matching step (and no `on any`), or a step with neither `format` nor
+    /// `sd`: the proxy's own line stands.
     Normal,
     /// The step says `drop`: send nothing.
     Drop,
-    /// The step's `format` (and optional `sd`) replace the proxy's line.
-    Format { format: &'p crate::logfmt::LogFormat, sd: Option<&'p crate::logfmt::LogFormat> },
+    /// The step's `format` and/or `sd` replace the proxy's line's message and/or
+    /// structured data.
+    Override {
+        format: Option<&'p crate::logfmt::LogFormat>,
+        sd: Option<&'p crate::logfmt::LogFormat>,
+    },
 }
 
 impl ResolvedProfile {
@@ -242,10 +246,11 @@ impl ResolvedProfile {
         match step {
             None => StepResolution::Normal,
             Some(s) if s.drop => StepResolution::Drop,
-            Some(s) => match s.format.as_ref() {
-                Some(format) => StepResolution::Format { format, sd: s.sd.as_deref() },
-                None => StepResolution::Normal,
+            Some(s) if s.format.is_some() || s.sd.is_some() => StepResolution::Override {
+                format: s.format.as_deref(),
+                sd: s.sd.as_deref(),
             },
+            Some(_) => StepResolution::Normal,
         }
     }
 }
@@ -336,7 +341,9 @@ impl SyslogTarget {
     fn resolve_profile(p: &alcyon_config::ast::logging::LogProfileSection) -> ResolvedProfile {
         ResolvedProfile {
             name: p.name.clone(),
-            log_tag: p.log_tag.clone(),
+            // `syslog_tag` format (`<name>[<pid>]`) so `split_tag` preserves the process
+            // PID when `log-profile` overrides the tag (`hdr.metadata[LOG_META_TAG]`).
+            log_tag: p.log_tag.as_deref().map(|t| format!("{t}[{}]", std::process::id())),
             steps: p
                 .steps
                 .iter()

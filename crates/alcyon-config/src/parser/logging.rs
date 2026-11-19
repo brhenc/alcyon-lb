@@ -247,18 +247,18 @@ pub(crate) fn parse_log_steps(steps: &mut Option<u8>, tokens: &[Token], kw: &Tok
             continue;
         }
         match name {
-            "accept" => mask |= 0x01,
-            "request" => mask |= 0x02,
-            "connect" => mask |= 0x04,
-            "response" => mask |= 0x08,
-            "close" => mask |= 0x20,
+            "accept" => mask |= crate::ast::LOG_STEP_ACCEPT,
+            "request" => mask |= crate::ast::LOG_STEP_REQUEST,
+            "connect" => mask |= crate::ast::LOG_STEP_CONNECT,
+            "response" => mask |= crate::ast::LOG_STEP_RESPONSE,
+            "close" => mask |= crate::ast::LOG_STEP_CLOSE,
             "http-req" | "http-res" | "http-after-res"
             | "tcp-req-conn" | "tcp-req-sess" | "tcp-req-cont" | "tcp-res-cont" => {}
             "all" => all = true,
             _ => return Err(err(name)),
         }
     }
-    *steps = Some(if all { 0x2F } else { mask });
+    *steps = Some(if all { crate::ast::LOG_STEP_ALL } else { mask });
     Ok(())
 }
 

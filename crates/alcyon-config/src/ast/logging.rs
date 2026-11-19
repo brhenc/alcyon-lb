@@ -65,6 +65,14 @@ pub struct LogSample {
     pub size: u32,
 }
 
+/// `log-steps` bitmask flags for the five standard stream steps.
+pub const LOG_STEP_ACCEPT: u8 = 0x01;
+pub const LOG_STEP_REQUEST: u8 = 0x02;
+pub const LOG_STEP_CONNECT: u8 = 0x04;
+pub const LOG_STEP_RESPONSE: u8 = 0x08;
+pub const LOG_STEP_CLOSE: u8 = 0x20;
+pub const LOG_STEP_ALL: u8 = LOG_STEP_ACCEPT | LOG_STEP_REQUEST | LOG_STEP_CONNECT | LOG_STEP_RESPONSE | LOG_STEP_CLOSE;
+
 /// The steps a `log-profile` names with `on <step>`, the seven `HAProxy` has always known
 /// and the extra ones registered by the `do-log` actions (`src/log.c`, `log_orig_register`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
