@@ -497,7 +497,9 @@ pub struct H2MuxContext {
     pub encoder: HpackEncoder,
     pub is_shut: bool,
     pub reset_count: u32,
-    pub continuation_stream: Option<u32>,
+    /// Stream ID of the open header block awaiting `CONTINUATION`; `0` means unset
+    /// (HTTP/2 stream IDs are 1..=0x7fff_ffff).
+    pub continuation_stream: u32,
     pub continuation_flags: u8,
     pub continuation_buf: Vec<u8>,
     pub continuation_count: u32,
@@ -616,7 +618,7 @@ impl H2MuxContext {
             encoder: HpackEncoder::new(),
             is_shut: false,
             reset_count: 0,
-            continuation_stream: None,
+            continuation_stream: 0,
             continuation_flags: 0,
             continuation_buf: Vec::new(),
             continuation_count: 0,
@@ -1662,7 +1664,8 @@ impl MuxH2 {
 
     /// A HEADERS frame (`header_block` without its padding and priority fields).
     fn handle_headers(ctx: &mut H2MuxContext, flags: u8, stream_id: u32, header_block: &[u8]) -> io::Result<()> {
-        if let Some(c_sid) = ctx.continuation_stream {
+        if ctx.continuation_stream != 0 {
+            let c_sid = ctx.continuation_stream;
             // As `handle_frame` answers any other frame where a CONTINUATION was due.
             ctx.send_goaway(c_sid, H2Error::ProtocolError, b"expected CONTINUATION frame");
             return Ok(());
@@ -1708,7 +1711,7 @@ impl MuxH2 {
 
         // (A block cannot pass 65536 bytes here: `parse` refuses a frame past 16384.)
         if (flags & frame_flags::END_HEADERS) == 0 {
-            ctx.continuation_stream = Some(stream_id);
+            ctx.continuation_stream = stream_id;
             ctx.continuation_flags = flags;
             ctx.continuation_buf = header_block.to_vec();
             ctx.continuation_count = 0;
@@ -1719,7 +1722,8 @@ impl MuxH2 {
     }
 
     fn handle_frame(ctx: &mut H2MuxContext, frame: Frame) -> io::Result<()> {
-        if let Some(c_sid) = ctx.continuation_stream {
+        if ctx.continuation_stream != 0 {
+            let c_sid = ctx.continuation_stream;
             if let Frame::Continuation {
                 stream_id,
                 flags,
@@ -1748,7 +1752,7 @@ impl MuxH2 {
                 if (flags & frame_flags::END_HEADERS) != 0 {
                     let combined_flags = ctx.continuation_flags;
                     let combined_block = std::mem::take(&mut ctx.continuation_buf);
-                    ctx.continuation_stream = None;
+                    ctx.continuation_stream = 0;
                     ctx.continuation_count = 0;
                     return Self::process_headers_block(ctx, c_sid, combined_flags, &combined_block);
                 }

@@ -60,7 +60,8 @@ pub struct StreamLog {
     pub unique_id: Option<String>,
     /// The configuration line of the last rule that ended a rule set for this request
     /// (`s->last_rule_line`), for `last_rule_file` and `last_rule_line`.
-    pub last_rule: Option<u32>,
+    /// `0` means unset (configuration line numbers are 1-based).
+    pub last_rule: u32,
     /// `set-priority-class` and `set-priority-offset` (`s->priority_class`, `priority_offset`).
     pub prio_class: i32,
     pub prio_offset: i32,
@@ -238,7 +239,7 @@ impl StreamLog {
             req_captures: Vec::new(),
             res_captures: Vec::new(),
             unique_id: None,
-            last_rule: None,
+            last_rule: 0,
             prio_class: 0,
             prio_offset: 0,
             uniq_id: STREAM_COUNTER.fetch_add(1, Ordering::Relaxed),
@@ -305,7 +306,7 @@ impl StreamLog {
         release_captures(req_captures);
         release_captures(res_captures);
         *unique_id = None;
-        *last_rule = None;
+        *last_rule = 0;
         *prio_class = 0;
         *prio_offset = 0;
         *uniq_id = STREAM_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -453,7 +454,7 @@ mod tests {
         l.res_captures = vec![None];
         set_capture(&mut l.res_captures[0], b"y");
         l.unique_id = Some("id".into());
-        (l.last_rule, l.prio_class, l.prio_offset) = (Some(4), 5, 6);
+        (l.last_rule, l.prio_class, l.prio_offset) = (4, 5, 6);
         (l.term, l.status, l.redispatched, l.applet, l.be_queue, l.asap_done, l.srv_status) = (Some(*b"PR"), Some(400), true, true, 7, true, 200);
         let _ = l.date();
         let id = l.uniq_id;

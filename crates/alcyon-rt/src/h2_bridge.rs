@@ -13,7 +13,7 @@
 //! connection (`HAProxy`'s `h2s` and `struct stream`).
 
 use crate::buf::Buf;
-use crate::proxy::{find_eoh, H2ActiveStream, H2ReqBody, TcpSession};
+use crate::proxy::{find_eoh, sess_flags, H2ActiveStream, H2ReqBody, TcpSession};
 use crate::raw;
 use crate::txn::{self, HttpTxn, MsgState};
 use alcyon_proto::endpoint::ScState;
@@ -265,7 +265,7 @@ fn start_adopted(sess: &mut TcpSession, rx: RxHead, facts: HeadFacts, abs_len: u
         // Text: the writer checked the scheme and the authority.
         let abs = (abs_len > 0).then(|| String::from_utf8_lossy(&rx.bytes()[facts.tail..facts.tail + abs_len]));
         sess.set_req_abs(abs.as_deref());
-        if sess.keep_request_line {
+        if sess.flags.has(sess_flags::KEEP_REQUEST_LINE) {
             let abs = abs.as_deref().unwrap_or("");
             sess.strm.log.request_line.set_parts(&[line.method, " ", abs, line.uri, " ", version]);
         }
@@ -297,11 +297,7 @@ fn start_adopted(sess: &mut TcpSession, rx: RxHead, facts: HeadFacts, abs_len: u
     }
     sess.htx_tail = tail;
     sess.htx_blocks = blocks;
-    sess.has_htx = true;
-    // The head is the HTX's alone until the send writes it (X4, `write_pending_head`):
-    // the rules edit the blocks only, as for an edited HTTP/1 head (X2).
-    sess.htx_modified = true;
-    sess.req_head_pending = true;
+    sess.flags.set(sess_flags::HAS_HTX | sess_flags::HTX_MODIFIED | sess_flags::REQ_HEAD_PENDING);
     if let Some(c) = sess.h2_child_mut() {
         c.stream.body.head_room = out_len;
     }
@@ -325,7 +321,7 @@ fn head_ws<'a>(headers: impl Iterator<Item = (&'a str, &'a str)>, key_written: b
 #[cold]
 #[inline(never)]
 fn start_text(sess: &mut TcpSession, head: &TextHead, request_line: Option<&str>, chunked: bool, d_req_htx: u64, bad_request: bool, head_no_mem: bool) {
-    if sess.keep_request_line {
+    if sess.flags.has(sess_flags::KEEP_REQUEST_LINE) {
         sess.strm.log.request_line.set_opt(request_line);
     }
     sess.req_ws = head.facts.ext_connect.then(|| head_ws(head.text_headers(), head.facts.key_written)).flatten();
@@ -393,10 +389,10 @@ fn start_txn(sess: &mut TcpSession, framing: txn::Framing, req_htx: u64, bad_req
 /// refuses (a `content-length` a rule made invalid) and no HTX at all.
 pub fn write_pending_head(sess: &mut TcpSession, lower: bool, case_map: Option<&std::collections::HashMap<String, String>>) -> bool {
     use alcyon_proto::h1_encode::{h1_encode_head, H1Dir, H1EncodeOpts, SlFlags};
-    if !std::mem::take(&mut sess.req_head_pending) || !sess.has_htx {
+    if !sess.flags.take(sess_flags::REQ_HEAD_PENDING) || !sess.flags.has(sess_flags::HAS_HTX) {
         return false;
     }
-    sess.htx_modified = false;
+    sess.flags.clear(sess_flags::HTX_MODIFIED);
     if let Some(c) = sess.h2_child_mut() {
         c.stream.body.head_room = 0;
     }
@@ -1080,7 +1076,7 @@ mod tests {
     fn a_head_the_h1_parser_refuses_still_starts_the_transaction_without_parsed_htx() {
         let (mut s, _owner, _peer) = child();
         start_request(&mut s, dispatch(text(&[(b":method", b"G T"), (b":scheme", b"https"), (b":path", b"/p")])));
-        assert!(!s.has_htx, "the parser refused the head: no HTX for the rules");
+        assert!(!s.flags.has(sess_flags::HAS_HTX), "the parser refused the head: no HTX for the rules");
         assert_eq!(s.req.readable(), b"G T /p HTTP/1.1\r\n\r\n", "the head is in `req` as it came");
         assert_eq!((s.req_method.as_deref(), s.req_uri.as_deref()), (Some("G T"), Some("/p")));
         assert_eq!(s.strm.txn.as_ref().and_then(|t| t.req_htx), Some(7));
@@ -1090,12 +1086,12 @@ mod tests {
         let (mut s, _owner, _peer) = child();
         let (rx, facts, abs_len) = written(&[(b":method", b"GET"), (b":scheme", b"https"), (b":path", b"/"), (b"host", b"x")]);
         start_request(&mut s, dispatch(DispatchHead::Htx { rx, facts, abs_len, version: "HTTP/2.0" }));
-        assert!(s.has_htx, "a valid head is parsed");
+        assert!(s.flags.has(sess_flags::HAS_HTX), "a valid head is parsed");
         // X4: in its HTX alone until the send writes it, once.
-        assert!(s.req.readable().is_empty() && s.req_head_pending, "no text before the send");
+        assert!(s.req.readable().is_empty() && s.flags.has(sess_flags::REQ_HEAD_PENDING), "no text before the send");
         assert!(write_pending_head(&mut s, false, None));
         assert_eq!(s.req.readable(), b"GET / HTTP/1.1\r\nhost: x\r\n\r\n");
-        assert!(!s.req_head_pending && !write_pending_head(&mut s, false, None), "written once");
+        assert!(!s.flags.has(sess_flags::REQ_HEAD_PENDING) && !write_pending_head(&mut s, false, None), "written once");
     }
 
     /// CP2b-2: the text of a head the checks refuse is forwarded with the canonical
@@ -1104,7 +1100,7 @@ mod tests {
     #[test]
     fn a_text_head_goes_out_framed_with_its_bytes() {
         let (mut s, _owner, _peer) = child();
-        s.keep_request_line = true;
+        s.flags.set(sess_flags::KEEP_REQUEST_LINE);
         let mut d = dispatch(text(&[(b":method", b"POST"), (b":scheme", b"https"), (b":path", b"/caf\xe9"), (b":authority", b"x"), (b"content-length", b"005")]));
         let DispatchHead::Text(t) = &d.head else { panic!("text") };
         d.add_len = t.add_len;
@@ -1115,7 +1111,7 @@ mod tests {
         assert_eq!(txn.req_htx, Some(7 - 3 + 1), "`005` counted as the `5` it goes out as");
         assert!(txn.req_len_hdrs.is_some_and(|l| l.clen));
         assert_eq!(s.strm.log.request_line.as_deref(), Some("POST https://x/caf\u{f7e9} HTTP/2.0"));
-        assert_eq!((s.req_headers.as_ref().map(Vec::len), s.has_htx), (Some(2), false));
+        assert_eq!((s.req_headers.as_ref().map(Vec::len), s.flags.has(sess_flags::HAS_HTX)), (Some(2), false));
 
         let (mut s, _owner, _peer) = child();
         let mut d = dispatch(text(&[(b":method", b"POST"), (b":scheme", b"https"), (b":path", b"/a\xe9"), (b":authority", b"x")]));
@@ -1131,7 +1127,7 @@ mod tests {
         let mut d = dispatch(DispatchHead::None);
         d.no_memory = true;
         start_request(&mut s, d);
-        assert!(!s.has_htx && s.req.readable().is_empty());
+        assert!(!s.flags.has(sess_flags::HAS_HTX) && s.req.readable().is_empty());
         assert!(s.strm.txn.as_ref().is_some_and(|t| t.req_htx == Some(7)));
     }
 
@@ -1196,12 +1192,12 @@ mod tests {
         let (rx, facts, abs_len) = written(&[(b":method", b"POST"), (b":scheme", b"https"), (b":path", b"/a"), (b":authority", b"x"), (b"content-length", b"005")]);
         let ptr = rx.bytes().as_ptr();
         let (mut s, _owner, _peer) = child();
-        s.keep_request_line = true;
+        s.flags.set(sess_flags::KEEP_REQUEST_LINE);
         let mut d = dispatch(DispatchHead::None);
         d.head = DispatchHead::Htx { rx, facts, abs_len, version: "HTTP/2.0" };
         start_request(&mut s, d);
         assert_eq!(s.htx_buf.raw_slice().as_ptr(), ptr, "adopted, not copied");
-        assert!(s.has_htx && s.req_head_pending && s.req.readable().is_empty());
+        assert!(s.flags.has(sess_flags::HAS_HTX) && s.flags.has(sess_flags::REQ_HEAD_PENDING) && s.req.readable().is_empty());
         assert_eq!((s.req_method.as_deref(), s.req_uri.as_deref()), (Some("POST"), Some("/a")));
         assert_eq!(s.strm.log.request_line.as_deref(), Some("POST https://x/a HTTP/2.0"));
         let txn = s.strm.txn.as_ref().expect("a transaction");
@@ -1226,7 +1222,7 @@ mod tests {
         let (rx, mut facts, _) = written(&[(b":method", b"GET"), (b":path", b"/")]);
         facts.blocks = 0;
         let (mut s, _owner, _peer) = child();
-        s.keep_request_line = true;
+        s.flags.set(sess_flags::KEEP_REQUEST_LINE);
         let mut d = dispatch(DispatchHead::None);
         d.head = DispatchHead::Htx { rx, facts, abs_len: 0, version: "HTTP/2.0" };
         start_request(&mut s, d);
