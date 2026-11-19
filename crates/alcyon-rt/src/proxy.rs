@@ -505,6 +505,10 @@ pub struct H2Child {
     /// The connection's session variables as the stream got them: what it changed of them
     /// goes back to the connection, and only that, as other streams may have set others.
     pub sess_vars_at_start: alcyon_sample::VarStore,
+    /// The connection's stream count (`h2c->nb_streams`, on the owner's mux), shared with
+    /// the connection and with the connection's other streams, so the stream reads
+    /// `fc_nb_streams` without touching the connection.
+    pub nb_streams: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl H2Child {
@@ -1106,6 +1110,22 @@ impl TcpSession {
         (self.mode == Mode::Http && self.srv.is_some()).then_some(1)
     }
 
+    /// `fc_nb_streams` (`smp_fetch_fc_nb_streams`, `src/connection.c`): how many streams the
+    /// client connection's mux serves now. One on an HTTP/1 connection, which serves a stream
+    /// at a time; on an HTTP/2 stream, the connection's count (`h2c->nb_streams`, kept on the
+    /// owner's mux and read through the stream's [`H2Child::nb_streams`], a single load); none
+    /// where the connection has no HTTP mux (TCP mode), where the connection is gone, or on
+    /// the connection's own entry, whose streams are the ones that read it.
+    #[must_use]
+    pub fn fc_nb_streams(&self) -> Option<u32> {
+        if let Some(H2Role::Child(c)) = self.h2_role.as_deref() {
+            return c.owner
+                .is_some()
+                .then(|| c.nb_streams.load(std::sync::atomic::Ordering::Acquire));
+        }
+        (self.mode == Mode::Http && self.h2_role.is_none()).then_some(1)
+    }
+
     /// The client connection's source address as the connection saw it.
     #[must_use]
     pub fn fc_src(&self) -> Option<SocketAddr> {
@@ -1354,6 +1374,10 @@ impl TcpSession {
     /// What a stream's session takes of its connection `owner` when its stream starts.
     fn h2_child_init(&mut self, owner: &mut TcpSession, owner_ref: (u32, alcyon_sched::TaskRef), stream: H2ActiveStream) {
         let c = self;
+        // The connection's stream count, on the connection's mux: what the stream's
+        // `fc_nb_streams` reads (always some for an HTTP/2 stream: the owner always has its
+        // `h2_ctx`, which is how the stream was made).
+        let nb_count = owner.h2_ctx.as_deref().map(|h| std::sync::Arc::clone(&h.nb_streams));
         // Each stream of the connection is a new stream in `HAProxy`, and its connector
         // starts at the session's value under the connection's: a previous stream's
         // stream-level set goes with that stream, not this one.
@@ -1395,7 +1419,10 @@ impl TcpSession {
         c.is_first_req = owner.is_first_req;
         // A session that served a stream before has its role and its strings still.
         if let Some(H2Role::Child(ch)) = c.h2_role.as_deref_mut() {
-            let H2Child { owner: o, stream: st, late_trailers, rsp_head, reset, finished, conn_end, owner_tx_pending, rst, goaway, tls: _, quic_ack, req_abs, sess_vars_at_start } = ch;
+            let H2Child { owner: o, stream: st, late_trailers, rsp_head, reset, finished, conn_end, owner_tx_pending, rst, goaway, tls: _, quic_ack, req_abs, sess_vars_at_start, nb_streams: _ } = ch;
+            // The role's `nb_streams` is the owner mux's counter: the role was built for
+            // this owner and the owner's mux is never replaced, so the stored `Arc` still
+            // is the connection's.
             *o = Some(owner_ref);
             *st = stream;
             *late_trailers = None;
@@ -1445,6 +1472,7 @@ impl TcpSession {
                 v.copy_scope_from(&owner.strm.vars, alcyon_sample::VarScope::Sess);
                 v
             },
+            nb_streams: nb_count.unwrap_or_else(|| std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1))),
         });
         c.h2_role = Some(match spare_role {
             Some(mut b) => {
@@ -1709,6 +1737,7 @@ impl TcpSession {
             keep
         });
         h2.streams = streams;
+        h2.count_streams();
         if h2.streams.is_empty() {
             h2.trim_idle();
         }

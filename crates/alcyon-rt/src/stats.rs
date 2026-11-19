@@ -1443,6 +1443,7 @@ mod tests {
             hash_preserve_affinity: alcyon_config::HashPreserveAffinity::default(),
             chash: std::sync::Arc::default(),
             fwrr: std::sync::Arc::default(),
+            listener_conns: None,
             log_format: None,
             extra_log: None,
             dont_log_null: false,

@@ -359,6 +359,10 @@ pub struct PhaseCtx<'a> {
     /// T326: the same for the server connection (`bc_http_major`); `None` where there is none
     /// yet or it is not HTTP.
     pub bc_http_major: Option<u8>,
+    /// The streams the client connection's mux serves now (`fc_nb_streams`): one on an
+    /// HTTP/1 connection, the connection's count on an HTTP/2 stream; `None` where the
+    /// connection has no HTTP mux or the count is not on this session.
+    pub fc_nb_streams: Option<u32>,
     /// The client connection's TLS session, for `ssl_fc*` and `ssl_c_used`; the default
     /// (`used` false, nothing else) for a plaintext one.
     pub ssl_fc: SslFacts<'a>,
@@ -440,6 +444,7 @@ impl PhaseCtx<'_> {
         act_conn: 0,
         fc_http_major: None,
         bc_http_major: None,
+        fc_nb_streams: None,
         ssl_fc: SslFacts::NONE,
         ssl_bc: None,
         quic_acks: None,
@@ -892,6 +897,10 @@ pub trait ProxyState: std::fmt::Debug {
     fn default_backend(&self, frontend: &str) -> Option<String>;
     /// The connections open on all the frontends (`actconn`).
     fn active_connections(&self) -> i64;
+    /// `dst_conn` (`smp_fetch_dconn`, src/listener.c): the connections established on the
+    /// bind line with id `luid`, including the one being evaluated; `None` if no proxy has
+    /// a bind of that id.
+    fn listener_connections(&self, luid: u32) -> Option<i64>;
     /// Whether `key` is an entry of the stick table `table`; `None` if there is no such
     /// table or the key cannot be one of its keys.
     fn table_has_key(&self, table: &str, key: &Sample) -> Option<bool>;
@@ -946,7 +955,6 @@ pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("avg_queue", "Alcyon has no server queues"),
     ("srv_queue", "Alcyon has no server queues"),
     // T331: `HAProxy` asks the front mux; an HTTP/2 stream's entry does not see its connection's.
-    ("fc_nb_streams", "a stream does not see its HTTP/2 connection's stream count"),
     ("fc_settings_streams_limit", "a stream does not see its HTTP/2 connection's advertised SETTINGS_MAX_CONCURRENT_STREAMS"),
     ("fc_glitches", "Alcyon counts no HTTP/1 glitches, and a stream does not see its HTTP/2 connection's count"),
 ];
@@ -2126,8 +2134,9 @@ impl Registry {
             func: fc_dst_is_local_fetch,
         });
 
-        // T331: `fc_nb_streams`, `fc_settings_streams_limit` and `fc_glitches` are refused
-        // instead ([`NOT_IMPLEMENTED`]): they were registered here as the constants 1, 1, 0.
+        // T331: `fc_settings_streams_limit` and `fc_glitches` are refused instead
+        // ([`NOT_IMPLEMENTED`]): they were registered as the constants 1, 0; `fc_nb_streams`
+        // reads the count the connection keeps ([`PhaseCtx::fc_nb_streams`]).
         // T331: the backend connection (`SMP_USE_L4SRV`). Without one, none has a value;
         // `bc_reused` is 0 on any stream (`smp_fetch_reused`).
         self.register_fetch(FetchDesc {
@@ -2139,6 +2148,14 @@ impl Registry {
             name: "bc_err_str",
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.bc_err.map(|e| Sample::Str(e.text.to_string())),
+        });
+        // `smp_fetch_fc_err_str` with the 'n' in the kw (`bc_err_name`): the name of the
+        // code, as `fc_err_name` reads the client connection's; empty on success, as
+        // `conn_err_code_name(CO_ER_NONE)`.
+        self.register_fetch(FetchDesc {
+            name: "bc_err_name",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.bc_err.map(|e| Sample::Str(e.name.to_string())),
         });
         self.register_fetch(FetchDesc {
             name: "bc_reused",
@@ -2158,6 +2175,22 @@ impl Registry {
             name: "bc_dst_port",
             out_type: SampleType::Sint,
             func: |ctx, _args| ctx.bc_dst.map(|sa| Sample::Sint(i64::from(sa.port()))),
+        });
+        // `smp_fetch_bc_src` / `smp_fetch_bc_src_port` (src/tcp_sample.c): the local
+        // address of the server connection, `None` before the stream has one.
+        self.register_fetch(FetchDesc {
+            name: "bc_src",
+            // An address, IPv4 or IPv6 (`SMP_T_ADDR`), typed as `bc_dst` is.
+            out_type: SampleType::Ipv4,
+            func: |ctx, _args| match ctx.bc_src?.ip() {
+                IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
+                IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_src_port",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.bc_src.map(|sa| Sample::Sint(i64::from(sa.port()))),
         });
 
         // --- 2. HTTP Request Line & URL Fetches ---
@@ -2292,6 +2325,39 @@ impl Registry {
             name: "bc_http_major",
             out_type: SampleType::Sint,
             func: |ctx, _args| ctx.bc_http_major.map(|m| Sample::Sint(i64::from(m))),
+        });
+
+        // `smp_fetch_fc_nb_streams` (src/connection.c): the streams the connection's mux
+        // serves now, and nothing where it has no connection or mux. On an HTTP/1
+        // connection the mux serves a stream at a time, one; on an HTTP/2 stream the count
+        // is the connection's ([`PhaseCtx::fc_nb_streams`]). The stream's server connection
+        // carries the stream only (`bc_nb_streams`, `smp_fetch_bc_nb_streams`): Alcyon has
+        // no multiplexed mux towards a server, so its mux serves one stream while there is
+        // an HTTP server connection, nothing before there is one.
+        self.register_fetch(FetchDesc {
+            name: "fc_nb_streams",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.fc_nb_streams.map(|n| Sample::Sint(i64::from(n))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_nb_streams",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.bc_http_major.map(|_| Sample::Sint(1)),
+        });
+
+        // `smp_fetch_conn_queues` (src/sample.c): the stream's position in the backend's
+        // and the server's queues, and nothing where there is no stream. Neither queue
+        // holds a stream in this `HAProxy`: the positions are 0 from the stream's birth
+        // (src/stream.c) and nothing changes them.
+        self.register_fetch(FetchDesc {
+            name: "bc_be_queue",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|_| Sample::Sint(0)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_srv_queue",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|_| Sample::Sint(0)),
         });
 
         // `smp_fetch_rqver` / `smp_fetch_stver` (src/http_fetch.c): the version without
@@ -3375,7 +3441,9 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "dst_conn",
             out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.act_conn))),
+            // `smp_fetch_dconn` (src/listener.c): the listener's `nbconn` -- the connections
+            // established on this socket including the one being evaluated, per bind line.
+            func: |ctx, _args| ctx.so_id.and_then(|luid| ctx.proxies?.listener_connections(luid)).map(Sample::Sint),
         });
         self.register_fetch(FetchDesc {
             name: "fe_sess_rate",
