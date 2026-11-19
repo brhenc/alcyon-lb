@@ -48,9 +48,15 @@ fn haproxy_refuses_these_samples() {
 }
 
 #[test]
-fn log_profile_is_refused_until_it_is_implemented() {
-    let err = parse_str("frontend f\n  log 127.0.0.1:514 profile p local0\n")
-        .expect_err("profile is not implemented, so it must not parse");
+fn log_profile_on_a_log_line_parses_and_requires_a_name() {
+    let cfg = parse_str(
+        "log-profile p\n  on accept drop\nfrontend f\n  log 127.0.0.1:514 profile p local0\n",
+    )
+    .expect("log profile should parse");
+    assert_eq!(cfg.frontends[0].logs[0].profile.as_deref(), Some("p"));
+
+    let err = parse_str("frontend f\n  log 127.0.0.1:514 profile\n")
+        .expect_err("profile without a name must not parse");
     assert!(err.message.contains("profile"), "{}", err.message);
 }
 

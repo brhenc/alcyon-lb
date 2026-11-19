@@ -185,34 +185,6 @@ pub struct LogProfileSection {
     pub steps: Vec<LogProfileStep>,
 }
 
-thread_local! {
-    /// The `log-profile` sections of the parse in progress on this thread, in the order the
-    /// sections were *closed* (a section enters the registry when the next one opens), so a
-    /// second `log-profile` with a taken name is caught when its header is read.
-    static LOG_PROFILES: std::cell::RefCell<Vec<LogProfileSection>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Forgets this thread's `log-profile` sections. Called at the start of `parse_str`.
-pub fn clear_log_profiles() {
-    LOG_PROFILES.with_borrow_mut(Vec::clear);
-}
-
-/// The line a `log-profile` with `name` was declared at, `None` if there is none yet.
-pub fn log_profile_declared_at(name: &str) -> Option<usize> {
-    LOG_PROFILES.with_borrow(|all| all.iter().find(|l| l.name == name).map(|l| l.line))
-}
-
-/// Keeps a closed `log-profile` section in the thread's registry.
-pub fn register_log_profile(section: LogProfileSection) {
-    LOG_PROFILES.with_borrow_mut(|all| all.push(section));
-}
-
-/// The thread's `log-profile` sections, taken out of the registry, in the order written.
-#[must_use]
-pub fn take_log_profiles() -> Vec<LogProfileSection> {
-    LOG_PROFILES.with_borrow_mut(std::mem::take)
-}
-
 /// Where a `log` line sends its output.
 ///
 /// `HAProxy` treats `stdout` and `stderr` as aliases for `fd@1` and `fd@2`

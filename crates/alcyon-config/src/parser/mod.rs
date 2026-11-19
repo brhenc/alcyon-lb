@@ -9,9 +9,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use crate::ast::{LogForwardSection, LogProfileSection, RingSection, ProxyKind, ServerExtras,
-    clear_http_errors_sections, clear_log_profiles, clear_resolved_checks, clear_userlists,
+    clear_http_errors_sections, clear_resolved_checks, clear_userlists,
     http_errors_section, http_errors_section_code,
-    register_log_profile, register_userlist, take_log_profiles, take_userlists, Userlist, UserlistUser,
+    register_userlist, take_userlists, Userlist, UserlistUser,
     register_http_errors_section, register_resolved_check, register_resolved_check_for_addr,
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config, CookieConfig,
     DefaultServerConfig, DefaultsSection, ErrorPageSource, FrontendSection, GlobalSection, ProxyV2Tlv,
@@ -155,7 +155,6 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     // parse many configs -- cannot leak a section into this one.
     clear_http_errors_sections();
     clear_userlists();
-    clear_log_profiles();
     warn::reset();
     acl_scope::begin();
     struct EndScope;
@@ -177,6 +176,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     let mut backends = Vec::new();
     let mut rings: Vec<RingSection> = Vec::new();
     let mut log_forwards: Vec<LogForwardSection> = Vec::new();
+    let mut log_profiles: Vec<LogProfileSection> = Vec::new();
     let mut resolvers: Vec<crate::ast::ResolversSection> = Vec::new();
     let mut cur_section: Option<CurrentSection> = None;
     let mut sample_refs = Vec::new();
@@ -214,6 +214,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut rings,
                     &mut log_forwards,
                     &mut resolvers,
+                    &mut log_profiles,
                 );
                 // HAProxy reads every `global` section into the same struct: a later one
                 // adds to the earlier ones, it does not replace them.
@@ -232,6 +233,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut rings,
                     &mut log_forwards,
                     &mut resolvers,
+                    &mut log_profiles,
                 );
                 check_inheritance(Inheritor::Defaults, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
                 if tokens.len() >= 2 && !tokens[1].text.is_empty() && tokens[1].text != "from" {
@@ -288,6 +290,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut rings,
                     &mut log_forwards,
                     &mut resolvers,
+                    &mut log_profiles,
                 );
                 check_inheritance(Inheritor::Listen, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
                 proxy_order.push((ProxyKind::Listen, listens.len()));
@@ -311,6 +314,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut rings,
                     &mut log_forwards,
                     &mut resolvers,
+                    &mut log_profiles,
                 );
                 check_inheritance(Inheritor::Frontend, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
                 proxy_order.push((ProxyKind::Frontend, frontends.len()));
@@ -334,6 +338,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut rings,
                     &mut log_forwards,
                     &mut resolvers,
+                    &mut log_profiles,
                 );
                 check_inheritance(Inheritor::Backend, tokens, &named_defaults, &defaults_lines, &mut defaults_users)?;
                 if !tokens.iter().any(|t| t.text == "from") {
@@ -362,6 +367,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut rings,
                     &mut log_forwards,
                     &mut resolvers,
+                    &mut log_profiles,
                 );
                 cur_section = Some(CurrentSection::Ring(ring::parse_ring_header(tokens, kw, &rings)?));
             }
@@ -378,6 +384,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut rings,
                     &mut log_forwards,
                     &mut resolvers,
+                    &mut log_profiles,
                 );
                 cur_section = Some(CurrentSection::LogForward(ring::parse_log_forward_header(tokens, kw, &log_forwards)?));
             }
@@ -394,8 +401,9 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut rings,
                     &mut log_forwards,
                     &mut resolvers,
+                    &mut log_profiles,
                 );
-                cur_section = Some(CurrentSection::LogProfile(logprofile::parse_log_profile_header(tokens, kw)?));
+                cur_section = Some(CurrentSection::LogProfile(logprofile::parse_log_profile_header(tokens, kw, &log_profiles)?));
             }
             "resolvers" => {
                 flush_current_section(
@@ -410,6 +418,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut rings,
                     &mut log_forwards,
                     &mut resolvers,
+                    &mut log_profiles,
                 );
                 cur_section = Some(CurrentSection::Resolvers(resolvers::parse_resolvers_header(tokens, kw, &resolvers)?));
             }
@@ -426,6 +435,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut rings,
                     &mut log_forwards,
                     &mut resolvers,
+                    &mut log_profiles,
                 );
                 let Some(name) = tokens.get(1).filter(|t| !t.text.is_empty()) else {
                     return Err(ConfigError::new(kw.line, kw.col, "'userlist' expects <name> as arguments."));
@@ -445,6 +455,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                     &mut rings,
                     &mut log_forwards,
                     &mut resolvers,
+                    &mut log_profiles,
                 );
                 if tokens.len() < 2 || tokens[1].text.is_empty() {
                     return Err(ConfigError::new(
@@ -522,6 +533,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         &mut rings,
         &mut log_forwards,
         &mut resolvers,
+        &mut log_profiles,
     );
 
     // HAProxy 3.5 accepts a config with no proxy sections -- including a completely
@@ -571,7 +583,6 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     for list in &mut userlists {
         list.resolve().map_err(|(line, msg)| ConfigError::new(line, 1, msg))?;
     }
-    let log_profiles = take_log_profiles();
 
     resolvers::check_resolvers(&resolvers);
     check_do_resolve(&mut listens, &mut frontends, &mut backends, &resolvers)?;
@@ -982,6 +993,7 @@ pub(crate) fn flush_current_section(
     rings: &mut Vec<RingSection>,
     log_forwards: &mut Vec<LogForwardSection>,
     resolvers: &mut Vec<crate::ast::ResolversSection>,
+    log_profiles: &mut Vec<LogProfileSection>,
 ) {
     if let Some(sec) = cur.take() {
         match sec {
@@ -1002,7 +1014,7 @@ pub(crate) fn flush_current_section(
             CurrentSection::HttpErrors(name, table) => register_http_errors_section(name, table),
             CurrentSection::Ring(r) => rings.push(r),
             CurrentSection::LogForward(l) => log_forwards.push(l),
-            CurrentSection::LogProfile(l) => register_log_profile(l),
+            CurrentSection::LogProfile(l) => log_profiles.push(l),
             CurrentSection::Resolvers(r) => resolvers.push(r),
         }
     }

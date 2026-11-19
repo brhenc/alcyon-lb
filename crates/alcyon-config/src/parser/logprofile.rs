@@ -5,7 +5,7 @@
 // (`src/log.c`): a named set of `on <step> [drop] [format <fmt>] [sd <sd_fmt>]`
 // lines that a `log ... profile <name>` target uses for each step of a stream.
 
-use crate::ast::{LogProfileSection, LogProfileStep, LogProfileStepKind, log_profile_declared_at};
+use crate::ast::{LogProfileSection, LogProfileStep, LogProfileStepKind};
 use crate::error::ConfigError;
 use crate::lexer::Token;
 
@@ -45,6 +45,7 @@ fn step_from_name(name: &str) -> Option<LogProfileStepKind> {
 pub(crate) fn parse_log_profile_header(
     tokens: &[Token],
     kw: &Token,
+    existing: &[LogProfileSection],
 ) -> Result<LogProfileSection, ConfigError> {
     let Some(name) = tokens.get(1).filter(|t| !t.text.is_empty()) else {
         return Err(ConfigError::new(kw.line, kw.col, "missing name for log-profile section."));
@@ -59,7 +60,7 @@ pub(crate) fn parse_log_profile_header(
             ),
         ));
     }
-    if let Some(prev) = log_profile_declared_at(&name.text) {
+    if let Some(prev) = existing.iter().find(|l| l.name == name.text).map(|l| l.line) {
         return Err(ConfigError::new(
             name.line,
             name.col,
