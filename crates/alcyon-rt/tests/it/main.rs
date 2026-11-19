@@ -528,6 +528,7 @@ mod var_size_cap;
 mod version_fetches;
 mod wait_for_body;
 mod watchdog;
+mod webstats_scope;
 mod websocket_handshake;
 mod when_applet;
 mod when_error_retries;

@@ -13506,9 +13506,10 @@ impl EngineDispatcher<'_> {
                         trimmed_uri
                     };
                     if base == "/" {
-                        req_uri == "/"
-                            || req_uri.starts_with("/;csv")
-                            || req_uri.starts_with("/api/data")
+                        // `http_stats_check_uri` compares the prefix against the request's
+                        // *path*: with the prefix `/`, every path holds it, so the applet
+                        // takes every request of the section (`/?;csv;scope=b1`, `/api/data`).
+                        req_uri.starts_with('/')
                     } else {
                         req_uri == base
                             || req_uri.starts_with(&format!("{base}/"))
@@ -13640,6 +13641,38 @@ impl EngineDispatcher<'_> {
         link
     }
 
+    /// The `scope=` text of the part of the request URI after the section's prefix, as
+    /// `http_handle_stats` keeps it (`STAT_SCOPE_INPUT_NAME`): at most 20 bytes, to the next
+    /// `;`, `&` or space, and none at all when one of those bytes is one `HAProxy` refuses
+    /// (`invalid_char`, `[A-Za-z0-9_:.-]`) or the `scope=` sits within the URI's last 8
+    /// bytes (the scan's `h <= end - 8`). Borrowed from `rest`, no copy.
+    fn stats_scope(rest: &str) -> &str {
+        let Some(at) = rest.find("scope=") else {
+            return "";
+        };
+        // `http_handle_stats` scans `for (h = lookup; h <= end - 8; h++)`: a `scope=` that
+        // starts fewer than 8 bytes before the end of the URI is never found (measured on
+        // the oracle: `GET /;scope=a` unscoped, `GET /;scope=ab` scoped).
+        if at + 8 > rest.len() {
+            return "";
+        }
+        let text = &rest[at + 6..];
+        let end = text.find(|c| c == ';' || c == '&' || c == ' ').unwrap_or(text.len());
+        // `STAT_SCOPE_TXT_MAXLEN` (20): the oracle keeps the first 20 *bytes* and validates
+        // exactly those (`memcpy(scope_txt, h2, itx)`). Work in bytes, where no cut can land
+        // mid-character: a byte the allowed set refuses clears the scope, as the oracle's
+        // `invalid_char` does (`isalnum` in the C locale, i.e. ASCII).
+        let bytes = &text.as_bytes()[..end.min(20)];
+        if bytes
+            .iter()
+            .any(|c| !matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b':' | b'.' | b'-'))
+        {
+            return "";
+        }
+        // The allowed set is ASCII, so the kept bytes are valid UTF-8.
+        std::str::from_utf8(bytes).unwrap()
+    }
+
     /// `stats_send_http_redirect`: the answer to an admin POST, whatever came of it.
     fn stats_redirect(entry: &mut SessionEntry, proxies: &Proxies, serving: usize, code: crate::stats_post::StCode) {
         let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
@@ -13653,8 +13686,17 @@ impl EngineDispatcher<'_> {
         if cfg.refresh.is_some() && rest.contains(";norefresh") {
             loc.push_str(";norefresh");
         }
+        // The page the browser lands on keeps the request's search text (`?scope=`), as the
+        // redirect the applet sends.
+        let scope = Self::stats_scope(rest);
+        if !scope.is_empty() {
+            loc.push_str("?scope=");
+            loc.push_str(scope);
+        }
+        // No `Connection: close`: the applet answers like any other HTTP response and the
+        // browser's next request rides the same connection (`stats_send_http_redirect`).
         let resp = format!(
-            "HTTP/1.1 303 See Other\r\ncache-control: no-cache\r\ncontent-type: text/plain\r\ncontent-length: 0\r\nlocation: {loc}\r\nconnection: close\r\n\r\n"
+            "HTTP/1.1 303 See Other\r\ncache-control: no-cache\r\ncontent-type: text/plain\r\ncontent-length: 0\r\nlocation: {loc}\r\n\r\n"
         );
         stats_write_reply(entry, proxies, resp.as_bytes());
     }
@@ -13694,7 +13736,20 @@ impl EngineDispatcher<'_> {
         if !crate::stats_post::fits_buffer(entry.sess.bufsize, head_len, nhdr, body.len().max(declared)) {
             return StCode::Excd;
         }
-        let mut backend = |name: &str| proxies.iter().position(|p| p.has_backend && p.name == name);
+        // The form's `b`: the backend's name or `#<id>` (`proxy_be_by_name`, the id being the
+        // proxy's `iid`, the sections numbered from 2).
+        let mut backend = |name: &str| {
+            let found = if let Some(digits) = name.strip_prefix('#') {
+                let id = digits
+                    .bytes()
+                    .take_while(|c| c.is_ascii_digit())
+                    .fold(0u32, |a, c| a.saturating_mul(10).saturating_add((c - b'0') as u32));
+                proxies.iter().position(|p| p.has_backend && p.ids.iid == id)
+            } else {
+                proxies.iter().position(|p| p.has_backend && p.name == name)
+            };
+            found
+        };
         let mut apply = |p: usize, verb: Verb, name: &str| -> Option<bool> {
             let s = proxies[p].srv_set().find(name).map(|s| s.index())?;
             let cur = proxies[p].srv_set().status_cell(s).map_or(0, |a| a.load(Ordering::Relaxed));
@@ -13812,21 +13867,30 @@ impl EngineDispatcher<'_> {
             return None;
         }
         if req_uri.contains(";json") {
-            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(crate::stats::StatFormat::Json, proxies[serving].stats_config.show_legends));
+            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(
+                crate::stats::StatFormat::Json,
+                proxies[serving].stats_config.show_legends,
+                Self::stats_scope(req_uri.get(proxies[serving].stats_config.uri.as_deref().unwrap_or("/haproxy?stats").len()..).unwrap_or(""))));
             stats_stream_page(entry, proxies, checks, pid, serving, "application/json", &refresh, page);
             return None;
         }
 
         // `;typed` (`stats-html.c`): the CLI's `show stat typed` rows; after `;json`, before `;csv`.
         if req_uri.contains(";typed") {
-            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(crate::stats::StatFormat::Typed, proxies[serving].stats_config.show_legends));
+            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(
+                crate::stats::StatFormat::Typed,
+                proxies[serving].stats_config.show_legends,
+                Self::stats_scope(req_uri.get(proxies[serving].stats_config.uri.as_deref().unwrap_or("/haproxy?stats").len()..).unwrap_or(""))));
             stats_stream_page(entry, proxies, checks, pid, serving, "text/plain", &refresh, page);
             return None;
         }
 
         // 1. CSV telemetry
         if req_uri.contains(";csv") || req_uri.ends_with("/csv") {
-            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(crate::stats::StatFormat::Csv, proxies[serving].stats_config.show_legends));
+            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(
+                crate::stats::StatFormat::Csv,
+                proxies[serving].stats_config.show_legends,
+                Self::stats_scope(req_uri.get(proxies[serving].stats_config.uri.as_deref().unwrap_or("/haproxy?stats").len()..).unwrap_or(""))));
             stats_stream_page(entry, proxies, checks, pid, serving, "text/plain", &refresh, page);
             return None;
         }
