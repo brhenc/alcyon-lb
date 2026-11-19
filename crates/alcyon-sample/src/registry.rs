@@ -258,6 +258,28 @@ pub struct QuicAckFacts {
     pub excess: Option<u64>,
 }
 
+/// Read-only facts of a stream's front connection (`HAProxy`'s `MUX_CTL_GET_*` on `fc`),
+/// borrowed from the connection's owner session on the same worker thread.
+pub trait FrontConnState {
+    /// Live stream count (`MUX_CTL_GET_NBSTRM`): `1` on HTTP/1, `h2c->nb_streams` on HTTP/2.
+    fn nb_streams(&self) -> u32;
+    /// Advertised `SETTINGS_MAX_CONCURRENT_STREAMS` (`MUX_CTL_GET_MAXSTRM`): `1` on HTTP/1.
+    fn max_concurrent_streams(&self) -> u32;
+    /// Protocol glitches counted on the connection (`MUX_CTL_GET_GLITCHES`): `None` where not
+    /// counted (HTTP/1 in Alcyon), `Some(n)` on HTTP/2 / HTTP/3.
+    fn glitches(&self) -> Option<u64>;
+}
+
+impl std::fmt::Debug for dyn FrontConnState + '_ {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrontConnState")
+            .field("nb_streams", &self.nb_streams())
+            .field("max_concurrent_streams", &self.max_concurrent_streams())
+            .field("glitches", &self.glitches())
+            .finish()
+    }
+}
+
 /// The facts a sample fetch reads, as one phase of the stream knows them (CP4a-2): built once
 /// for a rule phase and held across its rules, read through [`SampleContext::phase`]. The facts
 /// [`LiveReq`] gives are read from the live request instead where a context has one
@@ -375,6 +397,9 @@ pub struct PhaseCtx<'a> {
     /// The stream's tracked stick-table entries, for the `sc_*` and `src_*` fetches. `None`
     /// where the caller has none, and those fetches then give no sample.
     pub stick: Option<&'a dyn StickState>,
+    /// Read-only view of the stream's front connection (`fc_nb_streams`,
+    /// `fc_settings_streams_limit`, `fc_glitches`). `None` where no front connection is attached.
+    pub fc: Option<&'a dyn FrontConnState>,
     /// Counts the copies of the context ([`crate::work::Op::CtxClone`]).
     pub clones: crate::work::CloneCount,
 }
@@ -445,6 +470,7 @@ impl PhaseCtx<'_> {
         quic_acks: None,
         proxies: None,
         stick: None,
+        fc: None,
         clones: crate::work::CloneCount,
     };
 }
@@ -946,9 +972,8 @@ pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("avg_queue", "Alcyon has no server queues"),
     ("srv_queue", "Alcyon has no server queues"),
     // T331: `HAProxy` asks the front mux; an HTTP/2 stream's entry does not see its connection's.
+    // `fc_nb_streams` is left to CONNADDR's fixer (`gemini/connaddr-fix`).
     ("fc_nb_streams", "a stream does not see its HTTP/2 connection's stream count"),
-    ("fc_settings_streams_limit", "a stream does not see its HTTP/2 connection's advertised SETTINGS_MAX_CONCURRENT_STREAMS"),
-    ("fc_glitches", "Alcyon counts no HTTP/1 glitches, and a stream does not see its HTTP/2 connection's count"),
 ];
 
 /// Why `name` -- a fetch or a converter -- is in [`NOT_IMPLEMENTED`].
@@ -2126,8 +2151,25 @@ impl Registry {
             func: fc_dst_is_local_fetch,
         });
 
-        // T331: `fc_nb_streams`, `fc_settings_streams_limit` and `fc_glitches` are refused
-        // instead ([`NOT_IMPLEMENTED`]): they were registered here as the constants 1, 1, 0.
+        // T331 / G3 CONNVIEW: `fc_settings_streams_limit` (HTTP/1 and HTTP/2) and `fc_glitches`
+        // (HTTP/2 only; HTTP/1 is refused at load and returns `None` here). `fc_nb_streams` is
+        // left to CONNADDR's fixer.
+        self.register_fetch(FetchDesc {
+            name: "fc_settings_streams_limit",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| {
+                ctx.fc.map(|fc| Sample::Sint(i64::from(fc.max_concurrent_streams())))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_glitches",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| {
+                ctx.fc
+                    .and_then(|fc| fc.glitches())
+                    .map(|n| Sample::Sint(i64::try_from(n).unwrap_or(i64::MAX)))
+            },
+        });
         // T331: the backend connection (`SMP_USE_L4SRV`). Without one, none has a value;
         // `bc_reused` is 0 on any stream (`smp_fetch_reused`).
         self.register_fetch(FetchDesc {
