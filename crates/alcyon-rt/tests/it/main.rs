@@ -162,6 +162,7 @@ mod error_pages;
 mod error_reply_header_case;
 mod eth_converters;
 mod expect_proxy;
+mod netscaler_cip;
 mod expr_compile_once;
 mod fail_alloc;
 mod fc_rcvd_proxy;
