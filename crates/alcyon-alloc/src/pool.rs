@@ -2107,6 +2107,7 @@ mod tests {
             r.val = 42;
             r.extra[0] = 99;
         }
+        assert_eq!(b.get_or_init(&COLD_TEST).unwrap().val, 42);
         assert!(b.is_some());
         assert_eq!(b.as_ref().unwrap().val, 42);
         b.reset(&COLD_TEST);

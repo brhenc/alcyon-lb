@@ -8438,9 +8438,8 @@ fn stream_timeouts_enter(proxies: &crate::table::Table, fe_idx: usize, be_idx: u
 /// (`AN_RES_INSPECT`, set with the backend); they start when the server connects.
 fn arm_res_inspect(proxy: &Proxy, sess: &mut TcpSession) {
     if sess.mode == Mode::Tcp && !proxy.tcp_res_content_rules.is_empty() {
-        if let Some(r) = sess.res_inspect.get_or_init(&crate::proxy::RES_INSPECT_POOL) {
-            r.armed = Some(proxy.tcp_res_inspect_delay.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
-        }
+        let Some(r) = sess.res_inspect.get_or_init(&crate::proxy::RES_INSPECT_POOL) else { return };
+        r.armed = Some(proxy.tcp_res_inspect_delay.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
     }
 }
 
@@ -18989,9 +18988,17 @@ mod arena_tests {
         // Slot 2 = child pointing to owner at slot 1 (a > b).
         let i2 = arena.alloc(make(30, Some(child_role(1, 20)))).unwrap();
         assert_eq!(i2, 2);
-        let (c, o) = arena.get_mut_with_owner(2).unwrap();
-        assert_eq!(c.task, alcyon_sched::TaskRef(30));
-        assert_eq!(o.unwrap().task, alcyon_sched::TaskRef(20));
+        {
+            let (c, o) = arena.get_mut_with_owner(2).unwrap();
+            assert_eq!(c.task, alcyon_sched::TaskRef(30));
+            assert_eq!(o.unwrap().task, alcyon_sched::TaskRef(20));
+        }
+        // Slot 3 = child with a stale owner task ref -> returns owner as None.
+        let i3 = arena.alloc(make(40, Some(child_role(1, 999)))).unwrap();
+        assert_eq!(i3, 3);
+        let (c, o) = arena.get_mut_with_owner(3).unwrap();
+        assert_eq!(c.task, alcyon_sched::TaskRef(40));
+        assert!(o.is_none());
     }
 }
 

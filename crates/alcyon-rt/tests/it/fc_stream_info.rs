@@ -75,6 +75,19 @@ fn fc_stream_fetches_are_refused_with_a_reason() {
     assert_ne!(out.status.code(), Some(0));
     let txt = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(txt.contains("'fc_glitches' : not implemented in Alcyon"), "{txt}");
+
+    // `backend` section with `fc_glitches` loads (checked against frontend at runtime/bind).
+    let dir = std::env::temp_dir().join(format!("fc-stream-info-be-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.cfg");
+    std::fs::write(
+        &path,
+        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\nfrontend fe\n  bind 127.0.0.1:0 proto h2\n  default_backend be\nbackend be\n  http-request return status 200 content-type text/plain lf-string \"%[fc_glitches]\"\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-c").arg("-f").arg(&path).output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.status.code(), Some(0), "backend fc_glitches failed -c: {:?}", out);
 }
 
 fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
