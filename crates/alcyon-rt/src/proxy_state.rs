@@ -821,8 +821,6 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
                 .unwrap_or_else(|| crate::rule_exprs::check_sample_expr(&r.expr, registry))
                 .map_err(|e| in_line(format!("failed to parse sample expression <{}> : {e}", r.expr)))?;
         }
-        crate::rule_exprs::check_fc_glitches(config, r.section, r.proxy.as_deref(), crate::rule_exprs::leading_fetch(&r.expr))
-            .map_err(&in_line)?;
         // A fetch of the response where the stream has none would read the response of
         // whatever stream ran last on the thread (T156): in a request rule, and for the
         // headers in a log-format, rendered once they are gone. `HAProxy` refuses both.

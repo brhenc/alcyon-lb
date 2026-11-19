@@ -78,13 +78,10 @@ fn server_check_state_stays_small() {
 /// do not fit under the old 1664 (the session was exactly 1664 before), so the bound is the
 /// measured 1672. Folding them into the `proxy_info` box instead would save them, but
 /// `tcp-request session set-src` writes them while the rule context borrows that box's TLVs.
-/// `res_inspect` (`TcpSession::res_inspect`: `pending`, `exp`, `armed`) moved into a
-/// `ColdBox<ResInspect>` (8 bytes, `None` until TCP `tcp-response content` rules arm it),
-/// ratcheting `SessionEntry` down from 1672 to 1664.
 #[test]
 fn session_entry_stays_small() {
     let n = size_of::<alcyon_rt::engine::SessionEntry>();
-    assert!(n <= 1664, "SessionEntry grew to {n} bytes (bound 1664): one is held per client connection, box the new field");
+    assert!(n <= 1672, "SessionEntry grew to {n} bytes (bound 1672): one is held per client connection, box the new field");
 }
 
 /// `L7Retry` is 16 bytes: its own tag (the niche of `Saved(L7Box)`'s `Option` is inside the

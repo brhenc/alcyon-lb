@@ -20,7 +20,7 @@ pub mod zero_on_free;
 pub mod stack_probe;
 pub use zero_on_free::{AlcyonAllocator, ZeroOnFree};
 pub use pool::{
-    drain_local_pools, for_each_pool, hot_size, local_hot_bytes, set_hot_size, ColdBox, Pool, PoolBox, PoolDyn, PoolSpec, Poolable,
+    drain_local_pools, for_each_pool, hot_size, local_hot_bytes, set_hot_size, Pool, PoolBox, PoolDyn, PoolSpec, Poolable,
     HOT_SIZE_DEFAULT,
 };
 

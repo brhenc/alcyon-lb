@@ -59,37 +59,6 @@ fn leading_name(s: &str) -> &str {
     &s[..end]
 }
 
-fn bind_is_h2_only(b: &alcyon_config::ast::BindConfig) -> bool {
-    b.proto.as_deref() == Some("h2")
-        || (b.ssl && !b.alpn.is_empty() && b.alpn.iter().all(|a| a == "h2"))
-}
-
-/// Rule 5: Alcyon counts no HTTP/1 glitches, so `fc_glitches` is refused on a frontend or
-/// listen section whose binds can accept HTTP/1.
-pub fn check_fc_glitches(config: &Config, section: SectionKind, proxy: Option<&str>, fetch: &str) -> Result<(), String> {
-    if fetch != "fc_glitches" {
-        return Ok(());
-    }
-    let h2_only = match (section, proxy) {
-        (SectionKind::Frontend, Some(name)) => config
-            .frontends
-            .iter()
-            .find(|f| f.name == name)
-            .is_some_and(|f| !f.binds.is_empty() && f.binds.iter().all(bind_is_h2_only)),
-        (SectionKind::Listen, Some(name)) => config
-            .listens
-            .iter()
-            .find(|l| l.name == name)
-            .is_some_and(|l| !l.binds.is_empty() && l.binds.iter().all(bind_is_h2_only)),
-        _ => return Ok(()),
-    };
-    if h2_only {
-        Ok(())
-    } else {
-        Err("'fc_glitches' : not implemented in Alcyon (Alcyon counts no HTTP/1 glitches; requires 'proto h2' on bind)".to_string())
-    }
-}
-
 /// Checks the fetch and every converter `expr` names, as `sample_parse_expr` resolves
 /// them: the fetch is the leading run of name characters, exactly as written (`hdr_beg`
 /// and `path_beg` are ACL keywords, not fetches, and names are case-sensitive), and
@@ -456,10 +425,6 @@ impl Section<'_> {
                 // request headers left, and a `tcp-response` no request at all. `HAProxy`
                 // names the action for `set-var`, the expression for the others.
                 let fetch = leading_fetch(expr);
-                check_fc_glitches(config, self.at.section, self.at.proxy, fetch).map_err(|e| {
-                    let stop = if kw.starts_with("http-") && !e.ends_with('.') { "." } else { "" };
-                    format!("error detected in {} while parsing '{kw} {action}' rule : {e}{stop}", self.what)
-                })?;
                 let part = match *kw {
                     "http-request" | "tcp-request content" | "tcp-request session" | "tcp-request connection" => {
                         response_part(fetch).or_else(|| server_part(fetch))
