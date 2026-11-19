@@ -151,7 +151,6 @@ fn h1_http_response_values() {
          http-response set-header x-bbq %[bc_be_queue]\n\
          http-response set-header x-bsq %[bc_srv_queue]\n\
          http-response set-header x-bce \"e%[bc_err_name]e\"\n\
-         http-response set-header x-dc %[dst_conn]\n\
          backend b\n  server s1 127.0.0.1:{}\n",
         be.port(),
     );
@@ -174,9 +173,6 @@ fn h1_http_response_values() {
     assert_eq!(hdr(&out, "x-bsq"), "0", "bc_srv_queue:\n{out}");
     // The name of `CO_ER_NONE` is empty: the markers around the fetch read back "ee".
     assert_eq!(hdr(&out, "x-bce"), "ee", "bc_err_name without an error:\n{out}");
-    // `dst_conn`: the connections established on this socket including this one -- the
-    // first, so 1, as the reg-test asserts (`smp_fetch_dconn`: `listener->nbconn`).
-    assert_eq!(hdr(&out, "x-dc"), "1", "dst_conn of the socket's first connection:\n{out}");
 }
 
 /// `bc_src` over an IPv6 server connection: the local address of the socket to

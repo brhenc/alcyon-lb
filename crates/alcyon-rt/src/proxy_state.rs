@@ -157,16 +157,6 @@ impl ProxyState for ProxiesView<'_> {
             .sum()
     }
 
-    fn listener_connections(&self, luid: u32) -> Option<i64> {
-        self.0.iter().find_map(|p| {
-            p.ids
-                .listener_ids
-                .iter()
-                .position(|&id| id == luid)
-                .and_then(|bi| p.listener_conns.as_deref().map(|v| i64::from(v[bi].load(Ordering::Acquire))))
-        })
-    }
-
     fn default_backend(&self, frontend: &str) -> Option<String> {
         self.0.iter().find(|p| p.has_frontend && p.name == frontend)?.default_backend.clone()
     }

@@ -2036,14 +2036,6 @@ pub struct Proxy {
     pub chash: Arc<crate::lb::ChashRing>,
     /// `balance roundrobin`'s weighted order, shared by the workers.
     pub fwrr: Arc<crate::lb::Fwrr>,
-    /// The connections established on this proxy's bind lines, one per bind (parallel to
-    /// `ids.listener_ids`), what `dst_conn` reads (`listener->nbconn` in `HAProxy`, which
-    /// shares one socket across the threads and counts it there). `Arc` so the workers'
-    /// clones of the proxy, and a replaced slot, keep counting into the same counter.
-    /// `Option<Box>`: the counter row is 24 bytes and `Proxy` is bounded at 1656; a
-    /// backend's proxy has no binds and pays none. Updated on accept and close, read
-    /// with an `Acquire` load by the fetch.
-    pub listener_conns: Option<Box<Vec<Arc<AtomicU32>>>>,
 }
 
 impl Proxy {
@@ -4511,13 +4503,6 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         reply_pages: crate::rule_compiled::reply_pages(&listen.error_replies),
         res_stream: false,
     }.finish());
-    let listener_ids = alcyon_config::ast::listener_ids(&listen.binds);
-    // A section built in code with `addr` alone and no bind line gets one synthetic bind
-    // in the engine (no luid, so no `so_id` and no `dst_conn`); its listener still has a
-    // `bind_idx`, so the counter row keeps its slot and stays parallel to the engine's
-    // bind lines.
-    let n_binds = if listen.binds.is_empty() { 1 } else { listener_ids.len() };
-    let listener_conns = Some(Box::new((0..n_binds).map(|_| Arc::new(AtomicU32::new(0))).collect()));
     Ok(Proxy {
         id: usize_to_u32(proxy_idx),
         ids: Box::new(ProxyIdInfo {
@@ -4527,7 +4512,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
             next_decl: 0,
             forced_id: ids.forced,
             srv: ServerIdArrays::build(&listen.servers, &listen.server_extras, listen.mode == Mode::Http),
-            listener_ids,
+            listener_ids: alcyon_config::ast::listener_ids(&listen.binds),
             http_mode: listen.http_mode,
             persist: listen.persist,
             checkcache: listen.checkcache,
@@ -4610,7 +4595,6 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         hash_preserve_affinity: listen.hash_preserve_affinity.unwrap_or_default(),
         chash: Arc::new(crate::lb::ChashRing::new(listen.balance_uri)),
         fwrr: Arc::default(),
-        listener_conns,
     })
 }
 
@@ -4658,8 +4642,6 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         reply_pages: crate::rule_compiled::reply_pages(&fe.error_replies),
         res_stream: false,
     }.finish());
-    let fe_listener_ids = alcyon_config::ast::listener_ids(&frontend_binds(fe));
-    let fe_listener_conns = Some(Box::new((0..fe_listener_ids.len()).map(|_| Arc::new(AtomicU32::new(0))).collect()));
     Ok(Proxy {
         id: usize_to_u32(proxy_idx),
         ids: Box::new(ProxyIdInfo {
@@ -4668,7 +4650,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
             decl: ids.decl,
             next_decl: 0,
             forced_id: ids.forced,
-            listener_ids: fe_listener_ids,
+            listener_ids: alcyon_config::ast::listener_ids(&frontend_binds(fe)),
             http_mode: fe.http_mode,
             retry_on: alcyon_config::RE_CONN_FAILED,
             ..ProxyIdInfo::default()
@@ -4750,7 +4732,6 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         hash_preserve_affinity: alcyon_config::HashPreserveAffinity::default(),
         chash: Arc::default(),
         fwrr: Arc::default(),
-        listener_conns: fe_listener_conns,
     })
 }
 
@@ -4883,7 +4864,6 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         hash_preserve_affinity: be.hash_preserve_affinity.unwrap_or_default(),
         chash: Arc::new(crate::lb::ChashRing::new(be.balance_uri)),
         fwrr: Arc::default(),
-        listener_conns: None,
     })
 }
 
@@ -5295,7 +5275,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 let tls = bind_tls(&listen.name, &binds, b.addr)?;
                 for mut listener in listeners_for(worker_id, b.addr, usize_to_u32(proxy_idx), b.sock.as_deref().unwrap_or(&alcyon_config::ast::SocketTuning::default()), crate::listener::listener_backlog(b.sock.as_deref().and_then(|s| s.backlog), listen.backlog, listen.maxconn))? {
                     listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
-                    listener.bind_idx = usize_to_u32(bind_idx);
                     listener.maxconn = proxies[proxy_idx].maxconn.clone();
                     listener.name = b.name.as_deref().map(Into::into);
                     listener.accept_proxy = b.accept_proxy || b.accept_proxy_v2;
@@ -5332,7 +5311,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     let tls = bind_tls(&frontend.name, &frontend.binds, bind_addr)?;
                     for mut listener in listeners_for(worker_id, bind_addr, usize_to_u32(proxy_idx), b.sock.as_deref().unwrap_or(&alcyon_config::ast::SocketTuning::default()), crate::listener::listener_backlog(b.sock.as_deref().and_then(|s| s.backlog), frontend.backlog, frontend.maxconn))? {
                         listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
-                        listener.bind_idx = usize_to_u32(bind_idx);
                         listener.maxconn = proxies[proxy_idx].maxconn.clone();
                         listener.name = b.name.as_deref().map(Into::into);
                     listener.accept_proxy = b.accept_proxy || b.accept_proxy_v2;
@@ -7049,22 +7027,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 // From the accept loop the slot of `global maxconn` is already taken (`try_acquire`).
                 if proxy.counters().act_conn.load(Ordering::Relaxed) > proxy.counters().max_conn.load(Ordering::Relaxed) {
                     proxy.counters().max_conn.store(proxy.counters().act_conn.load(Ordering::Relaxed), Ordering::Relaxed);
-                }
-                // `dst_conn` counts per bind line (`listener->nbconn` in `HAProxy`, which
-                // shares the socket across the threads): one counter per socket, shared by
-                // the workers' clones of the proxy. The accepted listener belongs to this
-                // proxy, and every real bind line has its slot in `listener_conns`; the
-                // synthetic bind of a bindless code-built section has none (luid 0) and is
-                // not counted, as its connections have no `so_id` either.
-                let li = l_idx.unwrap();
-                let l = &self.listeners[li];
-                if l.luid != 0 {
-                    proxy
-                        .listener_conns
-                        .as_deref()
-                        .unwrap()
-                        [l.bind_idx as usize]
-                        .fetch_add(1, Ordering::Release);
                 }
             }
 
@@ -8897,15 +8859,6 @@ pub fn shutdown_session_entry(
         // ... nor does an HTTP/3 request stream (T504): its connection does.
         if proxy_idx < proxies.len() && !entry.sess.is_h2_child() && !entry.sess.h3 {
             proxies[proxy_idx].counters().act_conn.fetch_sub(1, Ordering::Relaxed);
-            // The bind's `dst_conn` counter is reclaimed with the connection slot: the
-            // session's `so_id` is the luid of the listener that accepted it, which sits
-            // at its bind line's slot in the same proxy's counter row (the table is
-            // read-only after load, so the position is found).
-            if let Some(luid) = entry.sess.so_id {
-                let p = &proxies[proxy_idx];
-                let bi = p.ids.listener_ids.iter().position(|&id| id == luid).unwrap();
-                p.listener_conns.as_deref().unwrap()[bi].fetch_sub(1, Ordering::Relaxed);
-            }
             crate::globalconn::release();
         }
         if let Some(s_idx) = entry.target_server_idx.filter(|_| !entry.sess.srv_uncounted()) {
@@ -10109,15 +10062,6 @@ fn cleanup_done(
     proxies[proxy_idx].counters().bytes_out.fetch_add(entry.sess.bytes_out, Ordering::Relaxed);
     if !entry.actconn_reclaimed && !entry.sess.h3 {
         proxies[proxy_idx].counters().act_conn.fetch_sub(1, Ordering::Relaxed);
-        // The bind's `dst_conn` counter is reclaimed with the connection slot: the
-        // session's `so_id` is the luid of the listener that accepted it, which sits at
-        // its bind line's slot in the same proxy's counter row (the table is read-only
-        // after load, so the position is found).
-        if let Some(luid) = entry.sess.so_id {
-            let p = &proxies[proxy_idx];
-            let bi = p.ids.listener_ids.iter().position(|&id| id == luid).unwrap();
-            p.listener_conns.as_deref().unwrap()[bi].fetch_sub(1, Ordering::Relaxed);
-        }
         crate::globalconn::release();
 
         if let Some(s_idx) = entry.target_server_idx.filter(|_| !entry.sess.srv_uncounted()) {

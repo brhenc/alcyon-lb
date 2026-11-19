@@ -47,10 +47,6 @@ pub struct Listener {
     pub name: Option<Arc<str>>,
     /// The listener's numeric id (`luid`), what `so_id` reads; 0 until the engine sets it.
     pub luid: u32,
-    /// The position of this bind line among the proxy's binds (in `ProxyIdInfo::listener_ids`):
-    /// the per-bind counter `dst_conn` reads and the accept/close paths update. The engine
-    /// sets it next to `luid`.
-    pub bind_idx: u32,
     /// `bind ... accept-proxy` (or `accept-proxy-v2`): connections this bind accepts start
     /// with a PROXY header. Per bind, as in `HAProxy` (`BC_O_ACC_PROXY`).
     pub accept_proxy: bool,
@@ -173,7 +169,6 @@ impl Listener {
             accept_proxy_v2: false,
             proto_h2: false,
             luid: 0,
-            bind_idx: 0,
             backlog,
             rate_paused: false,
         })
@@ -230,7 +225,6 @@ impl Listener {
             accept_proxy_v2: false,
             proto_h2: false,
             luid: 0,
-            bind_idx: 0,
             backlog: 1024,
             rate_paused: false,
         })

@@ -897,10 +897,6 @@ pub trait ProxyState: std::fmt::Debug {
     fn default_backend(&self, frontend: &str) -> Option<String>;
     /// The connections open on all the frontends (`actconn`).
     fn active_connections(&self) -> i64;
-    /// `dst_conn` (`smp_fetch_dconn`, src/listener.c): the connections established on the
-    /// bind line with id `luid`, including the one being evaluated; `None` if no proxy has
-    /// a bind of that id.
-    fn listener_connections(&self, luid: u32) -> Option<i64>;
     /// Whether `key` is an entry of the stick table `table`; `None` if there is no such
     /// table or the key cannot be one of its keys.
     fn table_has_key(&self, table: &str, key: &Sample) -> Option<bool>;
@@ -3441,9 +3437,7 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "dst_conn",
             out_type: SampleType::Sint,
-            // `smp_fetch_dconn` (src/listener.c): the listener's `nbconn` -- the connections
-            // established on this socket including the one being evaluated, per bind line.
-            func: |ctx, _args| ctx.so_id.and_then(|luid| ctx.proxies?.listener_connections(luid)).map(Sample::Sint),
+            func: |ctx, _args| Some(Sample::Sint(i64::from(ctx.act_conn))),
         });
         self.register_fetch(FetchDesc {
             name: "fe_sess_rate",
