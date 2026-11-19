@@ -2416,7 +2416,7 @@ impl SessionArena {
             }
         };
         if let Some((owner_idx, owner_task)) = owner_ref
-            && self.entries.get(owner_idx as usize).and_then(|s| s.as_ref()).is_some_and(|o| !o.parked && o.task == owner_task)
+            .filter(|&(oi, ot)| self.entries.get(oi as usize).and_then(|s| s.as_ref()).is_some_and(|o| !o.parked && o.task == ot))
         {
             let (a, b) = (idx as usize, owner_idx as usize);
             if a < b {
