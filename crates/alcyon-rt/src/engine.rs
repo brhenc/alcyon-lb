@@ -10134,13 +10134,6 @@ fn inject_connection_token_zero_alloc(buf: &mut crate::buf::Buf, token: &str, ca
     }
 }
 
-/// The buffer a thread builds the names of its log-format `use_backend` rules into
-/// (T637 DYNUSEBE): the request path writes the name into it and looks it up without
-/// allocating -- the `String` is paid once per worker and keeps its capacity.
-thread_local! {
-    static BE_NAME: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-}
-
 impl EngineDispatcher<'_> {
     /// What the sample fetches of a request rule see: the session, the proxy whose rules
     /// run (for its counters), and the proxies' state.
@@ -10213,13 +10206,11 @@ impl EngineDispatcher<'_> {
             }
             // A rule with a log-format name builds it per request (T637 DYNUSEBE) into the
             // thread's buffer and looks the result up by name, as `process_switching_rules`
-            // does; a static rule costs exactly what it costs on `main`.
+            // does, in a `scratch_str` pool string (rule 8); a static rule costs what it costs on `main`.
             let routed = match &rc.fmt {
-                Some(fmt) => BE_NAME.with(|name| {
-                    let mut name = name.borrow_mut();
-                    name.clear();
-                    fmt.render_into(&mut name, &ctx.as_ctx(), registry, None);
-                    proxies.route_dyn(proxy, &name)
+                Some(fmt) => crate::reuse::with_string(|name| {
+                    fmt.render_into(name, &ctx.as_ctx(), registry, None);
+                    proxies.route_dyn(proxy, name)
                 }),
                 None => proxies.route(proxy, Some(i)),
             };

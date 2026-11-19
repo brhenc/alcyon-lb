@@ -986,7 +986,6 @@ impl CliApplet {
     /// `publish backend <be>` and `unpublish backend <be>` (`cli_parse_publish_backend` and
     /// `cli_parse_unpublish_backend`, `src/proxy.c`): the flag the switching rules skip and
     /// `show stat` spells `(UNPUB)`, and the answer.
-    ///
     fn handle_be_publish(&mut self, target: &str, publish: bool, ctx: &mut AppletContext) {
         if !ctx.proxies.iter().any(|p| p.has_backend && p.name == target) {
             // A backend the configuration `disabled` is not built at all (`init_proxies`),
