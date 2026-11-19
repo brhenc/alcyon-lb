@@ -100,7 +100,6 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
         "Alcyon does not implement it; requests it should keep apart would share server connections",
     )),
     kw!("redir", Arg::Word, ROUTE),
-    kw!("set-proxy-v2-tlv-fmt", Arg::Word, SENT),
     kw!("shard", Arg::Word, Ignore("peers only")),
     kw!("slowstart", Arg::Delay, Ignore("the warm-up of a server coming back up")),
     kw!("source", Arg::Word, ROUTE),
@@ -147,9 +146,7 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
 ];
 
 fn find(word: &str) -> Option<&'static ServerKeyword> {
-    // `set-proxy-v2-tlv-fmt(<id>)` carries its argument in its name.
-    let name = word.split_once('(').map_or(word, |(n, _)| n);
-    UNIMPLEMENTED_SERVER_KEYWORDS.iter().find(|k| k.name == name)
+    UNIMPLEMENTED_SERVER_KEYWORDS.iter().find(|k| k.name == word)
 }
 
 /// `'server s1' : ` or, on a `default-server` line, nothing, as `HAProxy` prefixes it.

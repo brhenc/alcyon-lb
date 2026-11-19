@@ -97,7 +97,7 @@ const KEYWORDS: &[(&str, Alcyon)] = &[
     ("resolvers r1", Accepts),
     ("send-proxy", Accepts),
     ("send-proxy-v2", Accepts),
-    ("set-proxy-v2-tlv-fmt(0xE1) foo", Refuses),
+    ("set-proxy-v2-tlv-fmt(0xE1) foo", Accepts),
     ("shard 1", Accepts),
     ("slowstart 10s", Accepts),
     ("source 127.0.0.1", Refuses),

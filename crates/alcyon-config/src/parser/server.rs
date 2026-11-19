@@ -53,6 +53,9 @@ pub(crate) fn parse_server(
     let mut rise = default_server.and_then(|d| d.rise);
     let mut send_proxy = default_server.is_some_and(|d| d.send_proxy);
     let mut send_proxy_v2 = default_server.is_some_and(|d| d.send_proxy_v2);
+    // `srv_settings_cpy` copies `default-server`'s TLVs first; the server's own
+    // `set-proxy-v2-tlv-fmt` entries are appended, so the inherited ones are sent first.
+    let mut ppv2_tlvs = default_server.map(|d| d.ppv2_tlvs.clone()).unwrap_or_default();
     let mut maxconn = default_server.and_then(|d| d.maxconn);
     let mut pool_max_conn = default_server.and_then(|d| d.pool_max_conn).unwrap_or(-1);
     let mut max_reuse = default_server.and_then(|d| d.max_reuse).unwrap_or(-1);
@@ -113,6 +116,15 @@ pub(crate) fn parse_server(
             "no-send-proxy" => send_proxy = false,
             "send-proxy-v2" => send_proxy_v2 = true,
             "no-send-proxy-v2" => send_proxy_v2 = false,
+            t if t.starts_with("set-proxy-v2-tlv-fmt") => {
+                // `srv_parse_set_proxy_v2_tlv_fmt`: the id is in the keyword's
+                // parentheses, the log format the following token when there is one.
+                let (id, fmt, consumed) = parse_ppv2_tlv_fmt(tokens, i, who)?;
+                ppv2_tlvs.push(ProxyV2Tlv { id, fmt });
+                if consumed {
+                    i += 1;
+                }
+            }
             "weight" => {
                 i += 1;
                 if i < tokens.len() {
@@ -236,6 +248,9 @@ pub(crate) fn parse_server(
     }
     if puid != 0 {
         extras.puid.push((index, puid));
+    }
+    if !ppv2_tlvs.is_empty() {
+        extras.ppv2_tlvs.push((index, ppv2_tlvs));
     }
     if track.is_some() {
         extras.track_line.push((index, u32::try_from(kw.line).unwrap_or(u32::MAX)));
@@ -839,6 +854,13 @@ pub(crate) fn parse_default_server(
             "no-send-proxy" => cfg.send_proxy = false,
             "send-proxy-v2" => cfg.send_proxy_v2 = true,
             "no-send-proxy-v2" => cfg.send_proxy_v2 = false,
+            t if t.starts_with("set-proxy-v2-tlv-fmt") => {
+                let (id, fmt, consumed) = parse_ppv2_tlv_fmt(tokens, i, None)?;
+                cfg.ppv2_tlvs.push(ProxyV2Tlv { id, fmt });
+                if consumed {
+                    i += 1;
+                }
+            }
             "weight" => {
                 i += 1;
                 if i < tokens.len() {
@@ -1228,6 +1250,96 @@ fn parse_proxy_v2_options(arg: Option<&Token>, kw: &Token) -> Result<bool, Confi
         }
     }
     Ok(unique_id)
+}
+
+/// `set-proxy-v2-tlv-fmt(<id>) [<fmt>]` on the line of `server` (`None` for
+/// `default-server`), at `tokens[i]`. Returns the TLV id, the log format (the following
+/// token's text when there is one, else empty) and whether that token was consumed.
+/// `srv_parse_set_proxy_v2_tlv_fmt` reads the id from the keyword itself and the format
+/// from `args[*cur_arg + 1]`, unconditionally.
+fn parse_ppv2_tlv_fmt(
+    tokens: &[Token],
+    i: usize,
+    who: Option<&str>,
+) -> Result<(u8, Box<str>, bool), ConfigError> {
+    let tok = &tokens[i];
+    let token = tok.text.as_str();
+    let id = match token.strip_prefix("set-proxy-v2-tlv-fmt(") {
+        Some(inner) => parse_ppv2_tlv_id(inner, token, who, tok.line, tok.col)?,
+        None => 0, // `set-proxy-v2-tlv-fmt` with no parentheses: `*cmd` is not `'('`, id stays 0.
+    };
+    let (fmt, consumed) = match tokens.get(i + 1).filter(|t| !t.text.is_empty()) {
+        Some(next) => (next.text.clone().into_boxed_str(), true),
+        None => (Box::<str>::default(), false),
+    };
+    Ok((id, fmt, consumed))
+}
+
+/// The `<id>` of `set-proxy-v2-tlv-fmt(<id>)`, with C's `strtoul(, 0)` semantics
+/// (`srv_parse_set_proxy_v2_tlv_fmt`): an optional sign, then `0x` hex (only when a hex
+/// digit follows), `0b` binary (only when a `0`/`1` follows), a leading `0` octal (the `0`
+/// itself is the first digit), or decimal. `inner` is the token text after the `(`, so it
+/// ends with the closing `)` the scan must stop at. Measured on 3.5-dev11: `08`, `0x`, `0b`
+/// and `1e1` all stop mid-number ("expects ..."), `abc` and `()` convert nothing
+/// ("could not convert ..."), `0b100` is 4, `-1` is the maximum unsigned and trips the
+/// 255 limit.
+fn parse_ppv2_tlv_id(inner: &str, token: &str, who: Option<&str>, line: usize, col: usize) -> Result<u8, ConfigError> {
+    let reject = |reason: &str| {
+        ConfigError::new(line, col, format!("{}'{}' : {reason}", server_keywords::server_prefix(who), token))
+    };
+    let mut s = inner;
+    let neg = match s.as_bytes().first() {
+        Some(b'-') => {
+            s = &s[1..];
+            true
+        }
+        Some(b'+') => {
+            s = &s[1..];
+            false
+        }
+        _ => false,
+    };
+    let (base, digits) = if s.starts_with("0x") || s.starts_with("0X") {
+        let after = &s[2..];
+        if after.bytes().next().is_some_and(|c| (c as char).to_digit(16).is_some()) {
+            (16, after)
+        } else {
+            (8, s) // a `0x` with no hex digit is an octal `0` followed by junk.
+        }
+    } else if s.starts_with("0b") || s.starts_with("0B") {
+        let after = &s[2..];
+        if after.bytes().next().is_some_and(|c| matches!(c, b'0' | b'1')) {
+            (2, after)
+        } else {
+            (8, s)
+        }
+    } else if s.starts_with('0') {
+        (8, s)
+    } else {
+        (10, s)
+    };
+    let mut n = 0usize;
+    for c in digits.bytes() {
+        if (c as char).to_digit(base).is_some() {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    if n == 0 {
+        return Err(reject("could not convert TLV ID"));
+    }
+    // `*error` must be the closing parenthesis.
+    if digits[n..].as_bytes().first() != Some(&b')') {
+        return Err(reject("expects set-proxy-v2-tlv(<TLV ID>)"));
+    }
+    // The value, C's `ERANGE` included; the sign is applied afterwards, as unsigned.
+    let magnitude = u64::from_str_radix(&digits[..n], base).map_err(|_| reject("could not convert TLV ID"))?;
+    let value = if neg { magnitude.wrapping_neg() } else { magnitude };
+    if value > 0xFF {
+        return Err(reject("the maximum allowed TLV ID is 255"));
+    }
+    Ok(value as u8)
 }
 
 /// `fall`/`rise` are `int`s in HAProxy: one past `i32::MAX` reads negative and is refused

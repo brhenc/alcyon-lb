@@ -96,6 +96,14 @@ pub struct ServerArrays {
     server_check_tls: Vec<Option<Arc<crate::srv_tls::CheckTls>>>,
 }
 
+/// One server's `set-proxy-v2-tlv-fmt(<id>) [<fmt>]` TLVs (`srv->pp_tlvs`), compiled once
+/// and in the order `make_proxy_line_v2` sends them: the `default-server` ones first, then
+/// the server's own. `fmt` is `None` for a TLV without a format, whose value is empty.
+#[derive(Debug, Clone)]
+pub struct SrvPpv2Tlvs {
+    pub tlvs: Vec<(u8, Option<Arc<crate::logfmt::LogFormat>>)>,
+}
+
 /// The per-server arrays of a [`ProxyIdInfo`], private to this module for the same reason.
 #[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Default)]
@@ -140,6 +148,10 @@ pub struct ServerIdArrays {
     /// What the server-state file gave each server (T490, [`crate::server_state`]): read
     /// by `init_checks` and by the `lastchg` columns; empty when no file was applied.
     server_restored: Vec<Option<crate::server_state::Restored>>,
+    /// Each server's `set-proxy-v2-tlv-fmt(<id>) [<fmt>]` TLVs, compiled; a `None` slot
+    /// has none and the outer `None` means no server of the proxy does, so a proxy without
+    /// the keyword pays nothing to look (read it with [`ServerSet::pp_tlv_fmts_at`]).
+    server_pp_tlv_fmts: Option<Arc<Vec<Option<Arc<SrvPpv2Tlvs>>>>>,
 }
 
 impl Default for ServerArrays {
@@ -208,8 +220,37 @@ impl ServerIdArrays {
             server_check_ports: server_check_ports(servers),
             server_pool: pool_cfgs(servers, mode_http),
             server_restored: Vec::new(),
+            server_pp_tlv_fmts: pp_tlv_fmts(servers.len(), extras),
         }
     }
+}
+
+/// The `set-proxy-v2-tlv-fmt` formats of [`ServerIdArrays`], compiled once; `None` when no
+/// server of the proxy has one.
+fn pp_tlv_fmts(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Option<Arc<Vec<Option<Arc<SrvPpv2Tlvs>>>>> {
+    if extras.ppv2_tlvs.is_empty() {
+        return None;
+    }
+    let mut slots = vec![None; count];
+    for (idx, tlvs) in &extras.ppv2_tlvs {
+        // A format the configuration passed: `validate_config` refused the proxy otherwise,
+        // as `HAProxy` does at load.
+        let compiled: Vec<(u8, Option<Arc<crate::logfmt::LogFormat>>)> = tlvs
+            .iter()
+            .map(|t| {
+                let fmt = (!t.fmt.is_empty())
+                    .then(|| crate::logfmt::LogFormat::compile_rule(&t.fmt, &crate::engine::sample_registry(), false).ok())
+                    .flatten()
+                    .map(Arc::new);
+                (t.id, fmt)
+            })
+            .collect();
+        let idx = *idx as usize;
+        if idx < count {
+            slots[idx] = Some(Arc::new(SrvPpv2Tlvs { tlvs: compiled }));
+        }
+    }
+    Some(Arc::new(slots))
 }
 
 /// The idle connection settings of each server of a proxy, and its `proto h2` in `mode http`
@@ -664,6 +705,13 @@ impl<'a> ServerSet<'a> {
     #[must_use]
     pub fn pp_unique_id_at(&self, i: usize) -> bool {
         self.0.srv.server_pp_unique_id.get(i).copied().unwrap_or(false)
+    }
+
+    /// Slot `i`'s `set-proxy-v2-tlv-fmt(<id>) [<fmt>]` TLVs, in send order, `None` when
+    /// the server has none.
+    #[must_use]
+    pub fn pp_tlv_fmts_at(&self, i: usize) -> Option<&'a SrvPpv2Tlvs> {
+        self.0.ids.srv.server_pp_tlv_fmts.as_ref().and_then(|slots| slots.get(i)).and_then(Option::as_ref).map(Arc::as_ref)
     }
 
     /// Slot `i`'s session-rate counter.

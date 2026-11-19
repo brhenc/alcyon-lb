@@ -630,6 +630,28 @@ pub fn validate_formats(config: &Config, registry: &Registry) -> Result<(), Stri
             check("backend", &b.name, "unique-id", fmt)?;
         }
     }
+    // `set-proxy-v2-tlv-fmt`: each server's TLV formats are compiled when the server is
+    // finalised, inherited `default-server` formats included: a bad one is fatal,
+    // `'server <proxy>/<srv>' : <error>`. A section's `default-server` alone is never
+    // compiled (no server to finalise), matching HAProxy.
+    let tlv_sections = config
+        .listens
+        .iter()
+        .map(|l| (&l.name, &l.servers, &l.server_extras))
+        .chain(config.backends.iter().map(|b| (&b.name, &b.servers, &b.server_extras)));
+    for (name, servers, extras) in tlv_sections {
+        for (idx, tlvs) in &extras.ppv2_tlvs {
+            let srv = &servers[*idx as usize].id;
+            for tlv in tlvs {
+                if tlv.fmt.is_empty() {
+                    continue;
+                }
+                LogFormat::compile_rule(&tlv.fmt, registry, false)
+                    .map(|_| ())
+                    .map_err(|e| format!("'server {name}/{srv}' : {e}"))?;
+            }
+        }
+    }
     // `http-request capture ... id <n>` fills an existing request slot: a `declare
     // capture`, a `capture request header`, or another rule's (`check_http_req_capture`).
     let sections = config
