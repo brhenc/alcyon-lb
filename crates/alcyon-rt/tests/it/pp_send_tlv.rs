@@ -409,3 +409,9 @@ fn check_refuses_octal_eight() {
 fn check_refuses_octal_above_255() {
     check_refused("set-proxy-v2-tlv-fmt(0777) \"x\"", "the maximum allowed TLV ID is 255");
 }
+
+/// `-c` refuses an unknown fetch method in a TLV format.
+#[test]
+fn check_refuses_unknown_fetch_in_tlv_fmt() {
+    check_refused("set-proxy-v2-tlv-fmt(1) %[nosuchfetch]", "unknown fetch method 'nosuchfetch'");
+}
