@@ -224,6 +224,10 @@ pub struct StreamFacts {
     /// happened: the first byte, the request, the queue, the connect and the response
     /// (`%Ti`, `%TR`..., a rule's format reads them, T455). `None` where the caller has none.
     pub timers: Option<[i64; 5]>,
+    /// Position in the backend's queue when dequeued (`logs->prx_queue_pos`); 0 if not queued there.
+    pub be_queue: u32,
+    /// Position in the server's queue when dequeued (`logs->srv_queue_pos`); 0 if not queued there.
+    pub srv_queue: u32,
 }
 
 /// Why a client connection failed before a session began (`conn->err_code`): what
@@ -2342,18 +2346,17 @@ impl Registry {
         });
 
         // `smp_fetch_conn_queues` (src/sample.c): the stream's position in the backend's
-        // and the server's queues, and nothing where there is no stream. Neither queue
-        // holds a stream in this `HAProxy`: the positions are 0 from the stream's birth
-        // (src/stream.c) and nothing changes them.
+        // and the server's queues when dequeued (`logs->prx_queue_pos` / `srv_queue_pos`),
+        // 0 when it never queued there, and nothing where there is no stream.
         self.register_fetch(FetchDesc {
             name: "bc_be_queue",
             out_type: SampleType::Sint,
-            func: |ctx, _args| ctx.stream.map(|_| Sample::Sint(0)),
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::from(s.be_queue))),
         });
         self.register_fetch(FetchDesc {
             name: "bc_srv_queue",
             out_type: SampleType::Sint,
-            func: |ctx, _args| ctx.stream.map(|_| Sample::Sint(0)),
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::from(s.srv_queue))),
         });
 
         // `smp_fetch_rqver` / `smp_fetch_stver` (src/http_fetch.c): the version without

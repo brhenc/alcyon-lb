@@ -310,3 +310,78 @@ fn h2_single_stream_fc_nb_streams() {
     common::stop(&mut child);
     assert_eq!(body, "req=[1]", "fc_nb_streams over one HTTP/2 stream");
 }
+
+/// `bc_be_queue` and `bc_srv_queue` when requests wait in the backend's queue
+/// (`maxconn 1`, a held backend, 3 concurrent requests): the request that went
+/// straight to the server sees 0, and the two that waited see their queue positions
+/// (1 and 2).
+#[test]
+fn queued_requests_bc_be_queue() {
+    use std::sync::{mpsc, Arc, Mutex};
+
+    let be_port = common::reserve_port();
+    let be: SocketAddr = format!("127.0.0.1:{be_port}").parse().unwrap();
+    let l = TcpListener::bind(be).unwrap();
+    let (arrived_tx, arrived_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let be_thread = thread::spawn(move || {
+        for (i, s) in l.incoming().enumerate() {
+            let Ok(mut s) = s else { break };
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            if i == 0 {
+                let _ = arrived_tx.send(());
+                let _ = release_rx.lock().unwrap().recv();
+            }
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
+            if i == 2 {
+                break;
+            }
+        }
+    });
+
+    let fe_port = common::reserve_port();
+    let fe: SocketAddr = format!("127.0.0.1:{fe_port}").parse().unwrap();
+    let cfg = format!(
+        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 2s\n  timeout queue 5s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend f\n  bind 127.0.0.1:{fe_port}\n  default_backend b\n\
+         http-response set-header x-bbq %[bc_be_queue]\n\
+         http-response set-header x-bsq %[bc_srv_queue]\n\
+         backend b\n  server s1 127.0.0.1:{be_port} maxconn 1\n",
+    );
+    let mut child = start(&cfg, "bequeue", fe);
+
+    let send_req = |fe: SocketAddr| {
+        thread::spawn(move || {
+            let mut s = TcpStream::connect_timeout(&fe, Duration::from_secs(3)).unwrap();
+            s.write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").unwrap();
+            let mut out = String::new();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            s.read_to_string(&mut out).unwrap();
+            out
+        })
+    };
+
+    let h1 = send_req(fe);
+    arrived_rx.recv_timeout(Duration::from_secs(3)).expect("first request reached backend");
+
+    let h2 = send_req(fe);
+    thread::sleep(Duration::from_millis(50));
+    let h3 = send_req(fe);
+    thread::sleep(Duration::from_millis(50));
+
+    let _ = release_tx.send(());
+
+    let r1 = h1.join().unwrap();
+    let r2 = h2.join().unwrap();
+    let r3 = h3.join().unwrap();
+    common::stop(&mut child);
+    let _ = be_thread.join();
+
+    let mut bbqs: Vec<String> = [&r1, &r2, &r3].iter().map(|r| hdr(r, "x-bbq")).collect();
+    bbqs.sort();
+    let bsqs: Vec<String> = [&r1, &r2, &r3].iter().map(|r| hdr(r, "x-bsq")).collect();
+    assert_eq!(bbqs, vec!["0", "1", "2"], "bc_be_queue across 3 concurrent requests:\n{r1}\n{r2}\n{r3}");
+    assert_eq!(bsqs, vec!["0", "0", "0"], "bc_srv_queue without server assignment:\n{r1}\n{r2}\n{r3}");
+}

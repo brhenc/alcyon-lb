@@ -3252,6 +3252,8 @@ fn stream_facts(sess: &TcpSession, status: Option<u16>, timers: bool) -> alcyon_
         redispatched: sess.redispatched,
         // Only for a rule whose format prints them: five clock reads are not free (T455).
         timers: timers.then(|| [log.ms(log.first_byte), log.ms(log.request), log.ms(log.queue), log.ms(log.connect), log.ms(log.data)]),
+        be_queue: if log.queue_is_srv { 0 } else { log.be_queue },
+        srv_queue: if log.queue_is_srv { log.be_queue } else { 0 },
     }
 }
 
@@ -3307,6 +3309,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         term_state: Some(sess_term_state(s)),
         bc_dst: s.bc_dst(),
         bc_src: s.bc_src(),
+        stream: Some(stream_facts(s, None, false)),
         ..Default::default()
     }
 }
@@ -3583,7 +3586,8 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         retries: i64::from(s.max_retries.saturating_sub(s.conn_retries)),
         redispatched: s.strm.log.redispatched,
         uniq_id: l.uniq_id,
-        be_queue: u64::from(l.be_queue),
+        be_queue: u64::from(if l.queue_is_srv { 0 } else { l.be_queue }),
+        srv_queue: u64::from(if l.queue_is_srv { l.be_queue } else { 0 }),
         log_counter: fe.log_count.load(Ordering::Relaxed),
         pid,
         hostname: log_hostname(),
@@ -15337,6 +15341,7 @@ impl EngineDispatcher<'_> {
         let ms = entry.sess.queue_ms();
         let deadline = if ms == 0 { Tick::ETERNITY } else { now.add(ms) };
         entry.sess.strm.log.be_queue = entry.sess.queue.enter(entry.task, be_idx, srv, proxies[be_idx].stats.clone(), deadline);
+        entry.sess.strm.log.queue_is_srv = srv.is_some();
         None
     }
 
