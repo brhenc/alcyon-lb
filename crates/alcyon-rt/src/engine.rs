@@ -8599,20 +8599,27 @@ fn proxy_header(fe: &Proxy, proxy: &Proxy, proxies: &crate::table::Table, sess: 
             // `make_proxy_line_v2` appends the server's `pp_tlvs` first, in the order the
             // lines gave them (the `default-server` ones before its own), before the
             // unique-id TLV: type, length, the rendered value.
-            for (id, fmt) in &tlvs.tlvs {
-                tlv_data.push(*id);
-                tlv_data.extend_from_slice(&0u16.to_be_bytes());
-                if let Some(fmt) = fmt {
-                    let view = ProxiesView(proxies);
-                    let stick = StickView::new(proxies, &sess.tracked_sc);
-                    let phase = stream_sample_ctx(sess, fe, proxy, &view, &stick);
-                    let ctx = phase.as_ctx();
-                    let data = session_log_data(sess, fe, proxy, std::process::id());
-                    let start = tlv_data.len();
-                    fmt.render_value_append(&mut tlv_data, &data, sample_registry(), &ctx);
-                    let len = u16::try_from(tlv_data.len() - start).unwrap_or(u16::MAX);
-                    tlv_data[start - 2..start].copy_from_slice(&len.to_be_bytes());
+            let mut append_tlvs = |render: Option<(&_, &_)>| {
+                for (id, fmt) in &tlvs.tlvs {
+                    tlv_data.push(*id);
+                    tlv_data.extend_from_slice(&0u16.to_be_bytes());
+                    if let (Some(fmt), Some((data, ctx))) = (fmt, render) {
+                        let start = tlv_data.len();
+                        fmt.render_value_append(&mut tlv_data, data, sample_registry(), ctx);
+                        let len = u16::try_from(tlv_data.len() - start).unwrap_or(u16::MAX);
+                        tlv_data[start - 2..start].copy_from_slice(&len.to_be_bytes());
+                    }
                 }
+            };
+            if tlvs.tlvs.iter().any(|(_, fmt)| fmt.is_some()) {
+                let view = ProxiesView(proxies);
+                let stick = StickView::new(proxies, &sess.tracked_sc);
+                let phase = stream_sample_ctx(sess, fe, proxy, &view, &stick);
+                let ctx = phase.as_ctx();
+                let data = session_log_data(sess, fe, proxy, std::process::id());
+                append_tlvs(Some((&data, &ctx)));
+            } else {
+                append_tlvs(None);
             }
         }
         if proxy.srv_set().pp_unique_id_at(idx) {
