@@ -385,10 +385,6 @@ pub struct PhaseCtx<'a> {
     /// T326: the same for the server connection (`bc_http_major`); `None` where there is none
     /// yet or it is not HTTP.
     pub bc_http_major: Option<u8>,
-    /// The streams the client connection's mux serves now (`fc_nb_streams`): one on an
-    /// HTTP/1 connection, the connection's count on an HTTP/2 stream; `None` where the
-    /// connection has no HTTP mux or the count is not on this session.
-    pub fc_nb_streams: Option<u32>,
     /// The client connection's TLS session, for `ssl_fc*` and `ssl_c_used`; the default
     /// (`used` false, nothing else) for a plaintext one.
     pub ssl_fc: SslFacts<'a>,
@@ -473,7 +469,6 @@ impl PhaseCtx<'_> {
         act_conn: 0,
         fc_http_major: None,
         bc_http_major: None,
-        fc_nb_streams: None,
         ssl_fc: SslFacts::NONE,
         ssl_bc: None,
         quic_acks: None,
@@ -2157,8 +2152,15 @@ impl Registry {
             func: fc_dst_is_local_fetch,
         });
 
-        // T331 / G3 CONNVIEW: `fc_settings_streams_limit` (HTTP/1 and HTTP/2) and `fc_glitches`
+        // T331 / G3 CONNVIEW: `fc_nb_streams` (HTTP/1, HTTP/2, HTTP/3),
+        // `fc_settings_streams_limit` (HTTP/1 and HTTP/2) and `fc_glitches`
         // (HTTP/2 only; HTTP/1 is refused at load and returns `None` here).
+        // `smp_fetch_fc_nb_streams` (src/connection.c): live stream count from `PhaseCtx::fc`.
+        self.register_fetch(FetchDesc {
+            name: "fc_nb_streams",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.fc.map(|fc| Sample::Sint(i64::from(fc.nb_streams()))),
+        });
         self.register_fetch(FetchDesc {
             name: "fc_settings_streams_limit",
             out_type: SampleType::Sint,
@@ -2365,18 +2367,10 @@ impl Registry {
             func: |ctx, _args| ctx.bc_http_major.map(|m| Sample::Sint(i64::from(m))),
         });
 
-        // `smp_fetch_fc_nb_streams` (src/connection.c): the streams the connection's mux
-        // serves now, and nothing where it has no connection or mux. On an HTTP/1
-        // connection the mux serves a stream at a time, one; on an HTTP/2 stream the count
-        // is the connection's ([`PhaseCtx::fc_nb_streams`]). The stream's server connection
-        // carries the stream only (`bc_nb_streams`, `smp_fetch_bc_nb_streams`): Alcyon has
-        // no multiplexed mux towards a server, so its mux serves one stream while there is
-        // an HTTP server connection, nothing before there is one.
-        self.register_fetch(FetchDesc {
-            name: "fc_nb_streams",
-            out_type: SampleType::Sint,
-            func: |ctx, _args| ctx.fc_nb_streams.map(|n| Sample::Sint(i64::from(n))),
-        });
+        // `smp_fetch_bc_nb_streams` (src/connection.c): the stream's server connection
+        // carries the stream only: Alcyon has no multiplexed mux towards a server, so its
+        // mux serves one stream while there is an HTTP server connection, nothing before there
+        // is one.
         self.register_fetch(FetchDesc {
             name: "bc_nb_streams",
             out_type: SampleType::Sint,

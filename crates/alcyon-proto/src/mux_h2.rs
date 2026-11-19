@@ -30,7 +30,6 @@ use crate::h2::TextHead;
 use crate::htx::{HeaderField, HttpVersion, Htx, HtxBlock, RxHead};
 use crate::mux::{mux_flags, Mux, MuxFlags, MuxOps, ShutMode};
 use std::io;
-use std::sync::{atomic, Arc};
 
 /// Output waiting for the client past which the demux stops: what a client that reads
 /// nothing can make the connection queue in replies (RST_STREAM, PING and SETTINGS ACKs).
@@ -509,11 +508,6 @@ pub struct H2MuxContext {
     /// `:path` gets the relaxed check of `h2_make_htx_request(.., relaxed)` (T451).
     pub relaxed_path: bool,
     pub total_streams: usize,
-    /// The streams in `streams` now (`HAProxy`'s `h2c->nb_streams`), kept where the streams
-    /// of the connection can read it without touching the connection (`fc_nb_streams`):
-    /// atomic, because a stream's entry may read it while the connection's adds or lets go
-    /// of a stream, on another thread.
-    pub nb_streams: Arc<atomic::AtomicU32>,
     pub glitch_count: usize,
     pub graceful_goaway_sent: bool,
     /// The highest stream id that has had an entry in `streams`. A closed stream is taken
@@ -630,7 +624,6 @@ impl H2MuxContext {
             flood_config: H2FloodConfig::default(),
             relaxed_path: false,
             total_streams: 0,
-            nb_streams: Arc::new(atomic::AtomicU32::new(0)),
             glitch_count: 0,
             graceful_goaway_sent: false,
             highest_opened: 0,
@@ -670,12 +663,6 @@ impl H2MuxContext {
         if self.body_scratch.capacity() > 4096 {
             self.body_scratch = Vec::new();
         }
-    }
-
-    /// `nb_streams` written back to what `streams` holds now: the sites that add a stream or
-    /// let one go call it, so what a stream's `fc_nb_streams` reads is a single load.
-    pub fn count_streams(&self) {
-        self.nb_streams.store(self.streams.len() as u32, atomic::Ordering::Release);
     }
 
     /// `tx_buf` starts over once all of it has been sent.
@@ -883,7 +870,6 @@ impl H2MuxContext {
     fn stream_reset(&mut self, stream_id: u32, error_code: H2Error) {
         if self.streams.get(&stream_id).is_some_and(|s| !s.dispatched) {
             self.streams.remove(&stream_id);
-            self.count_streams();
         } else if let Some(stream) = self.streams.get_mut(&stream_id) {
             stream.state = H2StreamState::Reset(error_code);
             stream.reset_reason = Some(error_code);
@@ -1640,7 +1626,6 @@ impl MuxH2 {
             None
         };
         let spare_htx = ctx.spare_htx.pop();
-        let fresh = !ctx.streams.contains_key(&stream_id);
         let stream = ctx.streams.entry(stream_id).or_insert_with(|| {
             let mut s = H2StreamCtx::new(
                 stream_id,
@@ -1655,9 +1640,6 @@ impl MuxH2 {
 
         stream.state = H2StreamState::Open;
         ctx.highest_opened = ctx.highest_opened.max(stream_id);
-        if fresh {
-            ctx.nb_streams.fetch_add(1, atomic::Ordering::Release);
-        }
 
         let converted = if let Some(head) = head {
             request_head(stream, decoded, head, relaxed)

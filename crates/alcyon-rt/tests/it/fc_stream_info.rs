@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! T331 / G3 CONNVIEW: `fc_settings_streams_limit` (HTTP/1 and HTTP/2) and `fc_glitches` (HTTP/2
-//! only; HTTP/1 stays refused at load because Alcyon counts no HTTP/1 glitches) read the
-//! connection through `ConnView`. `fc_nb_streams` is implemented. `HAProxy` 3.5-dev8, three HEADERS
-//! frames in one write on a `proto h2` bind: `fc_nb_streams|fc_settings_streams_limit|fc_glitches`
-//! gives `3|100|0`, `2|100|0`, `1|100|0`, and `3|7|0`, ... with `tune.h2.fe.max-concurrent-streams 7`.
+//! T331 / G3 CONNVIEW: `fc_nb_streams` (HTTP/1, HTTP/2, HTTP/3), `fc_settings_streams_limit`
+//! (HTTP/1 and HTTP/2) and `fc_glitches` (HTTP/2 only; HTTP/1 stays refused at load because
+//! Alcyon counts no HTTP/1 glitches) read the connection through `ConnView`. `HAProxy` 3.5-dev8,
+//! three HEADERS frames in one write on a `proto h2` bind:
+//! `fc_nb_streams|fc_settings_streams_limit|fc_glitches` gives `3|100|0`, `2|100|0`, `1|100|0`,
+//! and `3|7|0`, `2|7|0`, `1|7|0` with `tune.h2.fe.max-concurrent-streams 7`.
 //! Set `T281_ORACLE=/path/to/haproxy` to run the wire tests against `HAProxy`.
 
 use crate::common;
@@ -128,14 +129,14 @@ fn fc_settings_streams_limit_h1_answers_one() {
     assert_eq!(body, "1", "expected 1 on HTTP/1, got {resp:?}");
 }
 
-fn run_h2_three_streams(max_concurrent_streams: Option<u32>) -> Vec<String> {
+fn run_h2_three_streams(max_concurrent_streams: Option<u32>, lf_string: &str) -> Vec<String> {
     let fe = common::reserve_addr();
     let tune = max_concurrent_streams.map_or_else(String::new, |n| format!("  tune.h2.fe.max-concurrent-streams {n}\n"));
     let cfg = format!(
         "global\n  nbthread 1\n{tune}\
          defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
          frontend fe\n  bind {fe} proto h2\n  \
-         http-request return status 200 content-type text/plain lf-string \"%[fc_settings_streams_limit]|%[fc_glitches]\"\n"
+         http-request return status 200 content-type text/plain lf-string \"{lf_string}\"\n"
     );
     let mut f = NamedTempFile::new().expect("tmp");
     f.write_all(cfg.as_bytes()).expect("cfg");
@@ -203,6 +204,14 @@ fn run_h2_three_streams(max_concurrent_streams: Option<u32>) -> Vec<String> {
 
 #[test]
 fn fc_settings_streams_limit_and_glitches_h2_three_streams() {
-    assert_eq!(run_h2_three_streams(None), vec!["100|0", "100|0", "100|0"]);
-    assert_eq!(run_h2_three_streams(Some(7)), vec!["7|0", "7|0", "7|0"]);
+    let lf = "%[fc_settings_streams_limit]|%[fc_glitches]";
+    assert_eq!(run_h2_three_streams(None, lf), vec!["100|0", "100|0", "100|0"]);
+    assert_eq!(run_h2_three_streams(Some(7), lf), vec!["7|0", "7|0", "7|0"]);
+}
+
+#[test]
+fn fc_nb_streams_h2_three_streams() {
+    let lf = "%[fc_nb_streams]|%[fc_settings_streams_limit]|%[fc_glitches]";
+    assert_eq!(run_h2_three_streams(None, lf), vec!["3|100|0", "2|100|0", "1|100|0"]);
+    assert_eq!(run_h2_three_streams(Some(7), lf), vec!["3|7|0", "2|7|0", "1|7|0"]);
 }

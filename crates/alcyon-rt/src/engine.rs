@@ -3322,7 +3322,6 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         ssl_fc: crate::proxy::ssl_fc(&s.cli_xprt, s.h2_role.as_deref()),
         quic_acks: s.quic_facts(),
         fc_http_major: s.fc_http_major(),
-        fc_nb_streams: s.fc_nb_streams(),
         bc_http_major: s.bc_http_major(),
         req_version: s.client_version(),
         ssl_bc: s.srv_xprt.ssl_facts(),
@@ -7914,7 +7913,6 @@ fn eval_tcp_req_content_rules(
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
         quic_acks: sess.quic_facts(),
         fc_http_major: sess.fc_http_major(),
-        fc_nb_streams: sess.fc_nb_streams(),
         bc_http_major: sess.bc_http_major(),
         req_version: sess.client_version(),
         ssl_bc: sess.srv_xprt.ssl_facts(),
@@ -8208,7 +8206,6 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &crate::table::Table, regi
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
         quic_acks: sess.quic_facts(),
         fc_http_major: sess.fc_http_major(),
-        fc_nb_streams: sess.fc_nb_streams(),
         bc_http_major: sess.bc_http_major(),
         req_version: sess.client_version(),
         ssl_bc: sess.srv_xprt.ssl_facts(),
@@ -10310,7 +10307,6 @@ impl EngineDispatcher<'_> {
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
             quic_acks: sess.quic_facts(),
             fc_http_major: sess.fc_http_major(),
-            fc_nb_streams: sess.fc_nb_streams(),
             bc_http_major: sess.bc_http_major(),
             req_version: sess.client_version(),
             ssl_bc: sess.srv_xprt.ssl_facts(),
@@ -11750,7 +11746,7 @@ impl EngineDispatcher<'_> {
             return out;
         }
         let mut connect_line: Option<(usize, String)> = None;
-        let mut owner_wake: Option<TaskRef> = None;
+        let mut owner_ref: Option<(u32, TaskRef)> = None;
         {
             let Some(entry) = self.sessions.get_mut(session_idx) else {
                 return Outcome::Done;
@@ -12090,8 +12086,8 @@ impl EngineDispatcher<'_> {
             // what it produced (its response, room for more of its request) and sees how it
             // ended (T280).
             // An HTTP/3 owner too (L2): its second run in a pass sends what this one moved.
-            if let Some((_, owner_task)) = entry.sess.h2_child().and_then(|c| c.owner) {
-                owner_wake = Some(owner_task);
+            if let Some(o) = entry.sess.h2_child().and_then(|c| c.owner) {
+                owner_ref = Some(o);
             }
 
             // Step 5: Update timer. Not for a stream that has ended: its task is freed when
@@ -12111,10 +12107,25 @@ impl EngineDispatcher<'_> {
             (entry.sess.is_done(), pending_admin, log_line, checkcache_alert)
         };
 
-        if let Some(owner_task) = owner_wake {
+        if let Some((owner_idx, owner_task)) = owner_ref {
             #[cfg(debug_assertions)]
-            if self.sessions.get(session_idx).and_then(|e| e.sess.h2_child()).and_then(|c| c.owner).and_then(|(i, _)| self.sessions.get(i)).is_some_and(|o| o.sess.h3_owner().is_some()) {
+            if self.sessions.get(owner_idx).is_some_and(|o| o.sess.h3_owner().is_some()) {
                 alcyon_sample::work::note(alcyon_sample::work::Op::H3OwnerWakeNow, 1);
+            }
+            // Frame a ready response into the owner's h2 mux right away so sibling streams in
+            // the same pass see the live stream count drop as each finishes, matching HAProxy's
+            // synchronous mux send (`h2_snd_buf` -> `h2s_close`).
+            if !is_done {
+                if let Some((o, c)) = self
+                    .sessions
+                    .get2_mut(owner_idx, session_idx)
+                    .filter(|(o, _)| o.task == owner_task && o.sess.h2_ctx.is_some())
+                {
+                    if !c.sess.rep.is_empty() && h2_bridge_moves(o, c, now) {
+                        let pending = o.sess.h2_ctx.as_deref().is_some_and(|h| h.tx_consumed < h.tx_buf.len());
+                        if let Some(ch) = c.sess.h2_child_mut() { ch.owner_tx_pending = pending; }
+                    }
+                }
             }
             self.wake_now.push(owner_task);
         }
@@ -13122,7 +13133,6 @@ impl EngineDispatcher<'_> {
             ssl_fc: crate::proxy::ssl_fc(&entry.sess.cli_xprt, entry.sess.h2_role.as_deref()),
             quic_acks: entry.sess.quic_facts(),
             fc_http_major: entry.sess.fc_http_major(),
-            fc_nb_streams: entry.sess.fc_nb_streams(),
             bc_http_major: entry.sess.bc_http_major(),
             req_version: entry.sess.client_version(),
             ssl_bc: entry.sess.srv_xprt.ssl_facts(),
@@ -13635,7 +13645,6 @@ impl EngineDispatcher<'_> {
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
             quic_acks: sess.quic_facts(),
             fc_http_major: sess.fc_http_major(),
-            fc_nb_streams: sess.fc_nb_streams(),
             req_version: sess.client_version(),
             req_uri: sess.req_uri.as_deref(),
             req_method: sess.req_method.as_deref(),
@@ -14237,7 +14246,6 @@ impl EngineDispatcher<'_> {
                 is_first_req: sess.is_first_req,
                 quic_acks: sess.quic_facts(),
                 fc_http_major: sess.fc_http_major(),
-                fc_nb_streams: sess.fc_nb_streams(),
                 bc_http_major: sess.bc_http_major(),
                 req_version: sess.client_version(),
                 // `ssl_bc` stays `None`: the parser refuses every `ssl_bc*` fetch in a request
@@ -18739,7 +18747,6 @@ fn after_res_on_reply<'r>(
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
             quic_acks: sess.quic_facts(),
             fc_http_major: sess.fc_http_major(),
-            fc_nb_streams: sess.fc_nb_streams(),
             bc_http_major: sess.bc_http_major(),
             req_version: sess.client_version(),
             ssl_bc: sess.srv_xprt.ssl_facts(),
@@ -18812,7 +18819,6 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &cra
                     ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
                     quic_acks: sess.quic_facts(),
                     fc_http_major: sess.fc_http_major(),
-                    fc_nb_streams: sess.fc_nb_streams(),
                     bc_http_major: sess.bc_http_major(),
                     req_version: sess.client_version(),
                     ssl_bc: sess.srv_xprt.ssl_facts(),
