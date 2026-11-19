@@ -175,6 +175,32 @@ pub enum ResolvedCheckConfig {
 /// Resolved HTTP health check parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedHttpCheck {
+    pub send_state: bool,
+    pub steps: Vec<ResolvedHttpStep>,
+}
+
+/// Single step in an HTTP health check sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedHttpStep {
+    Connect {
+        addr: Option<SocketAddr>,
+        port: Option<u16>,
+        send_proxy: bool,
+    },
+    Send(ResolvedHttpSend),
+    Expect(ResolvedHttpExpectRule),
+    SetVar {
+        var_name: String,
+        expr: String,
+    },
+    UnsetVar {
+        var_name: String,
+    },
+}
+
+/// Request parameters for an `http-check send` (or `option httpchk`) step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedHttpSend {
     pub method: String,
     pub uri: String,
     /// `uri` is a log-format (`uri-lf`); otherwise it is sent as written.
@@ -185,28 +211,6 @@ pub struct ResolvedHttpCheck {
     pub body: Option<String>,
     /// `body` is a log-format (`body-lf`).
     pub body_lf: bool,
-    /// The rule set has a request to send. Without one `HAProxy` connects and sends
-    /// nothing (a backend that has `http-check expect` rules only).
-    pub has_send: bool,
-    pub send_state: bool,
-    /// `set-var` / `unset-var` rules before the first `expect`: run when the request is
-    /// built, with no response to read (`HAProxy` runs them as it reaches them, and the
-    /// response is read by the first `expect`).
-    pub pre_rules: Vec<ResolvedHttpRule>,
-    /// The rules after the request, in order: run against the response.
-    pub rules: Vec<ResolvedHttpRule>,
-    pub check_port: Option<u16>,
-    pub send_proxy: bool,
-    /// `http-check connect addr`: where the check connects.
-    pub connect_addr: Option<SocketAddr>,
-}
-
-/// A rule run on a response, or a variable rule run before the request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResolvedHttpRule {
-    Expect(ResolvedHttpExpectRule),
-    SetVar { var_name: String, expr: String },
-    UnsetVar { var_name: String },
 }
 
 /// Single expectation rule for an HTTP health check response.

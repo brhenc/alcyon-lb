@@ -449,7 +449,6 @@ fn unimplemented_check_rules_are_refused_at_load() {
         "http-check connect ssl",
         "http-check expect status 200 on-error \"x\"",
         "http-check send meth GET hdr-lf a b",
-        "http-check send meth GET\n  http-check send meth GET",
         "http-check set-var(txn.x) str(a)",
         "tcp-check connect ssl",
         "tcp-check send-lf foo",

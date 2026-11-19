@@ -264,6 +264,7 @@ mod http_check_one_buffer;
 mod http_check_reply_framing;
 mod http_check_send_formats;
 mod http_check_send_values;
+mod http_check_sequences;
 mod http_close;
 mod http_encode_map;
 mod http_keep_alive_timeout;
