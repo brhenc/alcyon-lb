@@ -23,6 +23,9 @@ pub enum TcpReqConnAction {
     DoLog,
     /// `expect-proxy layer4`: a PROXY header is expected on the connections the rule matches.
     ExpectProxy,
+    /// `expect-netscaler-cip layer4`: a NetScaler Client IP header is expected on the
+    /// connections the rule matches; its magic is the bind's (`0` when the bind sets none).
+    ExpectNetscalerCip,
 }
 
 /// Rule pairing a TCP-request connection action with an optional condition.

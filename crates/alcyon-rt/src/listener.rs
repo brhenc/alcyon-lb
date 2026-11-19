@@ -52,6 +52,10 @@ pub struct Listener {
     pub accept_proxy: bool,
     /// `accept-proxy-v2`: the header must be v2.
     pub accept_proxy_v2: bool,
+    /// `bind ... accept-netscaler-cip <magic>`: connections this bind accepts start with a
+    /// NetScaler Client IP header whose first 4 bytes are the magic (`0` when the bind sets
+    /// none and a rule still expects one). Per bind, as in `HAProxy` (`BC_O_ACC_CIP`).
+    pub accept_netscaler_cip: Option<u32>,
     /// `bind ... proto h2`: connections start as HTTP/2 (the preface is expected).
     pub proto_h2: bool,
     /// The `listen()` backlog of the bind ([`listener_backlog`]), for the `listen()` that
@@ -167,6 +171,7 @@ impl Listener {
             name: None,
             accept_proxy: false,
             accept_proxy_v2: false,
+            accept_netscaler_cip: None,
             proto_h2: false,
             luid: 0,
             backlog,
@@ -223,6 +228,7 @@ impl Listener {
             name: None,
             accept_proxy: false,
             accept_proxy_v2: false,
+            accept_netscaler_cip: None,
             proto_h2: false,
             luid: 0,
             backlog: 1024,

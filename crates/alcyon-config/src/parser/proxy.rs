@@ -874,6 +874,7 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
         proto: None,
         accept_proxy: false,
         accept_proxy_v2: false,
+        accept_netscaler_cip: None,
         name: None,
         id: None,
         min_ver: None,
@@ -931,6 +932,30 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
             "accept-proxy-v2" => {
                 bind.accept_proxy = true;
                 bind.accept_proxy_v2 = true;
+            }
+            // `bind_parse_accept_netscaler_cip`: `uint32_t val = atol(arg)`, and
+            // `val <= 0` on the unsigned is `val == 0` -- so "abc" (atol 0) and
+            // "-4294967296" (wrapping to 0) are refused, "-1" is kept as 0xFFFFFFFF and
+            // "123abc" as 123 (measured). The refusal always prints 0, the val it holds.
+            "accept-netscaler-cip" => {
+                let a = arg(i, "missing value")?;
+                let t = a.text.trim();
+                let sign = usize::from(t.starts_with(['+', '-']));
+                let digits = t.get(sign..).map_or("", |s| s.split(|c: char| !c.is_ascii_digit()).next().unwrap_or(""));
+                // `atol` (glibc) clamps an overflow to `LLONG_MAX`/`LLONG_MIN`, not 0:
+                // `99999999999999999999` is 0x7FFFFFFFFFFFFFFF, and its low 32 bits are
+                // the magic 0xFFFFFFFF the oracle keeps (measured).
+                let value = if digits.is_empty() {
+                    0
+                } else {
+                    t[..sign + digits.len()].parse::<i64>().unwrap_or(if t.starts_with('-') { i64::MIN } else { i64::MAX })
+                };
+                let magic = value as u32;
+                if magic == 0 {
+                    return Err(ConfigError::new(a.line, a.col, format!("{prefix} : 'accept-netscaler-cip' : invalid value 0, must be >= 0")));
+                }
+                bind.accept_netscaler_cip = Some(magic);
+                i += 1;
             }
             // Socket options: `Listener::bind_tuned` applies them to the listening socket.
             "backlog" => {

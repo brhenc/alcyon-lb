@@ -131,6 +131,140 @@ impl ProxyHdrError {
     }
 }
 
+/// Why a connection that was to open with a NetScaler Client IP header did not get past
+/// it: `HAProxy`'s `CO_ER_CIP_*` codes, with the texts of `conn_err_code_str`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum CipError {
+    /// The client closed before sending a byte (`CO_ER_CIP_EMPTY`).
+    Empty,
+    /// The read failed, as on a reset (`CO_ER_CIP_ABORT`).
+    Abort,
+    /// `timeout client` expired with no header (`CO_ER_CIP_TIMEOUT`).
+    Timeout,
+    /// Some of a header, and `HAProxy` does not wait for the rest (`CO_ER_CIP_TRUNCATED`).
+    Truncated,
+    /// The magic number is not the one the bind declared (`CO_ER_CIP_BAD_MAGIC`).
+    BadMagic,
+    /// The encapsulated protocol is not IPv4 or IPv6, or it carries no TCP
+    /// (`CO_ER_CIP_BAD_PROTO`).
+    BadProto,
+}
+
+impl CipError {
+    /// The text `HAProxy` logs after `fe/<listener>: `.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "Connection closed while waiting for NetScaler Client IP header",
+            Self::Abort => "Connection error while waiting for NetScaler Client IP header",
+            Self::Timeout => "Timeout while waiting for a NetScaler Client IP header",
+            Self::Truncated => "Truncated NetScaler Client IP header received",
+            Self::BadMagic => "Received an invalid NetScaler Client IP magic number",
+            Self::BadProto => "Received an unhandled protocol in the NetScaler Client IP header",
+        }
+    }
+
+    /// `conn->err_code` (`CO_ER_CIP_*`): what `fc_err` reads.
+    #[must_use]
+    pub const fn code(self) -> i64 {
+        match self {
+            Self::Empty => 18,
+            Self::Abort => 19,
+            Self::Timeout => 20,
+            Self::Truncated => 21,
+            Self::BadMagic => 22,
+            Self::BadProto => 23,
+        }
+    }
+
+    /// `conn_err_code_name`: what `fc_err_name` reads.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Empty => "CIP_EMPTY",
+            Self::Abort => "CIP_ABORT",
+            Self::Timeout => "CIP_TIMEOUT",
+            Self::Truncated => "CIP_TRUNCATED",
+            Self::BadMagic => "CIP_BAD_MAGIC",
+            Self::BadProto => "CIP_BAD_PROTO",
+        }
+    }
+
+    /// `option dontlognull` drops the lines of a client that sent nothing, or timed out
+    /// while nothing had been taken in, as it does for a PROXY header.
+    #[must_use]
+    pub fn is_null(self) -> bool {
+        matches!(self, Self::Empty | Self::Abort | Self::Timeout)
+    }
+}
+
+/// Parses a NetScaler Client IP insertion header from the start of `buf`
+/// (`conn_recv_netscaler_cip`, `doc/netscaler-client-ip-insertion-protocol.txt`): the
+/// magic, then the legacy (8-byte) or standard (12-byte) prefix, then the encapsulated
+/// IP and TCP headers whose addresses the header reports. `Ok` is the reported source
+/// and destination and the bytes to consume; `Err` is the refusal. `HAProxy` peeks once:
+/// a header it did not get whole in that read it refuses as truncated, it does not wait
+/// for the rest.
+fn parse_netscaler_cip(magic: u32, buf: &[u8]) -> Result<(SocketAddr, SocketAddr, usize), CipError> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    // magic, length, type, header length
+    if buf.len() < 12 {
+        return Err(CipError::Truncated);
+    }
+    let u16 = |b: &[u8]| u16::from_be_bytes([b[0], b[1]]);
+    let u32 = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    if u32(&buf[0..4]) != magic {
+        return Err(CipError::BadMagic);
+    }
+    // Legacy CIP protocol: 8-byte prefix, 32-bit header length at byte 4.
+    let (hdr_len, line) = if buf[8] & 0xD0 == 0x40 {
+        (u32(&buf[4..8]) as usize, 8)
+    } else if buf[8] == 0x00 {
+        // Standard CIP protocol: 12-byte prefix, 16-bit header length at byte 10.
+        (u16(&buf[10..12]) as usize, 12)
+    } else {
+        return Err(CipError::BadProto);
+    };
+    if buf.len() < 20 || hdr_len > buf.len() - line {
+        return Err(CipError::Truncated);
+    }
+    let p = &buf[line..];
+    match p[0] >> 4 {
+        4 => {
+            if buf.len() < 40 || buf.len() < hdr_len {
+                return Err(CipError::Truncated);
+            }
+            let ip_hl = (p[0] & 0x0f) as usize;
+            if p[9] != 6 || ip_hl < 5 || hdr_len < ip_hl * 4 + 20 {
+                return Err(CipError::BadProto);
+            }
+            let tcp = &p[ip_hl * 4..];
+            Ok((
+                SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(p[12], p[13], p[14], p[15]), u16(&tcp[0..2]))),
+                SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(p[16], p[17], p[18], p[19]), u16(&tcp[2..4]))),
+                line + hdr_len,
+            ))
+        }
+        6 => {
+            if buf.len() < 60 || buf.len() < hdr_len {
+                return Err(CipError::Truncated);
+            }
+            if p[6] != 6 || hdr_len < 60 {
+                return Err(CipError::BadProto);
+            }
+            let tcp = &p[40..];
+            let src6 = Ipv6Addr::from([p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15], p[16], p[17], p[18], p[19], p[20], p[21], p[22], p[23]]);
+            let dst6 = Ipv6Addr::from([p[24], p[25], p[26], p[27], p[28], p[29], p[30], p[31], p[32], p[33], p[34], p[35], p[36], p[37], p[38], p[39]]);
+            Ok((
+                SocketAddr::V6(std::net::SocketAddrV6::new(src6, u16(&tcp[0..2]), 0, 0)),
+                SocketAddr::V6(std::net::SocketAddrV6::new(dst6, u16(&tcp[2..4]), 0, 0)),
+                line + hdr_len,
+            ))
+        }
+        _ => Err(CipError::BadProto),
+    }
+}
+
 /// Why a session ended. Reported to logs and to `show sess`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Ending {
@@ -1206,12 +1340,31 @@ pub struct H2ReqBody {
     pub head_room: usize,
 }
 
+/// The NetScaler Client IP header a connection must carry: the bind set
+/// `accept-netscaler-cip`, or a `tcp-request connection expect-netscaler-cip` matched
+/// (`HAProxy`'s `CO_FL_ACCEPT_CIP` on the connection). It rides in the session-address
+/// box, which exists only on the connections that set session-level state, so the
+/// default connection pays nothing for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CipState {
+    /// The magic the header's first 4 bytes must match: the bind's, or 0 when the bind
+    /// declares none and the rule that expects it matched.
+    pub magic: u32,
+    /// The header is consumed, and the session's addresses set.
+    pub done: bool,
+    /// The refusal, for the embryonic log, when the header was not accepted.
+    pub err: Option<CipError>,
+}
+
 /// The session-level addresses (`HAProxy`'s `sess->src`/`sess->dst`), behind
 /// [`TcpSession::sess_addr`]'s one box. `None` in either is "not set at session level".
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessAddr {
     pub src: Option<SocketAddr>,
     pub dst: Option<SocketAddr>,
+    /// The expected NetScaler Client IP header, `None` on a connection that carries no
+    /// one; the box holds only this when only the header sets the session's addresses.
+    pub cip: Option<CipState>,
 }
 
 /// TCP mode `tcp-response content` inspection state, held in a [`alcyon_alloc::ColdBox`] on
@@ -3309,11 +3462,123 @@ impl TcpSession {
         self.accept_proxy.is_pending() && self.proxy_hdr_err.is_none() && self.req.is_empty()
     }
 
+    /// The connection's pre-request handshake still to run: a PROXY header to be read,
+    /// or a NetScaler Client IP header. `HAProxy` completes the session -- runs the
+    /// `tcp-request session` rules and opens the server connection -- only after it.
+    #[inline]
+    pub fn handshake_pending(&self) -> bool {
+        self.accept_proxy.is_pending() || self.cip_state().is_some_and(|c| !c.done)
+    }
+
     /// Ends the connection for a PROXY header that was not accepted, and remembers why.
     fn refuse_proxy_header(&mut self, why: ProxyHdrError) {
         self.proxy_hdr_err = Some(why);
         self.cli_state = ScState::Error;
         self.ending = Some(Ending::Error);
+    }
+
+    /// The bind set `accept-netscaler-cip`, or a `tcp-request connection
+    /// expect-netscaler-cip` matched this connection: the connection must open with a
+    /// NetScaler Client IP header, whose magic is the bind's (0 when it declares none,
+    /// as `HAProxy` reads `bind_conf->ns_cip_magic`).
+    pub fn enable_accept_netscaler_cip(&mut self, magic: u32) {
+        self.sess_addr_mut().cip = Some(CipState { magic, ..Default::default() });
+        self.cli_state = ScState::Ready;
+        // The header's first read waits for the poller (T157), as the PROXY header's does.
+        self.flags.set(sess_flags::CLI_CANT_RECV);
+    }
+
+    /// The expected NetScaler Client IP header, `None` on a connection that carries no
+    /// one.
+    #[inline]
+    pub fn cip_state(&self) -> Option<&CipState> {
+        self.sess_addr.as_deref().and_then(|a| a.cip.as_ref())
+    }
+
+    /// A NetScaler Client IP header is expected and nothing of it has been taken in yet.
+    fn awaiting_cip_header(&self) -> bool {
+        self.cip_state().is_some_and(|c| !c.done && c.err.is_none()) && self.req.is_empty()
+    }
+
+    /// Takes a parsed NetScaler Client IP header as the connection's: it sets the
+    /// session's addresses, as a PROXY header does (`conn_recv_netscaler_cip` writes
+    /// `sess->src` and `sess->dst`, not the stream's real ones).
+    fn apply_cip_header(&mut self, src: SocketAddr, dst: SocketAddr) {
+        let a = self.sess_addr_mut();
+        a.src = Some(src);
+        a.dst = Some(dst);
+        if let Some(c) = a.cip.as_mut() {
+            c.done = true;
+        }
+        self.client_addr = Some(src);
+        self.server_addr = Some(dst);
+        self.cli_state = if self.mode == Mode::Http { ScState::Ready } else { ScState::Established };
+    }
+
+    /// Ends the connection for a NetScaler Client IP header that was not accepted, and
+    /// remembers why.
+    fn refuse_cip_header(&mut self, why: CipError) {
+        if let Some(c) = self.sess_addr.as_mut().and_then(|a| a.cip.as_mut()) {
+            c.err = Some(why);
+        }
+        self.cli_state = ScState::Error;
+        self.ending = Some(Ending::Error);
+    }
+
+    /// Applies a parsed CIP header once `consumed` bytes were taken from the socket,
+    /// otherwise refuses with `CipError::Abort` (or the parser's error).
+    fn finish_cip_peek(&mut self, parsed: Result<(SocketAddr, SocketAddr, usize), CipError>, taken: Io) -> bool {
+        match parsed {
+            Ok((src, dst, consumed)) if matches!(taken, Io::Done(k) if k == consumed) => {
+                self.apply_cip_header(src, dst);
+                true
+            }
+            Ok(_) => {
+                self.refuse_cip_header(CipError::Abort);
+                false
+            }
+            Err(e) => {
+                self.refuse_cip_header(e);
+                false
+            }
+        }
+    }
+
+    /// `accept-netscaler-cip` on a TLS bind: the header comes in plaintext, ahead of the
+    /// ClientHello, as a PROXY header does, and before one, if both are expected
+    /// (`HAProxy` checks `CO_FL_ACCEPT_CIP` ahead of `CO_FL_ACCEPT_PROXY`).
+    /// `Ok(true)` once the header is in, `Ok(false)` while it is still arriving.
+    fn read_cip_header_before_tls(&mut self) -> io::Result<bool> {
+        // Not before the poller reports the socket readable (`enable_accept_netscaler_cip`).
+        if self.flags.has(sess_flags::CLI_CANT_RECV) {
+            return Ok(false);
+        }
+        let Some(fd) = self.cli.fd() else { return Ok(false) };
+        let Some(magic) = self.cip_state().map(|c| c.magic) else { return Ok(false) };
+        let mut peek = [0u8; 16384];
+        let n = match raw::peek(fd, &mut peek)? {
+            Io::Done(n) => n,
+            Io::WouldBlock => return Ok(false),
+            // No bytes left: `HAProxy`'s zero-byte read is `CIP_EMPTY`. A readiness event
+            // that finds the queue already spent (a reset, or bytes a refusal below does
+            // not take) precedes a close the header cannot interrupt, and `HAProxy`'s
+            // error path aborts on it; this read is the first on the socket, so a
+            // readability with no data cannot follow a partial header it kept waiting for.
+            r @ (Io::Eof | Io::Closed) => {
+                self.refuse_cip_header(if matches!(r, Io::Eof) { CipError::Empty } else { CipError::Abort });
+                return Ok(false);
+            }
+        };
+        let parsed = parse_netscaler_cip(magic, &peek[..n]);
+        let taken = match parsed {
+            Ok((_, _, consumed)) => {
+                // The header is in `peek` already; this read only takes it off the socket
+                // ahead of the handshake. The peek showed it whole, so one read gets all.
+                raw::recv(fd, &mut peek[..consumed])?
+            }
+            Err(_) => Io::Done(0),
+        };
+        Ok(self.finish_cip_peek(parsed, taken))
     }
 
     /// `accept-proxy` on a TLS bind: the PROXY header comes in plaintext, ahead of the
@@ -3370,6 +3635,15 @@ impl TcpSession {
             return Ok(false);
         }
         let mut changed = false;
+
+        // A NetScaler Client IP header to a TLS bind precedes the handshake, as a PROXY
+        // header does, and before one, if both are expected.
+        if self.cli_xprt.is_tls() && self.cip_state().is_some_and(|c| !c.done && c.err.is_none()) {
+            if !self.read_cip_header_before_tls()? {
+                return Ok(matches!(self.cli_state, ScState::Error | ScState::Closed));
+            }
+            changed = true;
+        }
 
         // A PROXY header to a TLS bind precedes the handshake: read it before the
         // transport reads anything.
@@ -3438,7 +3712,9 @@ impl TcpSession {
                 let r = self.cli.recv(&mut self.cli_xprt, dst)?;
                 self.flags.set_to(sess_flags::CLI_CANT_RECV, self.polls_cli() && self.cli_xprt.drained(r, asked));
                 match r {
-                    // The client left before a byte of the PROXY header.
+                    // The client left before a byte of the expected header.
+                    Io::Eof if self.awaiting_cip_header() => self.refuse_cip_header(CipError::Empty),
+                    Io::Closed if self.awaiting_cip_header() => self.refuse_cip_header(CipError::Abort),
                     Io::Eof if self.awaiting_proxy_header() => self.refuse_proxy_header(ProxyHdrError::Empty),
                     Io::Closed if self.awaiting_proxy_header() => self.refuse_proxy_header(ProxyHdrError::Abort),
                     Io::Eof => {
@@ -3523,6 +3799,31 @@ impl TcpSession {
 
         if self.mode == Mode::Http {
             self.drain_request();
+        }
+
+        // A NetScaler Client IP header the bind requires, or the rule expects, precedes
+        // the request, and a PROXY header, if one is expected too: `HAProxy` reads it in
+        // `conn_recv_netscaler_cip` ahead of `conn_recv_proxy`.
+        if self.cip_state().is_some_and(|c| !c.done && c.err.is_none()) {
+            if !self.req.is_empty() {
+                let magic = self.cip_state().unwrap().magic;
+                match parse_netscaler_cip(magic, self.req.readable()) {
+                    Ok((src, dst, consumed)) => {
+                        self.apply_cip_header(src, dst);
+                        self.req.consume(consumed);
+                        changed = true;
+                    }
+                    Err(e) => {
+                        self.refuse_cip_header(e);
+                        return Ok(true);
+                    }
+                }
+            }
+            // The request is held until the header is in (or refused), as the PROXY
+            // header holds it.
+            if !self.cip_state().is_some_and(|c| c.done) {
+                return Ok(changed);
+            }
         }
 
         // Parse PROXY protocol header if accept-proxy is configured
@@ -5434,5 +5735,35 @@ mod tests {
             sess_vars_at_start: Default::default(),
         })));
         assert!(ConnView::from_conn(&s).is_none());
+    }
+
+    #[test]
+    fn cip_before_tls_handles_would_block_and_short_read() {
+        use super::{CipError, Ending, Io, ScState};
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+        use std::os::unix::net::UnixStream;
+
+        let (a, _peer) = UnixStream::pair().expect("pair");
+        let mut s = super::TcpSession::new(std::os::fd::OwnedFd::from(a), Default::default(), 0, alcyon_sched::Tick::ETERNITY);
+        s.enable_accept_netscaler_cip(0x1234_5678);
+        assert!(!s.read_cip_header_before_tls().expect("cant_recv"));
+        s.flags.clear(sess_flags::CLI_CANT_RECV);
+        assert!(!s.read_cip_header_before_tls().expect("would_block"));
+        assert_eq!(s.cip_state().and_then(|c| c.err), None);
+        assert_ne!(s.cli_state, ScState::Error);
+
+        let src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 1234));
+        let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 2), 80));
+        assert!(!s.finish_cip_peek(Ok((src, dst, 52)), Io::Done(10)));
+        assert_eq!(s.cip_state().and_then(|c| c.err), Some(CipError::Abort));
+        assert_eq!(s.cli_state, ScState::Error);
+        assert_eq!(s.ending, Some(Ending::Error));
+
+        let (b, _peer2) = UnixStream::pair().expect("pair2");
+        let mut s2 = super::TcpSession::new(std::os::fd::OwnedFd::from(b), Default::default(), 0, alcyon_sched::Tick::ETERNITY);
+        s2.enable_accept_netscaler_cip(0x1234_5678);
+        assert!(s2.finish_cip_peek(Ok((src, dst, 52)), Io::Done(52)));
+        assert_eq!(s2.client_addr, Some(src));
+        assert_eq!(s2.server_addr, Some(dst));
     }
 }

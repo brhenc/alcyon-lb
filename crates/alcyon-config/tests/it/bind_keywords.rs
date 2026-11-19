@@ -125,7 +125,6 @@ fn unimplemented_security_keywords_are_refused_in_both_sections() {
         "maxconn 5",
         "transparent",
         "user nobody",
-        "accept-netscaler-cip 1",
     ];
     for b in refused {
         for f in [in_listen, in_frontend] {
@@ -133,6 +132,56 @@ fn unimplemented_security_keywords_are_refused_in_both_sections() {
             let named = b.split_whitespace().any(|w| err.contains(&format!("'{w}'")));
             assert!(named && err.contains("not supported"), "{b}: {err}");
         }
+    }
+}
+
+#[test]
+fn accept_netscaler_cip_is_read_with_its_magic() {
+    for f in [in_listen, in_frontend] {
+        let cfg = f("bind 127.0.0.1:8080 accept-netscaler-cip 305419896").unwrap();
+        let b = match (cfg.listens.first(), cfg.frontends.first()) {
+            (Some(l), _) => &l.binds[0],
+            (_, Some(fe)) => &fe.binds[0],
+            _ => unreachable!(),
+        };
+        assert_eq!(b.accept_netscaler_cip, Some(305419896), "the declared magic is kept");
+    }
+    // `bind_parse_accept_netscaler_cip`: a 0 value (including one `atol` makes 0) is
+    // refused, and the keyword without a value is.
+    for bad in [
+        "accept-netscaler-cip 0",
+        "accept-netscaler-cip abc",
+        "accept-netscaler-cip -4294967296",
+        // `atol` clamps to `LLONG_MIN` (2026-11-19, measured: the oracle refuses it as 0).
+        "accept-netscaler-cip -99999999999999999999",
+    ] {
+        for f in [in_listen, in_frontend] {
+            let err = f(&format!("bind 127.0.0.1:8080 {bad}")).unwrap_err().to_string();
+            assert!(err.contains("invalid value 0, must be >= 0"), "{bad}: {err}");
+        }
+    }
+    // `uint32_t val = atol(...)`: a negative wraps, a digit run with trailing garbage
+    // keeps the run, and an overflow clamps to `LLONG_MAX`, whose low 32 bits are all
+    // ones (measured on the oracle: `-1` is 0xFFFFFFFF, `123abc` is 123,
+    // `99999999999999999999` is accepted as 0xFFFFFFFF).
+    for (arg, magic) in [
+        ("accept-netscaler-cip -1", u32::MAX),
+        ("accept-netscaler-cip 123abc", 123u32),
+        ("accept-netscaler-cip 99999999999999999999", u32::MAX),
+    ] {
+        for f in [in_listen, in_frontend] {
+            let cfg = f(&format!("bind 127.0.0.1:8080 {arg}")).unwrap();
+            let b = match (cfg.listens.first(), cfg.frontends.first()) {
+                (Some(l), _) => &l.binds[0],
+                (_, Some(fe)) => &fe.binds[0],
+                _ => unreachable!(),
+            };
+            assert_eq!(b.accept_netscaler_cip, Some(magic), "{arg}: kept as {magic}");
+        }
+    }
+    for f in [in_listen, in_frontend] {
+        let err = f("bind 127.0.0.1:8080 accept-netscaler-cip").unwrap_err().to_string();
+        assert!(err.contains("missing value"), "{err}");
     }
 }
 

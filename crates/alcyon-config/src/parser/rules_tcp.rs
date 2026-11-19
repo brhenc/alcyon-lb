@@ -79,6 +79,19 @@ pub(crate) fn parse_tcp_req_connection(
             let (_, cond) = parse_rule_condition(tokens, 4)?;
             rules.push(TcpReqConnRule { action: TcpReqConnAction::ExpectProxy, cond });
         }
+        "expect-netscaler-cip" => {
+            // HAProxy: only `layer4`, then `if`/`unless` or nothing.
+            let arg = tokens.get(3).map_or("", |t| t.text.as_str());
+            if arg != "layer4" {
+                return Err(ConfigError::new(
+                    act_tok.line,
+                    act_tok.col,
+                    format!("'tcp-request connection expect-netscaler-cip' only supports 'layer4' (got '{arg}')"),
+                ));
+            }
+            let (_, cond) = parse_rule_condition(tokens, 4)?;
+            rules.push(TcpReqConnRule { action: TcpReqConnAction::ExpectNetscalerCip, cond });
+        }
         "do-log" => {
             // HAProxy 3.1+: send the stream's line for the `tcp-req-conn` step, no argument.
             let (_, cond) = parse_rule_condition(tokens, 3)?;
@@ -219,6 +232,13 @@ pub(crate) fn parse_tcp_req_session(
                     act_tok.line,
                     act_tok.col,
                     "'expect-proxy layer4' is not allowed in 'tcp-request session' rules",
+                ));
+            }
+            "expect-netscaler-cip" => {
+                return Err(ConfigError::new(
+                    act_tok.line,
+                    act_tok.col,
+                    "'expect-netscaler-cip layer4' is not allowed in 'tcp-request session' rules",
                 ));
             }
             "attach-srv" => {

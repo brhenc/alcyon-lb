@@ -21,6 +21,7 @@ fn bind(crt: Vec<String>) -> BindConfig {
         proto: None,
         accept_proxy: false,
         accept_proxy_v2: false,
+        accept_netscaler_cip: None,
         name: None,
         id: None,
         min_ver: None,
