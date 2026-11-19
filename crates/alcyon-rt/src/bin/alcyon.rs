@@ -872,6 +872,43 @@ fn main() {
         process::exit(0);
     }
 
+    // A `log ... profile <name>` is resolved at startup, not under `-c`: the oracle starts,
+    // prints one alert per unresolvable profile and exits 1 (`postresolve_loggers`).
+    {
+        use alcyon_config::ast::ProxyKind;
+        let order: Vec<(ProxyKind, usize)> = if config.proxy_order.is_empty() {
+            (0..config.listens.len()).map(|i| (ProxyKind::Listen, i))
+                .chain((0..config.frontends.len()).map(|i| (ProxyKind::Frontend, i)))
+                .chain((0..config.backends.len()).map(|i| (ProxyKind::Backend, i)))
+                .collect()
+        } else {
+            config.proxy_order.clone()
+        };
+        let mut bad = false;
+        for (kind, idx) in order {
+            let (name, logs) = match kind {
+                ProxyKind::Listen => (&config.listens[idx].name, &config.listens[idx].logs),
+                ProxyKind::Frontend => (&config.frontends[idx].name, &config.frontends[idx].logs),
+                ProxyKind::Backend => (&config.backends[idx].name, &config.backends[idx].logs),
+            };
+            for log in logs {
+                if let Some(profile) = &log.profile {
+                    if !config.log_profiles.iter().any(|p| &p.name == profile) {
+                        let (file, line) = locate(&config_starts, log.line);
+                        config_alert_plain(&format!(
+                            "log directive declared in proxy section '{name}' in file '{file}' \
+                             at line {line} unknown log-profile '{profile}'."
+                        ));
+                        bad = true;
+                    }
+                }
+            }
+        }
+        if bad {
+            process::exit(1);
+        }
+    }
+
     // 9a. `-W -S`: this process becomes the master, and the proxy runs in worker processes
     //     it starts (see master.rs).
     //     Plain `-W` is a process of its own that reloads by starting the binary again,

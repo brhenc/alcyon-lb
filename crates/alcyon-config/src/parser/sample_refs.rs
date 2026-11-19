@@ -20,7 +20,7 @@ fn section_of(section: &CurrentSection) -> Option<(SectionKind, Option<String>)>
         CurrentSection::Backend(b) => Some((SectionKind::Backend, Some(b.name.clone()))),
         CurrentSection::Listen(l) => Some((SectionKind::Listen, Some(l.name.clone()))),
         CurrentSection::Global(_) | CurrentSection::Userlist(_) | CurrentSection::HttpErrors(..) | CurrentSection::Ring(_) | CurrentSection::LogForward(_)
-        | CurrentSection::Resolvers(_) => None,
+        | CurrentSection::LogProfile(_) | CurrentSection::Resolvers(_) => None,
     }
 }
 

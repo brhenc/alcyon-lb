@@ -296,6 +296,10 @@ pub struct PhaseCtx<'a> {
     /// Evaluated for the access log, after the request buffer is gone: `method` reads
     /// only the transaction's method enum then, so a method outside it has no value.
     pub at_log: bool,
+    /// The name `%OG` prints for the line being built (a `log-profile`'s step, as
+    /// [`crate`]'s `log_orig_to_str` names it): `txn_close`, `txn_connect`, ... . `None`
+    /// where the line is not tied to a log step and `%OG` has no value.
+    pub log_origin: Option<&'static str>,
     pub client_addr: Option<SocketAddr>,
     pub server_addr: Option<SocketAddr>,
     pub fc_src: Option<SocketAddr>,
@@ -415,6 +419,7 @@ impl PhaseCtx<'_> {
     pub const EMPTY: PhaseCtx<'static> = PhaseCtx {
         conn_err: None,
         at_log: false,
+        log_origin: None,
         client_addr: None,
         server_addr: None,
         fc_src: None,

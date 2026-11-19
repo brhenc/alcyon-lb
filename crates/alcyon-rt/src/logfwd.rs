@@ -343,10 +343,12 @@ fn serve_tcp(name: &str, listener: TcpListener, fwd: Arc<Forwarder>, tls: Option
 }
 
 fn start_section(config: &Config, section: &LogForwardSection) -> io::Result<()> {
-    let mut targets: Vec<SyslogTarget> = section.logs.iter().map(SyslogTarget::new).collect();
+    // A `log-forward` section forwards syslog; it is not a proxy, so its targets carry no
+    // `log-profile`.
+    let mut targets: Vec<SyslogTarget> = section.logs.iter().map(|c| SyslogTarget::new(c, None)).collect();
     if section.log_global {
         if let Some(g) = &config.global {
-            targets.extend(g.logs.iter().map(SyslogTarget::new));
+            targets.extend(g.logs.iter().map(|c| SyslogTarget::new(c, None)));
         }
     }
     let fwd = Arc::new(Forwarder {
