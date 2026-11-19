@@ -2415,22 +2415,20 @@ impl SessionArena {
                 _ => None,
             }
         };
-        if let Some((owner_idx, owner_task)) = owner_ref {
-            if let Some(o) = self.entries.get(owner_idx as usize).and_then(|s| s.as_ref()) {
-                if !o.parked && o.task == owner_task {
-                    let (a, b) = (idx as usize, owner_idx as usize);
-                    if a < b {
-                        let (lo, hi) = self.entries.split_at_mut(b);
-                        let entry = lo[a].as_mut()?;
-                        let owner = hi[0].as_ref()?;
-                        return Some((entry, Some(owner)));
-                    }
-                    let (lo, hi) = self.entries.split_at_mut(a);
-                    let owner = lo[b].as_ref()?;
-                    let entry = hi[0].as_mut()?;
-                    return Some((entry, Some(owner)));
-                }
+        if let Some((owner_idx, owner_task)) = owner_ref
+            && self.entries.get(owner_idx as usize).and_then(|s| s.as_ref()).is_some_and(|o| !o.parked && o.task == owner_task)
+        {
+            let (a, b) = (idx as usize, owner_idx as usize);
+            if a < b {
+                let (lo, hi) = self.entries.split_at_mut(b);
+                let entry = lo[a].as_mut()?;
+                let owner = hi[0].as_ref()?;
+                return Some((entry, Some(owner)));
             }
+            let (lo, hi) = self.entries.split_at_mut(a);
+            let owner = lo[b].as_ref()?;
+            let entry = hi[0].as_mut()?;
+            return Some((entry, Some(owner)));
         }
         Some((self.entries.get_mut(idx as usize)?.as_mut().filter(|e| !e.parked)?, None))
     }
