@@ -247,6 +247,8 @@ impl Opts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Alias {
     Bytes,
+    /// `%OG`: the log step's origin name (`log_origin` of the line's context).
+    Orig,
     CookieClient,
     CookieServer,
     Hostname,
@@ -315,7 +317,7 @@ enum Alias {
 /// `HAProxy` has that Alcyon refuses). `%o` is not here: it renders nothing and sets the
 /// options for what follows, so `compile` handles it before looking a name up.
 const ALIASES: &[(&str, Option<Alias>)] = &[
-    ("OG", None),
+    ("OG", Some(Alias::Orig)),
     ("B", Some(Alias::Bytes)),
     ("CC", Some(Alias::CookieClient)),
     ("CS", Some(Alias::CookieServer)),
@@ -974,7 +976,7 @@ impl LogFormat {
                         // The value as the plain format writes it, then as the encoding carries it:
                         // a number for the aliases that are one, a string for the others.
                         let mut plain = Out(Vec::new());
-                        alias(&mut plain, a, Opts { mandatory: false, ..Opts::default() }, d);
+                        alias(&mut plain, a, Opts { mandatory: false, ..Opts::default() }, d, ctx.phase.log_origin);
                         let value = match std::str::from_utf8(&plain.0).ok().and_then(|s| s.parse::<i64>().ok()) {
                             Some(v) if NUMERIC.contains(&a) => Sample::Sint(v),
                             _ => Sample::Bin(plain.0),
@@ -985,10 +987,10 @@ impl LogFormat {
                         }
                     } else if o.esc {
                         let mut plain = Out(Vec::new());
-                        alias(&mut plain, a, Opts { esc: false, ..o }, d);
+                        alias(&mut plain, a, Opts { esc: false, ..o }, d, ctx.phase.log_origin);
                         escaped_5424(out, &plain.0);
                     } else {
-                        alias(out, a, o, d);
+                        alias(out, a, o, d, ctx.phase.log_origin);
                     }
                 }
             }
@@ -1391,7 +1393,13 @@ pub fn recycle_line(line: Vec<u8>) {
 }
 
 #[allow(clippy::too_many_lines)]
-fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData) {
+fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData, origin: Option<&'static str>) {
+    if matches!(a, Alias::Orig) {
+        // `%OG`: the name the line's log step is logged from (`log_origin`), empty where
+        // there is none. It is text, so the usual `O`/`Q` options do not apply.
+        out.push_str(origin.unwrap_or(""));
+        return;
+    }
     let int = |out: &mut Out, v: i64| {
         let _ = write!(out, "{v}");
     };
@@ -1401,6 +1409,7 @@ fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData) {
         out.push('+');
     }
     match a {
+        Alias::Orig => {} // handled before the match, from the line's `log_origin`.
         Alias::Bytes => int(out, i64::try_from(d.bytes_out).unwrap_or(i64::MAX)),
         Alias::BytesUp => int(out, i64::try_from(d.bytes_in).unwrap_or(i64::MAX)),
         // Alcyon has no `capture cookie`, so there is never a cookie to show.

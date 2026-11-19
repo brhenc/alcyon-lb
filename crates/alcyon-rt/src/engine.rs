@@ -2018,6 +2018,14 @@ pub struct Proxy {
     /// `option dontlog-normal`, `option log-separate-errors`, `option logasap`: the
     /// `alcyon_config::LOG_OPT_*` bits.
     pub log_opts: u8,
+    /// `log-steps` mask for this proxy: the standard stream steps it logs (accept/request/
+    /// connect/response/close). `None` = no `log-steps` directive (log at close/error only,
+    /// as before); `Some(mask)` = the listed steps plus close. Set at load; read only.
+    pub log_steps: Option<u8>,
+    /// True when any of this proxy's log targets carries a `log-profile`. Computed once at
+    /// load; when it is `false` the stream's line is built and sent exactly as before, so a
+    /// proxy without profiles pays nothing for the machinery.
+    pub any_log_profile: bool,
     /// `unique-id-format`, compiled.
     pub unique_id_format: Option<Arc<crate::logfmt::LogFormat>>,
     /// `unique-id-header`: the request header the unique ID is sent to the server in (a
@@ -3861,6 +3869,24 @@ fn stream_log_line(entry: &SessionEntry, proxies: &crate::table::Table, pid: u32
     Some((line, sd, err))
 }
 
+/// The step a stream's line is the log of, for a `log-profile`'s step lookup: `logasap`'s
+/// connect (TCP) or response head (HTTP); a session that failed before it ever reached a
+/// server; else the stream's close.
+fn stream_log_origin(e: &SessionEntry, err: bool) -> alcyon_config::ast::logging::LogProfileStepKind {
+    use alcyon_config::ast::logging::LogProfileStepKind as K;
+    if e.sess.strm.log.asap_done {
+        if e.sess.mode == Mode::Tcp {
+            K::Connect
+        } else {
+            K::Response
+        }
+    } else if err && e.sess.strm.log.connect.is_none() {
+        K::Error
+    } else {
+        K::Close
+    }
+}
+
 /// `fmt` rendered, after the frontend's `log-format-sd` when it has one to send: one buffer,
 /// the STRUCTURED-DATA its first `sd_len` bytes (`send_log` splits it).
 fn with_sd(sd: Option<&crate::logfmt::LogFormat>, fmt: &crate::logfmt::LogFormat, data: &crate::logfmt::LogData, ctx: &SampleContext) -> (Vec<u8>, u32) {
@@ -4056,14 +4082,19 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
     let intern = |cfg: &alcyon_config::LogConfig, targets: &mut Vec<SyslogTarget>| -> usize {
         // Interned by target and facility, so two sections naming the same collector
         // share one socket. `stdout` and `stderr` intern too: a descriptor written from
-        // two places interleaves partial lines.
+        // two places interleaves partial lines. The profile is part of the logger: two `log`
+        // lines to one collector under different profiles are different loggers.
+        let profile = cfg
+            .profile
+            .as_deref()
+            .and_then(|n| config.log_profiles.iter().find(|p| p.name == n));
         if let Some(i) = targets
             .iter()
             .position(|t| t.same_logger(cfg))
         {
             return i;
         }
-        targets.push(SyslogTarget::new(cfg));
+        targets.push(SyslogTarget::new(cfg, profile));
         targets.len() - 1
     };
 
@@ -4118,6 +4149,10 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
         if proxy.log_cursors.len() != resolved.len() {
             proxy.log_cursors = Arc::new(resolved.iter().map(|_| AtomicU64::new(0)).collect());
         }
+        // True when any resolved target carries a `log-profile`; the stream's line is sent
+        // through the profile-aware path only then, so a profile-less proxy is unchanged.
+        // Read before `resolved` moves into the proxy.
+        proxy.any_log_profile = resolved.iter().any(|&i| targets[i].profile().is_some());
         proxy.log_target_idx = resolved;
         // `log-format-sd` fills only an rfc5424 header's STRUCTURED-DATA: a proxy none of
         // whose targets writes one never renders it. A frontend with such a target and no
@@ -4591,6 +4626,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         dont_log_null: listen.dontlognull,
         ignore_probes: listen.http_ignore_probes,
         log_opts: listen.log_opts,
+        log_steps: listen.log_steps,
+        any_log_profile: false,
         unique_id_format: listen.unique_id_format.as_deref().and_then(compile_unique_id_format),
         extra_log: extra_log_formats(listen.error_log_format.as_deref(), listen.log_format_sd.as_deref()),
         unique_id_header: listen.unique_id_header.as_deref().map(Box::from),
@@ -4728,6 +4765,8 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         dont_log_null: fe.dontlognull,
         ignore_probes: fe.http_ignore_probes,
         log_opts: fe.log_opts,
+        log_steps: fe.log_steps,
+        any_log_profile: false,
         unique_id_format: fe.unique_id_format.as_deref().and_then(compile_unique_id_format),
         extra_log: extra_log_formats(fe.error_log_format.as_deref(), fe.log_format_sd.as_deref()),
         unique_id_header: fe.unique_id_header.as_deref().map(Box::from),
@@ -4861,6 +4900,8 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         dont_log_null: false,
         ignore_probes: false,
         log_opts: 0,
+        log_steps: be.log_steps,
+        any_log_profile: false,
         unique_id_format: be.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: be.unique_id_header.as_deref().map(Box::from),
         req_capture_slots: Arc::from([]),
@@ -10450,6 +10491,8 @@ impl EngineDispatcher<'_> {
         wake_queue: &mut Vec<TaskRef>,
         now: Tick,
         lb_snap: &mut crate::lb::LbSnapCache,
+        log_targets: &[crate::syslog::SyslogTarget],
+        log_tag: &str,
     ) -> Option<crate::stats_html::AdminAction> {
         // An HTTP/2 connection serving a stream is not between requests: the stream is its
         // child's, which ends it (T280).
@@ -10621,7 +10664,7 @@ impl EngineDispatcher<'_> {
                 if Self::l7_retry(entry, proxies, fdtab, poller, now, lb_snap) {
                     continue;
                 }
-                if !Self::apply_http_response_rules(entry, proxies, now) {
+                if !Self::apply_http_response_rules(entry, proxies, now, pid, log_targets, log_tag) {
                     Self::write_response_head_names(entry, proxies);
                 }
             }
@@ -11945,6 +11988,8 @@ impl EngineDispatcher<'_> {
                     &mut self.wake_queue,
                     now,
                     self.lb_snap,
+                    &self.log_targets,
+                    &self.log_tag,
                 );
             }
 
@@ -12096,7 +12141,8 @@ impl EngineDispatcher<'_> {
                 }
                 // `session_kill_embryonic`: `err` with `log-separate-errors`, else `info`.
                 let err = self.proxies[e.proxy_idx].log_opts & alcyon_config::LOG_OPT_SEPARATE_ERRORS != 0;
-                return proxy_header_error_line(e, self.proxies, self.pid).map(|(l, sd)| (e.proxy_idx, l, sd, err));
+                return proxy_header_error_line(e, self.proxies, self.pid)
+                    .map(|(l, sd)| (e.proxy_idx, l, sd, err, alcyon_config::ast::logging::LogProfileStepKind::Error));
             }
             if e.sess.mode == Mode::Tcp || e.sess.strm.txn.is_some() {
                 account_stream(e, self.proxies);
@@ -12104,10 +12150,14 @@ impl EngineDispatcher<'_> {
             let queued = e.log_line.take().map(|l| (l, e.log_sd, e.log_err));
             queued
                 .or_else(|| (e.sess.mode == Mode::Tcp || e.sess.strm.txn.is_some()).then(|| stream_log_line(e, self.proxies, self.pid)).flatten())
-                .map(|(l, sd, err)| (e.proxy_idx, l, sd, err))
+                .map(|(l, sd, err)| (e.proxy_idx, l, sd, err, stream_log_origin(e, err)))
         });
-        if let Some((fe, line, sd, err)) = line {
-            self.send_stream_log(fe, err, &line, sd);
+        if let Some((fe, line, sd, err, origin)) = line {
+            if self.proxies[fe].any_log_profile {
+                self.send_stream_log_profiled(fe, origin, err, &line, sd);
+            } else {
+                self.send_stream_log(fe, err, &line, sd);
+            }
             crate::logfmt::recycle_line(line);
         }
         // A stream over as its transaction ended (not reset, not ending its connection, not a
@@ -12403,17 +12453,49 @@ impl EngineDispatcher<'_> {
     /// The response head's rules, framing and `Connection`. True when the head's names are
     /// in lower case already, from its index (E2), and [`Self::write_response_head_names`]
     /// has nothing to do.
-    fn apply_http_response_rules(entry: &mut SessionEntry, proxies: &crate::table::Table, now: Tick) -> bool {
+    fn apply_http_response_rules(
+        entry: &mut SessionEntry,
+        proxies: &crate::table::Table,
+        now: Tick,
+        pid: u32,
+        log_targets: &[crate::syslog::SyslogTarget],
+        log_tag: &str,
+    ) -> bool {
         if let Some(c) = entry.sess.h2_child_mut() {
             c.rsp_head = None;
         }
         let mut lowered = false;
-        Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered);
+        let mut do_log_res = false;
+        let mut do_log_after = false;
+        Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered, pid, &mut do_log_res, &mut do_log_after);
+        // A `do-log` at `http-response`/`http-after-response` sends the stream's line for its
+        // step. The response head is borrowed by the rules' context inside the `_in` function,
+        // so the send runs here, once that context is gone.
+        let fe_idx = entry.proxy_idx;
+        if (do_log_res || do_log_after) && proxies[fe_idx].any_log_profile {
+            if let Some((line, sd, err)) = stream_log_line(&entry, proxies, pid) {
+                if do_log_res {
+                    Self::send_stream_log_profiled_ctx(proxies, log_targets, log_tag, fe_idx, alcyon_config::ast::logging::LogProfileStepKind::HttpRes, err, &line, sd);
+                }
+                if do_log_after {
+                    Self::send_stream_log_profiled_ctx(proxies, log_targets, log_tag, fe_idx, alcyon_config::ast::logging::LogProfileStepKind::HttpAfterRes, err, &line, sd);
+                }
+                crate::logfmt::recycle_line(line);
+            }
+        }
         lowered
     }
 
     #[allow(clippy::too_many_lines)]
-    fn apply_http_response_rules_in(entry: &mut SessionEntry, proxies: &crate::table::Table, now: Tick, lowered: &mut bool) {
+    fn apply_http_response_rules_in(
+        entry: &mut SessionEntry,
+        proxies: &crate::table::Table,
+        now: Tick,
+        lowered: &mut bool,
+        pid: u32,
+        do_log_res: &mut bool,
+        do_log_after: &mut bool,
+    ) {
         let threshold = entry.sess.bufsize.saturating_sub(entry.sess.maxrewrite);
         // Empty lines ahead of a status line are skipped (`H1_MSG_RPBEFORE`), so that the
         // end of the head is not looked for in them (T275).
@@ -13241,6 +13323,7 @@ impl EngineDispatcher<'_> {
                     registry,
                     &mut entry.sess.strm.vars,
                     Some(ResWait { start, check: &mut check }),
+                    do_log_res,
                 ) {
                     Err(stop) => {
                         stopped = Some(stop);
@@ -13316,6 +13399,7 @@ impl EngineDispatcher<'_> {
                 Some(&mut res_caps),
                 registry,
                 &mut entry.sess.strm.vars,
+                do_log_after,
             );
             if !res_caps.is_empty() || !entry.sess.strm.log.res_captures.is_empty() {
                 note_res_caps_clone();
@@ -15692,6 +15776,98 @@ impl EngineDispatcher<'_> {
         }
     }
 
+    /// The profile-aware cousin of [`send_stream_log`], for a proxy one of whose targets
+    /// carries a `log-profile`. Each such target sends its profile's format for the line's
+    /// `origin` -- the step the line is the log of -- or nothing when the step is `drop`; a
+    /// step the profile does not name (and that has no `on any`) sends the proxy's own line,
+    /// as `HAProxy` does (`_process_send_log_override`). A target without a profile is sent
+    /// its line, and a profile's `log-tag` overrides the tag of every line it sends.
+    fn send_stream_log_profiled(
+        &self,
+        proxy_idx: usize,
+        origin: alcyon_config::ast::logging::LogProfileStepKind,
+        err: bool,
+        line: &[u8],
+        sd: u32,
+    ) {
+        Self::send_stream_log_profiled_ctx(self.proxies, &self.log_targets, &self.log_tag, proxy_idx, origin, err, line, sd);
+    }
+
+    /// The profile-aware send, in a form the response rules (which do not hold the engine)
+    /// can call: the targets and tag are passed in, as the stream's own line is.
+///
+/// A target with a `log-profile` sends its profile's format for the line's `origin` -- the
+/// step the line is the log of -- or nothing when the step is `drop`; a step the profile
+/// does not name (and that has no `on any`) sends the proxy's own line, as `HAProxy` does
+/// (`_process_send_log_override`). A target without a profile is sent its line, and a
+/// profile's `log-tag` overrides the tag of every line it sends.
+fn send_stream_log_profiled_ctx(
+    proxies: &crate::table::Table,
+    log_targets: &[crate::syslog::SyslogTarget],
+    log_tag: &str,
+    proxy_idx: usize,
+    origin: alcyon_config::ast::logging::LogProfileStepKind,
+    err: bool,
+    line: &[u8],
+    sd: u32,
+) {
+    let Some(proxy) = proxies.get(proxy_idx) else {
+        return;
+    };
+    let separate = proxy.log_opts & alcyon_config::LOG_OPT_SEPARATE_ERRORS != 0;
+    let level = if err && separate { LogLevel::Err } else { LogLevel::Info };
+    let (sd, msg) = line.split_at(usize::try_from(sd).unwrap_or(0).min(line.len()));
+    // A step's format renders against the line's origin: `%OG` reads it, and a step's
+    // format is a constant in the configurations this serves, so the (empty) data is never
+    // read. This runs once per log line, not per request; a step that needs the stream's
+    // full data is the rare case.
+    let min_phase = alcyon_sample::PhaseCtx { log_origin: Some(origin.og_name()), ..alcyon_sample::PhaseCtx::EMPTY };
+    let min_ctx = SampleContext { phase: &min_phase, live: None };
+    let data = crate::logfmt::LogData::default();
+    for (k, &i) in proxy.log_target_idx.iter().enumerate() {
+        let Some(target) = log_targets.get(i) else {
+            continue;
+        };
+        if !target.accepts(level) {
+            continue;
+        }
+        if let (Some(sample), Some(cursor)) = (target.sample(), proxy.log_cursors.get(k)) {
+            if !crate::syslog::sample_admits(sample, cursor) {
+                continue;
+            }
+        }
+        let prof = target.profile();
+        let tag = prof
+            .and_then(|p| p.log_tag.as_deref())
+            .or(proxy.log_tag.as_deref())
+            .unwrap_or(log_tag);
+        match match prof {
+            Some(p) => p.resolve(origin),
+            None => crate::syslog::StepResolution::Normal,
+        } {
+            crate::syslog::StepResolution::Drop => {}
+            crate::syslog::StepResolution::Normal => {
+                let _ = target.send_sd(level, tag, "", sd, msg);
+            }
+            crate::syslog::StepResolution::Format { format, sd: psd } => {
+                let pmsg = format.render_line(&data, sample_registry(), &min_ctx);
+                let psd = psd.map(|f| f.render_line(&data, sample_registry(), &min_ctx));
+                let _ = target.send_sd(level, tag, "", psd.as_deref().unwrap_or_default(), &pmsg);
+                crate::logfmt::recycle_line(pmsg);
+                if let Some(b) = psd {
+                    crate::logfmt::recycle_line(b);
+                }
+            }
+        }
+    }
+}
+
+    /// The `do-log` and mid-stream profile sends call this free form: the response rules run
+    /// in functions that do not hold the engine, so the targets and tag are passed in.
+    fn send_profiled(&self, proxy_idx: usize, origin: alcyon_config::ast::logging::LogProfileStepKind, err: bool, line: &[u8], sd: u32) {
+        Self::send_stream_log_profiled_ctx(self.proxies, &self.log_targets, &self.log_tag, proxy_idx, origin, err, line, sd);
+    }
+
     fn step_applet(&mut self, applet_idx: usize) -> Outcome {
         let applet_id = usize_to_u32(applet_idx);
         let Some(applet) = self.applets.get_mut(applet_id) else {
@@ -17371,6 +17547,8 @@ enum ResRule<'a> {
     Wait(u32, u32),
     /// `pause <time|expr>`: the time, the expression.
     Pause(u32, Option<&'a Expr>),
+    /// `do-log`: the caller, which has the stream, sends the step's line when this fires.
+    DoLog,
 }
 
 /// The `at_least` a [`ResWait`] check is called with for a `pause` rule: its `time_ms` is
@@ -17391,6 +17569,7 @@ impl<'a> ResOp<'a> {
             alcyon_config::HttpResAction::Capture { id, .. } => return ResRule::Capture(rc.expr.as_ref(), *id),
             alcyon_config::HttpResAction::WaitForBody { time_ms, at_least } => return ResRule::Wait(*time_ms, *at_least),
             alcyon_config::HttpResAction::Pause { time_ms, .. } => return ResRule::Pause(*time_ms, rc.expr.as_ref()),
+            alcyon_config::HttpResAction::DoLog => return ResRule::DoLog,
         })
     }
 
@@ -17404,6 +17583,7 @@ impl<'a> ResOp<'a> {
             alcyon_config::HttpAfterResAction::SetMap { .. }
             | alcyon_config::HttpAfterResAction::DelMap { .. }
             | alcyon_config::HttpAfterResAction::DelAcl { .. } => Self::MapAction(rc),
+            alcyon_config::HttpAfterResAction::DoLog => return ResRule::DoLog,
         })
     }
 }
@@ -18054,10 +18234,11 @@ fn run_res_rules<'a, 'c>(
     registry: &Registry,
     vars: &mut VarStore,
     wait: Option<ResWait<'_>>,
+    do_log: &mut bool,
 ) -> Result<Option<usize>, ResStop> {
     // In place, not a copy of the context per rule (S7).
     let prev = ctx.acls.replace(acls);
-    let flow = run_res_rules_in(rules, acls, head, &ctx.as_ctx(), rh, caps, registry, vars, wait);
+    let flow = run_res_rules_in(rules, acls, head, &ctx.as_ctx(), rh, caps, registry, vars, wait, do_log);
     ctx.acls = prev;
     flow
 }
@@ -18073,6 +18254,7 @@ fn run_res_rules_in<'a>(
     registry: &Registry,
     vars: &mut VarStore,
     mut wait: Option<ResWait<'_>>,
+    do_log: &mut bool,
 ) -> Result<Option<usize>, ResStop> {
     let (status, status_msg) = head;
     STRICT_MODE.set(true);
@@ -18097,6 +18279,11 @@ fn run_res_rules_in<'a>(
         }
         let op = match op {
             ResRule::Op(op) => op,
+            ResRule::DoLog => {
+                // The caller, which has the stream, sends the step's line.
+                *do_log = true;
+                continue;
+            }
             ResRule::Capture(expr, id) => {
                 // No sample, no capture (the slot keeps what it had); an `id` past the frontend's
                 // slots captures nothing (`http_action_res_capture_by_id`: `id >= fe->nb_rsp_cap`).
@@ -18169,6 +18356,7 @@ fn eval_after_res_rules<'c>(
     mut res_caps: Option<&mut Vec<Option<Vec<u8>>>>,
     registry: &Registry,
     vars: &mut VarStore,
+    do_log: &mut bool,
 ) -> Result<(), ResStop> {
     let (status, status_msg) = head;
     alcyon_sample::vars::with_stream(vars, |m| m.clear_scope(alcyon_sample::VarScope::Req));
@@ -18178,7 +18366,7 @@ fn eval_after_res_rules<'c>(
         // `http-after-response capture` writes the frontend's slots, whichever proxy the rule is in.
         let fe_slots = &proxies[fe_idx].res_capture_slots;
         let caps = res_caps.as_deref_mut().filter(|_| !fe_slots.is_empty()).map(|c| (c, &fe_slots[..]));
-        run_res_rules(rules, &proxies[px].acls, (&mut *status, &mut *status_msg), ctx, rh, caps, registry, vars, None)?;
+        run_res_rules(rules, &proxies[px].acls, (&mut *status, &mut *status_msg), ctx, rh, caps, registry, vars, None, do_log)?;
     }
     Ok(())
 }
@@ -18608,6 +18796,8 @@ fn after_res_on_reply<'r>(
             bc_src: sess.bc_src(),
             ..Default::default()
         };
+        // A reply Alcyon built has no live stream to `do-log` from; the flag is discarded.
+        let mut do_log = false;
         eval_after_res_rules(
             proxies,
             fe_idx,
@@ -18618,6 +18808,7 @@ fn after_res_on_reply<'r>(
             Some(&mut res_caps),
             sample_registry(),
             &mut vars,
+            &mut do_log,
         )
     };
     sess.strm.vars = vars;

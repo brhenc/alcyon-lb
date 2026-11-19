@@ -1140,6 +1140,10 @@ fn parse_http_req_rule_at(
             _ => HttpReqAction::SetMap { file, key, value: value.unwrap_or_default() },
         };
         rules.push(HttpReqRule { action, cond, line: 0 });
+    } else if act_str == "do-log" {
+        // HAProxy 3.1+: send the stream's line for the `http-req` step, no argument.
+        let cond = expect_cond_in("http-request", tokens, 2, act_token)?;
+        rules.push(HttpReqRule { action: HttpReqAction::DoLog, cond, line: 0 });
     } else {
         return Err(ConfigError::new(
             act_token.line,
@@ -1435,6 +1439,10 @@ fn parse_http_res_rule_at(
     } else if act_str == "pause" {
         let (time_ms, expr, cond) = parse_pause(tokens, "http-response", act_token)?;
         rules.push(HttpResRule { action: HttpResAction::Pause { time_ms, expr }, cond, line: 0 });
+    } else if act_str == "do-log" {
+        // HAProxy 3.1+: send the stream's line for the `http-res` step, no argument.
+        let cond = expect_cond_in("http-response", tokens, 2, act_token)?;
+        rules.push(HttpResRule { action: HttpResAction::DoLog, cond, line: 0 });
     } else {
         return Err(ConfigError::new(
             act_token.line,
@@ -1866,6 +1874,10 @@ pub(crate) fn parse_http_after_res_rule(
             _ => HttpAfterResAction::SetMap { file, key, value: value.unwrap_or_default() },
         };
         rules.push(HttpAfterResRule { action, cond });
+    } else if act_str == "do-log" {
+        // HAProxy 3.1+: send the stream's line for the `http-after-res` step, no argument.
+        let cond = expect_cond_in("http-after-response", tokens, 2, act_token)?;
+        rules.push(HttpAfterResRule { action: HttpAfterResAction::DoLog, cond });
     } else {
         return Err(ConfigError::new(
             act_token.line,

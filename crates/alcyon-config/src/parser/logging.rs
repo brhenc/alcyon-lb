@@ -40,6 +40,7 @@ pub(crate) fn parse_log(
     let mut max_len = 1024usize;
     let mut format = None;
     let mut sample = None;
+    let mut profile = None;
     while i + 1 < tokens.len() {
         match tokens[i].text.as_str() {
             "len" => {
@@ -75,25 +76,26 @@ pub(crate) fn parse_log(
                 sample = Some(Box::new(parse_log_sample(&tokens[i + 1])?));
                 i += 2;
             }
-            // Not implemented (`log-profile` sections). Refused rather than dropped, so a
-            // config relying on it does not load as if it worked.
+            // `profile <name>`: the `log-profile` section whose per-step formats this target
+            // uses (`doc/configuration.txt`). It must sit before the facility, as the other
+            // optional keywords do; a name after the facility is a level and is refused there.
             "profile" => {
-                return Err(ConfigError::new(
-                    tokens[i].line,
-                    tokens[i].col,
-                    "'log ... profile' is not supported",
-                ));
+                profile = Some(tokens[i + 1].text.clone());
+                i += 2;
             }
             _ => break,
         }
     }
 
     let Some(fac_tok) = tokens.get(i) else {
-        return Err(ConfigError::new(
-            kw.line,
-            kw.col,
-            "<log> expects <address> and <facility> as arguments.",
-        ));
+        // Nothing after the optional keywords: `HAProxy` parses an empty string there and
+        // refuses it as a facility, so only a bare `log <target>` gets the "expects" error.
+        let msg = if i > 2 {
+            "unknown log facility ''"
+        } else {
+            "<log> expects <address> and <facility> as arguments."
+        };
+        return Err(ConfigError::new(kw.line, kw.col, msg));
     };
     let facility = parse_facility(fac_tok)?;
     let level = match tokens.get(i + 1) {
@@ -102,11 +104,13 @@ pub(crate) fn parse_log(
     };
 
     logs.push(LogConfig {
+        line: kw.line,
         target,
         facility,
         level,
         max_len,
         format,
+        profile,
         sample,
     });
     Ok(false)
@@ -219,6 +223,43 @@ pub(crate) fn parse_log_tag(tokens: &[Token], kw: &Token) -> Result<std::sync::A
         Some(t) if !t.text.is_empty() => Ok(t.text.as_str().into()),
         _ => Err(ConfigError::new(kw.line, kw.col, "'log-tag' expects a tag for use in syslog")),
     }
+}
+
+/// `log-steps <steps>`: the log steps this proxy logs. `all` is every standard step; the
+/// `do-log` steps are named here so the list parses, but they are triggered only by the
+/// `do-log` action, so they set no bit of the returned mask. The mask holds the standard
+/// steps (`accept`=0x01, `request`=0x02, `connect`=0x04, `response`=0x08, `close`=0x20);
+/// `close` and `error` are the terminal steps and are logged whatever this mask says.
+pub(crate) fn parse_log_steps(steps: &mut Option<u8>, tokens: &[Token], kw: &Token) -> Result<(), ConfigError> {
+    let err = |name: &str| ConfigError::new(
+        kw.line,
+        kw.col,
+        format!("invalid log step name ({name}). Expected values are: accept, request, connect, response, close, http-req, http-res, http-after-res, tcp-req-conn, tcp-req-sess, tcp-req-cont, tcp-res-cont"),
+    );
+    let Some(tok) = tokens.get(1) else {
+        return Err(ConfigError::new(kw.line, kw.col, "'log-steps' expects a comma-separated list of log steps"));
+    };
+    let mut mask: u8 = 0;
+    let mut all = false;
+    for part in tok.text.split(',') {
+        let name = part.trim();
+        if name.is_empty() {
+            continue;
+        }
+        match name {
+            "accept" => mask |= 0x01,
+            "request" => mask |= 0x02,
+            "connect" => mask |= 0x04,
+            "response" => mask |= 0x08,
+            "close" => mask |= 0x20,
+            "http-req" | "http-res" | "http-after-res"
+            | "tcp-req-conn" | "tcp-req-sess" | "tcp-req-cont" | "tcp-res-cont" => {}
+            "all" => all = true,
+            _ => return Err(err(name)),
+        }
+    }
+    *steps = Some(if all { 0x2F } else { mask });
+    Ok(())
 }
 
 /// `sample <ranges>:<size>`, refused where `HAProxy`'s `parse_logger` refuses it: a range

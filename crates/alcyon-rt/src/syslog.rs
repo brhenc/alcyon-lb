@@ -198,6 +198,58 @@ enum Sink {
     Discard,
 }
 
+/// A `log-profile` resolved for a target: its `on <step>` lines with compiled formats,
+/// looked up per log step at send time. A target keeps one only when a `log` line named a
+/// profile, so a proxy without profiles holds none and pays nothing for them.
+pub struct ResolvedProfile {
+    /// The profile's name, as written on the `log` line: targets are interned by it, so two
+    /// `log` lines naming different profiles are different loggers even at one collector.
+    pub name: String,
+    /// The profile's `log-tag`, which overrides the tag of every line it sends.
+    pub log_tag: Option<String>,
+    /// The profile's `on` lines, in the order written.
+    pub steps: Vec<ResolvedStep>,
+}
+
+/// One `on <step> [drop] [format <fmt>] [sd <sd_fmt>]` line, its formats compiled once.
+pub struct ResolvedStep {
+    pub step: alcyon_config::ast::logging::LogProfileStepKind,
+    pub drop: bool,
+    pub format: Option<Arc<crate::logfmt::LogFormat>>,
+    pub sd: Option<Arc<crate::logfmt::LogFormat>>,
+}
+
+/// How a profile resolves a log step.
+pub enum StepResolution<'p> {
+    /// No profile, no matching step (and no `on any`), or a step with no `format`: the
+    /// proxy's own line stands.
+    Normal,
+    /// The step says `drop`: send nothing.
+    Drop,
+    /// The step's `format` (and optional `sd`) replace the proxy's line.
+    Format { format: &'p crate::logfmt::LogFormat, sd: Option<&'p crate::logfmt::LogFormat> },
+}
+
+impl ResolvedProfile {
+    /// The step for `origin`: the one named after it, else `on any`.
+    pub fn resolve(&self, origin: alcyon_config::ast::logging::LogProfileStepKind) -> StepResolution<'_> {
+        use alcyon_config::ast::logging::LogProfileStepKind as K;
+        let step = self
+            .steps
+            .iter()
+            .find(|s| s.step == origin)
+            .or_else(|| self.steps.iter().find(|s| s.step == K::Any));
+        match step {
+            None => StepResolution::Normal,
+            Some(s) if s.drop => StepResolution::Drop,
+            Some(s) => match s.format.as_ref() {
+                Some(format) => StepResolution::Format { format, sd: s.sd.as_deref() },
+                None => StepResolution::Normal,
+            },
+        }
+    }
+}
+
 pub struct SyslogTarget {
     facility: LogFacility,
     /// Level used when a message does not carry its own.
@@ -218,6 +270,10 @@ pub struct SyslogTarget {
     /// `format <fmt>`: the header the line is written under. `None` lets the message's own
     /// fields choose it (`LOG_FORMAT_UNSPEC`).
     format: Option<RingFormat>,
+    /// `profile <name>`: the resolved `log-profile` the line is sent under, or `None` when
+    /// the `log` line named no profile. `Box`ed so a target without a profile holds eight
+    /// bytes, not the profile's tables.
+    profile: Option<Box<ResolvedProfile>>,
 }
 
 impl SyslogTarget {
@@ -226,8 +282,11 @@ impl SyslogTarget {
     /// A bind failure is not fatal: the target is kept and simply never sends. Refusing
     /// to start because a log socket could not be created would make logging able to
     /// take down the proxy, which is the opposite of best-effort.
+    ///
+    /// `profile` is the `log-profile` the `log` line named, already looked up by the caller;
+    /// its `on` formats are compiled here, once.
     #[must_use]
-    pub fn new(cfg: &LogConfig) -> Self {
+    pub fn new(cfg: &LogConfig, profile: Option<&alcyon_config::ast::logging::LogProfileSection>) -> Self {
         let sink = match &cfg.target {
             LogTarget::Udp(addr) => {
                 let bind_addr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
@@ -269,7 +328,33 @@ impl SyslogTarget {
             sink,
             sample: cfg.sample.clone(),
             format: cfg.format.as_deref().and_then(RingFormat::from_name),
+            profile: profile.map(|p| Box::new(Self::resolve_profile(p))),
         }
+    }
+
+    /// Compiles a `log-profile`'s step formats once, into the target's resolved copy.
+    fn resolve_profile(p: &alcyon_config::ast::logging::LogProfileSection) -> ResolvedProfile {
+        ResolvedProfile {
+            name: p.name.clone(),
+            log_tag: p.log_tag.clone(),
+            steps: p
+                .steps
+                .iter()
+                .map(|s| ResolvedStep {
+                    step: s.step,
+                    drop: s.drop,
+                    format: s.format.as_deref().map(Self::compile_format).flatten(),
+                    sd: s.sd.as_deref().map(Self::compile_format).flatten(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Compiles a profile step's `format`/`sd`, once. A step format that does not compile
+    /// keeps its step but sends the proxy's line, the way a proxy whose own `log-format`
+    /// will not compile keeps logging nothing.
+    fn compile_format(fmt: &str) -> Option<Arc<crate::logfmt::LogFormat>> {
+        crate::logfmt::LogFormat::compile(fmt, crate::engine::sample_registry()).ok().map(Arc::new)
     }
 
     /// True if a message at `level` passes this target's filter.
@@ -385,9 +470,9 @@ impl SyslogTarget {
         }
     }
 
-    /// True when `cfg` is this target in every respect: destination, filters, length and
-    /// sampling. Only such a target may be shared between two `log` lines; one that
-    /// differed in level or `sample` would apply the first line's settings to both.
+    /// True when `cfg` is this target in every respect: destination, filters, length,
+    /// sampling and profile. Only such a target may be shared between two `log` lines; one
+    /// that differed in level or `sample` would apply the first line's settings to both.
     #[must_use]
     pub fn same_logger(&self, cfg: &LogConfig) -> bool {
         self.same_destination(cfg)
@@ -396,6 +481,7 @@ impl SyslogTarget {
             && self.max_len == cfg.max_len
             && self.sample == cfg.sample
             && self.format == cfg.format.as_deref().and_then(RingFormat::from_name)
+            && self.profile.as_ref().map(|p| p.name.as_str()) == cfg.profile.as_deref()
     }
 
     /// The `sample` setting, if any.
@@ -408,6 +494,12 @@ impl SyslogTarget {
     #[must_use]
     pub fn sample(&self) -> Option<&LogSample> {
         self.sample.as_deref()
+    }
+
+    /// The `log-profile` the line is sent under, `None` when the `log` line named none.
+    #[must_use]
+    pub fn profile(&self) -> Option<&ResolvedProfile> {
+        self.profile.as_deref()
     }
 
     #[must_use]

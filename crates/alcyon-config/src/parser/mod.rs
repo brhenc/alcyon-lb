@@ -8,9 +8,10 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use crate::ast::{LogForwardSection, RingSection, ProxyKind, ServerExtras,
-    clear_http_errors_sections, clear_resolved_checks, clear_userlists, http_errors_section, http_errors_section_code,
-    register_userlist, take_userlists, Userlist, UserlistUser,
+use crate::ast::{LogForwardSection, LogProfileSection, RingSection, ProxyKind, ServerExtras,
+    clear_http_errors_sections, clear_log_profiles, clear_resolved_checks, clear_userlists,
+    http_errors_section, http_errors_section_code,
+    register_log_profile, register_userlist, take_log_profiles, take_userlists, Userlist, UserlistUser,
     register_http_errors_section, register_resolved_check, register_resolved_check_for_addr,
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config, CookieConfig,
     DefaultServerConfig, DefaultsSection, ErrorPageSource, FrontendSection, GlobalSection, ProxyV2Tlv,
@@ -60,6 +61,8 @@ pub(crate) enum CurrentSection {
     Ring(RingSection),
     /// `log-forward <name>`.
     LogForward(LogForwardSection),
+    /// `log-profile <name>`.
+    LogProfile(LogProfileSection),
     /// `resolvers <name>`.
     Resolvers(crate::ast::ResolversSection),
 }
@@ -104,6 +107,7 @@ pub(crate) use userlist::*;
 pub(crate) use stick::*;
 pub(crate) mod logging;
 pub(crate) use logging::*;
+pub(crate) mod logprofile;
 pub(crate) mod acl;
 pub(crate) use acl::*;
 pub(crate) mod address;
@@ -151,6 +155,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     // parse many configs -- cannot leak a section into this one.
     clear_http_errors_sections();
     clear_userlists();
+    clear_log_profiles();
     warn::reset();
     acl_scope::begin();
     struct EndScope;
@@ -376,6 +381,22 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                 );
                 cur_section = Some(CurrentSection::LogForward(ring::parse_log_forward_header(tokens, kw, &log_forwards)?));
             }
+            "log-profile" => {
+                flush_current_section(
+                    &mut cur_section,
+                    &mut global,
+                    &mut defaults,
+                    &mut named_defaults,
+                    &mut defaults_sections,
+                    &mut listens,
+                    &mut frontends,
+                    &mut backends,
+                    &mut rings,
+                    &mut log_forwards,
+                    &mut resolvers,
+                );
+                cur_section = Some(CurrentSection::LogProfile(logprofile::parse_log_profile_header(tokens, kw)?));
+            }
             "resolvers" => {
                 flush_current_section(
                     &mut cur_section,
@@ -550,6 +571,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     for list in &mut userlists {
         list.resolve().map_err(|(line, msg)| ConfigError::new(line, 1, msg))?;
     }
+    let log_profiles = take_log_profiles();
 
     resolvers::check_resolvers(&resolvers);
     check_do_resolve(&mut listens, &mut frontends, &mut backends, &resolvers)?;
@@ -566,6 +588,7 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
         backends,
         rings,
         log_forwards,
+        log_profiles,
         resolvers,
         sample_refs,
         userlists,
@@ -979,6 +1002,7 @@ pub(crate) fn flush_current_section(
             CurrentSection::HttpErrors(name, table) => register_http_errors_section(name, table),
             CurrentSection::Ring(r) => rings.push(r),
             CurrentSection::LogForward(l) => log_forwards.push(l),
+            CurrentSection::LogProfile(l) => register_log_profile(l),
             CurrentSection::Resolvers(r) => resolvers.push(r),
         }
     }
@@ -1001,6 +1025,7 @@ pub(crate) fn parse_section_directive(
         CurrentSection::Userlist(u) => parse_userlist_directive(u, tokens, kw),
         CurrentSection::Ring(r) => ring::parse_ring_directive(r, tokens, kw),
         CurrentSection::LogForward(l) => ring::parse_log_forward_directive(l, tokens, kw),
+        CurrentSection::LogProfile(l) => logprofile::parse_log_profile_directive(l, tokens, kw),
         CurrentSection::Resolvers(r) => resolvers::parse_resolvers_directive(r, tokens, kw),
         CurrentSection::HttpErrors(_, table) => match kw.text.as_str() {
             "errorfile" => parse_errorfile_directive(table, tokens, kw),

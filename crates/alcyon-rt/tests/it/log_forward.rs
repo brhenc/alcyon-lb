@@ -306,7 +306,7 @@ fn a_log_line_format_decides_the_header() {
     let (col, cp) = collector();
     let sends = |fmt: &str| {
         let cfg = alcyon_config::parse_str(&format!("global\n  log 127.0.0.1:{cp} {fmt}local0\n")).expect("parses");
-        let t = alcyon_rt::SyslogTarget::new(&cfg.global.expect("global").logs[0]);
+        let t = alcyon_rt::SyslogTarget::new(&cfg.global.expect("global").logs[0], None);
         assert!(t.send(alcyon_config::LogLevel::Info, "mytag[4242]", "", "HELLO world"));
         recv(&col).expect("a line")
     };
@@ -511,7 +511,7 @@ fn a_ring_whose_server_is_not_up_yet_delivers_when_it_is() {
 #[test]
 fn a_log_line_naming_a_ring_that_does_not_exist_writes_nothing() {
     let cfg = alcyon_config::parse_str("global\n  log ring@never_made local0\n").expect("parses");
-    let t = alcyon_rt::SyslogTarget::new(&cfg.global.expect("global").logs[0]);
+    let t = alcyon_rt::SyslogTarget::new(&cfg.global.expect("global").logs[0], None);
     assert!(!t.send(alcyon_config::LogLevel::Info, "tag[1]", "", "lost"));
 }
 
@@ -563,11 +563,11 @@ fn descriptor_targets_write_and_the_rest_are_refused_quietly() {
     let cfg = alcyon_config::parse_str("global\n  log stdout format raw local0\n  log stderr format raw local0\n").expect("parses");
     let logs = cfg.global.expect("global").logs;
     for log in &logs {
-        let t = alcyon_rt::SyslogTarget::new(log);
+        let t = alcyon_rt::SyslogTarget::new(log, None);
         assert!(t.send_default("tag[1]", "", "to a descriptor"));
     }
     let cfg = alcyon_config::parse_str("global\n  log fd@5 local0\n").expect("parses");
-    let t = alcyon_rt::SyslogTarget::new(&cfg.global.expect("global").logs[0]);
+    let t = alcyon_rt::SyslogTarget::new(&cfg.global.expect("global").logs[0], None);
     assert!(!t.send(alcyon_config::LogLevel::Info, "tag[1]", "", "nowhere"));
 }
 
