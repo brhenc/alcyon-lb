@@ -545,3 +545,4 @@ mod res_caps_clone;
 
 mod rate_limit;
 mod size_map;
+mod server_observe;

@@ -819,6 +819,7 @@ impl CliApplet {
                     // `port` keyword sets too.
                     let agent_port = p.server_check_port(s_idx);
                     let mut check_port = agent_port;
+                    let mut check_addr = p.server_check_addr(s_idx);
                     let uweight = srv.weight().unwrap_or(1);
                     let iweight = p.initial_weight(s_idx);
                     
@@ -830,6 +831,7 @@ impl CliApplet {
                     if let Some(check) = ctx.checks.iter().find(|c| c.proxy() == p_idx && c.server() == s_idx) {
                         check_health = check.health;
                         check_port = check.config.check_port.unwrap_or(0);
+                        check_addr = check.config.check_addr;
                         check_state = 2; // CHK_ST_CONFIGURED
                         if check.enabled {
                             check_state |= 4; // CHK_ST_ENABLED
@@ -859,11 +861,13 @@ impl CliApplet {
                     let bk_forced = u8::from(p.ids.forced_id);
                     let srv_forced = u8::from(p.server_forced_id(s_idx));
                     let srv_fqdn = p.server_srv_fqdn(s_idx);
+                    let check_addr_str = check_addr.map(|a| a.to_string());
+                    let check_addr_field = check_addr_str.as_deref().unwrap_or("-");
                     self.out_buf.extend_from_slice(
                         format!(
-                            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} 0 {} {} {} {} {} {} {} - - {}\n",
+                            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} 0 {} {} {} {} {} {} {} {} - {}\n",
                             p.ids.iid, p.name, puid, s, addr, op_state, admin_state, uweight, iweight, lastchg, check_status, check_result, check_health, check_state, bk_forced, srv_forced,
-                            srv_fqdn.as_deref().or_else(|| p.server_fqdn(s_idx)).unwrap_or("-"), port, p.server_srv_record(s_idx).unwrap_or("-"), use_ssl, check_port, agent_port
+                            srv_fqdn.as_deref().or_else(|| p.server_fqdn(s_idx)).unwrap_or("-"), port, p.server_srv_record(s_idx).unwrap_or("-"), use_ssl, check_port, check_addr_field, agent_port
                         ).as_bytes()
                     );
                 }

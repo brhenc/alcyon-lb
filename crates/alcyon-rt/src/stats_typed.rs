@@ -116,6 +116,7 @@ pub(crate) static STAT_TAGS: &[(&str, &str, &str)] = &[
     ("bck", "SGPV", "u32"),
     ("chkfail", "MCPP", "u64"),
     ("chkdown", "MCPP", "u64"),
+    ("hanafail", "MCPP", "u64"),
     ("lastchg", "MAPP", "u32"),
     ("downtime", "MCPV", "u32"),
     ("qlimit", "CGSV", "u32"),
