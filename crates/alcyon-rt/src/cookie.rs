@@ -182,10 +182,11 @@ fn strip_equal_blanks(h: &mut Vec<u8>, att_end: usize, equal: &mut usize, val_be
 }
 
 /// One `Cookie` header value through `http_manage_client_side_cookies`. Returns whether any
-/// of the header is left; `h` is edited in place. `st` carries what earlier headers of the
-/// same request found, and `srv` the server chosen so far.
+/// of the header is left; `h` is edited in place. `servers` is server `i`'s cookie, read
+/// only while the value is looked up, for the `n_servers` of the backend. `st` carries what
+/// earlier headers of the same request found, and `srv` the server chosen so far.
 #[allow(clippy::too_many_lines)]
-fn client_value(cfg: &CookieConfig, now: i64, servers: &[SrvCookie<'_>], h: &mut Vec<u8>, st: &mut CookieTxn, srv: &mut Option<usize>) {
+fn client_value<'a>(cfg: &CookieConfig, now: i64, servers: &dyn Fn(usize) -> SrvCookie<'a>, n_servers: usize, h: &mut Vec<u8>, st: &mut CookieTxn, srv: &mut Option<usize>) {
     let name = cfg.name.as_bytes();
     let mut is_first = true;
     let mut del_from: Option<usize> = None;
@@ -311,7 +312,8 @@ fn client_value(cfg: &CookieConfig, now: i64, servers: &[SrvCookie<'_>], h: &mut
             let mut found = false;
             if delim != val_beg && !assigned {
                 let wanted = &h[val_beg..delim];
-                for (i, s) in servers.iter().enumerate() {
+                for i in 0..n_servers {
+                    let s = servers(i);
                     if s.value == Some(wanted) {
                         if s.usable || s.persistent {
                             *srv = Some(i);
@@ -362,7 +364,9 @@ fn client_value(cfg: &CookieConfig, now: i64, servers: &[SrvCookie<'_>], h: &mut
 
 /// `http_manage_client_side_cookies` over every `Cookie` header value of a request, in
 /// order. Returns the server the cookie chose (an index into `servers`), what the
-/// transaction learnt, and one edit per input value.
+/// transaction learnt, and one edit per input value. The request path does not collect the
+/// values or the servers: it cuts one header in its own buffer at a time
+/// ([`cut_cookie_value`]).
 #[must_use]
 pub fn client_side(
     cfg: &CookieConfig,
@@ -375,7 +379,7 @@ pub fn client_side(
     let mut edits = Vec::with_capacity(values.len());
     for v in values {
         let mut h = v.clone();
-        client_value(cfg, now, servers, &mut h, &mut st, &mut srv);
+        client_value(cfg, now, &|i| servers[i], servers.len(), &mut h, &mut st, &mut srv);
         edits.push(if h == *v {
             HeaderEdit::Keep
         } else if h.is_empty() {
@@ -387,9 +391,29 @@ pub fn client_side(
     (srv, st, edits)
 }
 
+/// [`client_value`] on one `Cookie` header value, the work done in `scratch`: the value is
+/// copied there and cut, and what is left reported as a change (an empty `scratch` is a
+/// removal, anything else a replacement of the whole value). `servers` is server `i`'s
+/// cookie, read only while it is needed.
+pub fn cut_cookie_value<'a>(
+    cfg: &CookieConfig,
+    now: i64,
+    servers: &dyn Fn(usize) -> SrvCookie<'a>,
+    n_servers: usize,
+    value: &[u8],
+    scratch: &mut Vec<u8>,
+    st: &mut CookieTxn,
+    srv: &mut Option<usize>,
+) -> bool {
+    scratch.clear();
+    scratch.extend_from_slice(value);
+    client_value(cfg, now, servers, n_servers, scratch, st, srv);
+    scratch != value
+}
+
 /// What a `Set-Cookie` header did to the persistence cookie (`TX_SCK_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Seen {
+pub enum Seen {
     /// Not the persistence cookie.
     No,
     /// It is, and is forwarded as it is.
@@ -403,7 +427,7 @@ enum Seen {
 /// One `Set-Cookie` value through `http_manage_server_side_cookies`. Only the first cookie of
 /// the header is looked at (a `Set-Cookie` cannot be folded). `target` is the server the
 /// request went to: `None` when there is none, else its `cookie` value.
-fn server_value(cfg: &CookieConfig, target: Option<Option<&[u8]>>, direct: bool, h: &mut Vec<u8>) -> Seen {
+pub fn server_value(cfg: &CookieConfig, target: Option<Option<&[u8]>>, direct: bool, h: &mut Vec<u8>) -> Seen {
     let name = cfg.name.as_bytes();
     let mut att_beg = 0;
     while att_beg < h.len() && spht(h[att_beg]) {
@@ -458,9 +482,7 @@ fn server_value(cfg: &CookieConfig, target: Option<Option<&[u8]>>, direct: bool,
             h.splice(val_beg..val_end, ck.iter().copied());
             return Seen::Replaced;
         } else if cfg.prefix {
-            let mut pre = ck.to_vec();
-            pre.push(b'~');
-            h.splice(val_beg..val_beg, pre);
+            h.splice(val_beg..val_beg, ck.iter().copied().chain(std::iter::once(b'~')));
             return Seen::Replaced;
         }
     }
@@ -498,18 +520,33 @@ pub fn response_cacheable(req: ReqKind, status: u16, hdrs: &[(String, String)]) 
 /// `option checkcache` blocks a response with both set and a `Set-Cookie`.
 #[must_use]
 pub fn response_cache_flags(req: ReqKind, status: u16, hdrs: &[(String, String)]) -> (bool, bool) {
+    let pragma = hdrs.iter().find(|(k, _)| k.eq_ignore_ascii_case("pragma")).map(|(_, v)| v.trim());
+    cache_flags_core(req, status, pragma, comma_values(hdrs, "cache-control"), |n| {
+        hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case(n))
+    })
+}
+
+/// The judgement [`response_cache_flags`] makes, on whatever hands it the `pragma` value,
+/// the `cache-control` directives in order, and a name test.
+fn cache_flags_core<'a>(
+    req: ReqKind,
+    status: u16,
+    pragma: Option<&'a str>,
+    cache_control: impl Iterator<Item = &'a str>,
+    has: impl Fn(&'a str) -> bool,
+) -> (bool, bool) {
     let mut cacheable = req.safe_method && matches!(status, 200 | 203 | 204 | 206 | 300 | 301 | 404 | 405 | 410 | 414 | 501);
     let mut cook = cacheable;
     if status < 200 {
         return (false, false);
     }
-    if let Some((_, v)) = hdrs.iter().find(|(k, _)| k.eq_ignore_ascii_case("pragma")) {
-        if v.trim().eq_ignore_ascii_case("no-cache") {
+    if let Some(v) = pragma {
+        if v.eq_ignore_ascii_case("no-cache") {
             return (false, false);
         }
     }
     let (mut fresh, mut null_maxage) = (false, false);
-    for v in comma_values(hdrs, "cache-control") {
+    for v in cache_control {
         if v.eq_ignore_ascii_case("public") {
             cacheable = true;
             cook = true;
@@ -539,15 +576,81 @@ pub fn response_cache_flags(req: ReqKind, status: u16, hdrs: &[(String, String)]
         cacheable = false;
         cook = false;
     }
-    let has_hdr = |n: &str| hdrs.iter().any(|(k, _)| k.eq_ignore_ascii_case(n));
     if !fresh {
-        fresh = has_hdr("expires");
+        fresh = has("expires");
     }
-    let validator = !fresh && (has_hdr("etag") || has_hdr("last-modified"));
+    let validator = !fresh && (has("etag") || has("last-modified"));
     if !fresh && !validator {
         cacheable = false;
     }
     (cacheable, cook)
+}
+
+/// The header block `i` of `h` as its bytes, `None` for a block that is not a header.
+fn header_bytes_at<'a>(h: &alcyon_proto::htx::HtxSliceRef<'a>, i: usize) -> Option<(&'a [u8], &'a [u8])> {
+    let d = h.read_desc(i);
+    (d.blk_type == alcyon_proto::htx::HtxBlockType::Header).then(|| {
+        let buf = h.buf();
+        (&buf[d.name_range()], &buf[d.value_range()])
+    })
+}
+
+/// The `cache-control` directives of the headers of a head in its HTX, in order: every
+/// header named `cache-control`, its value split on commas and the blanks around each part
+/// dropped, as [`comma_values`] does of the pair list.
+struct CacheControl<'h> {
+    h: &'h alcyon_proto::htx::HtxSliceRef<'h>,
+    i: usize,
+    part: Option<(&'h [u8], usize)>,
+}
+
+impl<'h> Iterator for CacheControl<'h> {
+    type Item = &'h str;
+    fn next(&mut self) -> Option<&'h str> {
+        loop {
+            if let Some((v, at)) = self.part {
+                let end = v[at..].iter().position(|&c| c == b',').map_or(v.len(), |p| at + p);
+                let mut start = at;
+                while start < end && (v[start] == b' ' || v[start] == b'\t') {
+                    start += 1;
+                }
+                let mut stop = end;
+                while stop > start && (v[stop - 1] == b' ' || v[stop - 1] == b'\t') {
+                    stop -= 1;
+                }
+                self.part = (end < v.len()).then(|| (v, end + 1));
+                if start < end {
+                    return Some(std::str::from_utf8(&v[start..stop]).unwrap_or(""));
+                }
+                continue;
+            }
+            while self.i < self.h.num_blocks() {
+                let i = self.i;
+                self.i += 1;
+                if let Some((k, v)) = header_bytes_at(self.h, i) {
+                    if k.eq_ignore_ascii_case(b"cache-control") {
+                        self.part = Some((v, 0));
+                        break;
+                    }
+                }
+            }
+            if self.part.is_none() {
+                return None;
+            }
+        }
+    }
+}
+
+/// [`response_cache_flags`] on a head still in its HTX: the names and the values walked as
+/// bytes, no pair list (COOKIEALLOC).
+#[must_use]
+pub fn response_cache_flags_htx(req: ReqKind, status: u16, h: &alcyon_proto::htx::HtxSliceRef<'_>) -> (bool, bool) {
+    let pragma = h
+        .header_bytes()
+        .find(|(k, _, _)| k.eq_ignore_ascii_case(b"pragma"))
+        .map(|(_, v, _)| std::str::from_utf8(v).unwrap_or("").trim());
+    let has = |n: &[u8]| (0..h.num_blocks()).any(|i| header_bytes_at(h, i).is_some_and(|(k, _)| k.eq_ignore_ascii_case(n)));
+    cache_flags_core(req, status, pragma, CacheControl { h, i: 0, part: None }, |n| has(n.as_bytes()))
 }
 
 /// The server the response came from, as far as the cookie is concerned.
@@ -654,6 +757,115 @@ pub fn process_response(
     // HTTP/1.0 caches keep cookies: tell them not to.
     if cacheable {
         hdrs.push(("Cache-control".to_string(), "private".to_string()));
+    }
+    sck
+}
+
+/// [`process_response`] on a head still in its HTX: the `Set-Cookie` blocks are read as
+/// bytes, edited in `scratch` and written back into their own blocks (a removal is a
+/// tombstone, the block indices stay valid), and the persistence cookie and the `nocache`
+/// header are added with the HTX API; no `(String, String)` list of the head is built
+/// (COOKIEALLOC). Returns what became of the persistence cookie (`CookieTxn::sck`).
+pub fn process_response_htx(
+    cfg: &CookieConfig,
+    target: Option<Target<'_>>,
+    txn: &CookieTxn,
+    req: ReqKind,
+    status: u16,
+    now: i64,
+    h: &mut alcyon_proto::htx::HtxSlice<'_>,
+    scratch: &mut Vec<u8>,
+) -> u8 {
+    // `http_manage_server_side_cookies`, block by block.
+    let tgt = target.map(|t| t.value);
+    let mut found = false;
+    let mut sck = txn.sck;
+    let n = h.num_blocks();
+    let mut i = 0;
+    while i < n {
+        if let Some((k, v)) = header_bytes_at(&h.as_ref(), i) {
+            if k.eq_ignore_ascii_case(b"set-cookie") {
+                scratch.clear();
+                scratch.extend_from_slice(v);
+                let seen = server_value(cfg, tgt, txn.direct, scratch);
+                found |= seen != Seen::No;
+                sck = match seen {
+                    Seen::No => sck,
+                    Seen::Passive => 1,
+                    Seen::Deleted => 2,
+                    Seen::Replaced => 4,
+                };
+                if seen == Seen::Deleted {
+                    h.remove_block(i);
+                } else if scratch != v {
+                    // A replaced value, or a stripped one: the old code wrote the value back
+                    // unconditionally, so a `SRV = a` stripped to `SRV=a` must reach the client.
+                    let _ = h.retry_after_defrag(|h| h.replace_block_value(i, scratch));
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let cacheable = cfg.nocache && response_cache_flags_htx(req, status, &h.as_ref()).0;
+
+    // Insert the cookie: the server is known and it is not the one the client asked for,
+    // or the dates of the cookie need refreshing.
+    let Some(Target { value }) = target else {
+        return sck;
+    };
+    let last_in_past = i64::from(txn.last_date) < now;
+    let insert = cfg.insert
+        && !(found && cfg.preserve)
+        && (!txn.direct
+            || ((cfg.maxidle != 0 || txn.last_date != 0) && (txn.last_date == 0 || last_in_past))
+            || (cfg.maxlife != 0 && txn.first_date == 0)
+            || (cfg.maxlife == 0 && txn.first_date != 0))
+        && (!cfg.postonly || req.post);
+    if !insert {
+        return sck;
+    }
+    scratch.clear();
+    if let Some(value) = value {
+        // The last-seen date, mandatory; and the first date, the original one or now.
+        scratch.extend_from_slice(cfg.name.as_bytes());
+        scratch.push(b'=');
+        scratch.extend_from_slice(value);
+        if cfg.maxidle != 0 || cfg.maxlife != 0 {
+            scratch.push(b'|');
+            scratch.extend_from_slice(&s30tob64(((now + 3) >> 2) as i32));
+            if cfg.maxlife != 0 {
+                scratch.push(b'|');
+                let first = if txn.first_date != 0 { txn.first_date >> 2 } else { ((now + 3) >> 2) as i32 };
+                scratch.extend_from_slice(&s30tob64(first));
+            }
+        }
+        scratch.extend_from_slice(b"; path=/");
+    } else {
+        scratch.extend_from_slice(cfg.name.as_bytes());
+        scratch.extend_from_slice(b"=; Expires=Thu, 01-Jan-1970 00:00:01 GMT; path=/");
+    }
+    if let Some(d) = &cfg.domain {
+        scratch.extend_from_slice(b"; domain=");
+        scratch.extend_from_slice(d.as_bytes());
+    }
+    if cfg.httponly {
+        scratch.extend_from_slice(b"; HttpOnly");
+    }
+    if cfg.secure {
+        scratch.extend_from_slice(b"; Secure");
+    }
+    if let Some(a) = &cfg.attrs {
+        scratch.extend_from_slice(b"; ");
+        scratch.extend_from_slice(a.as_bytes());
+    }
+    let _ = h.retry_after_defrag(|h| h.add_header_bytes(b"Set-Cookie", scratch));
+    // Only the date was updated when the server did not change.
+    sck = if value.is_some() && txn.direct { 5 } else { 3 };
+
+    // HTTP/1.0 caches keep cookies: tell them not to.
+    if cacheable {
+        let _ = h.retry_after_defrag(|h| h.add_header_bytes(b"Cache-control", b"private"));
     }
     sck
 }
@@ -948,6 +1160,59 @@ mod tests {
         assert!(response_cacheable(GET, 200, &h));
         let h = [("Cache-Control".to_string(), "no-cache".to_string()), ("Expires".to_string(), "x".to_string())];
         assert!(!response_cacheable(GET, 200, &h));
+    }
+
+    /// The byte-walking cacheability judgement reads the same flags as the pair-list one,
+    /// on a head that also holds non-header blocks (the status line, the Eoh).
+    #[test]
+    fn the_htx_cache_flags_match_the_pair_list_flags() {
+        let cases: [(&[(&str, &str)], (bool, bool)); 6] = [
+            (&[("Cache-Control", "no-cache , no-store ,, public")], (false, true)),
+            (&[("Cache-Control", "max-age=60 , no-cache=\"set-cookie\"")], (true, false)),
+            // Nothing in the list, but `cook` starts from `cacheable`: (false, true).
+            (&[("Cache-Control", " , , ,")], (false, true)),
+            (&[("Cache-Control", "max-age=60 , private")], (false, false)),
+            (&[("Pragma", " no-cache "), ("Cache-Control", "max-age=60")], (false, false)),
+            // Two Cache-Control headers: both are read, as the pair-list version does.
+            (&[("Cache-Control", "no-store"), ("Cache-Control", "public , max-age=0")], (false, false)),
+        ];
+        for (hdrs, want) in cases {
+            let list: Vec<(String, String)> = hdrs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+            let old = response_cache_flags(GET, 200, &list);
+            let mut buf = [0u8; 512];
+            let mut hx = alcyon_proto::htx::HtxSlice::new(&mut buf);
+            hx.push_res_line("HTTP/1.1", 200, "OK").unwrap();
+            for (k, v) in hdrs {
+                hx.push_header(k, v).unwrap();
+            }
+            hx.push_eoh().unwrap();
+            assert_eq!((old, response_cache_flags_htx(GET, 200, &hx.as_ref())), (want, want), "{hdrs:?}");
+        }
+    }
+
+    /// No server behind the response (a 503, or another backend): nothing is inserted, but
+    /// the Set-Cookie values are still read, and the blanks around the `=` still stripped
+    /// the way the pair-list version wrote them back.
+    #[test]
+    fn the_htx_response_without_a_target_still_strips_the_cookies() {
+        let hdrs = [("Set-Cookie", "SRV = a ; path=/x"), ("Set-Cookie", "x = y")];
+        let mut list: Vec<(String, String)> = hdrs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+        let old = process_response(&cfg("insert nocache"), None, &CookieTxn::default(), GET, 200, 1_700_000_000, &mut list);
+        let mut buf = [0u8; 512];
+        let mut hx = alcyon_proto::htx::HtxSlice::new(&mut buf);
+        hx.push_res_line("HTTP/1.1", 200, "OK").unwrap();
+        for (k, v) in hdrs {
+            hx.push_header(k, v).unwrap();
+        }
+        hx.push_eoh().unwrap();
+        let mut scratch = Vec::new();
+        let sck = process_response_htx(&cfg("insert nocache"), None, &CookieTxn::default(), GET, 200, 1_700_000_000, &mut hx, &mut scratch);
+        assert_eq!(sck, old);
+        let got: Vec<String> = (0..hx.num_blocks())
+            .filter_map(|i| header_bytes_at(&hx.as_ref(), i))
+            .map(|(k, v)| format!("{}: {}", String::from_utf8_lossy(k), String::from_utf8_lossy(v)))
+            .collect();
+        assert_eq!(got, list.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>());
     }
 
     /// T242 (fuzz cookie): a value removed after a run of blanks that starts the header

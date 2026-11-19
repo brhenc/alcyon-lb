@@ -13174,8 +13174,9 @@ impl EngineDispatcher<'_> {
                     safe_method: matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE"),
                     post: method == "POST",
                 };
-                // A cold path (a `cookie` line): on the headers as a list of pairs.
-                let (sck, _) = with_res_pairs(&mut rh.htx.borrow_mut(), |hdrs| crate::cookie::process_response(cfg, target, &cookie_txn, req, status, unix_now(), hdrs));
+                // A cold path (a `cookie` line): the `Set-Cookie` blocks edited in place and
+                // the rest of the head walked as bytes; no pair list is built (COOKIEALLOC).
+                let sck = crate::reuse::with_bytes(|scratch| crate::cookie::process_response_htx(cfg, target, &cookie_txn, req, status, unix_now(), &mut rh.htx.borrow_mut(), scratch));
                 if let Some(txn) = entry.sess.strm.txn.as_mut() {
                     txn.ck.sck = sck;
                 }
@@ -17026,43 +17027,60 @@ fn unix_now() -> i64 {
 /// goes to the transaction (`HttpTxn::ck`).
 fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
     let cfg = be.cookie.as_ref()?;
-    // `cur_state != SRV_ST_STOPPED`: a draining server still takes its clients.
-    let servers: Vec<crate::cookie::SrvCookie<'_>> = (0..be.srv_set().len())
-        .map(|i| crate::cookie::SrvCookie {
-            value: be.srv_set().cookie_at(i).map(str::as_bytes),
-            persistent: be.ids.persist,
-            usable: be
-                .srv_set()
-                .status_at(i)
-                .is_some_and(|s| s == ServerStatus::Up as u8 || s == ServerStatus::Drain as u8),
-        })
-        .collect();
-    // The HTX head: its block indices stay valid while others are replaced or removed.
-    let blocks: Vec<(usize, Vec<u8>)> = sess.htx_slice().map(|h| {
-        h.header_blocks().filter(|(_, k, _)| k.eq_ignore_ascii_case("cookie")).map(|(i, _, v)| (i, v.as_bytes().to_vec())).collect()
-    })?;
-    if blocks.is_empty() {
-        return None;
-    }
-    let values: Vec<Vec<u8>> = blocks.iter().map(|(_, v)| v.clone()).collect();
-    let (srv, st, edits) = crate::cookie::client_side(cfg, unix_now(), &servers, &values);
-    if let Some(txn) = sess.strm.txn.as_mut() {
-        txn.ck = st;
-    }
-    if edits.iter().all(|e| *e == crate::cookie::HeaderEdit::Keep) {
-        return srv;
-    }
-    sess.with_htx_mut(|htx| {
-        for ((idx, _), e) in blocks.iter().zip(&edits) {
-            match e {
-                crate::cookie::HeaderEdit::Keep => {}
-                crate::cookie::HeaderEdit::Set(v) => {
-                    let _ = htx.replace_block_value(*idx, v);
+    // `cur_state != SRV_ST_STOPPED`: a draining server still takes its clients. A server's
+    // cookie is read when it is looked up; the backend's set is not collected
+    // (COOKIEALLOC).
+    let servers = |i: usize| crate::cookie::SrvCookie {
+        value: be.srv_set().cookie_at(i).map(str::as_bytes),
+        persistent: be.ids.persist,
+        usable: be
+            .srv_set()
+            .status_at(i)
+            .is_some_and(|s| s == ServerStatus::Up as u8 || s == ServerStatus::Drain as u8),
+    };
+    let n_servers = be.srv_set().len();
+    let now = unix_now();
+    let mut st = crate::cookie::CookieTxn::default();
+    let mut srv = None;
+    // The `Cookie` headers are cut one in its own HTX block at a time, in the scratch the
+    // thread keeps for that (COOKIEALLOC); the block indices stay valid while other blocks
+    // are replaced or removed (a removal is a tombstone).
+    let mut touched = false;
+    let mut changed = false;
+    let was_modified = sess.htx_modified;
+    crate::reuse::with_bytes(|scratch| {
+        sess.with_htx_mut(|htx| {
+            let n = htx.num_blocks();
+            let mut i = 0;
+            while i < n {
+                let value = match crate::txn::htx_header_at(htx, i) {
+                    Some((k, v, _)) if k.eq_ignore_ascii_case(b"cookie") => Some(v),
+                    _ => None,
+                };
+                if let Some(value) = value {
+                    touched = true;
+                    if crate::cookie::cut_cookie_value(cfg, now, &servers, n_servers, value, scratch, &mut st, &mut srv) {
+                        changed = true;
+                        if scratch.is_empty() {
+                            htx.remove_block(i);
+                        } else {
+                            let _ = htx.replace_block_value(i, scratch);
+                        }
+                    }
                 }
-                crate::cookie::HeaderEdit::Remove => htx.remove_block(*idx),
+                i += 1;
             }
-        }
+        });
     });
+    // Nothing in the `Cookie` headers changed: the head is left as it came (X2).
+    if !changed {
+        sess.htx_modified = was_modified;
+    }
+    if touched {
+        if let Some(txn) = sess.strm.txn.as_mut() {
+            txn.ck = st;
+        }
+    }
     srv
 }
 

@@ -1538,3 +1538,211 @@ fn a_log_format_use_backend_allocates_nothing_per_request() {
         (diff.alloc_count, diff.realloc_count)
     );
 }
+
+// --- COOKIEALLOC -------------------------------------------------------------
+
+/// A keep-alive HTTP/1.1 origin answering every request on a connection with the fixed head
+/// `HTTP/1.1 200 OK`, `X-SRV: <marker>`, the request's own `Cookie` header echoed as
+/// `X-COOKIE: <value>` (the value empty when the request had no `Cookie` header), `extra`
+/// (row-specific fixed headers), a 2-byte body `ok`. The head is read into a fixed buffer and
+/// the answer assembled in a second, so the origin thread allocates nothing per request (the
+/// counter is process-wide).
+fn start_cookie_origin(
+    listener: TcpListener,
+    running: Arc<AtomicBool>,
+    marker: &'static [u8],
+    extra: &'static [u8],
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        listener.set_nonblocking(true).expect("nonblocking");
+        let mut conns: Vec<TcpStream> = Vec::with_capacity(8);
+        let mut ibuf = [0u8; 2048];
+        let mut out = [0u8; 2048];
+        while running.load(Ordering::Relaxed) {
+            if let Ok((s, _)) = listener.accept() {
+                s.set_nonblocking(true).expect("nonblocking");
+                conns.push(s);
+            }
+            conns.retain_mut(|s| {
+                let n = match s.read(&mut ibuf) {
+                    Ok(0) => return false,
+                    Ok(n) => n,
+                    Err(e) => return e.kind() == std::io::ErrorKind::WouldBlock,
+                };
+                let req = &ibuf[..n];
+                if !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    return true;
+                }
+                // The value of the first `Cookie:` line at a line start, or none.
+                let mut ck: &[u8] = &[];
+                let mut at = 0;
+                while let Some(i) = req[at..].windows(7).position(|w| w.eq_ignore_ascii_case(b"Cookie:")) {
+                    let j = at + i;
+                    if j == 0 || req[j - 1] == b'\n' {
+                        let v = &req[j + 7..];
+                        let end = v.iter().position(|&b| b == b'\r').unwrap_or(v.len());
+                        let mut start = 0;
+                        while start < end && (v[start] == b' ' || v[start] == b'\t') {
+                            start += 1;
+                        }
+                        ck = &v[start..end];
+                        break;
+                    }
+                    at = j + 7;
+                }
+                let mut o = 0;
+                let mut push = |o: &mut usize, chunk: &[u8]| {
+                    out[*o..*o + chunk.len()].copy_from_slice(chunk);
+                    *o += chunk.len();
+                };
+                push(&mut o, b"HTTP/1.1 200 OK\r\nX-SRV: ");
+                push(&mut o, marker);
+                push(&mut o, b"\r\nX-COOKIE: ");
+                push(&mut o, ck);
+                push(&mut o, b"\r\n");
+                push(&mut o, extra);
+                push(&mut o, b"Content-Length: 2\r\n\r\nok");
+                let _ = s.write_all(&out[..o]);
+                let _ = s.flush();
+                true
+            });
+            thread::sleep(Duration::from_micros(200));
+        }
+    })
+}
+
+/// One request `req` on the keep-alive `client`, the engine run until the whole response is
+/// back in `out` (it always ends with `b"\r\n\r\nok"`); its length. Nothing here allocates.
+fn drive_cookie_request(client: &mut TcpStream, engine: &mut Engine, req: &[u8], out: &mut [u8]) -> usize {
+    client.write_all(req).expect("write req");
+    let start = Instant::now();
+    let mut len = 0;
+    while start.elapsed() < Duration::from_secs(2) && !out[..len].ends_with(b"\r\n\r\nok") {
+        let _ = engine.run_once();
+        if let Ok(n) = client.read(&mut out[len..]) {
+            len += n;
+        }
+    }
+    assert!(out[..len].starts_with(b"HTTP/1.1 200") && out[..len].ends_with(b"\r\n\r\nok"), "response: {:?}", String::from_utf8_lossy(&out[..len]));
+    len
+}
+
+/// One row of `cookie_persistence_allocates_nothing_per_request`: the allocations of the
+/// third request of a keep-alive connection through a two-server backend with `cookie_line`
+/// (the servers' own `cookie` values are `s1`/`s2`), the request carrying `req_cookie` as its
+/// `Cookie` header (or none), the origins answering with `origin_extra`; and the whole
+/// response of that third request, which says what it routed to (`X-SRV`) and what the server
+/// saw (`X-COOKIE`).
+fn cookie_row(cookie_line: &str, req_cookie: Option<&[u8]>, origin_extra: &'static [u8]) -> (usize, Vec<u8>) {
+    let (l1, a1) = loopback0();
+    let (l2, a2) = loopback0();
+    let addr = common::reserve_addr();
+    let running = Arc::new(AtomicBool::new(true));
+    let o1 = start_cookie_origin(l1, Arc::clone(&running), b"s1", origin_extra);
+    let o2 = start_cookie_origin(l2, Arc::clone(&running), b"s2", origin_extra);
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend f\n  bind {addr}\n  default_backend b\nbackend b\n{cookie_line}\
+         server s1 {a1} cookie s1\n  server s2 {a2} cookie s2\n"
+    );
+    let mut engine = Engine::new(&alcyon_config::parse_str(&cfg).expect("parse"), 64).expect("Engine::new");
+    let mut client = TcpStream::connect(addr).expect("connect to frontend");
+    client.set_nonblocking(true).expect("set_nonblocking");
+    let mut req = Vec::new();
+    req.extend_from_slice(b"GET /api/test HTTP/1.1\r\nHost: localhost\r\n");
+    if let Some(ck) = req_cookie {
+        req.extend_from_slice(b"Cookie: ");
+        req.extend_from_slice(ck);
+        req.extend_from_slice(b"\r\n");
+    }
+    req.extend_from_slice(b"\r\n");
+    let mut rsp = [0u8; 2048];
+    for _ in 0..2 {
+        drive_cookie_request(&mut client, &mut engine, &req, &mut rsp);
+    }
+    let before = alcyon_alloc::alloc_counters();
+    let len = drive_cookie_request(&mut client, &mut engine, &req, &mut rsp);
+    let diff = before.diff(&alcyon_alloc::alloc_counters());
+    let out = rsp[..len].to_vec();
+    drop(client);
+    for _ in 0..5 {
+        let _ = engine.run_once();
+    }
+    running.store(false, Ordering::Relaxed);
+    let _ = o1.join();
+    let _ = o2.join();
+    (diff.alloc_count, out)
+}
+
+/// COOKIEALLOC: a backend with a `cookie` line allocates nothing per request. The `Cookie`
+/// header is cut in place (`indirect`, `prefix`) and the `Set-Cookie` headers edited or
+/// inserted on the HTX the head already lives in, the server list read through an accessor
+/// instead of a collected `Vec` -- none of the request-side `Vec<SrvCookie>`, the
+/// `Vec<(usize, Vec<u8>)>` of the header copies, the second `Vec<Vec<u8>>` of clones and the
+/// per-value `Vec<HeaderEdit>` the base built on every request, and none of the response-side
+/// `(String, String)` list of every header (and its clone) that `with_res_pairs` built. The
+/// third request of a keep-alive connection must cost the same in every row; the whole
+/// response of it says what it routed to and what the client and the server saw.
+#[test]
+fn cookie_persistence_allocates_nothing_per_request() {
+    let _lock = TEST_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // (row, backend `cookie` line, the request's `Cookie` value or none, the origins' extra
+    // headers, the whole response of the third request).
+    let rows: [(&str, &str, Option<&[u8]>, &'static [u8], &'static [u8]); 6] = [
+        (
+            "baseline",
+            "",
+            None,
+            b"",
+            b"HTTP/1.1 200 OK\r\nX-SRV: s1\r\nX-COOKIE: \r\nContent-Length: 2\r\n\r\nok",
+        ),
+        (
+            "insert indirect nocache",
+            "  cookie SRV insert indirect nocache\n",
+            None,
+            b"",
+            b"HTTP/1.1 200 OK\r\nX-SRV: s1\r\nX-COOKIE: \r\nContent-Length: 2\r\nSet-Cookie: SRV=s1; path=/\r\n\r\nok",
+        ),
+        (
+            "direct to s2",
+            "  cookie SRV insert indirect nocache\n",
+            Some(b"SRV=s2"),
+            b"",
+            b"HTTP/1.1 200 OK\r\nX-SRV: s2\r\nX-COOKIE: \r\nContent-Length: 2\r\n\r\nok",
+        ),
+        (
+            "indirect removes the middle cookie",
+            "  cookie SRV insert indirect nocache\n",
+            Some(b"a=1; SRV=s1; b=2"),
+            b"",
+            b"HTTP/1.1 200 OK\r\nX-SRV: s1\r\nX-COOKIE: a=1; b=2\r\nContent-Length: 2\r\n\r\nok",
+        ),
+        (
+            "prefix",
+            "  cookie SRV prefix\n",
+            Some(b"SRV=s1~abc"),
+            b"",
+            b"HTTP/1.1 200 OK\r\nX-SRV: s1\r\nX-COOKIE: SRV=abc\r\nContent-Length: 2\r\n\r\nok",
+        ),
+        (
+            "rewrite",
+            "  cookie SRV rewrite\n",
+            Some(b"SRV=s1"),
+            b"Set-Cookie: SRV=x\r\n",
+            b"HTTP/1.1 200 OK\r\nX-SRV: s1\r\nX-COOKIE: SRV=s1\r\nSet-Cookie: SRV=s1\r\nContent-Length: 2\r\n\r\nok",
+        ),
+    ];
+
+    let mut counts = Vec::new();
+    for (name, cookie_line, req_cookie, origin_extra, want) in &rows {
+        let (n, got) = cookie_row(cookie_line, *req_cookie, origin_extra);
+        counts.push((*name, n));
+        assert_eq!(got.as_slice(), *want, "row {name}: the response differs; the routing, the client's and the server's cookies changed");
+    }
+    let baseline = counts[0].1;
+    println!("[MEASUREMENT COOKIEALLOC] keep-alive third-request allocations, baseline {baseline}, {counts:?}");
+    for (name, n) in &counts[1..] {
+        assert_eq!(*n, baseline, "row {name} allocated {n} times on a keep-alive request, {baseline} without a cookie line");
+    }
+}
