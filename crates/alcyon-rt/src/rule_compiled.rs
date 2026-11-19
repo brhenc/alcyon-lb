@@ -552,6 +552,8 @@ pub fn http_after_res(rules: &[alcyon_config::HttpAfterResRule], acls: &Acls) ->
             HttpAfterResAction::SetMap { file, key, value } => Rule::new(r.cond.as_ref(), acls, None, None).with_pat(pat_op(PatOpKind::SetMap, file, key, Some(value))),
             HttpAfterResAction::DelMap { file, key } => Rule::new(r.cond.as_ref(), acls, None, None).with_pat(pat_op(PatOpKind::DelMap, file, key, None)),
             HttpAfterResAction::DelAcl { file, key } => Rule::new(r.cond.as_ref(), acls, None, None).with_pat(pat_op(PatOpKind::DelAcl, file, key, None)),
+            // `do-log` carries no sample or pattern: the action is read from the AST at run time.
+            HttpAfterResAction::DoLog => Rule::new(r.cond.as_ref(), acls, None, None),
         })
         .collect()
 }

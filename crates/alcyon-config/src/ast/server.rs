@@ -35,6 +35,16 @@ pub enum OnErrorMode {
     MarkDown = 3,
 }
 
+/// Agent check configuration (`agent-check`, `agent-addr`, `agent-port`, `agent-send`, `agent-inter`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentCheckConfig {
+    pub enabled: bool,
+    pub addr: Option<std::net::IpAddr>,
+    pub port: Option<u16>,
+    pub send: Option<Box<str>>,
+    pub inter: Option<Duration>,
+}
+
 /// Default server options applied to all servers in a backend.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DefaultServerConfig {
@@ -86,6 +96,8 @@ pub struct DefaultServerConfig {
     pub resolvers: Option<Box<str>>,
     /// `resolve-prefer`, `resolve-net`, `resolve-opts`.
     pub resolve: ResolveOpts,
+    /// `agent-check` and its companions.
+    pub agent: AgentCheckConfig,
 }
 
 /// `resolve-prefer`, `resolve-net` and `resolve-opts` (`struct resolv_options`): how a server
@@ -383,6 +395,8 @@ pub struct ServerExtras {
     /// The line of the `server` line of each server, by name: a second server of one name is
     /// refused (`another server named ... was already defined at line N`, T513).
     pub name_lines: std::collections::HashMap<Box<str>, u32>,
+    /// Servers with `agent-check` (or `agent-*` options) configured.
+    pub agent_checks: Vec<(u32, AgentCheckConfig)>,
 }
 
 impl ServerExtras {

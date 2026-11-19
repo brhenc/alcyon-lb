@@ -100,6 +100,7 @@ pub(crate) fn parse_listen_header(
         unique_id_format: defaults.and_then(|d| d.unique_id_format.clone()),
         error_log_format: defaults.and_then(|d| d.error_log_format.clone()),
         log_format_sd: defaults.and_then(|d| d.log_format_sd.clone()),
+        log_steps: None,
         unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
         req_header_captures: Vec::new(),
         res_header_captures: Vec::new(),
@@ -211,6 +212,7 @@ pub(crate) fn parse_frontend_header(
         unique_id_format: defaults.and_then(|d| d.unique_id_format.clone()),
         error_log_format: defaults.and_then(|d| d.error_log_format.clone()),
         log_format_sd: defaults.and_then(|d| d.log_format_sd.clone()),
+        log_steps: None,
         unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
         req_header_captures: Vec::new(),
         res_header_captures: Vec::new(),
@@ -287,6 +289,7 @@ pub(crate) fn parse_backend_header(
         log_tag: defaults.and_then(|d| d.log_tag.clone()),
         log_global: defaults.map_or(false, |d| d.log_global),
         log_format: defaults.and_then(|d| d.log_format.clone()),
+        log_steps: None,
         unique_id_format: defaults.and_then(|d| d.unique_id_format.clone()),
         unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
@@ -420,6 +423,7 @@ pub(crate) fn parse_listen_directive(
         ),
         "log" => parse_log(&mut proxy.logs, tokens, kw).map(|g| proxy.log_global |= g),
         "log-tag" => parse_log_tag(tokens, kw).map(|t| proxy.log_tag = Some(t)),
+        "log-steps" => parse_log_steps(&mut proxy.log_steps, tokens, kw),
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
         "balance" => {
@@ -607,6 +611,7 @@ pub(crate) fn parse_frontend_directive(
         "backlog" => super::parse_backlog(&mut fe.backlog, tokens, kw),
         "log" => parse_log(&mut fe.logs, tokens, kw).map(|g| fe.log_global |= g),
         "log-tag" => parse_log_tag(tokens, kw).map(|t| fe.log_tag = Some(t)),
+        "log-steps" => parse_log_steps(&mut fe.log_steps, tokens, kw),
         "acl" => parse_acl(&mut fe.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut fe.use_backends, tokens, kw),
         "force-be-switch" => parse_force_be_switch(&mut fe.force_be_switch, tokens, kw),
@@ -767,6 +772,7 @@ pub(crate) fn parse_backend_directive(
         // -- the health-check suites all declare their syslog target on the backend.
         "log" => parse_log(&mut be.logs, tokens, kw).map(|g| be.log_global |= g),
         "log-tag" => parse_log_tag(tokens, kw).map(|t| be.log_tag = Some(t)),
+        "log-steps" => parse_log_steps(&mut be.log_steps, tokens, kw),
         "http-check" => {
             take_own_http_check(&mut be.http_check_own, &mut be.httpchk, &mut be.http_checks);
             parse_http_check_directive(&mut be.http_checks, tokens, kw)?;

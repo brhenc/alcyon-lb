@@ -817,8 +817,26 @@ impl CliApplet {
                     let admin_state = admin_state | if p.server_fqdn_changed(s_idx) { 64 } else { 0 };
                     // `check.port` (the file may have changed it), and `agent.port`, which the
                     // `port` keyword sets too.
-                    let agent_port = p.server_check_port(s_idx);
-                    let mut check_port = agent_port;
+                    let agent_cfg = p.server_agent_config(s_idx);
+                    let agent_port = agent_cfg
+                        .and_then(|a| a.port)
+                        .unwrap_or_else(|| p.server_check_port(s_idx));
+                    let agent_addr_str = agent_cfg.and_then(|a| a.addr).map(|a| a.to_string());
+                    let agent_addr_field = agent_addr_str.as_deref().unwrap_or("-");
+                    let agent_state = if agent_cfg.is_some_and(|a| a.enabled) {
+                        let view = crate::track::agent_view(p, s_idx);
+                        let mut st = 2u8 | 16; // CHK_ST_CONFIGURED | CHK_ST_AGENT
+                        if view.as_ref().map_or(true, |v| v.enabled) {
+                            st |= 4; // CHK_ST_ENABLED
+                        }
+                        if view.as_ref().is_some_and(|v| v.in_progress) {
+                            st |= 1; // CHK_ST_INPROGRESS
+                        }
+                        st
+                    } else {
+                        0
+                    };
+                    let mut check_port = p.server_check_port(s_idx);
                     let mut check_addr = p.server_check_addr(s_idx);
                     let uweight = srv.weight().unwrap_or(1);
                     let iweight = p.initial_weight(s_idx);
@@ -865,9 +883,9 @@ impl CliApplet {
                     let check_addr_field = check_addr_str.as_deref().unwrap_or("-");
                     self.out_buf.extend_from_slice(
                         format!(
-                            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} 0 {} {} {} {} {} {} {} {} - {}\n",
-                            p.ids.iid, p.name, puid, s, addr, op_state, admin_state, uweight, iweight, lastchg, check_status, check_result, check_health, check_state, bk_forced, srv_forced,
-                            srv_fqdn.as_deref().or_else(|| p.server_fqdn(s_idx)).unwrap_or("-"), port, p.server_srv_record(s_idx).unwrap_or("-"), use_ssl, check_port, check_addr_field, agent_port
+                            "{} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}\n",
+                            p.ids.iid, p.name, puid, s, addr, op_state, admin_state, uweight, iweight, lastchg, check_status, check_result, check_health, check_state, agent_state, bk_forced, srv_forced,
+                            srv_fqdn.as_deref().or_else(|| p.server_fqdn(s_idx)).unwrap_or("-"), port, p.server_srv_record(s_idx).unwrap_or("-"), use_ssl, check_port, check_addr_field, agent_addr_field, agent_port
                         ).as_bytes()
                     );
                 }
@@ -2304,7 +2322,7 @@ impl CliApplet {
 
     /// The new weight `arg` asks for (`<n>` or `<n>%` of `iweight`), or HAProxy's message
     /// (`server_parse_weight_change_request`, `src/server.c`).
-    fn parse_weight_change(arg: &str, iweight: u32) -> Result<u32, &'static str> {
+    pub(crate) fn parse_weight_change(arg: &str, iweight: u32) -> Result<u32, &'static str> {
         let digits_end = arg
             .char_indices()
             .find(|&(i, c)| !(c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+'))))

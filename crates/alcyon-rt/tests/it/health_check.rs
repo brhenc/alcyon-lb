@@ -154,9 +154,11 @@ fn a_server_going_down_emits_a_syslog_datagram() {
     let config = Config {
         global: Some(GlobalSection {
             logs: vec![LogConfig {
+                line: 0,
                 target: LogTarget::Udp(collector_addr),
                 max_len: 1024,
                 format: None,
+                profile: None,
                 sample: None,
                 facility: LogFacility::Local0,
                 level: None,

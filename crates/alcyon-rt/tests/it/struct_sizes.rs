@@ -81,10 +81,17 @@ fn server_check_state_stays_small() {
 /// `res_inspect` (`TcpSession::res_inspect`: `pending`, `exp`, `armed`) moved into a
 /// `ColdBox<ResInspect>` (8 bytes, `None` until TCP `tcp-response content` rules arm it),
 /// ratcheting `SessionEntry` down from 1672 to 1664.
+/// G2 PACKFLAGS packed `TcpSession`'s 30 `bool` flags into `SessFlags(u64)`, combined
+/// `accept_proxy`/`accept_proxy_v2`/`proxy_handshake_done` into `AcceptProxy` and
+/// `proto_h2`/`h3` into `ClientProto`, and converted `so_id` (`u32`, sentinel `0`) and
+/// `inspect_exp` (`Tick`, sentinel `Tick::ETERNITY`), shrinking `TcpSession` from 1560 to
+/// 1528 bytes and ratcheting `SessionEntry` down from 1664 to 1632.
 #[test]
 fn session_entry_stays_small() {
+    let sess = size_of::<alcyon_rt::proxy::TcpSession>();
+    assert!(sess <= 1528, "TcpSession grew to {sess} bytes (bound 1528): one is held per client connection, box the new field");
     let n = size_of::<alcyon_rt::engine::SessionEntry>();
-    assert!(n <= 1664, "SessionEntry grew to {n} bytes (bound 1664): one is held per client connection, box the new field");
+    assert!(n <= 1632, "SessionEntry grew to {n} bytes (bound 1632): one is held per client connection, box the new field");
 }
 
 /// `L7Retry` is 16 bytes: its own tag (the niche of `Saved(L7Box)`'s `Option` is inside the

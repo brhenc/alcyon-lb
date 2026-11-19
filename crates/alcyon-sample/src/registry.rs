@@ -224,6 +224,10 @@ pub struct StreamFacts {
     /// happened: the first byte, the request, the queue, the connect and the response
     /// (`%Ti`, `%TR`..., a rule's format reads them, T455). `None` where the caller has none.
     pub timers: Option<[i64; 5]>,
+    /// Position in the backend's queue when dequeued (`logs->prx_queue_pos`); 0 if not queued there.
+    pub be_queue: u32,
+    /// Position in the server's queue when dequeued (`logs->srv_queue_pos`); 0 if not queued there.
+    pub srv_queue: u32,
 }
 
 /// Why a client connection failed before a session began (`conn->err_code`): what
@@ -292,6 +296,10 @@ pub struct PhaseCtx<'a> {
     /// Evaluated for the access log, after the request buffer is gone: `method` reads
     /// only the transaction's method enum then, so a method outside it has no value.
     pub at_log: bool,
+    /// The name `%OG` prints for the line being built (a `log-profile`'s step, as
+    /// [`crate`]'s `log_orig_to_str` names it): `txn_close`, `txn_connect`, ... . `None`
+    /// where the line is not tied to a log step and `%OG` has no value.
+    pub log_origin: Option<&'static str>,
     pub client_addr: Option<SocketAddr>,
     pub server_addr: Option<SocketAddr>,
     pub fc_src: Option<SocketAddr>,
@@ -411,6 +419,7 @@ impl PhaseCtx<'_> {
     pub const EMPTY: PhaseCtx<'static> = PhaseCtx {
         conn_err: None,
         at_log: false,
+        log_origin: None,
         client_addr: None,
         server_addr: None,
         fc_src: None,
@@ -971,9 +980,6 @@ pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("queue", "Alcyon has no server queues"),
     ("avg_queue", "Alcyon has no server queues"),
     ("srv_queue", "Alcyon has no server queues"),
-    // T331: `HAProxy` asks the front mux; an HTTP/2 stream's entry does not see its connection's.
-    // `fc_nb_streams` is left to CONNADDR's fixer (`gemini/connaddr-fix`).
-    ("fc_nb_streams", "a stream does not see its HTTP/2 connection's stream count"),
 ];
 
 /// Why `name` -- a fetch or a converter -- is in [`NOT_IMPLEMENTED`].
@@ -2151,9 +2157,15 @@ impl Registry {
             func: fc_dst_is_local_fetch,
         });
 
-        // T331 / G3 CONNVIEW: `fc_settings_streams_limit` (HTTP/1 and HTTP/2) and `fc_glitches`
-        // (HTTP/2 only; HTTP/1 is refused at load and returns `None` here). `fc_nb_streams` is
-        // left to CONNADDR's fixer.
+        // T331 / G3 CONNVIEW: `fc_nb_streams` (HTTP/1, HTTP/2, HTTP/3),
+        // `fc_settings_streams_limit` (HTTP/1 and HTTP/2) and `fc_glitches`
+        // (HTTP/2 only; HTTP/1 is refused at load and returns `None` here).
+        // `smp_fetch_fc_nb_streams` (src/connection.c): live stream count from `PhaseCtx::fc`.
+        self.register_fetch(FetchDesc {
+            name: "fc_nb_streams",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.fc.map(|fc| Sample::Sint(i64::from(fc.nb_streams()))),
+        });
         self.register_fetch(FetchDesc {
             name: "fc_settings_streams_limit",
             out_type: SampleType::Sint,
@@ -2182,6 +2194,14 @@ impl Registry {
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.bc_err.map(|e| Sample::Str(e.text.to_string())),
         });
+        // `smp_fetch_fc_err_str` with the 'n' in the kw (`bc_err_name`): the name of the
+        // code, as `fc_err_name` reads the client connection's; empty on success, as
+        // `conn_err_code_name(CO_ER_NONE)`.
+        self.register_fetch(FetchDesc {
+            name: "bc_err_name",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.bc_err.map(|e| Sample::Str(e.name.to_string())),
+        });
         self.register_fetch(FetchDesc {
             name: "bc_reused",
             out_type: SampleType::Bool,
@@ -2200,6 +2220,22 @@ impl Registry {
             name: "bc_dst_port",
             out_type: SampleType::Sint,
             func: |ctx, _args| ctx.bc_dst.map(|sa| Sample::Sint(i64::from(sa.port()))),
+        });
+        // `smp_fetch_bc_src` / `smp_fetch_bc_src_port` (src/tcp_sample.c): the local
+        // address of the server connection, `None` before the stream has one.
+        self.register_fetch(FetchDesc {
+            name: "bc_src",
+            // An address, IPv4 or IPv6 (`SMP_T_ADDR`), typed as `bc_dst` is.
+            out_type: SampleType::Ipv4,
+            func: |ctx, _args| match ctx.bc_src?.ip() {
+                IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
+                IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_src_port",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.bc_src.map(|sa| Sample::Sint(i64::from(sa.port()))),
         });
 
         // --- 2. HTTP Request Line & URL Fetches ---
@@ -2334,6 +2370,30 @@ impl Registry {
             name: "bc_http_major",
             out_type: SampleType::Sint,
             func: |ctx, _args| ctx.bc_http_major.map(|m| Sample::Sint(i64::from(m))),
+        });
+
+        // `smp_fetch_bc_nb_streams` (src/connection.c): the stream's server connection
+        // carries the stream only: Alcyon has no multiplexed mux towards a server, so its
+        // mux serves one stream while there is an HTTP server connection, nothing before there
+        // is one.
+        self.register_fetch(FetchDesc {
+            name: "bc_nb_streams",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.bc_http_major.map(|_| Sample::Sint(1)),
+        });
+
+        // `smp_fetch_conn_queues` (src/sample.c): the stream's position in the backend's
+        // and the server's queues when dequeued (`logs->prx_queue_pos` / `srv_queue_pos`),
+        // 0 when it never queued there, and nothing where there is no stream.
+        self.register_fetch(FetchDesc {
+            name: "bc_be_queue",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::from(s.be_queue))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_srv_queue",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::from(s.srv_queue))),
         });
 
         // `smp_fetch_rqver` / `smp_fetch_stver` (src/http_fetch.c): the version without

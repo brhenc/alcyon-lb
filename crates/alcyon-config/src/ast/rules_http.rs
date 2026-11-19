@@ -315,6 +315,8 @@ pub enum HttpReqAction {
         file: String,
         key: String,
     },
+    /// `do-log`: send the stream's log line for the `http-req` step, with no argument.
+    DoLog,
 }
 
 /// The argument of `set-retries`: an integer from 0 to 100, or an expression evaluated per
@@ -364,6 +366,8 @@ pub enum HttpResAction {
         lf_string: Option<String>,
         error_page: Option<ErrorPageSource>,
     },
+    /// `do-log`: send the stream's log line for the `http-res` step, with no argument.
+    DoLog,
 }
 
 /// The three kinds of `http-request redirect`.
@@ -440,6 +444,8 @@ pub enum HttpAfterResAction {
         file: String,
         key: String,
     },
+    /// `do-log`: send the stream's log line for the `http-after-res` step, with no argument.
+    DoLog,
 }
 
 /// Rule pairing an HTTP-after-response action with an optional condition.

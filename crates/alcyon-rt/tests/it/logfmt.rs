@@ -145,13 +145,17 @@ fn what_haproxy_refuses_or_alcyon_does_not_render_is_a_config_error() {
         ("%[no_such_fetch]", "unknown fetch method"),
         ("%[path,no_such_conv]", "unknown converter"),
         ("%{+Q}", "parse argument modifier without alias name"),
-        ("%OG", "not implemented"),
         ("%(name:raw)[int(1)]", "not implemented"),
         ("abc %", "truncated"),
     ] {
         let err = LogFormat::compile(fmt, reg).expect_err(fmt);
         assert!(err.contains(why), "{fmt}: {err}");
     }
+    let og = LogFormat::compile("%OG", reg).expect("%OG compiles");
+    let mut phase = alcyon_sample::PhaseCtx::EMPTY;
+    phase.log_origin = Some("txn_close");
+    let ctx = SampleContext { phase: &phase, live: None };
+    assert_eq!(og.render(&base(&[], &[]), reg, &ctx), "txn_close");
 }
 
 #[test]

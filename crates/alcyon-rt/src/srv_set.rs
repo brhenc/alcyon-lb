@@ -166,6 +166,8 @@ pub struct ServerIdArrays {
     server_check_addrs: Vec<Option<std::net::IpAddr>>,
     /// Per-server `observe` state; `None` when no server enables `observe`.
     server_observe: Option<Arc<Vec<ObserveSlot>>>,
+    /// Servers with `agent-check` (or `agent-*` options) configured.
+    server_agent_checks: Vec<(u32, alcyon_config::ast::AgentCheckConfig)>,
     /// `pool-max-conn`, `pool-low-conn` and `pool-purge-delay` per server; empty when every
     /// server has the defaults (read it with [`ProxyIdInfo::server_pool`]). Read when a
     /// server connection is released, so it lives here, off `Proxy`'s inline size
@@ -246,6 +248,7 @@ impl ServerIdArrays {
             server_check_ports: server_check_ports(servers),
             server_check_addrs: server_check_addrs(servers),
             server_observe: server_observe(servers),
+            server_agent_checks: extras.agent_checks.clone(),
             server_pool: pool_cfgs(servers, mode_http),
             server_restored: Vec::new(),
             server_pp_tlv_fmts: pp_tlv_fmts(servers.len(), extras),
@@ -576,6 +579,17 @@ impl Proxy {
 
     pub fn server_check_addr(&self, idx: usize) -> Option<std::net::IpAddr> {
         self.ids.srv.server_check_addrs.get(idx).copied().flatten()
+    }
+
+    /// Agent check configuration for server `idx`, if any.
+    #[must_use]
+    pub fn server_agent_config(&self, idx: usize) -> Option<&alcyon_config::ast::AgentCheckConfig> {
+        self.ids
+            .srv
+            .server_agent_checks
+            .iter()
+            .find(|(i, _)| *i as usize == idx)
+            .map(|(_, a)| a)
     }
 
     /// Whether the server at `idx` has an `id` of its own (`SRV_F_FORCED_ID`).

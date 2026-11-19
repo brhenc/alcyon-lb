@@ -93,11 +93,9 @@ pub(crate) fn parse_tcp_req_connection(
             rules.push(TcpReqConnRule { action: TcpReqConnAction::ExpectNetscalerCip, cond });
         }
         "do-log" => {
-            return Err(ConfigError::new(
-                act_tok.line,
-                act_tok.col,
-                "action do-log is not supported in this build",
-            ));
+            // HAProxy 3.1+: send the stream's line for the `tcp-req-conn` step, no argument.
+            let (_, cond) = parse_rule_condition(tokens, 3)?;
+            rules.push(TcpReqConnRule { action: TcpReqConnAction::DoLog, cond });
         }
         other => {
             if other.starts_with("lua.") {
@@ -251,11 +249,9 @@ pub(crate) fn parse_tcp_req_session(
                 ));
             }
             "do-log" => {
-                return Err(ConfigError::new(
-                    act_tok.line,
-                    act_tok.col,
-                    "action do-log is not supported in this build",
-                ));
+                // HAProxy 3.1+: send the stream's line for the `tcp-req-sess` step.
+                let (_, cond) = parse_rule_condition(tokens, 3)?;
+                rules.push(TcpReqSessionRule { action: TcpReqSessionAction::DoLog, cond });
             }
             other => {
                 if other.starts_with("lua.") {
@@ -551,11 +547,9 @@ fn parse_tcp_req_content_at(
                 ));
             }
             "do-log" => {
-                return Err(ConfigError::new(
-                    act_tok.line,
-                    act_tok.col,
-                    "action do-log is not supported in this build",
-                ));
+                // HAProxy 3.1+: send the stream's line for the `tcp-req-cont` step.
+                let (_, cond) = parse_rule_condition(tokens, 3)?;
+                rules.push(TcpReqContentRule { action: TcpReqContentAction::DoLog, cond, line: 0 });
             }
             other => {
                 return Err(ConfigError::new(
