@@ -1805,6 +1805,14 @@ pub struct ProxyIdInfo {
 pub struct Proxies(Arc<crate::table::Table>);
 
 impl Proxies {
+    /// Clones the underlying `Arc<Table>`.
+    #[must_use]
+    pub fn arc(&self) -> Arc<crate::table::Table> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl Proxies {
     #[must_use]
     pub fn new(proxies: Vec<Proxy>) -> Self {
         Self(Arc::new(crate::table::Table::new(proxies)))
@@ -5137,6 +5145,29 @@ impl Engine {
         let Some(i) = p.srv_set().find(srv).map(|s| s.index()) else { continue };
         p.srv_set_mut().mark_name_refd(i);
     }
+    // T637 S4, `del server`: the servers other configuration elements point to, marked at
+    // load and never cleared (`HAProxy`'s `SRV_F_NAME_REFD`, design doc section 1.2). The
+    // `use-server` rules named their target above (`Rule.server`, resolved at load).
+    for p in proxies.iter_mut().filter(|p| p.has_backend) {
+        let refd: Vec<usize> = p.rules.use_server.iter().filter_map(|r| r.server).collect();
+        for i in refd {
+            p.srv_set_mut().mark_name_refd(i);
+        }
+    }
+    // The same for `resolvers` (`HAProxy`'s `SRV_F_NON_PURGEABLE`). The proxies hold the
+    // sections in the order above: the non-disabled listens, then the non-disabled backends
+    // (the same walk as `resolvers::start_sections`).
+    let sections = config
+        .listens
+        .iter()
+        .filter(|l| !l.disabled)
+        .map(|l| &l.server_extras)
+        .chain(config.backends.iter().filter(|b| !b.disabled).map(|b| &b.server_extras));
+    for (p_idx, extras) in sections.enumerate() {
+        for (i, _, _) in &extras.resolvers_refs {
+            proxies[p_idx].srv_set_mut().mark_non_purgeable(*i as usize);
+        }
+    }
     crate::track::attach(&mut proxies, config);
     link_declaration_order(&mut proxies);
     crate::logfwd::start(config)?;
@@ -5602,6 +5633,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     }
                     g.reply(wid, n);
                 }
+                // T637 S4, `del server`: no event runs while this reply is made, so the count
+                // and the `Server deleted.` it settles see the same state.
+                crate::mailbox::Msg::Retire { be, srv, gather } => self.retire_server(be, srv, &gather),
                 crate::mailbox::Msg::Wake(t) => {
                     if self.scheduler.is_live(t) {
                         self.scheduler.tasklet_wakeup(t, Class::Urgent, state::WOKEN_IO);
@@ -5672,6 +5706,41 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             }
         }
         n
+    }
+
+    /// T637 S4, `del server`: closes this worker's idle connections to server `srv` of
+    /// backend `be` and replies how many of its streams and queued requests it still holds
+    /// (`srv_in_use`, one worker's part). An idle connection is closed, not counted, as
+    /// `HAProxy`'s `disable` does.
+    fn retire_server(&mut self, be: usize, srv: usize, gather: &std::sync::Arc<crate::mailbox::Gather<u64>>) {
+        // This worker's slot of the idle pool: the connections it keeps to `(be, srv)` are
+        // closed here (the door is closed, so nothing re-opens one), the pool is told of
+        // them as `purge_with` tells it, and they are not counted in the answer (HAProxy's
+        // `srv_in_use` sees idle connections only because they were still there; a
+        // connection this closed is gone for every worker).
+        let slot = self.idle_backend_pool.slot();
+        let mut pool = IdlePools::lock(slot);
+        let mut closed = 0;
+        if let Some(si) = pool.srv_mut((be, srv)) {
+            si.purge_at = None;
+            for p in si.conns.drain(..) {
+                si.safe -= usize::from(p.safe);
+                p.conn.close();
+                closed += 1;
+            }
+            pool.conns = pool.conns.saturating_sub(closed);
+        }
+        let conns = pool.conns;
+        let next = pool.next_purge();
+        slot.conns.store(conns, Ordering::Relaxed);
+        drop(pool);
+        self.idle_backend_pool.next_purge = next;
+        if closed != 0 {
+            self.idle_backend_pool.pools.count_idle((be, srv), 0, closed);
+        }
+        let streams = self.sessions.iter().filter(|(_, e)| e.srv_backend_idx == be && e.target_server_idx == Some(srv)).count();
+        let queued = crate::proxy::queued_on(be, srv);
+        gather.reply(self.mailbox_wid, (streams + queued) as u64);
     }
 
     /// This worker's streams as `show sess` lists them, and its CLI connections (`HAProxy`
@@ -10313,7 +10382,14 @@ impl EngineDispatcher<'_> {
                 if let Ok(Some(entry)) = tbl.get_entry(&key) {
                     if !assigned {
                         // The server stored by its id, if it is still there and not stopped.
-                        let i = entry.server_id.and_then(|id| (0..be.srv_set().len()).find(|&i| be.server_puid(i) == id));
+                        // T637 S4 (C1): a slot whose state is `Retiring` (a `del server` in
+                        // flight, or committed and left that way under the emptied name)
+                        // matches no entry: the key is kept (it is touched below) and the
+                        // request is load-balanced, as if no persistence matched.
+                        let i = entry.server_id.and_then(|id| (0..be.srv_set().len()).find(|&i| {
+                            be.server_puid(i) == id
+                                && be.srv_set().status_at(i) != Some(crate::check::RETIRING)
+                        }));
                         let up = |i: usize| be.srv_set().status_cell(i).is_none_or(|s| !matches!(ServerStatus::from(s.load(Ordering::Relaxed)), ServerStatus::Down | ServerStatus::Maint));
                         if let Some(i) = i.filter(|&i| be.ids.persist || up(i)) {
                             found = Some(i);
@@ -17030,13 +17106,18 @@ fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
     // `cur_state != SRV_ST_STOPPED`: a draining server still takes its clients. A server's
     // cookie is read when it is looked up; the backend's set is not collected
     // (COOKIEALLOC).
-    let servers = |i: usize| crate::cookie::SrvCookie {
-        value: be.srv_set().cookie_at(i).map(str::as_bytes),
-        persistent: be.ids.persist,
-        usable: be
-            .srv_set()
-            .status_at(i)
-            .is_some_and(|s| s == ServerStatus::Up as u8 || s == ServerStatus::Drain as u8),
+    // T637 S4 (C1): a slot whose state is `Retiring` (a `del server` in flight, or committed
+    // and left that way under the emptied name) has no cookie value at all, so a cookie that
+    // named it matches nothing and the request is load-balanced (even under `option
+    // persist`, which otherwise keeps a down server's cookie). One load of the state byte.
+    let servers = |i: usize| {
+        let st = be.srv_set().status_at(i);
+        let gone = st == Some(crate::check::RETIRING);
+        crate::cookie::SrvCookie {
+            value: if gone { None } else { be.srv_set().cookie_at(i).map(str::as_bytes) },
+            persistent: be.ids.persist,
+            usable: !gone && st.is_some_and(|s| s == ServerStatus::Up as u8 || s == ServerStatus::Drain as u8),
+        }
     };
     let n_servers = be.srv_set().len();
     let now = unix_now();
@@ -19655,5 +19736,27 @@ mod unpublished_tests {
         assert_eq!(EngineDispatcher::resolve_backend(&entry(f), &t), Some(b), "force-be-switch overrides an unpublished use_backend");
         assert_eq!(EngineDispatcher::resolve_backend(&entry(g), &t), Some(b), "and an unpublished default_backend");
         assert_eq!(EngineDispatcher::resolve_backend(&entry(h), &t), Some(k), "without force the rule is skipped for the default");
+    }
+
+    #[test]
+    fn retire_server_drains_idle_connections_and_replies_zero() {
+        let cfg = alcyon_config::parse_str("defaults\n  mode http\nbackend be\n  server s1 127.0.0.1:80\n").expect("parse");
+        let mut engine = Engine::new(&cfg, 16).expect("engine");
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = l.local_addr().expect("addr");
+        let stream = std::net::TcpStream::connect(addr).expect("connect");
+        let conn = IdleConn { fd: std::os::fd::OwnedFd::from(stream), xprt: crate::xprt::ServerXprt::Plain, src: None };
+        {
+            let slot = engine.idle_backend_pool.slot();
+            let mut pool = IdlePools::lock(slot);
+            pool.srv_entry((0, 0)).expect("entry").conns.push_back(Pooled { addr, name: None, safe: false, conn });
+            pool.conns = 1;
+        }
+        let gather = crate::mailbox::Gather::new(&engine.mailboxes, engine.mailbox_wid, TaskRef::NONE);
+        engine.retire_server(0, 0, &gather);
+        assert_eq!(gather.take(), Some(vec![0]));
+        let slot = engine.idle_backend_pool.slot();
+        let mut pool = IdlePools::lock(slot);
+        assert!(pool.srv_mut((0, 0)).is_none_or(|si| si.conns.is_empty()));
     }
 }

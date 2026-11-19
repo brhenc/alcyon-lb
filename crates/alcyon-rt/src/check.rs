@@ -62,6 +62,14 @@ impl ServerStatus {
 /// `HAProxy` keeps the two apart as `srv->cur_admin` and `srv->cur_state`.
 pub const DRAIN_DOWN: u8 = 4;
 
+/// The state a `del server` puts a server into while it asks every worker to stop
+/// assigning to it and to close its idle connections: the checks and the operator cannot
+/// set it, no path that may assign a not-up server (persistence cookie, stick table, the
+/// server found by its address, the queue) may return it, and a refused delete (a worker
+/// still holds a stream on it) restores the state it had. [`ServerStatus::from`] reads it
+/// as `Down`, so a balancing pick already refuses it.
+pub const RETIRING: u8 = 5;
+
 /// The state of a server that is `cur` (a `Proxy::server_statuses` value) once the operator
 /// sets its admin state to `to` (`Up` for `ready`, `Drain` or `Maint`), for a server with no
 /// check of its own: leaving maintenance starts it running, as `_srv_update_status_adm`
@@ -1426,6 +1434,17 @@ pub fn step_check(
     now: Tick,
     proxies: &crate::table::Table,
 ) -> io::Result<CheckStep> {
+    // T637 S4: `del server` empties the server's slot (its name is `""`): the check must
+    // never run again. Disable it rather than skip it, because a later slice reuses the
+    // slot for a different server, which must start unchecked until enabled. `get` (not the
+    // index) so a check driven without the table it belongs to (unit tests) is a no-op here.
+    // The disabled path below does the socket cleanup and rescheduling.
+    if let Some(px) = proxies.get(check.proxy()) {
+        if px.srv_set().at(check.server()).is_none() {
+            check.enabled = false;
+        }
+    }
+
     if !check.enabled {
         if check.in_progress {
             cleanup_check_socket(check, fdtab, poller);

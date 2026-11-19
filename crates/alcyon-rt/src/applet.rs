@@ -58,6 +58,63 @@ pub struct AppletContext<'a> {
     pub task: TaskRef,
 }
 
+/// Non-blocking in-progress flag (T637 S4): held by `del server` across its
+/// check-and-commit so that two `del server` commands from two connections cannot pass the
+/// checks for one server at once (C5) without ever blocking a worker thread.
+static CHANGE_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Guard for an in-flight `del server` (C4, C5): releases `CHANGE_IN_PROGRESS` on drop and,
+/// if armed and not disarmed before drop (e.g. client disconnected mid-delete), restores
+/// `prev` on the server slot if it is still `RETIRING`.
+struct RetireGuard {
+    table: Option<Arc<crate::table::Table>>,
+    be: usize,
+    srv: usize,
+    prev: u8,
+    armed: bool,
+}
+
+impl RetireGuard {
+    fn try_acquire() -> Option<Self> {
+        CHANGE_IN_PROGRESS
+            .compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+            .ok()
+            .map(|_| Self { table: None, be: 0, srv: 0, prev: 0, armed: false })
+    }
+
+    fn arm(&mut self, table: Arc<crate::table::Table>, be: usize, srv: usize, prev: u8) {
+        self.table = Some(table);
+        self.be = be;
+        self.srv = srv;
+        self.prev = prev;
+        self.armed = true;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RetireGuard {
+    fn drop(&mut self) {
+        if let Some(cell) = self
+            .armed
+            .then_some(())
+            .and(self.table.as_ref())
+            .and_then(|t| t.get(self.be))
+            .and_then(|px| px.srv_set().status_cell(self.srv))
+        {
+            let _ = cell.compare_exchange(
+                crate::check::RETIRING,
+                self.prev,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        CHANGE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// A command waiting for every worker's answer (`crate::mailbox`). The connection reads no
 /// further command until it is answered.
 enum Pending {
@@ -66,6 +123,17 @@ enum Pending {
     Quic(Arc<Gather<Vec<QuicSnap>>>, QuicShow),
     /// `shutdown session(s)`; `by_id` answers HAProxy's message when nothing matched.
     Shut(Arc<Gather<usize>>, bool),
+    /// T637 S4, `del server`: every worker's count of the server's streams and queued
+    /// requests, asked after the server went [`crate::check::RETIRING`]; `prev` is the state
+    /// a refusal restores (C4); `guard` holds `CHANGE_IN_PROGRESS` and restores `prev` if
+    /// the CLI connection closes mid-delete.
+    Retire {
+        counts: Arc<Gather<u64>>,
+        be: usize,
+        srv: usize,
+        prev: u8,
+        guard: RetireGuard,
+    },
 }
 
 /// What a `show quic` waiting for the workers prints: which connections, and (T569, `alcyon-acks`)
@@ -680,6 +748,8 @@ impl CliApplet {
             }
         } else if let Some(target) = cmd.strip_prefix("del backend ") {
             self.handle_del_backend(target.trim(), ctx);
+        } else if cmd == "del server" || cmd.starts_with("del server ") {
+            self.handle_del_server(cmd["del server".len()..].trim(), ctx);
         } else if let Some(target) = cmd.strip_prefix("unpublish backend") {
             self.handle_be_publish(target.trim(), false, ctx);
         } else if let Some(target) = cmd.strip_prefix("publish backend") {
@@ -1040,6 +1110,62 @@ impl CliApplet {
         } else {
             self.is_done = true;
         }
+    }
+
+    /// `del server <backend>/<server>` (T637 S4, `cli_parse_delete_server`): the server is
+    /// removed when nothing in the configuration points to it, it is in maintenance, and
+    /// no worker holds a stream, a queued request or an idle connection on it. The workers
+    /// are each asked between their events (`Msg::Retire`); none is stopped, and the commit
+    /// empties the slot's name, which every reader and listing goes through.
+    fn handle_del_server(&mut self, target: &str, ctx: &mut AppletContext) {
+        // `cli_parse_delete_server` parses `args[1]` only: the words after it are ignored.
+        let target = target.split_whitespace().next().unwrap_or("");
+        // `parse_be_srv`: a `backend/server`, and the server's name is not empty.
+        let Some((be_name, sv_name)) = target.split_once('/').filter(|(_, s)| !s.is_empty()) else {
+            self.finish_msg("Require 'backend/server'.");
+            return;
+        };
+        let Some(mut guard) = RetireGuard::try_acquire() else {
+            self.finish_msg("Another server deletion is in progress.");
+            return;
+        };
+        // `proxy_be_by_name`: a backend (or a `listen` section); a frontend is not one.
+        let Some((be, px)) = ctx.proxies.iter().enumerate().find(|(_, p)| p.has_backend && p.name == be_name) else {
+            self.finish_msg("No such backend.");
+            return;
+        };
+        // `server_find`, under `change`: the slot it names cannot be emptied by another
+        // `del server` before the commit, because every one of them holds `change` too.
+        let Some(srv) = px.srv_set().find(sv_name) else {
+            self.finish_msg("No such server.");
+            return;
+        };
+        let srv_idx = srv.index();
+        // `SRV_F_NON_PURGEABLE`/`SRV_F_NAME_REFD`: marked at load, never cleared.
+        if srv.name_refd() || srv.non_purgeable() {
+            self.finish_msg("This server cannot be removed at runtime due to other configuration elements pointing to it.");
+            return;
+        }
+        // The admin state the operator set, as `show servers state`'s `srv_admin_state`
+        // reports it: a server the configuration disabled is in maintenance, and so is one
+        // whose address the resolvers gave up on (`SRV_ADMF_MAINT` includes `RMAINT`).
+        let raw = srv.raw_status().unwrap_or(0);
+        if !px.server_cmaint(srv_idx) && !srv.rmaint() && ServerStatus::from(raw) != ServerStatus::Maint {
+            self.finish_msg("Only servers in maintenance mode can be deleted.");
+            return;
+        }
+        // Close the door: from here on, no path may assign the server (C2), and the
+        // operator's `enable` and `set server ... state` refuse to leave this state. Its
+        // state before the door is what a refusal restores (C4).
+        let prev = srv.swap_status(crate::check::RETIRING).unwrap_or(raw);
+        guard.arm(ctx.proxies.arc(), be, srv_idx, prev);
+        let counts = crate::mailbox::Gather::new(ctx.mailboxes, ctx.worker_id, ctx.task);
+        ctx.mailboxes.broadcast(|| crate::mailbox::Msg::Retire {
+            be,
+            srv: srv_idx,
+            gather: std::sync::Arc::clone(&counts),
+        });
+        self.pending = Some(Pending::Retire { counts, be, srv: srv_idx, prev, guard });
     }
 
     /// `vars_parse_cli_get_var` (src/vars.c): the CLI has no stream, so only the `proc`
@@ -1809,6 +1935,33 @@ impl CliApplet {
                 self.finish_msg("");
                 true
             }
+            Pending::Retire { counts, be, srv, prev, mut guard } => {
+                let Some(counts) = counts.take() else {
+                    self.pending = Some(Pending::Retire { counts, be, srv, prev, guard });
+                    return false;
+                };
+                let held: u64 = counts.iter().sum();
+                // The slot is still ours: nothing else could change it while `guard` was
+                // held, and only this command empties a slot.
+                let s = ctx.proxies[be].srv_set().at(srv).expect("the server waited for is still there");
+                if held == 0 {
+                    // The slot is empty from here on: `at`, `find`, `by_puid` and `live`
+                    // stop returning it, and every listing and lookup reads the name (rule 5:
+                    // this is the line where the delete reaches the data path). The state
+                    // stays `RETIRING` under the empty name, so a pick that still holds the
+                    // old index sees a state that is not `Up` (C1).
+                    s.rename("");
+                    ctx.proxies[be].srv_set().retr_remove(srv);
+                    self.finish_msg("Server deleted.");
+                } else {
+                    // C4: the server is back exactly as it was before the door.
+                    s.store_status(prev);
+                    self.finish_msg("Server still has connections attached to it, cannot remove it.");
+                }
+                guard.disarm();
+                // `guard` is dropped here, releasing `CHANGE_IN_PROGRESS`.
+                true
+            }
         }
     }
 
@@ -1910,7 +2063,7 @@ impl CliApplet {
         };
         let found_px = px_name.is_empty() || ctx.proxies.iter().any(|p| p.name == px_name);
         if !found_px {
-            self.out_buf.extend_from_slice(b"No such backend.\n");
+            self.out_buf.extend_from_slice(b"No such backend.\n\n");
         } else if px_name.is_empty()
             || !crate::engine::set_health_check_enabled(
                 ctx.checks,
@@ -1921,7 +2074,7 @@ impl CliApplet {
                 ctx.now,
             )
         {
-            self.out_buf.extend_from_slice(b"No such server.\n");
+            self.out_buf.extend_from_slice(b"No such server.\n\n");
         }
         if self.interactive {
             self.out_buf.extend_from_slice(b"\n> ");
@@ -1937,7 +2090,7 @@ impl CliApplet {
         };
         let found_px = px_name.is_empty() || ctx.proxies.iter().any(|p| p.name == px_name);
         if !found_px {
-            self.out_buf.extend_from_slice(b"No such backend.\n");
+            self.out_buf.extend_from_slice(b"No such backend.\n\n");
         } else if px_name.is_empty()
             || !crate::engine::set_health_check_enabled(
                 ctx.checks,
@@ -1948,7 +2101,7 @@ impl CliApplet {
                 ctx.now,
             )
         {
-            self.out_buf.extend_from_slice(b"No such server.\n");
+            self.out_buf.extend_from_slice(b"No such server.\n\n");
         }
         if self.interactive {
             self.out_buf.extend_from_slice(b"\n> ");
@@ -2018,13 +2171,20 @@ impl CliApplet {
         let mut found_px = false;
         let mut track_changes = Vec::new();
         let mut found_sv = false;
+        let mut retiring = false;
         for (p_idx, proxy) in ctx.proxies.iter().enumerate() {
             if proxy.name == px_name {
                 found_px = true;
                 for srv in proxy.srv_set().live() {
                     let (s_idx, sid) = (srv.index(), srv.name());
                     if sid == sv_name {
-                        track_changes.push((p_idx, s_idx, ServerStatus::Up));
+                        // A `del server` waiting for its workers has closed the door on
+                        // this server: its state must not be left (C2).
+                        if proxy.srv_set().status_at(s_idx) == Some(crate::check::RETIRING) {
+                            retiring = true;
+                        } else {
+                            track_changes.push((p_idx, s_idx, ServerStatus::Up));
+                        }
                         found_sv = true;
                     }
                 }
@@ -2038,6 +2198,8 @@ impl CliApplet {
             "No such backend."
         } else if !found_sv {
             "No such server."
+        } else if retiring {
+            "The server is being deleted; its state cannot be changed."
         } else {
             ""
         });
@@ -2051,13 +2213,20 @@ impl CliApplet {
         let mut found_px = false;
         let mut track_changes = Vec::new();
         let mut found_sv = false;
+        let mut retiring = false;
         for (p_idx, proxy) in ctx.proxies.iter().enumerate() {
             if proxy.name == px_name {
                 found_px = true;
                 for srv in proxy.srv_set().live() {
                     let (s_idx, sid) = (srv.index(), srv.name());
                     if sid == sv_name {
-                        track_changes.push((p_idx, s_idx, ServerStatus::Maint));
+                        // A `del server` waiting for its workers has closed the door on
+                        // this server: its state must not be left (C2).
+                        if proxy.srv_set().status_at(s_idx) == Some(crate::check::RETIRING) {
+                            retiring = true;
+                        } else {
+                            track_changes.push((p_idx, s_idx, ServerStatus::Maint));
+                        }
                         found_sv = true;
                     }
                 }
@@ -2071,6 +2240,8 @@ impl CliApplet {
             "No such backend."
         } else if !found_sv {
             "No such server."
+        } else if retiring {
+            "The server is being deleted; its state cannot be changed."
         } else {
             ""
         });
@@ -2200,6 +2371,12 @@ impl CliApplet {
                         return;
                     }
                 };
+                // A `del server` waiting for its workers has closed the door on this
+                // server: its state must not be left until that wait ends (C2).
+                if ctx.proxies[p_idx].srv_set().status_at(s_idx) == Some(crate::check::RETIRING) {
+                    self.finish_msg("The server is being deleted; its state cannot be changed.");
+                    return;
+                }
                 crate::track::apply_admin(ctx.proxies, ctx.checks, p_idx, s_idx, status, crate::srvlog::Cause::Cli);
                 self.finish_msg("");
             }
@@ -2647,5 +2824,94 @@ mod rv_d_tests {
         let mut applet = CliApplet::new(a, Tick::ETERNITY);
         applet.run_patref("show\\ map", None);
         assert!(CliApplet::is_patref_command("show map"));
+    }
+
+    #[test]
+    fn retire_guard_restores_prev_on_drop_when_armed() {
+        let cfg = alcyon_config::parse_str("defaults\n  mode http\nbackend be\n  server s1 127.0.0.1:80\n").expect("parse");
+        let table = crate::engine::Engine::build_shared_state(&cfg).expect("proxies").arc();
+        table[0].srv_set().at(0).expect("s1").store_status(crate::check::RETIRING);
+        let mut guard = RetireGuard::try_acquire().expect("acquire");
+        guard.arm(Arc::clone(&table), 0, 0, crate::check::ServerStatus::Maint as u8);
+        drop(guard);
+        assert_eq!(table[0].srv_set().status_at(0), Some(crate::check::ServerStatus::Maint as u8));
+        assert!(!CHANGE_IN_PROGRESS.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn retiring_refuses_enable_disable_and_set_server_state() {
+        let cfg = alcyon_config::parse_str("defaults\n  mode http\nbackend be\n  server s1 127.0.0.1:80\n").expect("parse");
+        let mut proxies = crate::engine::Engine::build_shared_state(&cfg).expect("proxies");
+        proxies[0].srv_set().at(0).expect("s1").store_status(crate::check::RETIRING);
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mailboxes = crate::mailbox::Mailboxes::new(1).expect("eventfd");
+        let mut applet = CliApplet::new(a, Tick::ETERNITY);
+        let mut ctx = AppletContext {
+            proxies: &mut proxies,
+            checks: &mut [],
+            sessions: None,
+            wake_queue: None,
+            start_time: Instant::now(),
+            pid: 0,
+            total_tasks: 0,
+            run_queue_len: 0,
+            now: Tick::ETERNITY,
+            mailboxes: &mailboxes,
+            worker_id: 0,
+            task: TaskRef::NONE,
+        };
+        for step in [
+            |a: &mut CliApplet, c: &mut AppletContext| a.handle_enable_server("be/s1", c),
+            |a: &mut CliApplet, c: &mut AppletContext| a.handle_disable_server("be/s1", c),
+            |a: &mut CliApplet, c: &mut AppletContext| a.handle_set_server("be/s1 state ready", c),
+        ] {
+            applet.out_buf.clear();
+            step(&mut applet, &mut ctx);
+            let out = std::str::from_utf8(&applet.out_buf).expect("utf8");
+            assert_eq!(out, "The server is being deleted; its state cannot be changed.\n\n");
+            assert_eq!(ctx.proxies[0].srv_set().status_at(0), Some(crate::check::RETIRING));
+        }
+    }
+
+    #[test]
+    fn resume_pending_retire_waits_and_restores_on_held() {
+        let cfg = alcyon_config::parse_str("defaults\n  mode http\nbackend be\n  server s1 127.0.0.1:80\n").expect("parse");
+        let mut proxies = crate::engine::Engine::build_shared_state(&cfg).expect("proxies");
+        proxies[0].srv_set().at(0).expect("s1").store_status(crate::check::RETIRING);
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mailboxes = crate::mailbox::Mailboxes::new(2).expect("eventfd");
+        let mut applet = CliApplet::new(a, Tick::ETERNITY);
+        let counts = crate::mailbox::Gather::new(&mailboxes, 0, TaskRef::NONE);
+        let mut guard = RetireGuard::try_acquire().expect("acquire");
+        guard.arm(proxies.arc(), 0, 0, crate::check::ServerStatus::Maint as u8);
+        let pending = Pending::Retire {
+            counts: Arc::clone(&counts),
+            be: 0,
+            srv: 0,
+            prev: crate::check::ServerStatus::Maint as u8,
+            guard,
+        };
+        let ctx = AppletContext {
+            proxies: &mut proxies,
+            checks: &mut [],
+            sessions: None,
+            wake_queue: None,
+            start_time: Instant::now(),
+            pid: 0,
+            total_tasks: 0,
+            run_queue_len: 0,
+            now: Tick::ETERNITY,
+            mailboxes: &mailboxes,
+            worker_id: 0,
+            task: TaskRef::NONE,
+        };
+        assert!(!applet.resume_pending(pending, &ctx));
+        counts.reply(0, 1);
+        counts.reply(1, 0);
+        let pending = applet.pending.take().expect("pending");
+        assert!(applet.resume_pending(pending, &ctx));
+        let out = std::str::from_utf8(&applet.out_buf).expect("utf8");
+        assert_eq!(out, "Server still has connections attached to it, cannot remove it.\n\n");
+        assert_eq!(ctx.proxies[0].srv_set().status_at(0), Some(crate::check::ServerStatus::Maint as u8));
     }
 }

@@ -284,6 +284,13 @@ thread_local! {
     static QUEUED: std::cell::RefCell<Vec<(alcyon_sched::TaskRef, usize, Option<usize>)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// The requests this thread queued for server `srv` of backend `be` (T637 S4: one worker's
+/// part of `del server`'s `srv_in_use`).
+#[must_use]
+pub fn queued_on(be: usize, srv: usize) -> usize {
+    QUEUED.with(|q| q.borrow().iter().filter(|(_, b, s)| *b == be && *s == Some(srv)).count())
+}
+
 impl QueueWait {
     /// A box in no queue.
     fn blank() -> Box<QueueWait> {

@@ -62,8 +62,11 @@ fn propagate(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize, s: usi
             if tr.target != (p, s) {
                 continue;
             }
+            // The tracker was deleted at runtime (`del server`): its slot is empty and its
+            // state no longer exists, so it is out of the chain.
+            let Some(tkr) = px.srv_set().at(t) else { continue };
             let own = ServerStatus::from(tr.own.load(Ordering::Relaxed));
-            px.srv_set().at(t).expect("tracking server").store_status(combine(own, state) as u8);
+            tkr.store_status_unless_retiring(combine(own, state) as u8);
             px.fwrr.changed();
             px.chash.changed();
             propagate(proxies, q, t);
@@ -114,11 +117,11 @@ fn set_status_inner(proxies: &(impl crate::table::ProxyList + ?Sized), p: usize,
         tr.own.store(st as u8, Ordering::Relaxed);
         let (tp, ts) = tr.target;
         let eff = combine(st, load(proxies, tp, ts));
-        proxies[p].srv_set().at(s).expect("tracking server").store_status(eff as u8);
+        proxies[p].srv_set().at(s).expect("tracking server").store_status_unless_retiring(eff as u8);
         proxies[p].fwrr.changed();
         proxies[p].chash.changed();
     } else if let Some(v) = proxies.get(p).and_then(|px| px.srv_set().at(s)) {
-        v.store_status(raw);
+        v.store_status_unless_retiring(raw);
         proxies[p].fwrr.changed();
         proxies[p].chash.changed();
     }
@@ -163,6 +166,12 @@ pub fn attach(proxies: &mut [Proxy], config: &alcyon_config::Config) {
                 })
                 .collect(),
         );
+    }
+    // T637 S4, `del server`: a tracked server is one other configuration elements point to
+    // (`HAProxy`'s `SRV_F_NAME_REFD`, set here at load, never cleared): it refuses to be
+    // removed at runtime, and its flag outlives its tracker.
+    for t in tracks.iter().flatten().flatten() {
+        proxies[t.target.0].srv_set_mut().mark_name_refd(t.target.1);
     }
     for (p, t) in tracks.into_iter().enumerate() {
         if t.iter().any(Option::is_some) {

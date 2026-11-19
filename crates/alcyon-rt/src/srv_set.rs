@@ -51,6 +51,14 @@ struct ServerCells {
     base: Box<[Cell]>,
 }
 
+/// A slot is named by a sample fetch, a `use-server` target, or another server's `track`.
+/// `set server <b>/<s> name` refuses to rename it and `del server` refuses to remove it
+/// (HAProxy `SRV_F_NAME_REFD`). Load-only: set once, never cleared.
+pub const NAME_REFD: u8 = 0x1;
+/// A `resolvers` section resolves the slot's address at run time (HAProxy
+/// `SRV_F_NON_PURGEABLE`). `del server` refuses it, but a rename is allowed. Load-only.
+pub const NON_PURGEABLE: u8 = 0x2;
+
 /// The per-server arrays of a [`Proxy`], private to this module (T637, section 4.2): the only
 /// way to a server is [`ServerSet`].
 #[derive(Debug, Clone)]
@@ -76,10 +84,14 @@ pub struct ServerArrays {
     /// `proxy-v2-options unique-id`, per server.
     server_pp_unique_id: Vec<bool>,
     server_backups: Vec<bool>,
-    /// The servers whose name a sample fetch's argument holds (`srv_is_up(be/s)` and the
-    /// other `srv_*`), which `set server <b>/<s> name` refuses to rename: the fetches look the
-    /// server up by name. Empty when no fetch names a server of this proxy.
-    server_name_refd: Box<[bool]>,
+    /// Each server's load-only "pointed to" flags, one byte per slot ([`NAME_REFD`],
+    /// [`NON_PURGEABLE`]): a sample fetch's argument (`srv_is_up(be/s)` and the other `srv_*`),
+    /// a `use-server` target, or another server's `track` names it, so `set server <b>/<s> name`
+    /// refuses to rename it and `del server` refuses to remove it; a `resolvers` section resolves
+    /// its address, so `del server` refuses it (a rename stays allowed). One byte per slot, not
+    /// two `bool` arrays, so the flags do not grow `Proxy`'s inline size (`struct_sizes.rs`).
+    /// Empty when no server has either flag.
+    server_name_flags: Box<[u8]>,
     /// Each server's `maxconn`, shared by every worker: `set maxconn server` changes it in
     /// place (T177).
     server_maxconn: crate::srv_rt::ServerMaxconns,
@@ -156,7 +168,7 @@ impl Default for ServerArrays {
             server_send_proxy_v2: Vec::new(),
             server_pp_unique_id: Vec::new(),
             server_backups: Vec::new(),
-            server_name_refd: Box::default(),
+            server_name_flags: Box::default(),
             server_maxconn: std::iter::empty().collect(),
             server_retr: Arc::default(),
             server_check_configs: Vec::new(),
@@ -183,7 +195,7 @@ impl ServerArrays {
             server_send_proxy_v2: servers.iter().map(|s| s.send_proxy_v2).collect(),
             server_pp_unique_id: servers.iter().map(|s| s.proxy_v2_unique_id).collect(),
             server_backups: servers.iter().map(|s| s.backup).collect(),
-            server_name_refd: Box::default(),
+            server_name_flags: Box::default(),
             server_maxconn: servers.iter().map(|s| s.maxconn).collect(),
             server_retr: Arc::default(),
             server_check_configs: server_check_configs(servers, check_timeout),
@@ -623,10 +635,21 @@ impl<'a> ServerSet<'a> {
         self.0.srv.servers.get(i)
     }
 
-    /// The first slot whose address is `a`.
+    /// The first slot whose address is `a` and that is not gone. A slot is gone when its
+    /// state is `Retiring`: that is set when a `del server` closes the door and stays set
+    /// under the emptied name once the delete commits, so one load of the state byte
+    /// rejects both an in-flight and a committed delete (the request is load-balanced, not
+    /// assigned to the slot).
     #[must_use]
     pub fn slot_of_addr(&self, a: SocketAddr) -> Option<usize> {
-        self.0.srv.servers.iter().position(|s| s == a)
+        let mut i = 0;
+        while let Some(s) = self.0.srv.servers.get(i) {
+            if s == a && self.status_at(i) != Some(crate::check::RETIRING) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
     }
 
     /// Slot `i`'s TLS, `None` for a plaintext server.
@@ -848,6 +871,15 @@ impl<'a> Srv<'a> {
         }
     }
 
+    /// Stores `v` unless the current status is `RETIRING` (`del server` in flight).
+    pub fn store_status_unless_retiring(&self, v: u8) -> bool {
+        let Some(a) = self.status_cell() else { return false };
+        a.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            (cur != crate::check::RETIRING).then_some(v)
+        })
+        .is_ok()
+    }
+
     /// Its current weight.
     #[must_use]
     pub fn weight(&self) -> Option<u32> {
@@ -895,10 +927,18 @@ impl<'a> Srv<'a> {
         self.px.srv.server_tls.get(self.i).is_some_and(Option::is_some)
     }
 
-    /// Whether a sample fetch names it, so it cannot be renamed.
+    /// Whether a sample fetch, a `use-server` target, or another server's `track` names it
+    /// ([`NAME_REFD`]), so it cannot be renamed or removed.
     #[must_use]
     pub fn name_refd(&self) -> bool {
-        self.px.srv.server_name_refd.get(self.i).copied().unwrap_or(false)
+        self.px.srv.server_name_flags.get(self.i).copied().unwrap_or(0) & NAME_REFD != 0
+    }
+
+    /// Whether it has a `resolvers` section ([`NON_PURGEABLE`]), so `del server` cannot remove it
+    /// at runtime (a rename is still allowed).
+    #[must_use]
+    pub fn non_purgeable(&self) -> bool {
+        self.px.srv.server_name_flags.get(self.i).copied().unwrap_or(0) & NON_PURGEABLE != 0
     }
 
     /// Its check configuration.
@@ -912,6 +952,15 @@ impl<'a> Srv<'a> {
     pub fn rmaint(&self) -> bool {
         self.px.server_rmaint(self.i)
     }
+}
+
+/// Sets one bit of a slot's load-only name flags, allocating the per-slot byte array on the
+/// first mark.
+fn set_name_flag(flags: &mut Box<[u8]>, n: usize, i: usize, bit: u8) {
+    if flags.is_empty() {
+        *flags = vec![0; n].into_boxed_slice();
+    }
+    flags[i] |= bit;
 }
 
 /// What the load writes into a proxy's server arrays while it still owns the proxy.
@@ -947,14 +996,15 @@ impl ServerSetMut<'_> {
     }
 
 
-    /// Marks slot `i` as named by a sample fetch, so it cannot be renamed.
+    /// Marks slot `i` as named by a sample fetch, a `use-server` target, or a `track`, so it
+    /// cannot be renamed or removed.
     pub fn mark_name_refd(&mut self, i: usize) {
-        let n = self.0.srv.server_ids.len();
-        let refd = &mut self.0.srv.server_name_refd;
-        if refd.is_empty() {
-            *refd = vec![false; n].into_boxed_slice();
-        }
-        refd[i] = true;
+        set_name_flag(&mut self.0.srv.server_name_flags, self.0.srv.server_ids.len(), i, NAME_REFD);
+    }
+
+    /// Marks slot `i` as addressed by a `resolvers` section, so `del server` refuses it.
+    pub fn mark_non_purgeable(&mut self, i: usize) {
+        set_name_flag(&mut self.0.srv.server_name_flags, self.0.srv.server_ids.len(), i, NON_PURGEABLE);
     }
 
     /// Gives each server what it tracks.
@@ -1160,5 +1210,10 @@ mod tests {
         assert!(p.srv_set().at(2).expect("s3").name_refd());
         assert_eq!(p.srv_set().checked_count(), 0);
         assert!(!p.srv_set().tfo_of(a2));
+        let s0 = p.srv_set().at(0).expect("s1");
+        s0.store_status(crate::check::RETIRING);
+        assert!(!s0.store_status_unless_retiring(crate::check::ServerStatus::Up as u8));
+        s0.store_status(crate::check::ServerStatus::Maint as u8);
+        assert!(s0.store_status_unless_retiring(crate::check::ServerStatus::Up as u8));
     }
 }
