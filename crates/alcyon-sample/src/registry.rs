@@ -284,6 +284,20 @@ impl std::fmt::Debug for dyn FrontConnState + '_ {
     }
 }
 
+/// What [`PhaseCtx::waiting_entity`] names: `HAProxy`'s `strm->waiting_entity`, the entity
+/// that holds the stream until it continues. `HAProxy`'s third kind, `STRM_ENTITY_FILTER`
+/// (a stream filter), has no value in this codebase, which has no stream filters -- the
+/// `waiting_entity` fetch therefore never claims one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitEntity<'a> {
+    /// `STRM_ENTITY_RULE`: the rule the stream stopped at, as its configuration file and
+    /// the line in the file (the `file:line` the fetch prints).
+    Rule(&'a str, u32),
+    /// `STRM_ENTITY_WREQ_BODY`: the implicit request-body wait of
+    /// `option http-buffer-request`, which `HAProxy` names for the option.
+    Body,
+}
+
 /// The facts a sample fetch reads, as one phase of the stream knows them (CP4a-2): built once
 /// for a rule phase and held across its rules, read through [`SampleContext::phase`]. The facts
 /// [`LiveReq`] gives are read from the live request instead where a context has one
@@ -410,6 +424,15 @@ pub struct PhaseCtx<'a> {
     pub fc: Option<&'a dyn FrontConnState>,
     /// Counts the copies of the context ([`crate::work::Op::CtxClone`]).
     pub clones: crate::work::CloneCount,
+    /// The stream's transaction id, the process stream counter as the stream took it (the
+    /// `%rt` fetch prints it): what `txn.id32` reads (`smp_fetch_id32`). `0` where the
+    /// phase has no stream of its own.
+    pub uniq_id: u64,
+    /// The entity that holds the stream until it continues: what `waiting_entity` reads
+    /// (`smp_fetch_waiting_entity`); `None` where nothing is named (a `tarpit` waits in
+    /// its own analyser, an `inspect-delay` data wait holds no rule, no stream filters
+    /// exist), and the fetch then gives no sample.
+    pub waiting_entity: Option<WaitEntity<'a>>,
 }
 
 
@@ -481,6 +504,8 @@ impl PhaseCtx<'_> {
         stick: None,
         fc: None,
         clones: crate::work::CloneCount,
+        uniq_id: 0,
+        waiting_entity: None,
     };
 }
 
@@ -3251,6 +3276,35 @@ impl Registry {
             name: "last_rule_line",
             out_type: SampleType::Sint,
             func: |ctx, _args| ctx.last_rule().map(|(_, line)| Sample::Sint(i64::from(line))),
+        });
+        // `smp_fetch_last_entity` (src/stream.c): the rule that ended a rule set for the
+        // request, as `file:line`. No sample where no rule did; the filter branch of the
+        // C fetch never is -- this codebase has no stream filters, and the fetch never
+        // claims one.
+        self.register_fetch(FetchDesc {
+            name: "last_entity",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.last_rule().map(|(file, line)| Sample::Str(format!("{file}:{line}"))),
+        });
+        // `smp_fetch_waiting_entity` (src/stream.c): the entity that holds the stream:
+        // the rule it stopped at, as `file:line`, or `http-buffer-request` for the
+        // implicit request-body wait. The C fetch's filter branch has no value here --
+        // this codebase has no stream filters, and the fetch never claims one.
+        self.register_fetch(FetchDesc {
+            name: "waiting_entity",
+            out_type: SampleType::Str,
+            func: |ctx, _args| match ctx.waiting_entity {
+                Some(WaitEntity::Rule(file, line)) => Some(Sample::Str(format!("{file}:{line}"))),
+                Some(WaitEntity::Body) => Some(Sample::Str("http-buffer-request".to_string())),
+                None => None,
+            },
+        });
+        // `smp_fetch_id32` (src/stream.c): the stream's transaction id, the same counter
+        // `%rt` prints.
+        self.register_fetch(FetchDesc {
+            name: "txn.id32",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(i64::try_from(ctx.uniq_id).unwrap_or(i64::MAX))),
         });
 
         // --- 7. Captures ---

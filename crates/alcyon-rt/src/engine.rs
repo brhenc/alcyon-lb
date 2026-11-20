@@ -3286,6 +3286,35 @@ fn note_last_rule(sess: &mut TcpSession, line: u32) {
     }
 }
 
+/// What `waiting_entity` names of a held wait (`HAProxy`'s `strm->waiting_entity`): the
+/// rule that holds the stream (`STRM_ENTITY_RULE`, as `file:line`), or the request body
+/// (`STRM_ENTITY_WREQ_BODY`, the implicit wait of `option http-buffer-request`, named for
+/// the option). `None` where `HAProxy` names nothing: the `inspect-delay` data wait holds
+/// no rule; a `tarpit` is denied (`ACT_RET_DENY`) and then waits in its own analyser,
+/// where no `waiting_entity` is set; and this codebase has no stream filters, so
+/// `STRM_ENTITY_FILTER` is a claim the fetch never makes. `rules` is the list the wait's
+/// `rule` indexes and `stage` its stage, as `w.backend` says.
+fn waiting_entity_of(w: &crate::txn::BodyWait, rules: &[alcyon_config::HttpReqRule], stage: bool) -> Option<alcyon_sample::WaitEntity<'static>> {
+    if w.inspect || w.backend != stage {
+        return None;
+    }
+    let rule = rules.get(w.rule)?;
+    if w.tarpit {
+        // `pause` yields, so the rule is the entity; `tarpit` denies and holds the
+        // client in its own analyser, where `HAProxy` sets no `waiting_entity`.
+        return matches!(rule.action, alcyon_config::HttpReqAction::Pause { .. })
+            .then(|| last_rule_at(rule.line))
+            .flatten()
+            .map(|(file, line)| alcyon_sample::WaitEntity::Rule(file, line));
+    }
+    if rule.line == 0 {
+        // The implicit `option http-buffer-request` wait is not a rule in `HAProxy`
+        // (`http_wait_for_request_body`); it is named for the option.
+        return Some(alcyon_sample::WaitEntity::Body);
+    }
+    last_rule_at(rule.line).map(|(file, line)| alcyon_sample::WaitEntity::Rule(file, line))
+}
+
 /// What `when()` reads of a stream (`sample_conv_when`): an error is a 5xx status; a
 /// connection attempt, once made, counts as forwarded. A connection retry (`retried`) is an
 /// error too (`conn_retries` with no error flag); a redispatch is one retry, so it is
@@ -3359,6 +3388,11 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         bc_dst: s.bc_dst(),
         bc_src: s.bc_src(),
         stream: Some(stream_facts(s, None, false)),
+        uniq_id: s.strm.log.uniq_id,
+        waiting_entity: s.strm.txn.as_ref().and_then(|t| t.body_wait).and_then(|w| {
+            let (rules, stage) = if w.backend { (&be.http_req_rules, true) } else { (&fe.http_req_rules, false) };
+            waiting_entity_of(&w, rules, stage)
+        }),
         ..Default::default()
     }
 }
@@ -11054,6 +11088,22 @@ impl EngineDispatcher<'_> {
         if entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Client))
             && entry.sess.strm.txn.as_ref().is_some_and(|t| t.body_wait.is_some_and(|w| !w.tarpit && !w.inspect))
         {
+            // `timeout client` resumes the wait with `ACT_OPT_FINAL`, and a wait a rule asked
+            // for answers it with `ACT_RET_ABRT`: the rule is the last entity. The implicit
+            // `http-buffer-request` wait has no rule, and `note_last_rule` of line 0 is a no-op.
+            if let Some(line) = entry.sess.strm.txn.as_ref()
+                .and_then(|t| t.body_wait)
+                .and_then(|w| {
+                    let rules = if w.backend {
+                        proxies.get(entry.backend_idx).map(|p| &p.http_req_rules)
+                    } else {
+                        Some(&proxies[entry.proxy_idx].http_req_rules)
+                    };
+                    rules.and_then(|r| r.get(w.rule)).map(|rule| rule.line)
+                })
+            {
+                note_last_rule(&mut entry.sess, line);
+            }
             let fe = &proxies[entry.proxy_idx];
             let mut page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
             // The request is an HTX message here (its head was accepted and the wait holds
@@ -14785,6 +14835,11 @@ impl EngineDispatcher<'_> {
                 acls: Some(acls),
                 act_conn,
                 stick: Some(&stick),
+                uniq_id: sess.strm.log.uniq_id,
+                // The wait these rules run to clear (`body_wait`), as `waiting_entity`
+                // names it: `rules` is the list its `rule` indexes and `be_stage` its
+                // stage, so the two never disagree.
+                waiting_entity: sess.strm.txn.as_ref().and_then(|t| t.body_wait).and_then(|w| waiting_entity_of(&w, rules, be_stage)),
                 ..Default::default()
             };
             macro_rules! make_ctx {
@@ -15417,6 +15472,9 @@ impl EngineDispatcher<'_> {
                             BodyWait::Ready => {}
                             BodyWait::Pending => return Ok(RuleFlow::Suspend),
                             BodyWait::TimedOut => {
+                                // The wait ended in `ACT_RET_ABRT`, so the rule is the
+                                // entity that ended the rule set: `last_entity` names it.
+                                note_last_rule(sess, rule.line);
                                 sess.strm.log.term.get_or_insert(*b"cR");
                                 return Err(408);
                             }
@@ -15436,7 +15494,12 @@ impl EngineDispatcher<'_> {
                                 }
                                 sess.strm.log.term.get_or_insert(*b"CR");
                             }
-                            BodyWait::Malformed => return Err(400),
+                            // A broken `at_least` expression is an `ACT_RET_INV`: the rule
+                            // is the one that ended the set, so `last_entity` names it.
+                            BodyWait::Malformed => {
+                                note_last_rule(sess, rule.line);
+                                return Err(400);
+                            }
                         }
                     }
                     alcyon_config::HttpReqAction::Capture { len, id, .. } => {
