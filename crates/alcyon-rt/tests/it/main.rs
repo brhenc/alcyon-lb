@@ -85,6 +85,7 @@ mod capture_slots;
 mod capture_ver;
 mod check_condition;
 mod check_malformed_replies;
+mod server_socks4;
 mod server_state_log;
 mod check_reply_buffer_bound;
 mod check_rules;

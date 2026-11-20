@@ -107,7 +107,7 @@ const KEYWORDS: &[(&str, Alcyon)] = &[
     ("tfo", Accepts),
     // `track` needs a checked server to point at, which these one-server lines lack: it is
     // implemented (T141) and tested in `crates/alcyon-rt/tests/server_track.rs`.
-    ("socks4 127.0.0.1:1080", Refuses),
+    ("socks4 127.0.0.1:1080", Accepts),
     ("usesrc client", Refuses),
     ("weight 10", Accepts),
     // src/check.c
@@ -123,7 +123,7 @@ const KEYWORDS: &[(&str, Alcyon)] = &[
     ("check-proto h2", Accepts),
     ("check-reuse-pool", Accepts),
     ("check-send-proxy", Refuses),
-    ("check-via-socks4", Refuses),
+    ("check-via-socks4", Accepts),
     ("no-agent-check", Accepts),
     ("no-check", Accepts),
     ("no-check-reuse-pool", Accepts),

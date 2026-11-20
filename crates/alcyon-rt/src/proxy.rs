@@ -868,6 +868,24 @@ pub fn bc_connect_now_errno(e: &io::Error) -> &'static alcyon_sample::ConnErr<'s
     }
 }
 
+/// The SOCKS4 handshake errors (`CO_ER_SOCKS4_*`, numbered as in
+/// `include/haproxy/connection-t.h`), worded as `conn_err_code_str` does.
+pub const BC_SOCKS4_SEND: alcyon_sample::ConnErr<'static> = bc_err(39, "SOCKS4_SEND", "SOCKS4 Proxy write error during handshake");
+pub const BC_SOCKS4_RECV: alcyon_sample::ConnErr<'static> = bc_err(40, "SOCKS4_RECV", "SOCKS4 Proxy read error during handshake");
+pub const BC_SOCKS4_DENY: alcyon_sample::ConnErr<'static> = bc_err(41, "SOCKS4_DENY", "SOCKS4 Proxy deny the request");
+pub const BC_SOCKS4_ABORT: alcyon_sample::ConnErr<'static> = bc_err(42, "SOCKS4_ABORT", "SOCKS4 Proxy handshake aborted by server");
+
+/// `bc_err` for a failed SOCKS4 handshake, by its `crate::socks4::Fail`.
+#[must_use]
+pub const fn bc_socks4(fail: crate::socks4::Fail) -> &'static alcyon_sample::ConnErr<'static> {
+    match fail {
+        crate::socks4::Fail::Send => &BC_SOCKS4_SEND,
+        crate::socks4::Fail::Recv => &BC_SOCKS4_RECV,
+        crate::socks4::Fail::Deny => &BC_SOCKS4_DENY,
+        crate::socks4::Fail::Abort => &BC_SOCKS4_ABORT,
+    }
+}
+
 /// One TCP / HTTP session: two connections, two buffers, two state machines.
 #[allow(clippy::struct_excessive_bools)]
 /// What waits to go into a session's `rep`.
@@ -1049,6 +1067,10 @@ pub mod sess_flags {
     pub const KEEP_REQUEST_LINE: u64 = 1 << 28;
     /// `option accept-unsafe-violations-in-http-request` on the frontend.
     pub const ACCEPT_UNSAFE_REQUEST: u64 = 1 << 29;
+    /// The `socks4` tunnel's 16-byte request is not yet fully written (`CO_FL_SOCKS4_SEND`).
+    pub const SOCKS4_SEND: u64 = 1 << 30;
+    /// The `socks4` tunnel's 8-byte reply is not yet read (`CO_FL_SOCKS4_RECV`).
+    pub const SOCKS4_RECV: u64 = 1 << 31;
 }
 
 /// Packed boolean flags on [`TcpSession`].
@@ -1155,6 +1177,11 @@ pub struct TcpSession {
     pub srv: Option<OwnedFd>,
     /// The transport under the backend server socket: plaintext, or TLS over the same fd.
     pub srv_xprt: ServerXprt,
+    // A `socks4` tunnel in flight (`socks4 <proxy>`) is signalled by the
+    // `SOCKS4_SEND` / `SOCKS4_RECV` bits on `flags`, not a field: the request is rebuilt
+    // on the stack from the (fixed) target on every drive, the reply is peeked
+    // all-or-nothing, and the two phases map one-to-one onto the two bits. No per-
+    // connection storage, so `TcpSession`'s size bound (`struct_sizes.rs`) holds.
     pub mode: Mode,
     pub client_addr: Option<SocketAddr>,
     /// The name of the bind that accepted this connection (`so_name`).
@@ -1947,6 +1974,7 @@ impl TcpSession {
         debug_assert!(srv.is_none(), "a parked stream holds no server connection");
         *srv = None;
         *srv_xprt = ServerXprt::Plain;
+        flags.clear(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
         req_uri.reset();
         req_method.reset();
         req_body_htx.set(None);
@@ -2546,8 +2574,9 @@ impl TcpSession {
         } else {
             ScState::Established
         };
-        // A TLS handshake still to run stays under `timeout connect` (see `process_srv_io`).
-        if self.srv_xprt.is_ready() {
+        // A TLS handshake or a `socks4` tunnel still to run stay under `timeout connect`
+        // (re-parked by `process_srv_io` once the handshake completes).
+        if self.srv_xprt.is_ready() && !self.socks4_active() {
             self.conn_exp = Tick::ETERNITY;
         }
         self.arm_server(now);
@@ -2578,6 +2607,7 @@ impl TcpSession {
     pub fn l7_retried(&mut self) {
         self.conn_retries = self.conn_retries.saturating_sub(1);
         self.srv = None;
+        self.flags.clear(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
         self.conn_exp = Tick::ETERNITY;
         self.srv_exp = Tick::ETERNITY;
         self.srv_state = ScState::Init;
@@ -2591,6 +2621,7 @@ impl TcpSession {
     /// server there is nothing to wait for, so the retry is immediate.
     pub fn server_failed_at(&mut self, now: Tick, same_server: bool) -> bool {
         self.srv = None;
+        self.flags.clear(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
         self.conn_exp = Tick::ETERNITY;
         if self.conn_retries > 0 && self.flags.has(sess_flags::RETRY_CONN) {
             self.conn_retries -= 1;
@@ -4402,6 +4433,52 @@ impl TcpSession {
     fn process_srv_io(&mut self) -> io::Result<bool> {
         let mut changed = false;
 
+        // A `socks4` tunnel completes before any traffic: the 16-byte request goes out,
+        // the 8-byte reply is read, and a refusal (or a short reply) fails the stream
+        // exactly as `conn_send_socks4_proxy_request` / `conn_recv_socks4_proxy_response`
+        // do (HAProxy `CO_ER_SOCKS4_*`). The connection-expiry timer stays live until
+        // the reply lands, as it does for a TLS handshake. The handshake's state is the
+        // `SOCKS4_SEND` / `SOCKS4_RECV` flags; the request is rebuilt on the stack from
+        // the (fixed) target the socket is dialing, so nothing is stored per connection.
+        if self.socks4_active() {
+            let sfd = self
+                .srv
+                .as_ref()
+                .map(AsFd::as_fd)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+            // The address the socket dials is the proxy; the address it must dial, what the
+            // 16-byte request carries, is the server's, as the connect computed it
+            // (`connect_addr`, the `target_addr` the connect stored).
+            let target = self
+                .target_addr
+                .map(|t| crate::engine::connect_addr(t, self.server_addr))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotConnected, "no server target for the SOCKS4 request")
+                })?;
+            let mut hs = crate::socks4::Hs {
+                sending: self.flags.has(sess_flags::SOCKS4_SEND),
+                receiving: self.flags.has(sess_flags::SOCKS4_RECV),
+            };
+            match crate::socks4::step(sfd, target, &mut hs) {
+                crate::socks4::Step::Pending => {
+                    self.flags.set_to(sess_flags::SOCKS4_SEND, hs.sending);
+                    self.flags.set_to(sess_flags::SOCKS4_RECV, hs.receiving);
+                    return Ok(changed);
+                }
+                crate::socks4::Step::Done => {
+                    self.flags.clear(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
+                    self.conn_exp = Tick::ETERNITY;
+                    changed = true;
+                }
+                crate::socks4::Step::Failed(f) => {
+                    self.flags.clear(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
+                    self.bc_err = Some(bc_socks4(f));
+                    self.srv_state = ScState::Error;
+                    return Err(io::Error::new(io::ErrorKind::Other, f.text()));
+                }
+            }
+        }
+
         if self.srv_xprt.is_tls() && !self.srv_xprt.is_ready() {
             let sfd = self
                 .srv
@@ -4778,9 +4855,19 @@ impl TcpSession {
         .is_some()
     }
 
+    /// A `socks4` tunnel is in flight on the server connection (its `CO_FL_SOCKS4_*`
+    /// phases): the request is still out, or the reply still owed.
+    #[must_use]
+    #[inline]
+    fn socks4_active(&self) -> bool {
+        self.flags.has(sess_flags::SOCKS4_SEND) || self.flags.has(sess_flags::SOCKS4_RECV)
+    }
+
     fn conn_timer_live(&self) -> bool {
         self.srv_state == ScState::Connecting
-            || (matches!(self.srv_state, ScState::Ready | ScState::Established) && self.srv_xprt.is_tls() && !self.srv_xprt.is_ready())
+            || (matches!(self.srv_state, ScState::Ready | ScState::Established)
+                && (self.srv_xprt.is_tls() && !self.srv_xprt.is_ready()
+                    || self.socks4_active()))
     }
 
     fn cli_timer_live(&self) -> bool {
@@ -4926,10 +5013,21 @@ impl TcpSession {
                 read: false,
                 write: true,
             },
-            ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW => Want {
-                read: self.srv_state.can_read() && !self.rep.is_full() && self.reads_server(),
-                write: self.srv_state.can_write() && ((self.req_window() > 0 && !self.srv_xprt.send_blocked()) || self.srv_xprt.wants_write()),
-            },
+            ScState::Ready | ScState::Established | ScState::ShutR | ScState::ShutW => {
+                if self.socks4_active() {
+                    // A tunnel in flight wants only its own bytes: the unsent request
+                    // (the `SOCKS4_SEND` bit), the unread reply (the `SOCKS4_RECV` bit).
+                    Want {
+                        read: self.flags.has(sess_flags::SOCKS4_RECV),
+                        write: self.flags.has(sess_flags::SOCKS4_SEND),
+                    }
+                } else {
+                    Want {
+                        read: self.srv_state.can_read() && !self.rep.is_full() && self.reads_server(),
+                        write: self.srv_state.can_write() && ((self.req_window() > 0 && !self.srv_xprt.send_blocked()) || self.srv_xprt.wants_write()),
+                    }
+                }
+            }
             _ => Want::default(),
         }
     }

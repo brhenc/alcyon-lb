@@ -5383,6 +5383,9 @@ fn init_checks(proxies: &crate::table::Table, scheduler: &mut Scheduler, now: Ti
             };
             let mut check = ServerCheckState::new(proxy_idx, server_idx, srv_addr, check_cfg, now);
             check.tls = proxy.srv_set().check_tls_at(server_idx).cloned();
+            // `check-via-socks4` rides the same tunnel as traffic (HAProxy
+            // `srv->check.via_socks4`); it is set up at check start (`step_check`), where
+            // the proxy and target addresses are read from the server state.
             if let Some(r) = proxy.ids.restored(server_idx) {
                 // What the server-state file said (T490), already in `server_statuses`.
                 let published = proxy.srv_set().status_cell(server_idx).map_or(0, |s| s.load(Ordering::Relaxed));
@@ -9227,6 +9230,23 @@ pub(crate) fn connect_addr(server: SocketAddr, dst: Option<SocketAddr>) -> Socke
     SocketAddr::new(ip, port)
 }
 
+/// The `socks4 <proxy>` address of slot `s_idx`'s server, if any: the socket then
+/// connects to the proxy, and the server's own address rides in the 16-byte SOCKS4
+/// request the tunnel sends first (`srv_parse_socks4`, `src/server.c`).
+fn socks4_proxy_of(proxies: &crate::table::Table, be_idx: usize, s_idx: Option<usize>) -> Option<SocketAddr> {
+    s_idx.and_then(|i| proxies[be_idx].srv_set().socks4_at(i))
+}
+
+/// Opens the SOCKS4 handshake on a server socket that went out through the slot's
+/// `socks4` proxy: the `CO_FL_SOCKS4_*` flags start the request out and the reply owed.
+/// The request itself is rebuilt on the stack by `process_srv_io` from the (fixed)
+/// target the socket is dialing, so nothing is stored on the session.
+fn start_socks4_handshake(sess: &mut TcpSession, proxy: Option<SocketAddr>) {
+    if proxy.is_some() {
+        sess.flags.set(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
+    }
+}
+
 /// The stream connects to `target` now: `%si` and the stats read the configured address,
 /// `bc_dst` the one the socket connects to.
 fn set_target(entry: &mut SessionEntry, target: SocketAddr) {
@@ -9515,12 +9535,15 @@ fn init_client_session(
             sess.set_backend_timeouts(proxy);
 
             sess.target_addr = Some(target);
-            let connected = raw::connect_opts(connect_addr(target, sess.server_addr), proxy.srv_set().tfo_of(target))
+            let s_idx = proxy.srv_set().slot_of_addr(target);
+            let real = connect_addr(target, sess.server_addr);
+            let socks4 = socks4_proxy_of(proxies, proxy_idx, s_idx);
+            let connected = raw::connect_opts(socks4.unwrap_or(real), proxy.srv_set().tfo_of(target))
                 .inspect_err(|e| sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)));
             if let Ok((srv_fd, immediate)) = connected {
                 let sfd = srv_fd.as_raw_fd();
-                let s_idx = proxy.srv_set().slot_of_addr(target);
                 attach_server_to(&mut sess, proxies, proxy_idx, proxy_idx, s_idx, srv_fd, now);
+                start_socks4_handshake(&mut sess, socks4);
                 srv_raw_fd = Some(sfd);
                 if immediate {
                     sess.server_connected(now);
@@ -9930,6 +9953,7 @@ fn release_server(
     entry.sess.srv_park_exp = Tick::ETERNITY;
     entry.sess.flags.clear(sess_flags::SRV_KEPT);
     entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
+    entry.sess.flags.clear(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
     if !actconn_released {
         release_server_actconn(entry, proxies, parked);
     }
@@ -10455,6 +10479,7 @@ fn retry_server_connect(
 ) -> bool {
     release_failed_server(entry, fdtab, poller);
     entry.sess.srv = None;
+    entry.sess.flags.clear(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
 
     // The slot the failed attempt held stays the stream's while it retries the same server,
     // the turnaround included (`s->srv_conn` is kept: `assign_server_and_queue` returns at
@@ -10591,11 +10616,14 @@ fn retry_server_connect(
     maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
     set_target(entry, target_addr);
-    if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].srv_set().tfo_of(target_addr))
+    let real = connect_addr(target_addr, entry.sess.server_addr);
+    let socks4 = socks4_proxy_of(proxies, be_idx, s_idx);
+    if let Ok((srv_fd, immediate)) = raw::connect_opts(socks4.unwrap_or(real), proxies[be_idx].srv_set().tfo_of(target_addr))
         .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
     {
         let sfd = srv_fd.as_raw_fd();
         attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
+        start_socks4_handshake(&mut entry.sess, socks4);
         entry.srv_raw_fd = Some(sfd);
         if immediate {
             entry.sess.server_connected(now);
@@ -16265,6 +16293,11 @@ impl EngineDispatcher<'_> {
         maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
         set_target(entry, target_addr);
+        // `socks4 <proxy>`: a new connection goes out to the proxy; the tunnel request
+        // carries the server's address and is driven before any traffic. A pooled
+        // connection finished its handshake when it was made.
+        let real = connect_addr(target_addr, entry.sess.server_addr);
+        let socks4 = socks4_proxy_of(proxies, be_idx, s_idx);
 
         let mut reused = None;
         entry.srv_served = 0;
@@ -16340,11 +16373,12 @@ impl EngineDispatcher<'_> {
                     new_interest.writable,
                 );
             }
-        } else if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].srv_set().tfo_of(target_addr))
+        } else if let Ok((srv_fd, immediate)) = raw::connect_opts(socks4.unwrap_or(real), proxies[be_idx].srv_set().tfo_of(target_addr))
         .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
     {
             let sfd = srv_fd.as_raw_fd();
             attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
+            start_socks4_handshake(&mut entry.sess, socks4);
             entry.srv_raw_fd = Some(sfd);
             if immediate {
                 entry.sess.server_connected(now);
@@ -16520,17 +16554,24 @@ impl EngineDispatcher<'_> {
 
         maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
+        // `socks4 <proxy>`: the connection goes to the proxy; the tunnel request carries
+        // the real server address and is driven by the stream before any traffic
+        // (`TcpSession::process_srv_io`), mirroring `tcp_connect_server` +
+        // `conn_send_socks4_proxy_request`.
+        let real = connect_addr(target_addr, entry.sess.server_addr);
+        let socks4 = socks4_proxy_of(proxies, be_idx, s_idx);
         set_target(entry, target_addr);
         // A connect that completed at once (`connect()` returning 0, which a TCP socket on
         // Linux never does: it is EINPROGRESS even on loopback) takes the same path: the
         // socket is reported writable on the next poll and completes there. Only INET
         // servers exist (`unix@` is refused at parse time), so no test could reach a
         // separate branch for it.
-        if let Ok((srv_fd, _immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].srv_set().tfo_of(target_addr))
+        if let Ok((srv_fd, _immediate)) = raw::connect_opts(socks4.unwrap_or(real), proxies[be_idx].srv_set().tfo_of(target_addr))
         .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
     {
             let sfd = srv_fd.as_raw_fd();
             attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
+            start_socks4_handshake(&mut entry.sess, socks4);
             entry.srv_raw_fd = Some(sfd);
             {
                 entry.srv_interest = Interest::WRITE;

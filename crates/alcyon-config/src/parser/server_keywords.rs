@@ -98,7 +98,6 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("slowstart", Arg::Delay, Ignore("the warm-up of a server coming back up")),
     kw!("source", Arg::Word, ROUTE),
     kw!("strict-maxconn", Arg::None, Ignore("whether idle connections count against maxconn")),
-    kw!("socks4", Arg::Word, ROUTE),
     kw!("usesrc", Arg::None, ROUTE),
     // src/check.c
     kw!("agent-addr", Arg::Word, CHECK),
@@ -109,8 +108,9 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("check-pool-conn-name", Arg::Word, Ignore("health checks reusing idle connections")),
     kw!("check-reuse-pool", Arg::None, Ignore("health checks reusing idle connections")),
     kw!("check-send-proxy", Arg::None, CHECK),
-    kw!("check-via-socks4", Arg::None, CHECK),
     // `fastinter` and `downinter` are read in `server.rs` (T207) and paced in `check.rs`.
+    // `socks4` and `check-via-socks4` are read in `server.rs` (T281) and driven in
+    // `socks4.rs`, `engine.rs` and `check.rs`.
     // src/cfgparse-ssl.c: the rest is implemented in `server.rs` (`parse_server_ssl_keyword`).
     kw!("allow-0rtt", Arg::None, TLS),
     kw!("ciphers", Arg::Word, TLS),
