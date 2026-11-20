@@ -152,6 +152,23 @@ pub fn response_part(fetch: &str) -> Option<&'static str> {
         // `SMP_USE_L6RES` (`src/payload.c`): the raw response, which a request rule or a
         // `tcp-request` has not got.
         "res.len" | "res.payload" | "res.payload_lv" | "res.ssl_hello_type" | "rep_ssl_hello_type" => Some("response buffer"),
+        // `SMP_USE_RSFIN`: the response's final statistics, stamped when its stream is
+        // logged -- a request rule or a `tcp-request` has not got them either.
+        "res.timer.data" => Some("response buffer statistics"),
+        _ => None,
+    }
+}
+
+/// What a `tcp-request session`/`connection` rule's expression cannot read beyond the
+/// response and the server (`response_part`, `server_part`): the request's timer
+/// (`SMP_USE_HRQHV`, the head is not in yet) and the transaction's statistics
+/// (`SMP_USE_TXFIN`). The `tcp-request content` checkpoint runs once the first bytes are
+/// in -- the head in `mode http` -- and admits them both, as does an `http-request` rule.
+#[must_use]
+pub fn tcp_request_part(fetch: &str) -> Option<&'static str> {
+    match fetch {
+        "req.timer.tq" => Some("HTTP request headers"),
+        "txn.timer.total" | "txn.timer.user" => Some("transaction statistics"),
         _ => None,
     }
 }
@@ -461,8 +478,15 @@ impl Section<'_> {
                     format!("error detected in {} while parsing '{kw} {action}' rule : {e}{stop}", self.what)
                 })?;
                 let part = match *kw {
-                    "http-request" | "tcp-request content" | "tcp-request session" | "tcp-request connection" => {
-                        response_part(fetch).or_else(|| server_part(fetch))
+                    "http-request" | "tcp-request content" => response_part(fetch).or_else(|| server_part(fetch)),
+                    // The `content` checkpoint runs once the request's first bytes are in,
+                    // which is the head in `mode http`: `req.timer.tq` and the `txn.timer.*`
+                    // fetches are admitted there (measured on the oracle). `session` and
+                    // `connection` have none of it yet.
+                    "tcp-request session" | "tcp-request connection" => {
+                        response_part(fetch)
+                            .or_else(|| server_part(fetch))
+                            .or_else(|| tcp_request_part(fetch))
                     }
                     "http-response" | "http-after-response" => request_part(fetch, false),
                     _ => request_part(fetch, true), // "tcp-response content", the last of the seven

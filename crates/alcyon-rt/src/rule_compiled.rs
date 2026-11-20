@@ -303,6 +303,9 @@ pub struct Rules {
     /// Some response rule's format reads the stream's measures: the response context then
     /// carries the timers.
     pub res_stream: bool,
+    /// Some `http-request` rule's format or expression reads a stream timer fetch: the
+    /// http-request context then carries the timers (five clock reads, not free - T455).
+    pub req_stream: bool,
 }
 
 impl Rules {
@@ -310,9 +313,14 @@ impl Rules {
     #[must_use]
     pub fn finish(mut self) -> Self {
         let reads = |r: &Rule| {
-            r.fmt.iter().chain(r.fmt2.iter()).any(Format::needs_stream) || r.reply.iter().chain(r.page.iter()).any(|p| p.needs_stream())
+            r.fmt.iter().chain(r.fmt2.iter()).any(Format::needs_stream)
+                // A bare expression that is not a format: a `set-var` of a timer fetch
+                // reads the stream's logs as well.
+                || r.expr.as_ref().is_some_and(|e| crate::logfmt::STREAM_TIMER_FETCHES.contains(&e.fetch_name.as_str()))
+                || r.reply.iter().chain(r.page.iter()).any(|p| p.needs_stream())
         };
         self.res_stream = self.http_res.iter().chain(&self.http_after_res).any(reads) || self.reply_pages.values().any(|p| p.needs_stream());
+        self.req_stream = self.http_req.iter().any(reads);
         self
     }
 }

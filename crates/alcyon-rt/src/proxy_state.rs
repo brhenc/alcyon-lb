@@ -874,6 +874,32 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
         // `error-log-format`, `log-format-sd`): `hdr` needs both, and a request fetch the
         // request's. `HAProxy` refuses them all at load (3.5-dev8-885761-29, T286); the
         // captures (`%hr`, `capture.req.hdr`) are what a log line reads headers with.
+        // The timer fetches of a `tcp-request` or `tcp-response` rule's format (a
+        // `set-var-fmt`'s `%[...]`, this ref): `HAProxy` compiles the format with the
+        // request's sources still missing (`tcp-request session`/`connection`), the head
+        // not parsed (`tcp-request content` has its bytes, but not the server or the
+        // response) or the request's headers gone (`tcp-response`), and refuses the fetch
+        // in the bare `log.c` words. Its bare expressions are refused wider still
+        // (`rule_exprs::tcp_request_part`); an ACL is only warned about there.
+        if !r.acl && !r.whole_format {
+            let fetch = crate::rule_exprs::leading_fetch(&r.expr);
+            let (directive, action) = (r.directive.as_str(), r.action.as_str());
+            let part = match (directive, fetch) {
+                ("tcp-request", "req.timer.queue" | "bc.timer.connect") => Some("server address"),
+                ("tcp-request", "res.timer.data") => Some("response buffer statistics"),
+                ("tcp-request", f @ ("req.timer.tq" | "txn.timer.total" | "txn.timer.user"))
+                    if action == "session" || action == "connection" => {
+                    Some(if f == "req.timer.tq" { "HTTP request headers" } else { "transaction statistics" })
+                }
+                ("tcp-response", "req.timer.tq") => Some("HTTP request headers"),
+                _ => None,
+            };
+            if let Some(part) = part {
+                return Err(in_line(format!(
+                    "sample fetch <{fetch}> may not be reliably used here because it needs '{part}' which is not available here"
+                )));
+            }
+        }
         let in_log = matches!(r.directive.as_str(), "log-format" | "error-log-format" | "log-format-sd");
         let part_missing = |fetch: &str| match r.directive.as_str() {
             "http-response" | "http-after-response" => crate::rule_exprs::request_part(fetch, false),
