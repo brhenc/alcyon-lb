@@ -518,6 +518,7 @@ mod drop_trailers;
 mod trailer_values;
 mod tune_maxaccept;
 mod transport_edges;
+mod txn_log_actions;
 mod txn_variables_race;
 mod typed_sample_args;
 mod typed_variables;

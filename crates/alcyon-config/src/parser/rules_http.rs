@@ -6,7 +6,7 @@ use super::{
     args_end, parse_acl_condition_from_tokens, parse_error_body_args,
     parse_gpc_array_action, parse_sc_counter_action, parse_u16, ConfigError, ErrorPageSource,
     AclCondition, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction,
-    HttpResRule, RedirectCookie, RedirectKind, RedirectRule, RetriesValue, Token,
+    HttpResRule, LogLevel, RedirectCookie, RedirectKind, RedirectRule, RetriesValue, Token,
 };
 
 /// The single sample expression at `tokens[2]` and the optional condition after it, as
@@ -172,6 +172,85 @@ fn expect_cond_in(list: &str, tokens: &[Token], at: usize, act_token: &Token) ->
             ),
         )),
     }
+}
+
+/// The argument of `set-log-level` (`stream_parse_set_log_level`, `src/stream.c`): exactly
+/// one, `silent` or a syslog level name, then the optional condition. What it becomes is
+/// `s->logs.level`: -1 for `silent`, the level's syslog number plus one for a name;
+/// anything else is refused.
+fn parse_set_log_level_arg(list: &str, tokens: &[Token], act_token: &Token) -> Result<(i8, Option<AclCondition>), ConfigError> {
+    let bad = || {
+        ConfigError::new(
+            act_token.line,
+            act_token.col,
+            format!("'{list} set-log-level' expects exactly 1 argument (log level name or 'silent')"),
+        )
+    };
+    let Some(arg) = tokens.get(2) else {
+        return Err(bad());
+    };
+    let level = if arg.text == "silent" {
+        -1
+    } else {
+        super::logging::parse_level(arg).map_or(0, |l| match l {
+            LogLevel::Emerg => 1,
+            LogLevel::Alert => 2,
+            LogLevel::Crit => 3,
+            LogLevel::Err => 4,
+            LogLevel::Warning => 5,
+            LogLevel::Notice => 6,
+            LogLevel::Info => 7,
+            LogLevel::Debug => 8,
+        })
+    };
+    if level == 0 {
+        return Err(bad());
+    }
+    Ok((level, expect_cond_in(list, tokens, 3, act_token)?))
+}
+
+/// The leading number of a word, the way `atoi` (`src/tools.c`) reads one: over whitespace,
+/// a sign, then digits; what follows the digits is ignored, and a word with no number is 0.
+fn atoi_word(text: &str) -> i32 {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i] <= b' ' {
+        i += 1;
+    }
+    let sign: i32 = match b.get(i) {
+        Some(b'+') => {
+            i += 1;
+            1
+        }
+        Some(b'-') => {
+            i += 1;
+            -1
+        }
+        _ => 1,
+    };
+    let start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if start == i {
+        return 0;
+    }
+    let n = b[start..i].iter().fold(0i32, |acc, d| acc.saturating_mul(10).saturating_add(i32::from(d - b'0')));
+    sign.saturating_mul(n)
+}
+
+/// The argument of `set-nice` (`stream_parse_set_nice`, `src/stream.c`): exactly one, an
+/// integer read `atoi`-style and clamped to -1024..=1024, then the optional condition.
+fn parse_set_nice_arg(list: &str, tokens: &[Token], act_token: &Token) -> Result<(i16, Option<AclCondition>), ConfigError> {
+    let Some(arg) = tokens.get(2) else {
+        return Err(ConfigError::new(
+            act_token.line,
+            act_token.col,
+            format!("'{list} set-nice' expects exactly 1 argument (integer value)"),
+        ));
+    };
+    let nice = atoi_word(&arg.text).clamp(-1024, 1024);
+    Ok((nice as i16, expect_cond_in(list, tokens, 3, act_token)?))
 }
 
 /// `silent-drop rst-ttl <ttl>` sends the RST with that TTL. The http-response form is not
@@ -1144,6 +1223,16 @@ fn parse_http_req_rule_at(
         // HAProxy 3.1+: send the stream's line for the `http-req` step, no argument.
         let cond = expect_cond_in("http-request", tokens, 2, act_token)?;
         rules.push(HttpReqRule { action: HttpReqAction::DoLog, cond, line: 0 });
+    } else if act_str == "set-log-level" {
+        // `stream_parse_set_log_level` (src/stream.c): the stream's lines go out at the
+        // named level, `silent` sends none of them.
+        let (level, cond) = parse_set_log_level_arg("http-request", tokens, act_token)?;
+        rules.push(HttpReqRule { action: HttpReqAction::SetLogLevel(level), cond, line: 0 });
+    } else if act_str == "set-nice" {
+        // `stream_parse_set_nice` (src/stream.c): the stream's task runs with the nice from
+        // its next wakeup on.
+        let (nice, cond) = parse_set_nice_arg("http-request", tokens, act_token)?;
+        rules.push(HttpReqRule { action: HttpReqAction::SetNice(nice), cond, line: 0 });
     } else {
         return Err(ConfigError::new(
             act_token.line,
@@ -1443,6 +1532,12 @@ fn parse_http_res_rule_at(
         // HAProxy 3.1+: send the stream's line for the `http-res` step, no argument.
         let cond = expect_cond_in("http-response", tokens, 2, act_token)?;
         rules.push(HttpResRule { action: HttpResAction::DoLog, cond, line: 0 });
+    } else if act_str == "set-log-level" {
+        let (level, cond) = parse_set_log_level_arg("http-response", tokens, act_token)?;
+        rules.push(HttpResRule { action: HttpResAction::SetLogLevel(level), cond, line: 0 });
+    } else if act_str == "set-nice" {
+        let (nice, cond) = parse_set_nice_arg("http-response", tokens, act_token)?;
+        rules.push(HttpResRule { action: HttpResAction::SetNice(nice), cond, line: 0 });
     } else {
         return Err(ConfigError::new(
             act_token.line,
@@ -1878,6 +1973,11 @@ pub(crate) fn parse_http_after_res_rule(
         // HAProxy 3.1+: send the stream's line for the `http-after-res` step, no argument.
         let cond = expect_cond_in("http-after-response", tokens, 2, act_token)?;
         rules.push(HttpAfterResRule { action: HttpAfterResAction::DoLog, cond });
+    } else if act_str == "set-log-level" {
+        // `HAProxy` lists `set-log-level` for `http-after-response` (not `set-nice`, which
+        // the fall-through below refuses).
+        let (level, cond) = parse_set_log_level_arg("http-after-response", tokens, act_token)?;
+        rules.push(HttpAfterResRule { action: HttpAfterResAction::SetLogLevel(level), cond });
     } else {
         return Err(ConfigError::new(
             act_token.line,

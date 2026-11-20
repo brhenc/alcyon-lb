@@ -65,6 +65,10 @@ pub struct StreamLog {
     /// `set-priority-class` and `set-priority-offset` (`s->priority_class`, `priority_offset`).
     pub prio_class: i32,
     pub prio_offset: i32,
+    /// `set-log-level` (`s->logs.level`): 0 when no rule set one, -1 for `silent` (the
+    /// stream's lines are not sent), else the level's syslog number plus one (1 `emerg` .. 8
+    /// `debug`).
+    pub log_level: i8,
     /// `%rt`.
     pub uniq_id: u64,
     /// The termination state, when the proxy itself ended the stream: `PR` for a denied
@@ -242,6 +246,7 @@ impl StreamLog {
             last_rule: 0,
             prio_class: 0,
             prio_offset: 0,
+            log_level: 0,
             uniq_id: STREAM_COUNTER.fetch_add(1, Ordering::Relaxed),
             term: None,
             status: None,
@@ -280,6 +285,7 @@ impl StreamLog {
             last_rule,
             prio_class,
             prio_offset,
+            log_level,
             uniq_id,
             term,
             status,
@@ -309,6 +315,7 @@ impl StreamLog {
         *last_rule = 0;
         *prio_class = 0;
         *prio_offset = 0;
+        *log_level = 0;
         *uniq_id = STREAM_COUNTER.fetch_add(1, Ordering::Relaxed);
         *term = None;
         *status = None;
@@ -346,6 +353,7 @@ impl StreamLog {
             last_rule,
             prio_class,
             prio_offset,
+            log_level,
             uniq_id,
             term,
             status,
@@ -365,7 +373,7 @@ impl StreamLog {
         copy_captures(req_captures, &src.req_captures);
         copy_captures(res_captures, &src.res_captures);
         unique_id.clone_from(&src.unique_id);
-        (*last_rule, *prio_class, *prio_offset, *uniq_id) = (src.last_rule, src.prio_class, src.prio_offset, src.uniq_id);
+        (*last_rule, *prio_class, *prio_offset, *log_level, *uniq_id) = (src.last_rule, src.prio_class, src.prio_offset, src.log_level, src.uniq_id);
         (*term, *status) = (src.term, src.status);
         (*redispatched, *applet, *be_queue, *queue_is_srv, *asap_done, *srv_status) = (src.redispatched, src.applet, src.be_queue, src.queue_is_srv, src.asap_done, src.srv_status);
     }
