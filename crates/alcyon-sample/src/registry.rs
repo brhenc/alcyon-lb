@@ -235,6 +235,16 @@ pub struct StreamFacts {
     pub be_queue: u32,
     /// Position in the server's queue when dequeued (`logs->srv_queue_pos`); 0 if not queued there.
     pub srv_queue: u32,
+    /// The request's bytes in (`logs.req_in`), the same the log's `%U` reads.
+    pub req_in: u64,
+    /// The request's bytes out (`logs.req_out`): the server's count of what it received; 0 for a
+    /// request the proxy answered itself (it never reached a server).
+    pub req_out: u64,
+    /// The response's bytes in (`logs.res_in`), the same the log's `%B` reads.
+    pub res_in: u64,
+    /// The response's bytes out (`logs.res_out`): the client's count of what it received; twice
+    /// the response for one the proxy made in place of the server's (measured on the oracle).
+    pub res_out: u64,
 }
 
 /// Why a client connection failed before a session began (`conn->err_code`): what
@@ -3174,6 +3184,43 @@ impl Registry {
             name: "res.body_len",
             out_type: SampleType::Sint,
             func: response_body_len_fetch,
+        });
+
+        // The byte counters (`smp_fetch_bytes`, src/sample.c): `bytes_in` and `req.bytes_in`
+        // the request's bytes in (`%U`); `req.bytes_out` what a server counted of it (0 for a
+        // request the proxy answered itself); `bytes_out` and `res.bytes_in` the response's
+        // bytes in (`%B`); `res.bytes_out` what the client counted of it (twice the response
+        // for one the proxy made in place of the server's, measured on the oracle). The log's
+        // contexts have the finished stream the `SMP_USE_RQFIN`/`SMP_USE_RSFIN` fetches want.
+        self.register_fetch(FetchDesc {
+            name: "bytes_in",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::try_from(s.req_in).unwrap_or(i64::MAX))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bytes_out",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::try_from(s.res_in).unwrap_or(i64::MAX))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "req.bytes_in",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::try_from(s.req_in).unwrap_or(i64::MAX))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "req.bytes_out",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::try_from(s.req_out).unwrap_or(i64::MAX))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "res.bytes_in",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::try_from(s.res_in).unwrap_or(i64::MAX))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "res.bytes_out",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::try_from(s.res_out).unwrap_or(i64::MAX))),
         });
 
         crate::rawpayload::register(self);
