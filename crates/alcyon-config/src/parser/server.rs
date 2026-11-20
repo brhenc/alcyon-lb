@@ -59,6 +59,7 @@ pub(crate) fn parse_server(
     // `set-proxy-v2-tlv-fmt` entries are appended, so the inherited ones are sent first.
     let mut ppv2_tlvs = default_server.map(|d| d.ppv2_tlvs.clone()).unwrap_or_default();
     let mut maxconn = default_server.and_then(|d| d.maxconn);
+    let mut maxqueue = default_server.and_then(|d| d.maxqueue);
     let mut pool_max_conn = default_server.and_then(|d| d.pool_max_conn).unwrap_or(-1);
     let mut max_reuse = default_server.and_then(|d| d.max_reuse).unwrap_or(-1);
     let mut pool_low_conn = default_server.and_then(|d| d.pool_low_conn).unwrap_or(0);
@@ -147,6 +148,10 @@ pub(crate) fn parse_server(
                 if i < tokens.len() {
                     maxconn = Some(parse_u32(&tokens[i], "maxconn")?);
                 }
+            }
+            "maxqueue" => {
+                maxqueue = Some(parse_u32(server_kw_arg(tokens, i, who, "expects an integer argument.")?, "maxqueue")?);
+                i += 1;
             }
             "pool-max-conn" => {
                 pool_max_conn = parse_pool_max_conn(tokens, i, who)?;
@@ -275,6 +280,11 @@ pub(crate) fn parse_server(
     // Kept apart from the server: a backend of 60,000 of them must stay small.
     if health != 0 {
         extras.init_health.push((index, health));
+    }
+    if let Some(mq) = maxqueue {
+        if mq > 0 {
+            extras.maxqueue.push((index, mq));
+        }
     }
     if puid != 0 {
         extras.puid.push((index, puid));
@@ -970,6 +980,10 @@ pub(crate) fn parse_default_server(
                 if i < tokens.len() {
                     cfg.maxconn = Some(parse_u32(&tokens[i], "maxconn")?);
                 }
+            }
+            "maxqueue" => {
+                cfg.maxqueue = Some(parse_u32(server_kw_arg(tokens, i, None, "expects an integer argument.")?, "maxqueue")?);
+                i += 1;
             }
             "pool-max-conn" => {
                 cfg.pool_max_conn = Some(parse_pool_max_conn(tokens, i, None)?);

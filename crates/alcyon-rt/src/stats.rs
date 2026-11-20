@@ -550,6 +550,13 @@ pub fn note_process_start(t: Instant) {
     let _ = PROCESS_START.set(t);
 }
 
+/// The process's start, `uptime` and `show info` alike: what the engine recorded, else
+/// now (the process started, and nothing recorded it yet).
+#[must_use]
+pub fn process_start() -> Instant {
+    *PROCESS_START.get_or_init(Instant::now)
+}
+
 /// Records the scheduler's `Tasks` and `Run_queue` for [`process_info_pairs`].
 pub fn note_sched(tasks: usize, run_queue: usize) {
     SCHED_TASKS.store(tasks, std::sync::atomic::Ordering::Relaxed);

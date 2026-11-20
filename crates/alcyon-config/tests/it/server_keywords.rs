@@ -68,8 +68,9 @@ const KEYWORDS: &[(&str, Alcyon)] = &[
     ("log-bufsize 1024", Accepts),
     ("log-proto legacy", Accepts),
     ("maxconn 10", Accepts),
-    // T240: a limit Alcyon cannot apply is refused; 0, no limit, is what Alcyon does.
-    ("maxqueue 10", Refuses),
+    // The server's queue limit: a request the balancing assigned waits for the server
+    // there, and 0, no limit, is the default.
+    ("maxqueue 10", Accepts),
     ("maxqueue 0", Accepts),
     ("max-reuse 10", Accepts),
     ("minconn 5", Accepts),

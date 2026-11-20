@@ -46,9 +46,73 @@ struct Cell {
 
 /// The cells of the servers of the configuration (`base`). Later slices add the servers
 /// created at run time next to it; one object shared by every table of the proxy.
+///
+/// The per-server `maxqueue` and queue length of the proxy, in one object:
+///
+/// - `max`: each server's load-only `maxqueue` (0 is unlimited, the default);
+/// - `queue`: the requests queued on each server now (`HAProxy`'s `srv->queueslength`).
+///
+/// Allocated only for a proxy that has a server with a positive `maxqueue` (at load) or
+/// that actually queues a request on one of its servers (on the first such queueing, at
+/// run time); every other proxy keeps no array, so a configuration of 60,000 backends
+/// costs nothing here. A request queued on a server keeps an [`SrvQueue`] by `Arc`, so it
+/// can count itself in and out, the counter included, when the backend's arrays are gone
+/// (`del backend` while it waits).
+#[derive(Debug, Default)]
+struct ServerQueueState {
+    max: Box<[u32]>,
+    queue: Box<[AtomicU32]>,
+}
+
+/// The cells of the servers of the configuration (`base`). Later slices add the servers
+/// created at run time next to it; one object shared by every table of the proxy.
+///
+/// `queue_max` holds the proxy's [`ServerQueueState`]; see it for why most proxies have
+/// none.
 #[derive(Debug, Default)]
 struct ServerCells {
     base: Box<[Cell]>,
+    queue_max: std::sync::OnceLock<Box<ServerQueueState>>,
+}
+
+/// One server's queue counter, by reference: the request queued on it keeps one so it can
+/// count itself in and out (`HAProxy`'s `srv->queueslength`), the counter included, when
+/// the backend's arrays are gone (`del backend` while it waits).
+#[derive(Clone)]
+pub(crate) struct SrvQueue {
+    cells: Arc<ServerCells>,
+    idx: usize,
+}
+
+impl SrvQueue {
+    /// This server's queue counter, creating the proxy's arrays on the first queueing. The
+    /// arrays cannot be derived at load time: whether any request ever queues on a server
+    /// without a `maxqueue` is decided at run time by the servers reaching their `maxconn`.
+    fn counter(&self) -> &AtomicU32 {
+        let n = self.cells.base.len();
+        let st = self
+            .cells
+            .queue_max
+            .get_or_init(|| {
+                Box::new(ServerQueueState {
+                    max: vec![0u32; n].into_boxed_slice(),
+                    queue: (0..n).map(|_| AtomicU32::new(0)).collect(),
+                })
+            });
+        &st.queue[self.idx]
+    }
+
+    /// One more request on this server's queue.
+    #[inline]
+    pub(crate) fn inc(&self) {
+        self.counter().fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One less.
+    #[inline]
+    pub(crate) fn dec(&self) {
+        self.counter().fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A slot is named by a sample fetch, a `use-server` target, or another server's `track`.
@@ -210,9 +274,31 @@ impl ServerArrays {
     /// The arrays of a section's `servers`.
     pub(crate) fn build(servers: &[alcyon_config::Server], extras: &alcyon_config::ast::ServerExtras, check_timeout: Option<Duration>) -> Self {
         let status = |i: usize, s: &alcyon_config::Server| AtomicU8::new(initial_status(s, extras.unresolved(i)));
-        let base = servers.iter().enumerate().map(|(i, s)| Cell { status: status(i, s), ..Cell::default() }).collect();
+        let base = servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Cell { status: status(i, s), ..Cell::default() })
+            .collect();
+        // The `maxqueue` values, when any server has one: built once here, at load. A
+        // proxy whose servers have no `maxqueue` and no queueing keeps no arrays at all.
+        let n = servers.len();
+        let queue_max = extras.maxqueue.iter().any(|&(_, m)| m > 0).then(|| {
+            let mut max = vec![0u32; n];
+            for &(i, m) in &extras.maxqueue {
+                if let Some(slot) = max.get_mut(i as usize) {
+                    *slot = m;
+                }
+            }
+            Box::new(ServerQueueState {
+                max: max.into_boxed_slice(),
+                queue: (0..n).map(|_| AtomicU32::new(0)).collect(),
+            })
+        });
         Self {
-            cells: Arc::new(ServerCells { base }),
+            cells: Arc::new(ServerCells {
+                base,
+                queue_max: queue_max.map(std::sync::OnceLock::from).unwrap_or_default(),
+            }),
             servers: servers.iter().map(|s| s.addr).collect(),
             server_ids: servers.iter().map(|s| s.id.clone()).collect(),
             server_cookies: servers.iter().map(|s| s.cookie.as_deref().map(Box::from)).collect(),
@@ -703,6 +789,32 @@ impl<'a> ServerSet<'a> {
     #[must_use]
     pub fn maxconn_at(&self, i: usize) -> Option<u32> {
         self.0.srv.server_maxconn.get(i)
+    }
+
+    /// Slot `i`'s `maxqueue`: 0 when it is unlimited (the default) or the proxy keeps no
+    /// arrays (no server has a `maxqueue` and none of them has queued a request yet).
+    #[inline]
+    #[must_use]
+    pub fn maxqueue_at(&self, i: usize) -> u32 {
+        self.0.srv.cells.queue_max.get().and_then(|st| st.max.get(i)).copied().unwrap_or(0)
+    }
+
+    /// The requests queued on slot `i` now (`HAProxy`'s `srv->queueslength`).
+    #[inline]
+    #[must_use]
+    pub fn queue_len(&self, i: usize) -> u32 {
+        self.0.srv.cells.queue_max.get().and_then(|st| st.queue.get(i)).map_or(0, |q| q.load(Ordering::Relaxed))
+    }
+
+    /// The reference a request queued on slot `i` keeps to count itself in and out;
+    /// `None` for a slot that is not a server.
+    #[must_use]
+    pub fn queue_ref(&self, i: usize) -> Option<SrvQueue> {
+        Some(SrvQueue {
+            cells: Arc::clone(&self.0.srv.cells),
+            idx: i,
+        })
+        .filter(|_| self.cell(i).is_some())
     }
 
     /// Whether slot `i` is a `backup` server.

@@ -59,6 +59,8 @@ pub struct DefaultServerConfig {
     pub send_proxy: bool,
     pub send_proxy_v2: bool,
     pub maxconn: Option<u32>,
+    /// `maxqueue`: the server's own queue cap; 0 (the default) is unlimited.
+    pub maxqueue: Option<u32>,
     /// `pool-max-conn`.
     pub pool_max_conn: Option<i32>,
     /// `max-reuse`.
@@ -380,6 +382,10 @@ pub struct ServerExtras {
     /// What `show servers state` reports as `srv_check_health` while no check runs on the
     /// server, when that is not 0; see `parse_server`.
     pub init_health: Vec<(u32, u32)>,
+    /// The `maxqueue` effective on each server that has one set (its own, or its
+    /// `default-server`'s), as `HAProxy`'s `srv->maxqueue`: 0 is unlimited, so only
+    /// positive limits are kept.
+    pub maxqueue: Vec<(u32, u32)>,
     /// The line of the `server` line of each server that has a `track`, for the alerts of
     /// the check after the parse (`unable to find required server ... for tracking`).
     pub track_line: Vec<(u32, u32)>,
@@ -400,6 +406,13 @@ pub struct ServerExtras {
 }
 
 impl ServerExtras {
+    /// The `maxqueue` on server `idx` after `default-server` inheritance: 0 (unlimited,
+    /// `HAProxy`'s default) when no positive one was written for it.
+    #[must_use]
+    pub fn maxqueue(&self, idx: usize) -> u32 {
+        self.maxqueue.iter().find(|(i, _)| *i as usize == idx).map_or(0, |(_, m)| *m)
+    }
+
     /// The name the address of server `idx` was written as, if it was one.
     #[must_use]
     pub fn fqdn(&self, idx: usize) -> Option<&str> {

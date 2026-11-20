@@ -798,6 +798,9 @@ pub struct ServerState {
     pub iweight: u32,
     /// T331: `srv_uweight`: the user weight as `set server weight` leaves it (`srv->uweight`).
     pub uweight: u32,
+    /// The requests queued on the server now (`srv->queueslength`), the one `maxqueue`
+    /// bounds.
+    pub queue_len: u32,
 }
 
 /// A frontend counter, for [`ProxyState::frontend_counter`].
@@ -909,6 +912,18 @@ pub trait ProxyState: std::fmt::Debug {
     /// in maintenance, weight above 0 -- or, when there are none, 1 if a backup is usable;
     /// `None` if no proxy with a backend named `backend` exists.
     fn usable_servers(&self, backend: &str) -> Option<i64>;
+    /// `smp_fetch_queue_size` (`px->totpend`): the streams queued in the backend's queue
+    /// and in the queues of all its servers (`pendconn_add` counts both in `totpend`);
+    /// `None` if there is no proxy named `backend`.
+    fn backend_queue(&self, backend: &str) -> Option<i64>;
+    /// `smp_fetch_avg_queue_size`: the backend's queue over its usable servers, rounded up;
+    /// the queue doubled when there are no usable servers.
+    fn backend_avg_queue(&self, backend: &str) -> Option<i64>;
+    /// `smp_fetch_connslots`: the free connection and queue slots over the servers that
+    /// are not stopped, `-1` when one of them has no `maxconn` or no `maxqueue`.
+    fn backend_connslots(&self, backend: &str) -> Option<i64>;
+    /// `smp_fetch_uptime`: the seconds since the process started.
+    fn process_uptime(&self) -> i64;
     /// `smp_fetch_be_conn_free`: the free connection slots over the servers that would take
     /// traffic, `-1` if one of them has no `maxconn`.
     fn backend_conn_free(&self, backend: &str) -> Option<i64>;
@@ -977,9 +992,6 @@ pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("fc_rttvar", "Alcyon does not read TCP_INFO"),
     ("bc_rtt", "Alcyon does not read TCP_INFO"),
     ("bc_rttvar", "Alcyon does not read TCP_INFO"),
-    ("queue", "Alcyon has no server queues"),
-    ("avg_queue", "Alcyon has no server queues"),
-    ("srv_queue", "Alcyon has no server queues"),
 ];
 
 /// Why `name` -- a fetch or a converter -- is in [`NOT_IMPLEMENTED`].
@@ -3370,8 +3382,7 @@ impl Registry {
             },
         });
         // The server and backend state fetches (`src/backend.c`). Their arguments are
-        // resolved when the configuration loads; `queue`, `avg_queue` and `srv_queue` are
-        // refused there instead (see [`NOT_IMPLEMENTED`]).
+        // resolved when the configuration loads.
         self.register_fetch(FetchDesc {
             name: "srv_is_up",
             out_type: SampleType::Bool,
@@ -3449,6 +3460,36 @@ impl Registry {
             name: "be_conn_free",
             out_type: SampleType::Sint,
             func: |ctx, args| ctx.proxies?.backend_conn_free(backend_arg(ctx, args)?).map(Sample::Sint),
+        });
+        // `smp_fetch_queue_size`, `smp_fetch_avg_queue_size` and `smp_fetch_connslots`
+        // (src/backend.c): the backend's queue (its own and the servers', `totpend`),
+        // that queue over the usable servers, and the free connection and queue slots.
+        self.register_fetch(FetchDesc {
+            name: "queue",
+            out_type: SampleType::Sint,
+            func: |ctx, args| ctx.proxies?.backend_queue(backend_arg(ctx, args)?).map(Sample::Sint),
+        });
+        self.register_fetch(FetchDesc {
+            name: "avg_queue",
+            out_type: SampleType::Sint,
+            func: |ctx, args| ctx.proxies?.backend_avg_queue(backend_arg(ctx, args)?).map(Sample::Sint),
+        });
+        self.register_fetch(FetchDesc {
+            name: "connslots",
+            out_type: SampleType::Sint,
+            func: |ctx, args| ctx.proxies?.backend_connslots(backend_arg(ctx, args)?).map(Sample::Sint),
+        });
+        // `smp_fetch_srv_queue`: the server's own queue, the one `maxqueue` bounds.
+        self.register_fetch(FetchDesc {
+            name: "srv_queue",
+            out_type: SampleType::Sint,
+            func: |ctx, args| server_fetch(ctx, args, |s| Sample::Sint(i64::from(s.queue_len))),
+        });
+        // `smp_fetch_uptime`: the seconds since the process started.
+        self.register_fetch(FetchDesc {
+            name: "uptime",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(ctx.proxies?.process_uptime())),
         });
         self.register_fetch(FetchDesc {
             name: "fe_conn",
@@ -5969,9 +6010,7 @@ impl Registry {
 
         // --- 8. Stick table, server and frontend converters ---
         //
-        // These read the runtime state, so they are context converters. The `table_*`
-        // family and `srv_queue` are not implemented and are refused at load
-        // ([`NOT_IMPLEMENTED`]); they used to be registered here returning 0.
+        // These read the runtime state, so they are context converters.
         self.register_ctx_converter(CtxConvDesc {
             name: "in_table",
             in_type: TypeSpec::Any,
@@ -6141,6 +6180,19 @@ impl Registry {
                 let name = input_str(smp)?;
                 let (be, srv) = server_arg(ctx, &name)?;
                 ctx.proxies?.server(be, srv).map(|s| Sample::Bool(s.is_up))
+            },
+        });
+
+        // `sample_conv_srv_queue`: `<backend>/<server>`, or `<server>` in the current
+        // backend; a name that resolves to nothing gives no sample.
+        self.register_ctx_converter(CtxConvDesc {
+            name: "srv_queue",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |ctx, smp, _args| {
+                let name = input_str(smp)?;
+                let (be, srv) = server_arg(ctx, &name)?;
+                ctx.proxies?.server(be, srv).map(|s| Sample::Sint(i64::from(s.queue_len)))
             },
         });
 

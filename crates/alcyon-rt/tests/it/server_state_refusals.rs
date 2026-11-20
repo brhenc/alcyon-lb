@@ -14,12 +14,10 @@
 //!   'be', referenced in arg 1 of sample fetch keyword 'srv_is_up' ...`), and every
 //!   `ACCEPTED` rule exits 0. `src_trackers` and `src_in_table` are not `HAProxy` fetches
 //!   ("unknown fetch method").
-//! * **Alcyon has not implemented it.** `HAProxy` accepts every `NOT_IMPLEMENTED` rule (exit
-//!   0, same measurement). Alcyon has no server queues, keeps no tracker count on a
-//!   stick-table entry, and has only the `table_*` converters that read a counter. These
-//!   used to load and evaluate to a constant 0 or 1. They are refused now, naming what is
-//!   missing, wherever the expression appears: an ACL, an inline condition, a log-format,
-//!   a rule action, `http-check send`.
+//! The queue fetches (`queue`, `avg_queue`, `srv_queue` and its converter) and the tracker
+//! counts used to be refused because Alcyon did not keep the state; they are implemented
+//! now, and the `ACCEPTED` rows carry them with their `HAProxy`-accepted spellings, an ACL,
+//! an inline condition, a rule action and `http-check send` among them.
 
 use std::process::Command;
 
@@ -93,16 +91,14 @@ const ACCEPTED: &[(&str, &str)] = &[
     // to be refused as "Alcyon does not count the streams on a backend".
     ("http-request set-var(txn.x) be_conn(be)", ""),
     ("", "http-request set-header x %[be_conn]"),
-];
-
-/// `(frontend rule, backend rule, the keyword the error must name)`.
-const NOT_IMPLEMENTED: &[(&str, &str, &str)] = &[
-    ("use_backend be if { queue(be) gt 1 }", "", "queue"),
-    ("acl q avg_queue(be) gt 1\n  use_backend be if q", "", "avg_queue"),
-    ("http-request set-header x %[srv_queue(be/s1)]", "", "srv_queue"),
-    ("http-request set-header x %[str(be/s1),srv_queue]", "", "srv_queue"),
-    ("http-request set-var(txn.x) str(be/s1),srv_queue", "", "srv_queue"),
-    ("", "option httpchk\n  http-check send hdr x %[queue]", "queue"),
+    // The queue fetches and the `srv_queue` converter, implemented with the server's queue:
+    // an ACL, an inline condition, a rule action, `http-check send`, and the converter.
+    ("use_backend be if { queue(be) gt 1 }", ""),
+    ("acl q avg_queue(be) gt 1\n  use_backend be if q", ""),
+    ("http-request set-header x %[srv_queue(be/s1)]", ""),
+    ("http-request set-header x %[str(be/s1),srv_queue]", ""),
+    ("http-request set-var(txn.x) str(be/s1),srv_queue", ""),
+    ("", "option httpchk\n  http-check send hdr x %[queue]"),
 ];
 
 #[test]
@@ -121,18 +117,6 @@ fn alcyon_c_resolves_backend_server_and_table_arguments_as_haproxy_does() {
         }
     }
     assert!(wrong.is_empty(), "{} of {} cases differ from HAProxy:\n{}", wrong.len(), ARG_REFUSED.len() + ACCEPTED.len(), wrong.join("\n"));
-}
-
-#[test]
-fn alcyon_c_refuses_what_alcyon_does_not_implement_instead_of_returning_a_constant() {
-    let mut wrong = Vec::new();
-    for (i, &(fe, be, kw)) in NOT_IMPLEMENTED.iter().enumerate() {
-        let (code, text) = check(200 + i, &config(fe, be));
-        if code != Some(1) || !text.contains(&format!("'{kw}'")) || !text.contains("not implemented in Alcyon") {
-            wrong.push(format!("fe `{fe}` be `{be}`: exit {code:?}, wanted 1 naming '{kw}' as not implemented in Alcyon; got {text:?}"));
-        }
-    }
-    assert!(wrong.is_empty(), "{} of {} loaded, or were refused without saying why:\n{}", wrong.len(), NOT_IMPLEMENTED.len(), wrong.join("\n"));
 }
 
 /// The timeouts every configuration below starts its sections with.

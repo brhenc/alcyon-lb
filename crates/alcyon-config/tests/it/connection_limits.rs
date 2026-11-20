@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 
-//! `maxsslconn` (global) and `maxqueue` (server) reach no data path in Alcyon: there is no
-//! count of TLS connections to cap, and no per-server queue (a request waits in its
-//! backend's queue). Both were accepted and dropped (T240 item 4); a limit is now
-//! refused, and 0 -- HAProxy's "no limit" (`atol`, so also a word) -- is accepted, since
-//! that is what Alcyon does. The syntax errors are HAProxy's (3.5-dev8, `haproxy -c`).
+//! `maxsslconn` (global) reaches no data path in Alcyon: there is no count of TLS
+//! connections to cap. It was accepted and dropped (T240 item 4); a limit is now refused,
+//! and 0 -- HAProxy's "no limit" (`atol`, so also a word) -- is accepted, since that is
+//! what Alcyon does. The syntax errors are HAProxy's (3.5-dev8, `haproxy -c`).
+//!
+//! `maxqueue` (server) reaches the data path: the queue a request the balancing assigned
+//! to the server takes when it is at its `maxconn` (`alcyon-rt`'s `pendconn_add`) is
+//! bounded by it, `SRV_STATUS_FULL` otherwise. The value, and 0 for unlimited, load.
 
 use alcyon_config::parse_str;
 
@@ -38,14 +41,31 @@ fn maxsslconn_syntax_errors_are_haproxys() {
 }
 
 #[test]
-fn a_server_maxqueue_limit_is_refused_and_zero_loads() {
-    let m = refusal("backend b\n server s 127.0.0.1:1 maxqueue 10\n");
-    assert!(m.contains("'maxqueue' is not supported: Alcyon has no per-server queue"), "{m}");
-    assert!(parse_str("backend b\n server s 127.0.0.1:1 maxqueue 0\n").is_ok());
+fn a_server_maxqueue_limit_loads_and_reaches_the_ast() {
+    let cfg = parse_str("backend b\n server s 127.0.0.1:1 maxconn 1 maxqueue 10\n").unwrap();
+    assert_eq!(cfg.backends[0].server_extras.maxqueue(0), 10);
+    // 0 (unlimited) loads and stays 0.
+    let cfg = parse_str("backend b\n server s 127.0.0.1:1 maxqueue 0\n").unwrap();
+    assert_eq!(cfg.backends[0].server_extras.maxqueue(0), 0);
     assert!(parse_str("backend b\n default-server maxqueue 0\n server s 127.0.0.1:1\n").is_ok());
-    // `atol` takes a leading `+`: `+5` is a limit of 5, refused as well.
-    let m = refusal("backend b\n server s 127.0.0.1:1 maxqueue +5\n");
-    assert!(m.contains("'maxqueue' is not supported"), "{m}");
-    let m = refusal("backend b\n default-server maxqueue 5\n server s 127.0.0.1:1\n");
-    assert!(m.contains("'maxqueue' is not supported"), "{m}");
+    // `atol` takes a leading `+`: `+5` is a limit of 5.
+    let cfg = parse_str("backend b\n server s 127.0.0.1:1 maxqueue +5\n").unwrap();
+    assert_eq!(cfg.backends[0].server_extras.maxqueue(0), 5);
+    // `default-server` sets it for the servers that follow.
+    let cfg = parse_str("backend b\n default-server maxqueue 5\n server s 127.0.0.1:1\n").unwrap();
+    assert_eq!(cfg.backends[0].server_extras.maxqueue(0), 5);
+    // The same integer as `maxconn`: a non-numeric value is refused.
+    assert_eq!(
+        refusal("backend b\n server s 127.0.0.1:1 maxqueue abc\n"),
+        "<maxqueue> expects an integer argument."
+    );
+    // No argument at all: refused, as in `HAProxy` (`expect_integer`).
+    assert_eq!(
+        refusal("backend b\n server s 127.0.0.1:1 maxqueue\n"),
+        "'server s' : 'maxqueue' expects an integer argument."
+    );
+    assert_eq!(
+        refusal("backend b\n default-server maxqueue\n"),
+        "'maxqueue' expects an integer argument."
+    );
 }
