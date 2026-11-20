@@ -226,14 +226,14 @@ fn cycle(
     // r2b is assigned: queued on s1b's server queue. The slot shows in `connslots`
     // (s1b: (1-1)+(1-1)=0; s2b is still free: (1-0)+(1-0)=2).
     let r2b = client(fe2, get_cookie, &["200 OK", "503 "]);
-    let _ = probe_until(pe, probe, &[("x-q2", "1"), ("x-c2", "2")], 5000, &format!("cycle {cycle}: r2b in s1b's queue"));
+    let _ = probe_until(pe, probe, &[("x-q2", "1"), ("x-aq2", "1"), ("x-c2", "2")], 5000, &format!("cycle {cycle}: r2b in s1b's queue"));
     // r2c is assigned with the queue full: not refused (option redispatch) -- the balancer
     // is asked again and gives it the free s2b. Wait for that to settle: the slot shows
     // in `connslots` (s2b: (1-1)+(1-0)=1) and b2's queue still holds only r2b, so the
     // redispatch's success is the only way to read this: the re-pick of `s2b` is not left
     // to the arrival order of the clients.
     let r2c = client(fe2, get_cookie, &["200 OK", "503 "]);
-    let _ = probe_until(pe, probe, &[("x-q2", "1"), ("x-c2", "1")], 5000, &format!("cycle {cycle}: r2c redispatched to s2b"));
+    let _ = probe_until(pe, probe, &[("x-q2", "1"), ("x-aq2", "1"), ("x-c2", "1")], 5000, &format!("cycle {cycle}: r2c redispatched to s2b"));
     // r2d is assigned to s2b (cookie): the server is at maxconn (r2c) and its queue has
     // room, so r2d is queued on s2b.
     let r2d = client(fe2, get_cookie2, &["200 OK", "503 "]);
@@ -244,7 +244,7 @@ fn cycle(
     // maxqueue+1 until the drain, and `connslots` underflows (measured: 4294967295).
     // Sending r2e only after r2d's enqueue is visible keeps both binaries on the
     // deterministic path: r2e finds s2b's queue full.
-    let _ = probe_until(pe, probe, &[("x-q2", "2"), ("x-c2", "0")], 5000, &format!("cycle {cycle}: r2d in s2b's queue"));
+    let _ = probe_until(pe, probe, &[("x-q2", "2"), ("x-aq2", "1"), ("x-c2", "0")], 5000, &format!("cycle {cycle}: r2d in s2b's queue"));
     // r2e is assigned to s2b with the queue full: `option redispatch` asks the balancer
     // again, but every server is at its maxconn, so it gives up and r2e waits in b2's
     // proxy queue, where maxqueue does not limit it.
@@ -353,6 +353,142 @@ fn queue_fetches_match_the_oracle() {
 
     for c in 0..CYCLES {
         cycle(c, fe, fe2, pe, release.clone(), accepted.clone(), get, get_cookie, get_cookie2, probe);
+    }
+
+    common::stop(&mut child);
+}
+
+#[test]
+fn connslots_down_backup_and_avg_queue_match_the_oracle() {
+    let bin = std::env::var("T281_ORACLE")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_alcyon").to_string());
+
+    let fe_zero = common::reserve_addr();
+    let fe_bak = common::reserve_addr();
+    let pe = common::reserve_addr();
+    let release = Arc::new(AtomicU64::new(0));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let be = held_backend(release.clone(), accepted.clone());
+
+    let mut cfg = NamedTempFile::new().expect("tmp");
+    write!(
+        cfg,
+        "defaults\n  mode http\n  timeout connect 3s\n  timeout client 30s\n  timeout server 30s\n\
+         timeout queue 30s\n\
+         frontend fz\n  bind {fe_zero}\n  default_backend b_zero\n\
+         frontend fb\n  bind {fe_bak}\n  default_backend b_bak_down\n\
+         frontend p\n  bind {pe}\n  http-request return status 200 \
+         hdr x-d-up2 \"%[srv_is_up(b_down/s2)]\" hdr x-d-up3 \"%[srv_is_up(b_down/s3)]\" \
+         hdr x-d-cs \"%[connslots(b_down)]\" \
+         hdr x-b-nb \"%[nbsrv(b_bak)]\" hdr x-b-cs \"%[connslots(b_bak)]\" \
+         hdr x-bd-up1 \"%[srv_is_up(b_bak_down/s1)]\" hdr x-bd-nb \"%[nbsrv(b_bak_down)]\" \
+         hdr x-bd-cs \"%[connslots(b_bak_down)]\" hdr x-bd-q \"%[queue(b_bak_down)]\" hdr x-bd-aq \"%[avg_queue(b_bak_down)]\" \
+         hdr x-z-nb \"%[nbsrv(b_zero)]\" hdr x-z-cs \"%[connslots(b_zero)]\" \
+         hdr x-z-q \"%[queue(b_zero)]\" hdr x-z-aq \"%[avg_queue(b_zero)]\"\n\
+         backend b_down\n\
+           server s1 {be} maxconn 2 maxqueue 3\n\
+           server s2 127.0.0.1:1 maxconn 5 maxqueue 5 check inter 50ms fall 1\n\
+           server s3 127.0.0.1:2 check inter 50ms fall 1\n\
+         backend b_bak\n\
+           server s1 {be} maxconn 1 maxqueue 1\n\
+           server sb {be} maxconn 2 maxqueue 4 backup\n\
+         backend b_bak_down\n\
+           server s1 127.0.0.1:1 maxconn 3 maxqueue 3 check inter 50ms fall 1\n\
+           server sb {be} maxconn 1 maxqueue 2 backup\n\
+         backend b_zero\n\
+           cookie srv insert\n\
+           server s1 {be} weight 0 maxconn 1 maxqueue 2 cookie c1\n"
+    )
+    .expect("write");
+
+    let mut child = Command::new(&bin)
+        .arg("-f")
+        .arg(cfg.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    assert!(common::wait_listening(pe), "proxy never opened the probe port");
+    assert!(common::wait_listening(fe_zero), "proxy never opened fe_zero");
+    assert!(common::wait_listening(fe_bak), "proxy never opened fe_bak");
+
+    let probe = "GET /p HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    let get = "GET /a HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    let get_cookie = "GET /z HTTP/1.1\r\nHost: t\r\nCookie: srv=c1\r\nConnection: close\r\n\r\n";
+
+    // Wait for health checks on 127.0.0.1:1 / :2 to mark the Down servers SRV_ST_STOPPED.
+    // Once Down:
+    // - b_down skips s2 (maxconn 5 maxqueue 5) AND s3 (no maxconn/maxqueue -> would be -1),
+    //   leaving only s1: 2 + 3 = 5.
+    // - b_bak has active s1 (1+1) and backup sb (2+4): nbsrv = 1, connslots = 8.
+    // - b_bak_down skips Down s1, leaving backup sb: nbsrv = 1, connslots = 1 + 2 = 3.
+    // - b_zero has weight 0 s1 (still Up): nbsrv = 0, connslots = 1 + 2 = 3.
+    let _ = probe_until(
+        pe,
+        probe,
+        &[
+            ("x-d-up2", "0"),
+            ("x-d-up3", "0"),
+            ("x-d-cs", "5"),
+            ("x-b-nb", "1"),
+            ("x-b-cs", "8"),
+            ("x-bd-up1", "0"),
+            ("x-bd-nb", "1"),
+            ("x-bd-cs", "3"),
+            ("x-z-nb", "0"),
+            ("x-z-cs", "3"),
+        ],
+        5000,
+        "health checks settled",
+    );
+
+    // Hold connections to test avg_queue with nbsrv == 0 (totpend * 2) and backup queueing.
+    release.fetch_add(1, Ordering::SeqCst);
+    accepted.store(0, Ordering::SeqCst);
+
+    let z1 = client(fe_zero, get_cookie, &["200 OK"]);
+    let b1 = client(fe_bak, get, &["200 OK"]);
+    for _ in 0..400 {
+        if accepted.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(accepted.load(Ordering::SeqCst), 2, "backend holds both z1 and b1");
+
+    // Queue 1 on b_zero (cookie-assigned -> s1's server queue, nbsrv == 0 -> avg_queue = totpend * 2 = 2)
+    // and 1 on b_bak_down (unassigned -> proxy queue, so sb's 2 maxqueue slots remain free: connslots = 2).
+    let z2 = client(fe_zero, get_cookie, &["200 OK", "503 "]);
+    let b2 = client(fe_bak, get, &["200 OK", "503 "]);
+    let _ = probe_until(
+        pe,
+        probe,
+        &[
+            ("x-z-q", "1"),
+            ("x-z-aq", "2"),
+            ("x-z-cs", "1"),
+            ("x-bd-q", "1"),
+            ("x-bd-aq", "1"),
+            ("x-bd-cs", "2"),
+        ],
+        5000,
+        "one queued in b_zero and one in b_bak_down",
+    );
+
+    // Queue a second request on b_zero (totpend == 2, nbsrv == 0 -> avg_queue = 4, connslots = 0).
+    let z3 = client(fe_zero, get_cookie, &["200 OK", "503 "]);
+    let _ = probe_until(
+        pe,
+        probe,
+        &[("x-z-q", "2"), ("x-z-aq", "4"), ("x-z-cs", "0")],
+        5000,
+        "two queued in b_zero",
+    );
+
+    release.store(0, Ordering::SeqCst);
+    for (name, h) in [("z1", z1), ("z2", z2), ("z3", z3), ("b1", b1), ("b2", b2)] {
+        let out = h.join().unwrap();
+        assert_eq!(status(&out), 200, "{name} should return 200 after release: {out:?}");
     }
 
     common::stop(&mut child);

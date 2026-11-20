@@ -230,6 +230,10 @@ pub struct BindConfig {
     pub proto: Option<String>,
     pub accept_proxy: bool,
     pub accept_proxy_v2: bool,
+    /// `accept-netscaler-cip <magic>`: connections the bind accepts start with a NetScaler
+    /// Client IP header whose first 4 bytes are the magic. `None` when the bind sets none
+    /// (0 when the rule that expects one reads it, as in `HAProxy`).
+    pub accept_netscaler_cip: Option<u32>,
     /// `name <n>`: what `so_name` reads on connections this bind accepted.
     pub name: Option<String>,
     /// `id <n>`: the listener's explicit numeric id, what `so_id` reads. `None` takes the

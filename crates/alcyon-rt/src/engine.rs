@@ -25,7 +25,7 @@ use crate::syslog::SyslogTarget;
 use crate::srv_set::{ServerArrays, ServerIdArrays};
 use alcyon_config::LogLevel;
 use crate::txn::MsgState;
-use crate::proxy::{sess_flags, AcceptProxy, ClientProto, TcpSession, Timeouts};
+use crate::proxy::{sess_flags, ClientProto, TcpSession, Timeouts};
 use crate::raw;
 use alcyon_config::{BalanceAlgorithm, Config, Mode, StickRule, UseBackendRule};
 use alcyon_proto::endpoint::ScState;
@@ -4254,6 +4254,24 @@ fn proxy_header_failure(s: &TcpSession) -> Option<crate::proxy::ProxyHdrError> {
     matches!(s.ending?, Ending::Timeout(crate::proxy::Which::Client)).then_some(ProxyHdrError::Timeout)
 }
 
+/// Why a connection that was to open with a NetScaler Client IP header did not get past
+/// it, if that is what happened: the parser's refusal, or the client closing, resetting
+/// or timing out before sending one.
+fn cip_header_failure(s: &TcpSession) -> Option<crate::proxy::CipError> {
+    use crate::proxy::{CipError, Ending};
+    let Some(c) = s.cip_state() else {
+        return None;
+    };
+    if c.done {
+        return None;
+    }
+    if let Some(e) = c.err {
+        return Some(e);
+    }
+    // The header's reads end in the refusal themselves; what is left is the timer.
+    matches!(s.ending?, Ending::Timeout(crate::proxy::Which::Client)).then_some(CipError::Timeout)
+}
+
 /// Why a connection ended before a session began: the message of `HAProxy`'s line, whether
 /// `option dontlognull` drops it, and what `fc_err` and the like read in an
 /// `error-log-format`.
@@ -4284,6 +4302,17 @@ impl EmbryonicFailure {
 /// header, or a TLS handshake that failed.
 fn embryonic_failure(s: &TcpSession) -> Option<EmbryonicFailure> {
     if let Some(why) = proxy_header_failure(s) {
+        return Some(EmbryonicFailure {
+            message: why.message().to_string(),
+            null: why.is_null(),
+            code: why.code(),
+            name: why.name(),
+            text: why.message(),
+            tls: false,
+            ssl: None,
+        });
+    }
+    if let Some(why) = cip_header_failure(s) {
         return Some(EmbryonicFailure {
             message: why.message().to_string(),
             null: why.is_null(),
@@ -4777,6 +4806,7 @@ fn frontend_binds(frontend: &alcyon_config::FrontendSection) -> Vec<alcyon_confi
                 proto: None,
                 accept_proxy: frontend.accept_proxy,
                 accept_proxy_v2: frontend.accept_proxy_v2,
+                accept_netscaler_cip: None,
                 name: None,
                 id: None,
                 min_ver: None,
@@ -5642,6 +5672,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     proto: None,
                     accept_proxy: listen.accept_proxy,
                     accept_proxy_v2: listen.accept_proxy_v2,
+                    accept_netscaler_cip: None,
                     name: None,
                     id: None,
                     min_ver: None,
@@ -5663,6 +5694,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     listener.name = b.name.as_deref().map(Into::into);
                     listener.accept_proxy = b.accept_proxy || b.accept_proxy_v2;
                     listener.accept_proxy_v2 = b.accept_proxy_v2;
+                    listener.accept_netscaler_cip = b.accept_netscaler_cip;
                     listener.proto_h2 = b.proto.as_deref() == Some("h2");
                     listener.tls.clone_from(&tls);
                     let l_idx = listeners.len();
@@ -5697,9 +5729,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
                         listener.maxconn = proxies[proxy_idx].maxconn.clone();
                         listener.name = b.name.as_deref().map(Into::into);
-                    listener.accept_proxy = b.accept_proxy || b.accept_proxy_v2;
-                    listener.accept_proxy_v2 = b.accept_proxy_v2;
-                    listener.proto_h2 = b.proto.as_deref() == Some("h2");
+                        listener.accept_proxy = b.accept_proxy || b.accept_proxy_v2;
+                        listener.accept_proxy_v2 = b.accept_proxy_v2;
+                        listener.accept_netscaler_cip = b.accept_netscaler_cip;
+                        listener.proto_h2 = b.proto.as_deref() == Some("h2");
                         listener.tls.clone_from(&tls);
                         let l_idx = listeners.len();
                         let lfd = listener.raw_fd();
@@ -6360,7 +6393,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 let mut tracked: [Option<(usize, StickKey)>; 3] = [None, None, None];
                 let emit = LogEmit { targets: &self.log_targets, tag: &self.log_tag, pid: self.pid };
                 let admitted = match eval_tcp_req_conn_rules(&self.proxies[proxy_idx], &self.proxies, sample_registry(), peer, local, Some(&mut tracked), emit) {
-                    ConnEvalOutcome::Accept(c, s, fs, fd, _) => Some((c, s, fs, fd)),
+                    ConnEvalOutcome::Accept(c, s, fs, fd, _, _) => Some((c, s, fs, fd)),
                     ConnEvalOutcome::Reject | ConnEvalOutcome::SilentDrop(_) => {
                         self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
                         None
@@ -6395,7 +6428,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         maxrewrite,
                         flood,
                         false,
-                        (false, false),
+                        false,
+                        (false, false, None),
                         lb_snap,
                         emit,
                     )
@@ -7392,7 +7426,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
             // 2. `tcp-request connection` rules, `track-sc*` among them, in rule order.
             let emit = LogEmit { targets: &self.log_targets, tag: &self.log_tag, pid: self.pid };
-            let (client_addr, server_addr, fc_src, fc_dst, expect_proxy) = match eval_tcp_req_conn_rules(
+            let (client_addr, server_addr, fc_src, fc_dst, expect_proxy, expect_cip) = match eval_tcp_req_conn_rules(
                 &self.proxies[proxy_idx],
                 &self.proxies,
                 sample_registry(),
@@ -7401,7 +7435,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 Some(&mut tracked_sc),
                 emit,
             ) {
-                ConnEvalOutcome::Accept(c, s, fs, fd, ep) => (c, s, fs, fd, ep),
+                ConnEvalOutcome::Accept(c, s, fs, fd, ep, ec) => (c, s, fs, fd, ep, ec),
                 ConnEvalOutcome::Reject => {
                     raw::abort_with_rst(cli_fd.as_fd());
                     self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
@@ -7488,6 +7522,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 fc_dst,
                 tracked_sc,
                 expect_proxy,
+                expect_cip,
                 quic_ack,
             );
         }
@@ -7845,8 +7880,9 @@ fn with_port(addr: Option<SocketAddr>, port: u16) -> SocketAddr {
 
 #[derive(Debug)]
 enum ConnEvalOutcome {
-    /// Client, server, `fc_src`, `fc_dst`, and whether `expect-proxy` matched.
-    Accept(SocketAddr, SocketAddr, SocketAddr, SocketAddr, bool),
+    /// Client, server, `fc_src`, `fc_dst`, and whether `expect-proxy` or
+    /// `expect-netscaler-cip` matched.
+    Accept(SocketAddr, SocketAddr, SocketAddr, SocketAddr, bool, bool),
     Reject,
     /// `silent-drop`; the TTL of the RST (`rst-ttl`, 0 without it: `TCP_REPAIR` first, then 1).
     SilentDrop(u8),
@@ -7866,7 +7902,7 @@ enum SessionEvalOutcome {
 /// and timeouts are. A refusal has the connection-error line of a bad header, with the
 /// text "Success" (`ProxyHdrError::SessionRefused`).
 fn run_deferred_session_rules(proxy_idx: usize, proxies: &crate::table::Table, sess: &mut TcpSession, emit: LogEmit<'_>) {
-    if !sess.flags.has(sess_flags::SESSION_RULES_PENDING) || sess.accept_proxy != AcceptProxy::Done || sess.is_done() {
+    if !sess.flags.has(sess_flags::SESSION_RULES_PENDING) || sess.handshake_pending() || sess.is_done() {
         return;
     }
     sess.flags.clear(sess_flags::SESSION_RULES_PENDING);
@@ -7900,6 +7936,7 @@ fn eval_tcp_req_conn_rules(
     let mut fc_src = peer_addr;
     let mut fc_dst = local_addr;
     let mut expect_proxy = false;
+    let mut expect_cip = false;
 
     let stick = StickView::new(proxies, tracked.as_deref().unwrap_or(&[None, None, None]));
     let mut ctx = alcyon_sample::PhaseCtx {
@@ -7933,6 +7970,9 @@ fn eval_tcp_req_conn_rules(
             }
             alcyon_config::TcpReqConnAction::ExpectProxy => {
                 expect_proxy = true;
+            }
+            alcyon_config::TcpReqConnAction::ExpectNetscalerCip => {
+                expect_cip = true;
             }
             // In rule order: an earlier `accept` or `reject` ends the list before it, and the
             // key is read from the address as the rules before it left it. A slot that tracks an
@@ -8018,7 +8058,7 @@ fn eval_tcp_req_conn_rules(
             _ => {}
         }
     }
-    ConnEvalOutcome::Accept(client_addr, server_addr, fc_src, fc_dst, expect_proxy)
+    ConnEvalOutcome::Accept(client_addr, server_addr, fc_src, fc_dst, expect_proxy, expect_cip)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8840,6 +8880,7 @@ fn register_new_session(
     fc_dst: SocketAddr,
     tracked_sc: [Option<(usize, StickKey)>; 3],
     expect_proxy: bool,
+    expect_cip: bool,
     quic_ack: Option<crate::proxy::QuicAckSrc>,
 ) {
     // Cloned out before `proxies` is borrowed mutably. TLS belongs to the bind that
@@ -8870,9 +8911,10 @@ fn register_new_session(
         engine.global_maxrewrite,
         engine.global_h2_flood_config,
         expect_proxy,
+        expect_cip,
         listener_idx
             .and_then(|i| engine.listeners.get(i))
-            .map_or((false, false), |l| (l.accept_proxy, l.accept_proxy_v2)),
+            .map_or((false, false, None), |l| (l.accept_proxy, l.accept_proxy_v2, l.accept_netscaler_cip)),
         &mut engine.lb_snap,
         emit,
     ) else {
@@ -9165,7 +9207,8 @@ fn init_client_session(
     global_maxrewrite: usize,
     global_h2_flood_config: alcyon_proto::H2FloodConfig,
     expect_proxy: bool,
-    bind_proxy: (bool, bool),
+    expect_cip: bool,
+    bind_proxy: (bool, bool, Option<u32>),
     lb_snap: &mut crate::lb::LbSnapCache,
     emit: LogEmit<'_>,
 ) -> Option<(TcpSession, Option<SocketAddr>, Option<RawFd>)> {
@@ -9232,10 +9275,17 @@ fn init_client_session(
         // `tcp-request connection expect-proxy layer4` matched: v1 or v2, as `accept-proxy`.
         sess.enable_accept_proxy(false);
     }
+    // `accept-netscaler-cip` belongs to the bind that accepted, likewise; a
+    // `tcp-request connection expect-netscaler-cip` that matched reads the magic the
+    // bind declares, 0 when it declares none.
+    if bind_proxy.2.is_some() || expect_cip {
+        sess.enable_accept_netscaler_cip(bind_proxy.2.unwrap_or(0));
+    }
 
     let registry = sample_registry();
-    // With a PROXY header to come, the rules wait for it (`run_deferred_session_rules`).
-    let session_rules = if sess.accept_proxy.is_pending() {
+    // With a PROXY header or a NetScaler Client IP header to come, the rules wait for
+    // it (`run_deferred_session_rules`).
+    let session_rules = if sess.handshake_pending() {
         sess.flags.set(sess_flags::SESSION_RULES_PENDING);
         sess.flags.set(sess_flags::RARE_ARMED);
         SessionEvalOutcome::Accept
@@ -9267,7 +9317,7 @@ fn init_client_session(
     let use_server = use_server.or_else(|| {
         let p = &proxies[proxy_idx];
         let direct = mode == Mode::Tcp
-            && !sess.accept_proxy.is_pending()
+            && !sess.handshake_pending()
             && p.tcp_req_inspect_delay.is_none()
             && p.tcp_req_content_rules.is_empty()
             && p.use_backends.is_empty()
@@ -9298,7 +9348,7 @@ fn init_client_session(
         sess.cli_state = ScState::ShutR;
         sess.srv_state = ScState::Closed;
     } else if mode == Mode::Tcp
-        && !sess.accept_proxy.is_pending()
+        && !sess.handshake_pending()
         && sess.flags.has(sess_flags::TCP_INSPECT_DONE)
         // A proxy that routes (`use_backend`, `default_backend`) connects once the backend
         // is resolved (`connect_tcp_backend`): its own server list is not the one to use.
@@ -10939,9 +10989,14 @@ impl EngineDispatcher<'_> {
                 // `timeout client` before a request head is complete: HAProxy answers 408
                 // (`h1_handle_req_tout`, `src/mux_h1.c`) from the frontend's pages, also on
                 // a new connection that sent nothing. Only a keep-alive connection waiting
-                // for its next request, with nothing of one on it, closes silently.
+                // for its next request, with nothing of one on it, closes silently. A
+                // connection still waiting for its PROXY or NetScaler Client IP header is
+                // embryonic for `HAProxy` (no session yet): its timeout is the embryonic
+                // kill, no page (measured: the oracle closes a silent client on an
+                // `accept-proxy` and an `accept-netscaler-cip` bind with no bytes).
                 if entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Client))
                     && (!entry.sess.req.is_empty() || entry.sess.flags.has(sess_flags::IS_FIRST_REQ))
+                    && !entry.sess.handshake_pending()
                 {
                     let fe = &proxies[entry.proxy_idx];
                     let mut page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
@@ -12155,7 +12210,7 @@ impl EngineDispatcher<'_> {
             if entry.sess.flags.has(sess_flags::RARE_ARMED) {
                 alcyon_sample::work::note(alcyon_sample::work::Op::RareCheck, 1);
             }
-            if entry.sess.flags.has(sess_flags::RARE_ARMED) && entry.connect_log_due && !entry.sess.accept_proxy.is_pending() && entry.sess.cli_xprt.is_ready() {
+            if entry.sess.flags.has(sess_flags::RARE_ARMED) && entry.connect_log_due && !entry.sess.handshake_pending() && entry.sess.cli_xprt.is_ready() {
                 entry.connect_log_due = false;
                 let fe = &self.proxies[entry.proxy_idx];
                 let unknown = SocketAddr::from(([0, 0, 0, 0], 0));
@@ -12437,7 +12492,7 @@ impl EngineDispatcher<'_> {
             // Step 3.6: If in TCP mode and server not yet connected (e.g. deferred on accept-proxy or inspect), connect once ready
             if entry.sess.mode == Mode::Tcp
                 && entry.sess.srv_state == ScState::Init
-                && !entry.sess.accept_proxy.is_pending()
+                && !entry.sess.handshake_pending()
                 && entry.sess.flags.has(sess_flags::TCP_INSPECT_DONE)
                 && !entry.sess.is_done()
                 // A retry waiting out its turnaround connects in step 2 when it is over.

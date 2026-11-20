@@ -117,10 +117,10 @@ impl ProxyState for ProxiesView<'_> {
         let p = self.backend(backend)?;
         let mut slots = 0i64;
         for i in 0..p.srv_set().len() {
-            // `SRV_ST_STOPPED`: `disabled` in the file, and the CLI's `set server-state`
-            // maintenance. A server down by its check alone is counted, as it still is in
-            // `HAProxy`, where the check and the lifecycle are apart.
-            if status(p, i) == ServerStatus::Maint {
+            // `SRV_ST_STOPPED` (`src/backend.c` `smp_fetch_connslots`): skip servers in
+            // maintenance (`disabled` / `Maint`) and servers stopped by health check
+            // (`Down`), matching `is_up`.
+            if !is_up(p, i) {
                 continue;
             }
             let maxconn = p.srv_set().at(i).and_then(|s| s.maxconn()).unwrap_or(0);
