@@ -2943,6 +2943,17 @@ impl TcpSession {
         } else {
             txn::MsgState::Body(txn::Body::Length(raw.len() as u64))
         };
+        // `res.bytes_out` of a reply the proxy made in place of the server's is twice what a
+        // relay of the same bytes would count as `%B` (measured on the oracle): the head as
+        // `HAProxy` counts a server's (`HeadFacts`), plus the body it carries. Only when no
+        // server's response was counted already: an `http-response` rule that replaces one
+        // leaves `%B` the server's message, and `rsp_htx` still holds it.
+        if txn.rsp_htx.is_none() && !raw.is_empty() {
+            let hl = find_eoh(raw).map_or(raw.len(), |(h, e)| h + e);
+            if let Some(f) = crate::txn::HeadFacts::scan(&raw[..hl], false) {
+                txn.rsp_htx = Some(f.size + (raw.len() - hl) as u64);
+            }
+        }
         self.rep.clear();
         if !self.rep.alloc_for(crate::buf_wait::Class::MuxTx) {
             // At `tune.buffers.limit` the reply waits for a buffer (S6b, `DB_MUX_TX`, the most

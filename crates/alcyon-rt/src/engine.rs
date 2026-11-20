@@ -3329,6 +3329,13 @@ fn waiting_entity_of(w: &crate::txn::BodyWait, rules: &[alcyon_config::HttpReqRu
 fn stream_facts(sess: &TcpSession, status: Option<u16>, timers: bool) -> alcyon_sample::StreamFacts {
     let log = &sess.strm.log;
     let used = sess.max_retries.saturating_sub(sess.conn_retries);
+    // The four byte counters `bytes_in`/`bytes_out`/`req.*`/`res.*` read (`logs`, stream.c):
+    // the same `%U` and `%B` the log prints, plus the other direction each way. A reply the
+    // proxy made in place of the server's never reached a server (no `req_out`) and is counted
+    // twice to the client (`res_out`, measured on the oracle).
+    let req_in = stream_bytes_in(sess);
+    let res_in = stream_bytes_out(sess);
+    let (local, rsp_htx) = sess.strm.txn.as_ref().map_or((false, None), |t| (t.local, t.rsp_htx));
     alcyon_sample::StreamFacts {
         error: used > 0 || status.is_some_and(|s| s >= 500),
         forwarded: log.queue.is_some() || log.connect.is_some(),
@@ -3339,6 +3346,10 @@ fn stream_facts(sess: &TcpSession, status: Option<u16>, timers: bool) -> alcyon_
         timers: timers.then(|| [log.ms(log.first_byte), log.ms(log.request), log.ms(log.queue), log.ms(log.connect), log.ms(log.data)]),
         be_queue: if log.queue_is_srv { 0 } else { log.be_queue },
         srv_queue: if log.queue_is_srv { log.be_queue } else { 0 },
+        req_in,
+        req_out: if local { 0 } else { req_in },
+        res_in,
+        res_out: if local { rsp_htx.map_or(0, |n| n.saturating_mul(2)) } else { res_in },
     }
 }
 

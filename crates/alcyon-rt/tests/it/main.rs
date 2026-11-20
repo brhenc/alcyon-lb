@@ -101,6 +101,7 @@ mod host_authority_sync;
 mod http_reject_silent_drop;
 mod silent_drop_repair;
 mod http_reply_refusals;
+mod bytes_fetches;
 mod chunked_body_errors;
 mod chunked_resp_to_http10;
 mod entity_fetches;
