@@ -3306,6 +3306,19 @@ fn stream_facts(sess: &TcpSession, status: Option<u16>, timers: bool) -> alcyon_
     }
 }
 
+/// `stream_facts` for the `http-request` rules: `t_request` is still `-1` there, as the
+/// oracle answers (measured, `req.timer.tq` in a rule after a `wait-for-body` too) -
+/// `HAProxy` stamps `logs.request_ts` only once the request's analysis ends
+/// (`src/http_ana.c`), after the rules ran. `Alcyon` stamps its `request` at parse for
+/// the log's `%Tq`, which the log's contexts read.
+fn request_phase_facts(sess: &TcpSession) -> alcyon_sample::StreamFacts {
+    let mut facts = stream_facts(sess, None, true);
+    if let Some(timers) = facts.timers.as_mut() {
+        timers[1] = -1;
+    }
+    facts
+}
+
 /// `request_date`: the accept date plus the idle time before the request's first byte
 /// (`accept_date + t_idle + t_handshake`, `tcp_sample.c`), as unix seconds and
 /// milliseconds; the accept date while no byte has come.
@@ -3358,7 +3371,10 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         term_state: Some(sess_term_state(s)),
         bc_dst: s.bc_dst(),
         bc_src: s.bc_src(),
-        stream: Some(stream_facts(s, None, false)),
+        // The stream's five logs ride with every stream context: the timer fetches
+        // (`req.timer.tq`, `res.timer.data`, ...) read them, and they are `duration_since`
+        // on instants the stream already holds, not clock reads.
+        stream: Some(stream_facts(s, None, true)),
         ..Default::default()
     }
 }
@@ -3902,7 +3918,9 @@ fn stream_log_line(entry: &SessionEntry, proxies: &crate::table::Table, pid: u32
     let tr = entry.sess.strm.log.data.zip(entry.sess.strm.log.connect).map(|(d, c)| d.saturating_duration_since(c).as_millis());
     CURRENT_RES_TR.set(tr.map_or(-1, |ms| i64::try_from(ms).unwrap_or(i64::MAX)));
     let origin = stream_log_origin(entry, err);
-    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, log_origin: Some(origin.og_name()), res_status: txn_status, ..stream_sample_ctx(&entry.sess, fe, be, &view, &stick, None) }, live: None };
+    // `t_close` is the same value the line's `%Tt` prints (`session_log_data` stamped it
+    // into `data`), so `fc.timer.total` in the log-format reads the log's number.
+    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, log_origin: Some(origin.og_name()), res_status: txn_status, t_close: data.t_close, ..stream_sample_ctx(&entry.sess, fe, be, &view, &stick, None) }, live: None };
     let (line, sd) = with_sd(fe.log_format_sd(), fmt, &data, &ctx);
     fe.log_count.fetch_add(1, Ordering::Relaxed);
     Some((line, sd, err))
@@ -4363,7 +4381,7 @@ fn proxy_header_error_line(entry: &SessionEntry, proxies: &crate::table::Table, 
     let (view, stick) = (ProxiesView(proxies), StickView::new(proxies, &s.tracked_sc));
     // No stream, so no backend either: `be_name` has no value in `HAProxy`'s line.
     let fc = crate::proxy::ConnView::from_conn(s);
-    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, conn_err: Some(failure.conn_err()), be_name: None, be_id: None, ..stream_sample_ctx(s, fe, fe, &view, &stick, fc.as_ref()) }, live: None };
+    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, conn_err: Some(failure.conn_err()), be_name: None, be_id: None, t_close: data.t_close, ..stream_sample_ctx(s, fe, fe, &view, &stick, fc.as_ref()) }, live: None };
     let line = match fe.error_log_format() {
         Some(elf) => with_sd(fe.log_format_sd(), elf, &data, &ctx),
         None => {
@@ -4862,6 +4880,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         force_be: crate::rule_compiled::force_be(&listen.force_be_switch, &acls),
         reply_pages: crate::rule_compiled::reply_pages(&listen.error_replies),
         res_stream: false,
+        req_stream: false,
     }.finish());
     Ok(Proxy {
         id: usize_to_u32(proxy_idx),
@@ -5003,6 +5022,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         force_be: crate::rule_compiled::force_be(&fe.force_be_switch, &acls),
         reply_pages: crate::rule_compiled::reply_pages(&fe.error_replies),
         res_stream: false,
+        req_stream: false,
     }.finish());
     Ok(Proxy {
         id: usize_to_u32(proxy_idx),
@@ -5135,6 +5155,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         force_be: crate::rule_compiled::force_be(&[], &acls),
         reply_pages: crate::rule_compiled::reply_pages(&be.error_replies),
         res_stream: false,
+        req_stream: false,
     }.finish());
     Ok(Proxy {
         id: usize_to_u32(proxy_idx),
@@ -8090,6 +8111,9 @@ fn eval_tcp_req_session_rules(
         accept_date: Some(sess.strm.log.date()),
         captures_req_hdr: Some(&sess.strm.log.req_captures),
         captures_res_hdr: Some(&sess.strm.log.res_captures),
+        // The stream exists by the time these rules run: `fc.timer.total` reads its
+        // `t_close` (0 until the stream is logged) and `fc.timer.handshake` rides with it.
+        stream: Some(stream_facts(sess, None, true)),
         ..Default::default()
     };
 
@@ -8330,6 +8354,9 @@ fn eval_tcp_req_content_rules(
         prio: (sess.strm.log.prio_class, sess.strm.log.prio_offset),
         captures_req_hdr: Some(&sess.strm.log.req_captures),
         captures_res_hdr: Some(&sess.strm.log.res_captures),
+        // The stream exists by the time these rules run: the timer fetches read its logs,
+        // `-1` where nothing is stamped yet.
+        stream: Some(stream_facts(sess, None, true)),
         ..Default::default()
     };
 
@@ -14781,6 +14808,11 @@ impl EngineDispatcher<'_> {
                 // The request's time to its first byte (`s->logs.t_idle`, `%Ti`), as
                 // `req.timer.idle` reads it in a request rule.
                 req_timer_idle: sess.strm.log.ms(sess.strm.log.first_byte),
+                // The stream exists by the time the request rules run (`smp->strm`): a rule
+                // that reads a timer fetch carries the stream's logs, `-1` where nothing is
+                // stamped yet (`request_phase_facts` keeps `t_request` at `-1` for the whole
+                // phase); the clock reads run only when a rule needs them (T455).
+                stream: proxies[pages_idx].rules.req_stream.then(|| request_phase_facts(sess)),
                 be_max_retries: Some(be_retries),
                 acls: Some(acls),
                 act_conn,

@@ -367,6 +367,7 @@ mod regex_group_refs;
 mod regex_nocapture;
 mod req_hdrs;
 mod req_timer_hdr;
+mod timer_fetches;
 mod map_key_types;
 mod reload;
 mod reload_robustness;

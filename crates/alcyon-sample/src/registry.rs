@@ -190,6 +190,13 @@ pub static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 pub static CPU_USAGE_SOURCE: std::sync::OnceLock<fn() -> u8> = std::sync::OnceLock::new();
 
 /// A stream is being processed (`smp->strm` is set).
+/// Timer fetches (`req.timer.*`, `res.timer.data`, `txn.timer.*`, `fc.timer.*`,
+/// `bc.timer.*`): the stream's five logs in `[t_idle, t_request, t_queue, t_connect,
+/// t_data]` order, `-1` where `HAProxy` stamps none, no sample without a stream.
+fn timer_part(ctx: &SampleContext<'_>, i: usize) -> Option<i64> {
+    ctx.stream?.timers?.get(i).copied()
+}
+
 fn has_stream(ctx: &SampleContext<'_>) -> bool {
     ctx.stream.is_some() || ctx.fe_id.is_some()
 }
@@ -370,6 +377,12 @@ pub struct PhaseCtx<'a> {
     /// The request's time to its first byte, in milliseconds, as the http-request rules find it
     /// (`s->logs.t_idle`, `%Ti`): what `req.timer.idle` reads. `0` where the phase has no stream.
     pub req_timer_idle: i64,
+    /// The stream's close time in milliseconds from its start (`s->logs.t_close`, `%Tt`), as
+    /// the phase finds it: `0` while the stream has not closed - what a rule finds, `HAProxy`
+    /// stamping `t_close` only when the stream is logged - and the line's own value at log
+    /// time: what `fc.timer.total` reads, and what `txn.timer.total`, `txn.timer.user` and
+    /// `res.timer.data` subtract from.
+    pub t_close: i64,
     /// What `when()` reads of the stream; `None` is a stream that has done nothing yet.
     pub stream: Option<StreamFacts>,
     /// The proxy's ACLs, for `when(acl,<name>)`; `None` where the caller has none, and the
@@ -464,6 +477,7 @@ impl PhaseCtx<'_> {
         accept_date: None,
         request_date: None,
         req_timer_idle: 0,
+        t_close: 0,
         stream: None,
         acls: None,
         is_first_req: false,
@@ -2522,6 +2536,79 @@ impl Registry {
             name: "req.timer.idle",
             out_type: SampleType::Sint,
             func: |ctx, _args| Some(Sample::Sint(ctx.req_timer_idle)),
+        });
+
+        // The timer fetches `HAProxy` computes from the stream's logs
+        // (`smp_fetch_reX_timers`, `smp_fetch_txn_timers`, `smp_fetch_conn_timers`,
+        // `src/sample.c`): each reads the same millisecond the access log writes for its
+        // alias - `StreamFacts::timers` is `[t_idle, t_request, t_queue, t_connect,
+        // t_data]`, `PhaseCtx::t_close` the stream's `t_close`, and Alcyon's handshake is
+        // the `0` the log prints for `%Th` (`session_log_data`). Without a stream
+        // `HAProxy` gives no sample, `fc.timer.handshake` the session's value (0) among them.
+        self.register_fetch(FetchDesc {
+            name: "req.timer.tq",
+            out_type: SampleType::Sint,
+            // `t_request`: `-1` while the request head is incomplete - the http-request
+            // rules find it that way, `request_ts` being stamped after they ran.
+            func: |ctx, _args| timer_part(ctx, 1).map(Sample::Sint),
+        });
+        self.register_fetch(FetchDesc {
+            name: "req.timer.queue",
+            out_type: SampleType::Sint,
+            // `t_queue - t_request`: the queue time since the request completed.
+            func: |ctx, _args| {
+                let queue = timer_part(ctx, 2)?;
+                Some(Sample::Sint(if queue >= 0 { queue - timer_part(ctx, 1).unwrap_or(-1) } else { -1 }))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc.timer.connect",
+            out_type: SampleType::Sint,
+            // `t_connect - t_queue`: the connect time since the stream was queued.
+            func: |ctx, _args| {
+                let connect = timer_part(ctx, 3)?;
+                Some(Sample::Sint(if connect >= 0 { connect - timer_part(ctx, 2).unwrap_or(-1) } else { -1 }))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "res.timer.data",
+            out_type: SampleType::Sint,
+            // `t_close - t_data`: the response's time after its head. `t_close` is 0 at
+            // rule time, so the fetch reads negative there once the head has arrived.
+            func: |ctx, _args| {
+                let data = timer_part(ctx, 4)?;
+                Some(Sample::Sint(if data >= 0 { ctx.t_close - data } else { -1 }))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc.timer.handshake",
+            out_type: SampleType::Sint,
+            // `logs->t_handshake` (the session's, with no stream): 0, as the log's `%Th`.
+            func: |_ctx, _args| Some(Sample::Sint(0)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc.timer.total",
+            out_type: SampleType::Sint,
+            // `logs->t_close`: 0 until the stream is logged.
+            func: |ctx, _args| ctx.stream.is_some().then_some(Sample::Sint(ctx.t_close)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "txn.timer.total",
+            out_type: SampleType::Sint,
+            // `t_close - (t_idle >= 0 ? t_idle + t_handshake : 0)`.
+            func: |ctx, _args| {
+                let idle = timer_part(ctx, 0)?;
+                Some(Sample::Sint(ctx.t_close - idle.max(0)))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "txn.timer.user",
+            out_type: SampleType::Sint,
+            // `t_close - (t_idle >= 0 ? t_idle : 0)`.
+            func: |ctx, _args| {
+                let idle = timer_part(ctx, 0)?;
+                Some(Sample::Sint(ctx.t_close - idle.max(0)))
+            },
         });
 
         // `smp_fetch_proto_http` (`src/http_fetch.c`), registered as `req.proto_http` and, T326,
