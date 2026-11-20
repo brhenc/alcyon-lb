@@ -328,3 +328,48 @@ fn set_log_level_with_unknown_level_is_refused() {
     let out = refused_at_load("  http-request set-log-level bogus\n");
     assert!(out.contains("set-log-level"), "the refusal must name the action: {out}");
 }
+
+#[test]
+fn http_request_return_with_after_response_set_log_level() {
+    let case = start(
+        "  http-request set-var(txn.p) path\n\
+         http-after-response set-log-level err    if { var(txn.p) -m str /err }\n\
+         http-after-response set-log-level silent if { var(txn.p) -m str /silent }\n\
+         http-request return status 200\n",
+    );
+    for p in ["/normal", "/err", "/silent"] {
+        request(case.fe, p);
+    }
+    let lines = collect(&case, 2, Duration::from_secs(2));
+    assert_eq!(
+        lines,
+        vec![
+            ("<134>".into(), "uri=/normal st=200 ts=LR".into()),
+            ("<131>".into(), "uri=/err st=200 ts=LR".into()),
+        ],
+        "local reply honours http-after-response set-log-level err and silent"
+    );
+}
+
+#[test]
+fn http_response_do_log_before_set_log_level() {
+    let case = start(
+        "  http-request set-var(txn.p) path\n\
+         http-response do-log\n\
+         http-response set-log-level err    if { var(txn.p) -m str /err }\n\
+         http-response set-log-level silent if { var(txn.p) -m str /silent }\n",
+    );
+    for p in ["/err", "/silent"] {
+        request(case.fe, p);
+    }
+    let lines = collect(&case, 3, Duration::from_secs(2));
+    assert_eq!(
+        lines,
+        vec![
+            ("<134>".into(), "uri=/err st=200 ts=--".into()),
+            ("<131>".into(), "uri=/err st=200 ts=--".into()),
+            ("<134>".into(), "uri=/silent st=200 ts=--".into()),
+        ],
+        "do-log emits at the level active when it fires; later set-log-level only affects subsequent lines"
+    );
+}

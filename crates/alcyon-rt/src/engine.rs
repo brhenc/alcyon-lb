@@ -4142,6 +4142,18 @@ fn emit_step_log_entry(
     emit: LogEmit<'_>,
     origin: alcyon_config::ast::logging::LogProfileStepKind,
 ) {
+    emit_step_log_entry_level(entry, proxies, emit, origin, entry.sess.strm.log.log_level);
+}
+
+/// Emits a `log-steps` or `do-log` step for `entry` with an explicit `log_level`
+/// (the `s->logs.level` active when `do-log` ran).
+fn emit_step_log_entry_level(
+    entry: &SessionEntry,
+    proxies: &crate::table::Table,
+    emit: LogEmit<'_>,
+    origin: alcyon_config::ast::logging::LogProfileStepKind,
+    log_level: i8,
+) {
     let fe = &proxies[entry.proxy_idx];
     if fe.log_target_idx.is_empty() {
         return;
@@ -4155,7 +4167,7 @@ fn emit_step_log_entry(
         ..stream_sample_ctx(&entry.sess, fe, be, &view, &stick, None)
     };
     let sc = SampleContext { phase: &phase, live: None };
-    emit_step_log_with(fe, emit, origin, stream_log_level(entry.sess.strm.log.log_level, fe, false), &data, &sc);
+    emit_step_log_with(fe, emit, origin, stream_log_level(log_level, fe, false), &data, &sc);
 }
 
 /// Emits a `log-steps` or `do-log` step with prebuilt `data` and `sc`, at `level` (`None`
@@ -7005,6 +7017,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
         let mut timer_updates = std::mem::take(&mut self.timer_updates);
         timer_updates.clear();
+        let mut nice_updates = std::mem::take(&mut self.nice_updates);
+        nice_updates.clear();
 
         let mut dispatcher = EngineDispatcher {
             sessions: &mut self.sessions,
@@ -7023,7 +7037,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             run_queue_len,
             now,
             timer_updates,
-            nice_updates: std::mem::take(&mut self.nice_updates),
+            nice_updates,
             wake_queue: std::mem::take(&mut self.wake_scratch),
             heavy: Vec::new(),
             h2_spawn: std::mem::take(&mut self.h2_spawn_scratch),
@@ -7059,12 +7073,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 self.scheduler.queue_timer(task_ref, expiry);
             }
         }
-        // The nice a `set-nice` rule set this pass (`task_set_nice`): the running task is
-        // not on a queue while it runs, so the scheduler reads the value at its next
-        // wakeup, and nothing else shows in between.
-        for &(task_ref, nice) in &dispatcher.nice_updates {
+        // The nice a `set-nice` rule set this pass (`task_set_nice`): drain so stale
+        // entries never leak or overwrite a later connection that reuses the `TaskRef`.
+        for (task_ref, nice) in dispatcher.nice_updates.drain(..) {
             if self.scheduler.is_live(task_ref) {
-                self.scheduler.tasks.get_mut(task_ref).nice = nice;
+                self.scheduler.set_nice(task_ref, nice);
             }
         }
         for &task_ref in &dispatcher.heavy {
@@ -13144,8 +13157,8 @@ impl EngineDispatcher<'_> {
             c.rsp_head = None;
         }
         let mut lowered = false;
-        let mut do_log_res = false;
-        let mut do_log_after = false;
+        let mut do_log_res = None;
+        let mut do_log_after = None;
         let was_waiting = entry.sess.strm.txn.as_ref().is_some_and(|t| t.rsp == MsgState::Waiting);
         Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered, pid, &mut do_log_res, &mut do_log_after, fc, set_nice);
         // A `do-log` at `http-response`/`http-after-response` (and `log-steps response`) sends
@@ -13153,8 +13166,8 @@ impl EngineDispatcher<'_> {
         // inside the `_in` function, so the send runs here, once that context is gone.
         let fe_idx = entry.proxy_idx;
         let emit = LogEmit { targets: log_targets, tag: log_tag, pid };
-        if do_log_res {
-            emit_step_log_entry(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::HttpRes);
+        if let Some(level) = do_log_res {
+            emit_step_log_entry_level(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::HttpRes, level);
         }
         if was_waiting
             && proxies[fe_idx].log_steps.is_some_and(|m| m & alcyon_config::LOG_STEP_RESPONSE != 0)
@@ -13162,8 +13175,8 @@ impl EngineDispatcher<'_> {
         {
             emit_step_log_entry(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::Response);
         }
-        if do_log_after {
-            emit_step_log_entry(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::HttpAfterRes);
+        if let Some(level) = do_log_after {
+            emit_step_log_entry_level(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::HttpAfterRes, level);
         }
         lowered
     }
@@ -13175,8 +13188,8 @@ impl EngineDispatcher<'_> {
         now: Tick,
         lowered: &mut bool,
         _pid: u32,
-        do_log_res: &mut bool,
-        do_log_after: &mut bool,
+        do_log_res: &mut Option<i8>,
+        do_log_after: &mut Option<i8>,
         fc: Option<crate::proxy::ConnView<'_>>,
         set_nice: &mut Option<i16>,
     ) {
@@ -19057,7 +19070,7 @@ fn run_res_rules<'a, 'c>(
     registry: &Registry,
     vars: &mut VarStore,
     wait: Option<ResWait<'_>>,
-    do_log: &mut bool,
+    do_log: &mut Option<i8>,
     set_log_level: &mut i8,
     set_nice: &mut Option<i16>,
 ) -> Result<Option<usize>, ResStop> {
@@ -19079,7 +19092,7 @@ fn run_res_rules_in<'a>(
     registry: &Registry,
     vars: &mut VarStore,
     mut wait: Option<ResWait<'_>>,
-    do_log: &mut bool,
+    do_log: &mut Option<i8>,
     set_log_level: &mut i8,
     set_nice: &mut Option<i16>,
 ) -> Result<Option<usize>, ResStop> {
@@ -19107,8 +19120,9 @@ fn run_res_rules_in<'a>(
         let op = match op {
             ResRule::Op(op) => op,
             ResRule::DoLog => {
-                // The caller, which has the stream, sends the step's line.
-                *do_log = true;
+                // Capture the level active when `do-log` fires (`s->logs.level`) so a
+                // later `set-log-level` rule in the same list does not alter it.
+                *do_log = Some(*set_log_level);
                 continue;
             }
             ResRule::SetLogLevel(l) => {
@@ -19195,7 +19209,7 @@ fn eval_after_res_rules<'c>(
     mut res_caps: Option<&mut Vec<Option<Vec<u8>>>>,
     registry: &Registry,
     vars: &mut VarStore,
-    do_log: &mut bool,
+    do_log: &mut Option<i8>,
     set_log_level: &mut i8,
     set_nice: &mut Option<i16>,
 ) -> Result<(), ResStop> {
@@ -19640,7 +19654,7 @@ fn after_res_on_reply<'r>(
             ..Default::default()
         };
         // A reply Alcyon built has no live stream to `do-log` from; the flag is discarded.
-        let mut do_log = false;
+        let mut do_log = None;
         // `set-nice` is not an `http-after-response` action, so this is not written.
         let mut set_nice = None;
         // The level is out on a local: the context above still borrows the stream, and the
@@ -20907,5 +20921,100 @@ mod unpublished_tests {
         let slot = engine.idle_backend_pool.slot();
         let mut pool = IdlePools::lock(slot);
         assert!(pool.srv_mut((0, 0)).is_none_or(|si| si.conns.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod nice_updates_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn nice_updates_drained_and_does_not_overwrite_reused_task_ref() {
+        let cfg = alcyon_config::parse_str(
+            "defaults\n  mode http\n  timeout client 5s\n\
+             frontend fe\n  bind 127.0.0.1:0\n\
+             http-request set-nice 5 if { path /nice }\n\
+             http-request return status 200\n",
+        )
+        .expect("parse");
+        let mut engine = Engine::new(&cfg, 16).expect("engine");
+        let addr = engine.listeners[0].addr();
+
+        fn step_until(engine: &mut Engine, tick: &mut u32, mut cond: impl FnMut(&mut Engine) -> bool) {
+            let mut done = false;
+            for _ in 0..200 {
+                *tick += 5;
+                let _ = engine.step(Tick(*tick));
+                done = cond(engine);
+                if done { break; }
+            }
+            assert!(done, "condition was not met");
+        }
+        let mut tick = 100u32;
+
+        // 1. First connection runs `http-request set-nice 5` on keep-alive.
+        let mut c1 = std::net::TcpStream::connect(addr).expect("connect c1");
+        c1.set_nonblocking(true).expect("nonblocking");
+        c1.write_all(b"GET /nice HTTP/1.1\r\nHost: x\r\n\r\n").expect("write c1");
+
+        let mut buf1 = Vec::new();
+        let mut tmp = [0u8; 512];
+        step_until(&mut engine, &mut tick, |_| {
+            if let Ok(n) = c1.read(&mut tmp) {
+                buf1.extend_from_slice(&tmp[..n]);
+            }
+            buf1.windows(12).any(|w| w == b"HTTP/1.1 200")
+        });
+
+        assert!(engine.nice_updates.is_empty(), "nice_updates must be drained after pass");
+        let t1 = engine
+            .sessions
+            .entries
+            .iter()
+            .flatten()
+            .find(|e| !e.parked)
+            .map(|e| e.task)
+            .expect("live session 1");
+        assert_eq!(engine.scheduler.tasks.get(t1).nice, 5, "c1 task nice must be 5");
+
+        // 2. Close c1 and step until its session and TaskRef are freed.
+        drop(c1);
+        step_until(&mut engine, &mut tick, |e| {
+            e.sessions.entries.iter().flatten().all(|s| s.parked) && !e.scheduler.is_live(t1)
+        });
+        assert!(engine.nice_updates.is_empty(), "nice_updates must remain empty");
+
+        // 3. Second connection reuses the freed TaskRef slot without running set-nice.
+        let mut c2 = std::net::TcpStream::connect(addr).expect("connect c2");
+        c2.set_nonblocking(true).expect("nonblocking");
+        c2.write_all(b"GET /plain HTTP/1.1\r\nHost: x\r\n\r\n").expect("write c2");
+
+        let mut buf2 = Vec::new();
+        step_until(&mut engine, &mut tick, |_| {
+            if let Ok(n) = c2.read(&mut tmp) {
+                buf2.extend_from_slice(&tmp[..n]);
+            }
+            buf2.windows(12).any(|w| w == b"HTTP/1.1 200")
+        });
+        // Extra pass to confirm no stale update applies after c2 is live.
+        tick += 5;
+        let _ = engine.step(Tick(tick));
+
+        assert!(engine.nice_updates.is_empty(), "nice_updates must be empty after c2");
+        let t2 = engine
+            .sessions
+            .entries
+            .iter()
+            .flatten()
+            .find(|e| !e.parked)
+            .map(|e| e.task)
+            .expect("live session 2");
+        assert_eq!(t2, t1, "c2 should reuse the freed TaskRef slot");
+        assert_eq!(
+            engine.scheduler.tasks.get(t2).nice,
+            0,
+            "stale nice_updates must not overwrite reused Task.nice"
+        );
     }
 }
