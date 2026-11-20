@@ -374,3 +374,27 @@ fn max_reuse_reads_its_argument_as_atoi() {
     assert_eq!(reuse("abc"), 0);
     assert!(reuse("-1") < 0 && reuse("-5") < 0, "a negative value is no limit");
 }
+
+#[test]
+fn socks4_default_server_and_literal_proxy_validation() {
+    let cfg = parse_str(&format!(
+        "{DEFAULTS}backend b\n  default-server socks4 127.0.0.1:1080 check-via-socks4\n  \
+         server s1 127.0.0.1:8080\n  server s2 127.0.0.1:8081 socks4 127.0.0.1:1081\n"
+    ))
+    .expect("default-server socks4 inherits");
+    let extras = &cfg.backends[0].server_extras;
+    assert_eq!(extras.socks4, vec![
+        (0, "127.0.0.1:1080".parse().unwrap()),
+        (1, "127.0.0.1:1081".parse().unwrap()),
+    ]);
+    assert_eq!(extras.check_via_socks4, vec![0, 1]);
+
+    for bad in [
+        format!("{DEFAULTS}backend b\n  server s1 127.0.0.1:8080 socks4 proxy.example.com:1080\n"),
+        format!("{DEFAULTS}backend b\n  server s1 127.0.0.1:8080 socks4 quic+127.0.0.1:1080\n"),
+        format!("{DEFAULTS}backend b\n  default-server socks4 proxy.example.com:1080\n  server s1 127.0.0.1:8080\n"),
+    ] {
+        let err = parse_str(&bad).expect_err(&bad);
+        assert!(err.message.contains("'socks4'"), "{bad}: {}", err.message);
+    }
+}

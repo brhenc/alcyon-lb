@@ -132,19 +132,7 @@ pub(crate) fn parse_server(
             "send-proxy-v2" => send_proxy_v2 = true,
             "no-send-proxy-v2" => send_proxy_v2 = false,
             "socks4" => {
-                let tok = server_kw_arg(tokens, i, who, "expects <addr>:<port> as argument.")?;
-                let (addr, is_quic, name) = parse_server_addr(tok, None)?;
-                if is_quic || name.is_some() {
-                    let prefix = server_keywords::server_prefix(who);
-                    return Err(ConfigError::new(
-                        tok.line,
-                        tok.col,
-                        format!(
-                            "{prefix}'socks4' : the proxy must be a literal <addr>:<port>; resolving its name is not supported"
-                        ),
-                    ));
-                }
-                socks4 = Some(addr);
+                socks4 = Some(parse_socks4_addr(tokens, i, who)?);
                 i += 1;
             }
             "check-via-socks4" => check_via_socks4 = true,
@@ -945,6 +933,22 @@ fn parse_pool_purge_delay(tokens: &[Token], i: usize, who: Option<&str>) -> Resu
     })
 }
 
+/// Parses `socks4 <addr>:<port>`, refusing hostnames and QUIC prefixes because proxy
+/// addresses are not DNS-resolved.
+fn parse_socks4_addr(tokens: &[Token], i: usize, who: Option<&str>) -> Result<SocketAddr, ConfigError> {
+    let tok = server_kw_arg(tokens, i, who, "expects <addr>:<port> as argument.")?;
+    let (addr, is_quic, name) = parse_server_addr(tok, None)?;
+    if is_quic || name.is_some() {
+        let prefix = server_keywords::server_prefix(who);
+        return Err(ConfigError::new(
+            tok.line,
+            tok.col,
+            format!("{prefix}'socks4' : the proxy must be a literal <addr>:<port>; resolving its name is not supported"),
+        ));
+    }
+    Ok(addr)
+}
+
 pub(crate) fn parse_default_server(
     def: &mut Option<DefaultServerConfig>,
     tokens: &[Token],
@@ -991,15 +995,7 @@ pub(crate) fn parse_default_server(
             // `default-server` inherits `socks4`/`check-via-socks4` to its servers
             // (`srv_settings_cpy` copies both from the default server).
             "socks4" => {
-                let (addr, is_quic, name) = parse_server_addr(server_kw_arg(tokens, i, None, "expects <addr>:<port> as argument.")?, None)?;
-                if is_quic || name.is_some() {
-                    return Err(ConfigError::new(
-                        tokens[i].line,
-                        tokens[i].col,
-                        "'default-server socks4' : the proxy must be a literal <addr>:<port>; resolving its name is not supported".to_string(),
-                    ));
-                }
-                cfg.socks4 = Some(addr);
+                cfg.socks4 = Some(parse_socks4_addr(tokens, i, None)?);
                 i += 1;
             }
             "check-via-socks4" => cfg.check_via_socks4 = true,

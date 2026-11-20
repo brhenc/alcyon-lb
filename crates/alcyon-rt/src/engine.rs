@@ -9253,6 +9253,7 @@ fn socks4_proxy_of(proxies: &crate::table::Table, be_idx: usize, s_idx: Option<u
 /// The request itself is rebuilt on the stack by `process_srv_io` from the (fixed)
 /// target the socket is dialing, so nothing is stored on the session.
 fn start_socks4_handshake(sess: &mut TcpSession, proxy: Option<SocketAddr>) {
+    sess.clear_socks4();
     if proxy.is_some() {
         sess.flags.set(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
     }
@@ -9901,6 +9902,8 @@ fn release_server(
         entry.srv_raw_fd = None;
         let reusable = reusable
             && matches!(entry.sess.srv_state, ScState::Ready | ScState::Established)
+            // A tunnel whose SOCKS4 handshake has not finished cannot be pooled.
+            && !entry.sess.socks4_active()
             // A connection that opened with a PROXY header speaks for this client only.
             && !entry.sess.flags.has(sess_flags::SEND_PROXY_PREPENDED)
             // A TLS session goes to the pool with its socket, once it is established.
@@ -9964,7 +9967,7 @@ fn release_server(
     entry.sess.srv_park_exp = Tick::ETERNITY;
     entry.sess.flags.clear(sess_flags::SRV_KEPT);
     entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
-    entry.sess.flags.clear(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
+    entry.sess.clear_socks4();
     if !actconn_released {
         release_server_actconn(entry, proxies, parked);
     }
@@ -10490,7 +10493,7 @@ fn retry_server_connect(
 ) -> bool {
     release_failed_server(entry, fdtab, poller);
     entry.sess.srv = None;
-    entry.sess.flags.clear(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
+    entry.sess.clear_socks4();
 
     // The slot the failed attempt held stays the stream's while it retries the same server,
     // the turnaround included (`s->srv_conn` is kept: `assign_server_and_queue` returns at
@@ -12501,7 +12504,9 @@ impl EngineDispatcher<'_> {
 
             // Step 3: Stream engine process pass
             if !entry.sess.is_done() {
+                let was_connected = entry.sess.strm.log.connect.is_some();
                 entry.sess.advance(now);
+                log_if_newly_connected(was_connected, entry, self.proxies, emit);
             }
             #[cfg(debug_assertions)]
             crate::crash::fault_point(false, entry.sess.req_uri.as_deref().filter(|_| entry.sess.strm.txn.is_some()));
@@ -12533,20 +12538,22 @@ impl EngineDispatcher<'_> {
                 commit_stick_stores(stores.into_iter(), self.proxies, entry.srv_backend_idx, entry.target_server_idx);
             }
 
-            // Step 3.1: a TLS handshake with the server that failed (certificate refused,
-            // a peer not speaking TLS) is a connect failure: `HAProxy` retries it and,
-            // out of retries, answers 503 `SC` (measured: `ssl verify required` against
-            // a certificate the SNI does not match, "0/0/-1/-1/1 503 ... SC-- ... /3").
-            if entry.sess.srv_state == ScState::Error && entry.sess.srv_xprt.handshake_failed() {
+            // Step 3.1: a TLS or SOCKS4 handshake with the server that failed is a connect
+            // failure: `HAProxy` retries it and, out of retries, answers 503 `SC`.
+            let socks4_failed = entry.sess.socks4_failed();
+            if entry.sess.srv_state == ScState::Error && (entry.sess.srv_xprt.handshake_failed() || socks4_failed) {
                 if let (Some(fd), Some(sfd)) = (entry.sess.srv.as_ref(), entry.srv_raw_fd.take()) {
                     let _ = self.poller.delete(fd.as_fd());
                     self.fdtab.remove(sfd);
                 }
                 entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
+                entry.sess.flags.clear(sess_flags::SOCKS4_FAILED);
                 entry.sess.ending = None;
-                // `HAProxy` records a `CO_ER_SSL_*` code here, which Alcyon does not tell
-                // apart yet: no `bc_err` rather than the 0 of the TCP connect.
-                entry.sess.bc_err = None;
+                if !socks4_failed {
+                    // `HAProxy` records a `CO_ER_SSL_*` code here, which Alcyon does not tell
+                    // apart yet: no `bc_err` rather than the 0 of the TCP connect.
+                    entry.sess.bc_err = None;
+                }
                 server_connect_failed(entry, self.proxies, self.fdtab, self.poller, now, true, self.lb_snap);
             }
 

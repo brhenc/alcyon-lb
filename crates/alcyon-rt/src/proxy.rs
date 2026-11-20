@@ -1071,6 +1071,13 @@ pub mod sess_flags {
     pub const SOCKS4_SEND: u64 = 1 << 30;
     /// The `socks4` tunnel's 8-byte reply is not yet read (`CO_FL_SOCKS4_RECV`).
     pub const SOCKS4_RECV: u64 = 1 << 31;
+    /// The `socks4` handshake failed (`Step::Failed`); retried as a connect failure.
+    pub const SOCKS4_FAILED: u64 = 1 << 32;
+    /// Bit shift and mask for the `0..=16` bytes already sent in the SOCKS4 request.
+    pub const SOCKS4_SENT_SHIFT: u32 = 33;
+    pub const SOCKS4_SENT_MASK: u64 = 0x1f << SOCKS4_SENT_SHIFT;
+    /// Every `SOCKS4_*` flag bit.
+    pub const SOCKS4_ALL: u64 = SOCKS4_SEND | SOCKS4_RECV | SOCKS4_FAILED | SOCKS4_SENT_MASK;
 }
 
 /// Packed boolean flags on [`TcpSession`].
@@ -1974,7 +1981,7 @@ impl TcpSession {
         debug_assert!(srv.is_none(), "a parked stream holds no server connection");
         *srv = None;
         *srv_xprt = ServerXprt::Plain;
-        flags.clear(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
+        flags.clear(sess_flags::SOCKS4_ALL);
         req_uri.reset();
         req_method.reset();
         req_body_htx.set(None);
@@ -2362,7 +2369,7 @@ impl TcpSession {
     pub fn wants_rerun(&self) -> bool {
         self.flags.has(sess_flags::PASSES_RAN_OUT)
             || self.has_undispatched_h2_streams()
-            || (self.srv_state == ScState::Error && self.srv_xprt.handshake_failed())
+            || (self.srv_state == ScState::Error && (self.srv_xprt.handshake_failed() || self.socks4_failed()))
     }
 
     /// How many streams of an HTTP/2 connection are served at once (T280): as many as the
@@ -2568,23 +2575,27 @@ impl TcpSession {
 
     /// The server connection completed.
     pub fn server_connected(&mut self, now: Tick) {
-        self.bc_err = Some(&BC_CONNECTED);
         self.srv_state = if self.mode == Mode::Http {
             ScState::Ready
         } else {
             ScState::Established
         };
         // A TLS handshake or a `socks4` tunnel still to run stay under `timeout connect`
-        // (re-parked by `process_srv_io` once the handshake completes).
-        if self.srv_xprt.is_ready() && !self.socks4_active() {
-            self.conn_exp = Tick::ETERNITY;
+        // (re-parked by `process_srv_io` once the handshake completes). For `socks4`,
+        // `bc_err` and `log.connect` wait until the tunnel grants the connection so a
+        // refused or timed-out handshake reports `SC`/`sC` and its `CO_ER_SOCKS4_*`.
+        if !self.socks4_active() {
+            self.bc_err = Some(&BC_CONNECTED);
+            self.strm.log.connect = Some(crate::txnlog::loop_now());
+            if self.srv_xprt.is_ready() {
+                self.conn_exp = Tick::ETERNITY;
+            }
         }
         self.arm_server(now);
         // A TCP stream is a tunnel from here: the client's timer, armed at accept, restarts.
         if self.mode == Mode::Tcp && self.tunnel_ms().is_some() {
             self.arm_client(now);
         }
-        self.strm.log.connect = Some(crate::txnlog::loop_now());
         // `AN_RES_INSPECT` runs from here, before any of the response has arrived.
         if let Some(r) = self.res_inspect.as_mut() {
             let Some(delay) = r.armed.take() else { return };
@@ -2607,7 +2618,7 @@ impl TcpSession {
     pub fn l7_retried(&mut self) {
         self.conn_retries = self.conn_retries.saturating_sub(1);
         self.srv = None;
-        self.flags.clear(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
+        self.clear_socks4();
         self.conn_exp = Tick::ETERNITY;
         self.srv_exp = Tick::ETERNITY;
         self.srv_state = ScState::Init;
@@ -2621,7 +2632,7 @@ impl TcpSession {
     /// server there is nothing to wait for, so the retry is immediate.
     pub fn server_failed_at(&mut self, now: Tick, same_server: bool) -> bool {
         self.srv = None;
-        self.flags.clear(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
+        self.clear_socks4();
         self.conn_exp = Tick::ETERNITY;
         if self.conn_retries > 0 && self.flags.has(sess_flags::RETRY_CONN) {
             self.conn_retries -= 1;
@@ -4280,6 +4291,11 @@ impl TcpSession {
         if self.is_h2() || self.mode == Mode::Http {
             return false;
         }
+        // A failed TLS or SOCKS4 handshake is still to be retried by the engine (`Step 3.1`);
+        // do not shut down the client until retries are exhausted.
+        if self.srv_state == ScState::Error && (self.srv_xprt.handshake_failed() || self.socks4_failed()) {
+            return false;
+        }
 
         let mut changed = false;
 
@@ -4462,30 +4478,34 @@ impl TcpSession {
             // (`connect_addr`, the `target_addr` the connect stored).
             let target = self
                 .target_addr
-                .map(|t| crate::engine::connect_addr(t, self.server_addr))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotConnected, "no server target for the SOCKS4 request")
-                })?;
+                .map_or(SocketAddr::from(([0, 0, 0, 0], 0)), |t| crate::engine::connect_addr(t, self.server_addr));
             let mut hs = crate::socks4::Hs {
-                sending: self.flags.has(sess_flags::SOCKS4_SEND),
+                sent: ((self.flags.0 & sess_flags::SOCKS4_SENT_MASK) >> sess_flags::SOCKS4_SENT_SHIFT) as u8,
                 receiving: self.flags.has(sess_flags::SOCKS4_RECV),
             };
             match crate::socks4::step(sfd, target, &mut hs) {
                 crate::socks4::Step::Pending => {
-                    self.flags.set_to(sess_flags::SOCKS4_SEND, hs.sending);
+                    self.flags.set_to(sess_flags::SOCKS4_SEND, hs.sending());
                     self.flags.set_to(sess_flags::SOCKS4_RECV, hs.receiving);
+                    self.flags.0 = (self.flags.0 & !sess_flags::SOCKS4_SENT_MASK)
+                        | ((u64::from(hs.sent) << sess_flags::SOCKS4_SENT_SHIFT) & sess_flags::SOCKS4_SENT_MASK);
                     return Ok(changed);
                 }
                 crate::socks4::Step::Done => {
-                    self.flags.clear(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
-                    self.conn_exp = Tick::ETERNITY;
+                    self.clear_socks4();
+                    if self.srv_xprt.is_ready() {
+                        self.conn_exp = Tick::ETERNITY;
+                        self.bc_err = Some(&BC_CONNECTED);
+                        self.strm.log.connect.get_or_insert_with(crate::txnlog::loop_now);
+                    }
                     changed = true;
                 }
                 crate::socks4::Step::Failed(f) => {
-                    self.flags.clear(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
+                    self.clear_socks4();
+                    self.flags.set(sess_flags::SOCKS4_FAILED);
                     self.bc_err = Some(bc_socks4(f));
                     self.srv_state = ScState::Error;
-                    return Err(io::Error::new(io::ErrorKind::Other, f.text()));
+                    return Err(io::Error::other(f.text()));
                 }
             }
         }
@@ -4502,6 +4522,8 @@ impl TcpSession {
                     // the handshake (HAProxy: a TLS handshake that hangs is a connect
                     // timeout), and the server timer starts here.
                     self.conn_exp = Tick::ETERNITY;
+                    self.bc_err.get_or_insert(&BC_CONNECTED);
+                    self.strm.log.connect.get_or_insert_with(crate::txnlog::loop_now);
                     changed = true;
                 }
                 Ok(false) => {}
@@ -4870,8 +4892,21 @@ impl TcpSession {
     /// phases): the request is still out, or the reply still owed.
     #[must_use]
     #[inline]
-    fn socks4_active(&self) -> bool {
-        self.flags.has(sess_flags::SOCKS4_SEND) || self.flags.has(sess_flags::SOCKS4_RECV)
+    pub fn socks4_active(&self) -> bool {
+        self.flags.has(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV)
+    }
+
+    /// Whether the SOCKS4 tunnel handshake failed on the current connect attempt.
+    #[must_use]
+    #[inline]
+    pub fn socks4_failed(&self) -> bool {
+        self.flags.has(sess_flags::SOCKS4_FAILED)
+    }
+
+    /// Clears all `SOCKS4_*` handshake flags on the session.
+    #[inline]
+    pub fn clear_socks4(&mut self) {
+        self.flags.clear(sess_flags::SOCKS4_ALL);
     }
 
     fn conn_timer_live(&self) -> bool {
@@ -5465,6 +5500,10 @@ mod tests {
         assert_eq!((e.code, e.name, e.text), (47, "EREFUSED", "ECONNREFUSED returned by OS"));
         assert!(!e.tls && e.ssl_code == 0 && e.ssl_text.is_none());
         assert_eq!(super::BC_CONNECTED.text, "Success");
+        assert_eq!(super::bc_socks4(crate::socks4::Fail::Send).code, 39);
+        assert_eq!(super::bc_socks4(crate::socks4::Fail::Recv).code, 40);
+        assert_eq!(super::bc_socks4(crate::socks4::Fail::Deny).code, 41);
+        assert_eq!(super::bc_socks4(crate::socks4::Fail::Abort).code, 42);
     }
 
     /// A stream of an HTTP/2 connection has no socket of its own (T280): reads and writes

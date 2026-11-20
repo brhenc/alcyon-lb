@@ -1729,11 +1729,8 @@ pub fn step_check(
                     Ok(Some(io::Error::from(io::ErrorKind::NotConnected)))
                 };
                 if let Ok(None) = connect_res {
-                    match drive_check_handshake(check, fdtab, poller, raw_fd) {
-                        Handshake::Ready => {}
-                        Handshake::Pending => return Ok(CheckStep::pending(Some(check.exp))),
-                        Handshake::Failed(info) => return Ok(fail_check_l6(check, fdtab, poller, now, duration, info)),
-                        Handshake::FailedL4(info) => return Ok(fail_check_l4(check, fdtab, poller, now, duration, info)),
+                    if let Some(step) = check_handshake_step(check, fdtab, poller, raw_fd, now, duration) {
+                        return Ok(step);
                     }
                 }
                 // A connect check over TLS passes at layer 6 ("Layer6 check passed").
@@ -1772,11 +1769,8 @@ pub fn step_check(
                 };
 
                 if let Ok(None) = connect_res {
-                    match drive_check_handshake(check, fdtab, poller, raw_fd) {
-                        Handshake::Ready => {}
-                        Handshake::Pending => return Ok(CheckStep::pending(Some(check.exp))),
-                        Handshake::Failed(info) => return Ok(fail_check_l6(check, fdtab, poller, now, duration, info)),
-                        Handshake::FailedL4(info) => return Ok(fail_check_l4(check, fdtab, poller, now, duration, info)),
+                    if let Some(step) = check_handshake_step(check, fdtab, poller, raw_fd, now, duration) {
+                        return Ok(step);
                     }
                     match check.resolved_config.as_deref().cloned() {
                         Some(ResolvedCheckConfig::Redis) => {
@@ -1956,7 +1950,7 @@ pub fn step_check(
             | ResolvedCheckConfig::Mysql { .. }
             | ResolvedCheckConfig::Pgsql { .. }
             | ResolvedCheckConfig::SslHello => {
-                match connect_check(proxies, check, None) {
+                match connect_check(proxies, check, None, true) {
                     Ok((sock, _)) => {
                         let raw_fd = sock.as_raw_fd();
                         check.run.check_fd = Some(raw_fd);
@@ -1981,7 +1975,7 @@ pub fn step_check(
             }
             ResolvedCheckConfig::TcpConnect => {
                 check.run.sub_state = CheckSubState::TcpConnecting;
-                match connect_check(proxies, check, None) {
+                match connect_check(proxies, check, None, true) {
                     Ok((sock, immediate)) => {
                         if immediate {
                             let event = check.on_success(0);
@@ -2096,14 +2090,11 @@ fn progress_http_check(
                     let connect_res = raw::check_connect_error(sock.as_fd());
 
                     if let Ok(None) = connect_res {
-                        match drive_check_handshake(check, fdtab, poller, raw_fd) {
-                            Handshake::Ready => {}
-                            Handshake::Pending => {
+                        if let Some(step) = check_handshake_step(check, fdtab, poller, raw_fd, now, duration) {
+                            if step.event.is_none() {
                                 check.run.sub_state = CheckSubState::HttpRunning { step_idx, phase, send_offset };
-                                return Ok(CheckStep::pending(Some(check.exp)));
                             }
-                            Handshake::Failed(info) => return Ok(fail_check_l6(check, fdtab, poller, now, duration, info)),
-                            Handshake::FailedL4(info) => return Ok(fail_check_l4(check, fdtab, poller, now, duration, info)),
+                            return Ok(step);
                         }
                         check.run.pending_send_proxy = *send_proxy;
                         step_idx += 1;
@@ -2128,7 +2119,7 @@ fn progress_http_check(
                 let target_addr = SocketAddr::new(base, port.unwrap_or(check.addr.port()));
                 check.run.http_target_addr = target_addr;
 
-                match connect_check(proxies, check, Some(target_addr)) {
+                match connect_check(proxies, check, Some(target_addr), true) {
                     Ok((sock, _)) => {
                         let raw_fd = sock.as_raw_fd();
                         check.run.check_fd = Some(raw_fd);
@@ -2433,7 +2424,8 @@ fn progress_tcp_check(
 
     while step_idx < steps.len() {
         match &steps[step_idx] {
-            ResolvedTcpStep::Connect { port, .. } => {
+            ResolvedTcpStep::Connect { port, implicit, .. } => {
+                let allow_socks4 = *implicit;
                 let target_addr =
                     SocketAddr::new(check.config.check_addr.unwrap_or(check.addr.ip()), port.unwrap_or(check.addr.port()));
                 // The socket in hand is this step's own connection only for the first
@@ -2458,6 +2450,12 @@ fn progress_tcp_check(
                     fdtab.clear_ready(raw_fd, true, true);
                     let connect_res = raw::check_connect_error(sock.as_fd());
                     if let Ok(None) = connect_res {
+                        if let Some(step) = check_handshake_step(check, fdtab, poller, raw_fd, now, duration) {
+                            if step.event.is_none() {
+                                check.run.sub_state = CheckSubState::TcpRunning { step_idx, send_offset, recv_buf };
+                            }
+                            return Ok(step);
+                        }
                         check.run.tcp_connect_step = None;
                         step_idx += 1;
                         continue;
@@ -2484,7 +2482,7 @@ fn progress_tcp_check(
                 recv_buf.clear();
                 send_offset = 0;
 
-                let connected = connect_check(proxies, check, Some(target_addr));
+                let connected = connect_check(proxies, check, Some(target_addr), allow_socks4);
                 if let Ok((sock, immediate)) = connected {
                         let raw_fd = sock.as_raw_fd();
                         check.run.check_fd = Some(raw_fd);
@@ -2708,7 +2706,7 @@ fn socks4_for_check(proxies: &crate::table::Table, check: &ServerCheckState) -> 
     Some(crate::socks4::CheckState {
         proxy_addr,
         target: check_target(check),
-        hs: crate::socks4::Hs { sending: true, receiving: true },
+        hs: crate::socks4::Hs::new(),
     })
 }
 
@@ -2718,17 +2716,19 @@ fn socks4_for_check(proxies: &crate::table::Table, check: &ServerCheckState) -> 
 /// path: its handshake runs from the `*Connecting` state ([`drive_check_handshake`]).
 /// `check-via-socks4` arms the tunnel here (every connect re-derives it, so a pooled-run
 /// release can never drop it); the handshake runs from [`drive_check_handshake`].
-fn connect_check(proxies: &crate::table::Table, check: &mut ServerCheckState, addr: Option<SocketAddr>) -> io::Result<(OwnedFd, bool)> {
+fn connect_check(proxies: &crate::table::Table, check: &mut ServerCheckState, addr: Option<SocketAddr>, allow_socks4: bool) -> io::Result<(OwnedFd, bool)> {
     let addr = addr.unwrap_or_else(|| check_target(check));
-    check.run.socks4 = socks4_for_check(proxies, check);
-    let (sock, immediate) = match check.run.socks4.as_mut() {
+    check.run.socks4 = if allow_socks4 { socks4_for_check(proxies, check) } else { None };
+    let (sock, mut immediate) = match check.run.socks4.as_mut() {
         Some(c) => {
             c.target = addr;
-            c.hs = crate::socks4::Hs { sending: true, receiving: true };
             raw::connect(c.proxy_addr)?
         }
         None => raw::connect(addr)?,
     };
+    if check.run.socks4.is_some() {
+        immediate = false;
+    }
     let h2 = check.config.h2 && matches!(check.resolved_config.as_deref(), Some(ResolvedCheckConfig::Http(_)));
     let Some(tls) = check.tls.as_ref() else {
         check.xprt = if h2 { ServerXprt::Plain.into_h2()? } else { ServerXprt::Plain };
@@ -2757,7 +2757,7 @@ fn check_host(check: &ServerCheckState) -> Option<String> {
     })
 }
 
-/// Where a check's TLS handshake stands.
+/// Where a check's TLS or SOCKS4 handshake stands.
 enum Handshake {
     /// A plaintext check, or a handshake already complete.
     Ready,
@@ -2765,8 +2765,8 @@ enum Handshake {
     Pending,
     /// Failed, with `HAProxy`'s wording for the log.
     Failed(String),
-    /// A `check-via-socks4` tunnel failed: a layer-4 failure, not a TLS one.
-    FailedL4(String),
+    /// A `check-via-socks4` tunnel failed.
+    FailedSocks4(crate::socks4::Fail),
 }
 
 /// Drives the handshake of a check whose socket is connected: the `check-via-socks4`
@@ -2774,21 +2774,18 @@ enum Handshake {
 /// PROXY protocol header and the TLS ClientHello).
 fn drive_check_handshake(check: &mut ServerCheckState, fdtab: &mut FdTab, poller: &mut Poller, raw_fd: RawFd) -> Handshake {
     if let Some(c) = check.run.socks4.as_mut().filter(|c| !c.hs.done()) {
-        let Some(sock) = check.sock.as_ref() else {
-            return Handshake::FailedL4("General socket error".to_string());
-        };
-        match crate::socks4::step(sock.as_fd(), c.target, &mut c.hs) {
+        let step = check.sock.as_ref().map_or(crate::socks4::Step::Failed(crate::socks4::Fail::Abort), |s| crate::socks4::step(s.as_fd(), c.target, &mut c.hs));
+        match step {
             crate::socks4::Step::Done => {}
             crate::socks4::Step::Pending => {
-                let interest = Interest {
-                    readable: c.hs.receiving,
-                    writable: c.hs.sending,
-                };
+                let interest = Interest { readable: c.hs.receiving, writable: c.hs.sending() };
                 fdtab.set_interest(raw_fd, interest);
-                let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), interest.readable, interest.writable);
+                if let Some(sock) = check.sock.as_ref() {
+                    let _ = poller.modify(sock.as_fd(), u64::try_from(raw_fd).unwrap_or(0), interest.readable, interest.writable);
+                }
                 return Handshake::Pending;
             }
-            crate::socks4::Step::Failed(f) => return Handshake::FailedL4(f.text().to_string()),
+            crate::socks4::Step::Failed(f) => return Handshake::FailedSocks4(f),
         }
     }
     if !check.xprt.is_tls() || check.xprt.is_ready() {
@@ -2830,20 +2827,40 @@ fn drive_check_handshake(check: &mut ServerCheckState, fdtab: &mut FdTab, poller
     }
 }
 
-/// Ends a check whose TLS handshake failed: `L6RSP`, as `HAProxy` reports it.
-fn fail_check_l6(check: &mut ServerCheckState, fdtab: &mut FdTab, poller: &mut Poller, now: Tick, duration: u32, info: String) -> CheckStep {
-    cleanup_check_socket(check, fdtab, poller);
-    let event = check.on_failure_full("L6RSP", "Layer6 invalid response", duration, None, Some(info));
-    let next = check.schedule_next(now);
-    check.next_check = next;
-    CheckStep { next: Some(next), event }
+/// Drives `drive_check_handshake` and converts pending or failed states into a `CheckStep`.
+fn check_handshake_step(
+    check: &mut ServerCheckState,
+    fdtab: &mut FdTab,
+    poller: &mut Poller,
+    raw_fd: RawFd,
+    now: Tick,
+    duration: u32,
+) -> Option<CheckStep> {
+    match drive_check_handshake(check, fdtab, poller, raw_fd) {
+        Handshake::Ready => None,
+        Handshake::Pending => Some(CheckStep::pending(Some(check.exp))),
+        Handshake::Failed(info) => Some(fail_check_handshake(check, fdtab, poller, now, duration, "L6RSP", "Layer6 invalid response", info)),
+        Handshake::FailedSocks4(f) => {
+            let (status, desc) = f.check_status();
+            Some(fail_check_handshake(check, fdtab, poller, now, duration, status, desc, f.text().to_string()))
+        }
+    }
 }
 
-/// Ends a check whose SOCKS4 tunnel failed (`check-via-socks4`): `L4CON`, as a
-/// connection problem, the failure `tcpcheck_connect_server` reports for the handshake.
-fn fail_check_l4(check: &mut ServerCheckState, fdtab: &mut FdTab, poller: &mut Poller, now: Tick, duration: u32, info: String) -> CheckStep {
+/// Ends a check whose SOCKS4 or TLS handshake failed.
+#[allow(clippy::too_many_arguments)]
+fn fail_check_handshake(
+    check: &mut ServerCheckState,
+    fdtab: &mut FdTab,
+    poller: &mut Poller,
+    now: Tick,
+    duration: u32,
+    status: &'static str,
+    desc: &'static str,
+    info: String,
+) -> CheckStep {
     cleanup_check_socket(check, fdtab, poller);
-    let event = check.on_failure_full("L4CON", "Layer4 connection problem", duration, None, Some(info));
+    let event = check.on_failure_full(status, desc, duration, None, Some(info));
     let next = check.schedule_next(now);
     check.next_check = next;
     CheckStep { next: Some(next), event }
