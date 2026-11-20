@@ -247,6 +247,12 @@ impl Task {
 
     #[must_use]
     #[inline]
+    pub const fn in_run_queue(&self) -> bool {
+        !self.rq_ref.is_none()
+    }
+
+    #[must_use]
+    #[inline]
     pub const fn queued(&self) -> bool {
         self.state & state::QUEUED != 0
     }
