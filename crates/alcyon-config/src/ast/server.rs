@@ -92,6 +92,11 @@ pub struct DefaultServerConfig {
     pub disabled: bool,
     /// `track [<proxy>/]<server>`, as written.
     pub track: Option<Box<str>>,
+    /// `socks4 <proxy>`: the servers' connections go to the SOCKS4 proxy, which is asked
+    /// for each server's address (inherited by the servers, as in `HAProxy`).
+    pub socks4: Option<SocketAddr>,
+    /// `check-via-socks4`: the health checks ride the `socks4` tunnel.
+    pub check_via_socks4: bool,
     /// `init-addr`.
     pub init_addr: Option<InitAddr>,
     /// `resolvers <section>`.
@@ -403,6 +408,13 @@ pub struct ServerExtras {
     pub name_lines: std::collections::HashMap<Box<str>, u32>,
     /// Servers with `agent-check` (or `agent-*` options) configured.
     pub agent_checks: Vec<(u32, AgentCheckConfig)>,
+    /// The servers with a `socks4 <proxy>`: the connection to the server goes to the proxy,
+    /// which is asked to dial the server (`socks4_addr` in `src/server.c`); sparse, most
+    /// servers have no tunnel.
+    pub socks4: Vec<(u32, SocketAddr)>,
+    /// The servers whose health checks ride their `socks4` tunnel (`check-via-socks4`); a
+    /// server without `socks4` is a no-op.
+    pub check_via_socks4: Vec<u32>,
 }
 
 impl ServerExtras {
@@ -519,6 +531,9 @@ pub struct Server {
     pub disabled: bool,
     /// `track [<proxy>/]<server>`, as written.
     pub track: Option<Box<str>>,
+    // `socks4` and `check-via-socks4` are in `ServerExtras` (sparse): a tunnel is rare,
+    // and a `Server` is paid 60,000 times over (`struct_sizes.rs`), so they do not live
+    // here.
 }
 
 impl Default for Server {

@@ -228,6 +228,12 @@ pub struct ServerIdArrays {
     server_check_ports: Vec<u16>,
     /// Each server's `addr` (`check addr`): empty when no server has one.
     server_check_addrs: Vec<Option<std::net::IpAddr>>,
+    /// Each server's `socks4 <proxy>`: the connection goes to the proxy, which dials the
+    /// server; empty when no server has a tunnel (kept off `Proxy`'s inline size,
+    /// `struct_sizes.rs`).
+    server_socks4: Vec<Option<SocketAddr>>,
+    /// Each server's `check-via-socks4`: the health checks ride the tunnel; empty when none.
+    server_check_via_socks4: Vec<bool>,
     /// Per-server `observe` state; `None` when no server enables `observe`.
     server_observe: Option<Arc<Vec<ObserveSlot>>>,
     /// Servers with `agent-check` (or `agent-*` options) configured.
@@ -333,6 +339,8 @@ impl ServerIdArrays {
             server_srv: crate::resolvers::SrvSlots::new(servers.len(), extras),
             server_check_ports: server_check_ports(servers),
             server_check_addrs: server_check_addrs(servers),
+            server_socks4: server_socks4(servers.len(), extras),
+            server_check_via_socks4: server_check_via_socks4(servers.len(), extras),
             server_observe: server_observe(servers),
             server_agent_checks: extras.agent_checks.clone(),
             server_pool: pool_cfgs(servers, mode_http),
@@ -457,6 +465,38 @@ fn server_check_addrs(servers: &[alcyon_config::ast::Server]) -> Vec<Option<std:
         return Vec::new();
     }
     servers.iter().map(alcyon_config::ast::Server::check_addr).collect()
+}
+
+/// Each server's `socks4 <proxy>`, from the sparse `ServerExtras::socks4`: `None` for a
+/// server without a tunnel; empty when no server has one.
+fn server_socks4(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Vec<Option<SocketAddr>> {
+    if extras.socks4.is_empty() {
+        return Vec::new();
+    }
+    let mut slots = vec![None; count];
+    for &(idx, addr) in &extras.socks4 {
+        let idx = idx as usize;
+        if idx < count {
+            slots[idx] = Some(addr);
+        }
+    }
+    slots
+}
+
+/// Each server's `check-via-socks4`, from the sparse `ServerExtras::check_via_socks4`;
+/// empty when no server sets it.
+fn server_check_via_socks4(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Vec<bool> {
+    if extras.check_via_socks4.is_empty() {
+        return Vec::new();
+    }
+    let mut slots = vec![false; count];
+    for &idx in &extras.check_via_socks4 {
+        let idx = idx as usize;
+        if idx < count {
+            slots[idx] = true;
+        }
+    }
+    slots
 }
 
 fn server_observe(servers: &[alcyon_config::ast::Server]) -> Option<Arc<Vec<ObserveSlot>>> {
@@ -904,6 +944,18 @@ impl<'a> ServerSet<'a> {
     #[must_use]
     pub fn send_proxy_v2_at(&self, i: usize) -> bool {
         self.0.srv.server_send_proxy_v2.get(i).copied().unwrap_or(false)
+    }
+
+    /// Slot `i`'s SOCKS4 proxy (`socks4 <addr>:<port>`), `None` for a server without one.
+    #[must_use]
+    pub fn socks4_at(&self, i: usize) -> Option<SocketAddr> {
+        self.0.ids.srv.server_socks4.get(i).copied().flatten()
+    }
+
+    /// Whether slot `i`'s health checks ride its SOCKS4 tunnel (`check-via-socks4`).
+    #[must_use]
+    pub fn check_via_socks4_at(&self, i: usize) -> bool {
+        self.0.ids.srv.server_check_via_socks4.get(i).copied().unwrap_or(false)
     }
 
     /// Whether slot `i`'s PROXY v2 header carries the unique id.

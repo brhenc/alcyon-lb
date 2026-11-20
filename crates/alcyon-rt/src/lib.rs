@@ -76,6 +76,7 @@ pub mod reuse;
 pub mod resolvers;
 pub mod srv_rt;
 pub mod srv_set;
+pub mod socks4;
 pub mod table;
 pub mod srv_h2;
 pub mod srv_tls;

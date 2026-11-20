@@ -79,6 +79,9 @@ pub(crate) fn parse_server(
     let mut ssl = default_server.map(|d| d.ssl.clone()).unwrap_or_default();
     let mut disabled = default_server.is_some_and(|d| d.disabled);
     let mut track = default_server.and_then(|d| d.track.clone());
+    // `srv_settings_cpy` copies `default-server`'s proxy and check mode (src/server.c).
+    let mut socks4 = default_server.and_then(|d| d.socks4);
+    let mut check_via_socks4 = default_server.is_some_and(|d| d.check_via_socks4);
     let mut agent = default_server.map(|d| d.agent.clone()).unwrap_or_default();
     let mut puid = 0u32;
     let index = u32::try_from(servers.len()).unwrap_or(u32::MAX);
@@ -128,6 +131,11 @@ pub(crate) fn parse_server(
             "no-send-proxy" => send_proxy = false,
             "send-proxy-v2" => send_proxy_v2 = true,
             "no-send-proxy-v2" => send_proxy_v2 = false,
+            "socks4" => {
+                socks4 = Some(parse_socks4_addr(tokens, i, who)?);
+                i += 1;
+            }
+            "check-via-socks4" => check_via_socks4 = true,
             t if t.starts_with("set-proxy-v2-tlv-fmt") => {
                 // `srv_parse_set_proxy_v2_tlv_fmt`: the id is in the keyword's
                 // parentheses, the log format the following token when there is one.
@@ -316,6 +324,12 @@ pub(crate) fn parse_server(
         });
     }
     extras.name_lines.insert(tokens[1].text.as_str().into(), u32::try_from(kw.line).unwrap_or(u32::MAX));
+    if let Some(p) = socks4 {
+        extras.socks4.push((index, p));
+    }
+    if check_via_socks4 {
+        extras.check_via_socks4.push(index);
+    }
     servers.push(Server {
         check_port,
         check_proto,
@@ -919,6 +933,22 @@ fn parse_pool_purge_delay(tokens: &[Token], i: usize, who: Option<&str>) -> Resu
     })
 }
 
+/// Parses `socks4 <addr>:<port>`, refusing hostnames and QUIC prefixes because proxy
+/// addresses are not DNS-resolved.
+fn parse_socks4_addr(tokens: &[Token], i: usize, who: Option<&str>) -> Result<SocketAddr, ConfigError> {
+    let tok = server_kw_arg(tokens, i, who, "expects <addr>:<port> as argument.")?;
+    let (addr, is_quic, name) = parse_server_addr(tok, None)?;
+    if is_quic || name.is_some() {
+        let prefix = server_keywords::server_prefix(who);
+        return Err(ConfigError::new(
+            tok.line,
+            tok.col,
+            format!("{prefix}'socks4' : the proxy must be a literal <addr>:<port>; resolving its name is not supported"),
+        ));
+    }
+    Ok(addr)
+}
+
 pub(crate) fn parse_default_server(
     def: &mut Option<DefaultServerConfig>,
     tokens: &[Token],
@@ -962,6 +992,13 @@ pub(crate) fn parse_default_server(
             "no-send-proxy" => cfg.send_proxy = false,
             "send-proxy-v2" => cfg.send_proxy_v2 = true,
             "no-send-proxy-v2" => cfg.send_proxy_v2 = false,
+            // `default-server` inherits `socks4`/`check-via-socks4` to its servers
+            // (`srv_settings_cpy` copies both from the default server).
+            "socks4" => {
+                cfg.socks4 = Some(parse_socks4_addr(tokens, i, None)?);
+                i += 1;
+            }
+            "check-via-socks4" => cfg.check_via_socks4 = true,
             t if t.starts_with("set-proxy-v2-tlv-fmt") => {
                 let (id, fmt, consumed) = parse_ppv2_tlv_fmt(tokens, i, None)?;
                 cfg.ppv2_tlvs.push(ProxyV2Tlv { id, fmt });
