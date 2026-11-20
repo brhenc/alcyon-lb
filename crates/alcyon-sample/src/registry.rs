@@ -438,9 +438,9 @@ pub struct PhaseCtx<'a> {
     /// Counts the copies of the context ([`crate::work::Op::CtxClone`]).
     pub clones: crate::work::CloneCount,
     /// The stream's transaction id, the process stream counter as the stream took it (the
-    /// `%rt` fetch prints it): what `txn.id32` reads (`smp_fetch_id32`). `0` where the
-    /// phase has no stream of its own.
-    pub uniq_id: u64,
+    /// `%rt` fetch prints it): what `txn.id32` reads (`smp_fetch_id32`). `None` where the
+    /// phase has no stream of its own (`!smp->strm`), and `txn.id32` then gives no sample.
+    pub uniq_id: Option<u64>,
     /// The entity that holds the stream until it continues: what `waiting_entity` reads
     /// (`smp_fetch_waiting_entity`); `None` where nothing is named (a `tarpit` waits in
     /// its own analyser, an `inspect-delay` data wait holds no rule, no stream filters
@@ -518,7 +518,7 @@ impl PhaseCtx<'_> {
         stick: None,
         fc: None,
         clones: crate::work::CloneCount,
-        uniq_id: 0,
+        uniq_id: None,
         waiting_entity: None,
     };
 }
@@ -3387,11 +3387,11 @@ impl Registry {
             },
         });
         // `smp_fetch_id32` (src/stream.c): the stream's transaction id, the same counter
-        // `%rt` prints.
+        // `%rt` prints (`if (!smp->strm) return 0;`).
         self.register_fetch(FetchDesc {
             name: "txn.id32",
             out_type: SampleType::Sint,
-            func: |ctx, _args| Some(Sample::Sint(i64::try_from(ctx.uniq_id).unwrap_or(i64::MAX))),
+            func: |ctx, _args| ctx.uniq_id.map(|id| Sample::Sint(i64::try_from(id).unwrap_or(i64::MAX))),
         });
 
         // --- 7. Captures ---

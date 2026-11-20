@@ -3360,6 +3360,13 @@ fn request_date(log: &crate::txnlog::StreamLog) -> (i64, u32) {
     (secs, ms % 1000)
 }
 
+/// Whether `s` currently has an active stream (`smp->strm` in HAProxy): TCP sessions
+/// always do once accepted; HTTP sessions do only once a request head was parsed (not
+/// `<BADREQ>` or idle/aborted pre-head connections).
+fn stream_has_strm(s: &TcpSession) -> bool {
+    s.mode == Mode::Tcp || s.strm.txn.as_ref().is_some_and(|t| t.req_len_hdrs.is_some())
+}
+
 /// The sample context a log line's `%[...]` reads.
 fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>, fc: Option<&'a crate::proxy::ConnView<'a>>) -> alcyon_sample::PhaseCtx<'a> {
     alcyon_sample::PhaseCtx {
@@ -3404,7 +3411,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         // (`req.timer.tq`, `res.timer.data`, ...) read them, and they are `duration_since`
         // on instants the stream already holds, not clock reads.
         stream: Some(stream_facts(s, None, true)),
-        uniq_id: s.strm.log.uniq_id,
+        uniq_id: stream_has_strm(s).then_some(s.strm.log.uniq_id),
         waiting_entity: s.strm.txn.as_ref().and_then(|t| t.body_wait).and_then(|w| {
             let (rules, stage) = if w.backend { (&be.http_req_rules, true) } else { (&fe.http_req_rules, false) };
             waiting_entity_of(&w, rules, stage)
@@ -4413,9 +4420,9 @@ fn proxy_header_error_line(entry: &SessionEntry, proxies: &crate::table::Table, 
         ..session_log_data(s, fe, fe, pid)
     };
     let (view, stick) = (ProxiesView(proxies), StickView::new(proxies, &s.tracked_sc));
-    // No stream, so no backend either: `be_name` has no value in `HAProxy`'s line.
+    // No stream, so no backend either: `be_name` and `txn.id32` have no value in `HAProxy`'s line.
     let fc = crate::proxy::ConnView::from_conn(s);
-    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, conn_err: Some(failure.conn_err()), be_name: None, be_id: None, t_close: data.t_close, ..stream_sample_ctx(s, fe, fe, &view, &stick, fc.as_ref()) }, live: None };
+    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, conn_err: Some(failure.conn_err()), be_name: None, be_id: None, t_close: data.t_close, uniq_id: None, ..stream_sample_ctx(s, fe, fe, &view, &stick, fc.as_ref()) }, live: None };
     let line = match fe.error_log_format() {
         Some(elf) => with_sd(fe.log_format_sd(), elf, &data, &ctx),
         None => {
@@ -8391,6 +8398,7 @@ fn eval_tcp_req_content_rules(
         // The stream exists by the time these rules run: the timer fetches read its logs,
         // `-1` where nothing is stamped yet.
         stream: Some(stream_facts(sess, None, true)),
+        uniq_id: Some(sess.strm.log.uniq_id),
         ..Default::default()
     };
 
@@ -8688,6 +8696,8 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &crate::table::Table, regi
         term_state: Some(sess_term_state(sess)),
         bc_dst: sess.bc_dst(),
         bc_src: sess.bc_src(),
+        last_rule: last_rule_at(sess.strm.log.last_rule),
+        uniq_id: Some(sess.strm.log.uniq_id),
         ..Default::default()
     }, live: None };
     for (rule, rc) in proxy.tcp_res_content_rules.iter().zip(&proxy.rules.tcp_res_content) {
@@ -10822,6 +10832,8 @@ impl EngineDispatcher<'_> {
             accept_date: Some(sess.strm.log.date()),
             captures_req_hdr: Some(&sess.strm.log.req_captures),
             captures_res_hdr: Some(&sess.strm.log.res_captures),
+            last_rule: last_rule_at(sess.strm.log.last_rule),
+            uniq_id: Some(sess.strm.log.uniq_id),
             ..Default::default()
         }
     }
@@ -13754,6 +13766,7 @@ impl EngineDispatcher<'_> {
             srv_name: entry
                 .target_server_idx
                 .and_then(|i| proxies.get(entry.srv_backend_idx)?.srv_set().name_at(i)),
+            uniq_id: Some(entry.sess.strm.log.uniq_id),
             ..Default::default()
         };
         let rh = RepHead {
@@ -13868,6 +13881,7 @@ impl EngineDispatcher<'_> {
             if tcp_stop {
                 break 'rules None;
             }
+            ctx.last_rule = last_rule_at(entry.sess.strm.log.last_rule);
             CURRENT_RES_STATUS.set(status);
 
             // 1. The backend's `http-response` rules, then the frontend's when it is another
@@ -13944,6 +13958,7 @@ impl EngineDispatcher<'_> {
             }
             if let Some(line) = LAST_RULE.take().filter(|&l| l != 0) {
                 entry.sess.strm.log.last_rule = line;
+                ctx.last_rule = last_rule_at(line);
             }
             // What the rules captured is what the log line shows, and what the rules after
             // them (`http-after-response`) read.
@@ -14249,6 +14264,7 @@ impl EngineDispatcher<'_> {
             be_name: Some(name),
             be_id: Some(proxies[serving].ids.iid),
             acls: Some(&proxies[serving].acls),
+            uniq_id: Some(sess.strm.log.uniq_id),
             ..Default::default()
         }
     }
@@ -14867,7 +14883,7 @@ impl EngineDispatcher<'_> {
                 acls: Some(acls),
                 act_conn,
                 stick: Some(&stick),
-                uniq_id: sess.strm.log.uniq_id,
+                uniq_id: Some(sess.strm.log.uniq_id),
                 // The wait these rules run to clear (`body_wait`), as `waiting_entity`
                 // names it: `rules` is the list its `rule` indexes and `be_stage` its
                 // stage, so the two never disagree.
@@ -14892,8 +14908,7 @@ impl EngineDispatcher<'_> {
                 }
                 if matches!(
                     rule.action,
-                    alcyon_config::HttpReqAction::Return { .. }
-                        | alcyon_config::HttpReqAction::UseServicePrometheus
+                    alcyon_config::HttpReqAction::UseServicePrometheus
                         | alcyon_config::HttpReqAction::Deny { .. }
                         | alcyon_config::HttpReqAction::Allow
                         | alcyon_config::HttpReqAction::Auth { .. }
@@ -14932,6 +14947,10 @@ impl EngineDispatcher<'_> {
                                 }
                             }
                         });
+                        // `http_req_get_intercept_rule` sets `last_entity` once `http_action_return`
+                        // returns, so `http-after-response` inside `return` sees nothing, while the
+                        // log line sees the rule.
+                        note_last_rule(sess, rule.line);
                         return Ok(RuleFlow::Replied);
                     }
                     // `use-service prometheus-exporter`: the metrics page answers the request and
@@ -19493,6 +19512,8 @@ fn after_res_on_reply<'r>(
             term_state: Some(sess_term_state(sess)),
             bc_dst: sess.bc_dst(),
             bc_src: sess.bc_src(),
+            last_rule: last_rule_at(sess.strm.log.last_rule),
+            uniq_id: Some(sess.strm.log.uniq_id),
             ..Default::default()
         };
         // A reply Alcyon built has no live stream to `do-log` from; the flag is discarded.
@@ -19554,6 +19575,7 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &cra
                     fe_id: Some(fe.ids.iid),
                     be_name: Some(be.name.as_str()),
                     be_id: Some(be.ids.iid),
+                    uniq_id: stream_has_strm(sess).then_some(sess.strm.log.uniq_id),
                     ..Default::default()
                 }, live: None };
                 return Some(build_templated_error_response(
