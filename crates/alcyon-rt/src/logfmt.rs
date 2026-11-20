@@ -503,6 +503,20 @@ const NUMERIC: &[Alias] = &[
     Alias::SrvQueue,
 ];
 
+/// The timer fetches that read the stream's logs (`smp_fetch_reX_timers`,
+/// `smp_fetch_txn_timers`, `smp_fetch_conn_timers`): a format carrying one needs the
+/// stream in its context. `fc.timer.handshake` is out: it reads the session's handshake,
+/// 0 in Alcyon, with or without a stream.
+pub const STREAM_TIMER_FETCHES: [&str; 7] = [
+    "req.timer.tq",
+    "req.timer.queue",
+    "res.timer.data",
+    "fc.timer.total",
+    "txn.timer.total",
+    "txn.timer.user",
+    "bc.timer.connect",
+];
+
 impl LogFormat {
     /// Compiles `fmt`, checking every expression's fetch and converters against
     /// `registry`.
@@ -572,16 +586,16 @@ impl LogFormat {
     /// line, the counters. A format that does not is rendered from [`LogData::of_context`] alone.
     #[must_use]
     pub fn needs_stream(&self) -> bool {
-        self.nodes.iter().any(|n| {
-            !matches!(
-                n,
-                Node::Text(_)
-                    | Node::Expr(..)
-                    | Node::Alias(
-                        Alias::ClientIp | Alias::ClientPort | Alias::FrontendIp | Alias::FrontendPort | Alias::ServerIp | Alias::ServerPort | Alias::BackendIp | Alias::BackendPort | Alias::Frontend | Alias::Backend | Alias::Server,
-                        ..
-                    )
-            )
+        self.nodes.iter().any(|n| match n {
+            Node::Text(_) => false,
+            // The timer fetches read the stream's logs (`src/sample.c`'s `smp_fetch_reX_timers`
+            // and friends), not only what a context holds: a format that carries one must be
+            // rendered with a stream in the context (`Rules::res_stream`).
+            Node::Expr(e, ..) => STREAM_TIMER_FETCHES.contains(&e.fetch_name.as_str()),
+            Node::Alias(a, ..) => !matches!(
+                a,
+                Alias::ClientIp | Alias::ClientPort | Alias::FrontendIp | Alias::FrontendPort | Alias::ServerIp | Alias::ServerPort | Alias::BackendIp | Alias::BackendPort | Alias::Frontend | Alias::Backend | Alias::Server
+            ),
         })
     }
 
