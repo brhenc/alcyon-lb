@@ -197,6 +197,10 @@ pub struct QueueWait {
     /// it waits for, in `HAProxy` in that server's queue (`pendconn_add` with `srv` set, T592);
     /// `None`: whichever server the balancing picks.
     srv: Option<usize>,
+    /// That server's queue counter (kept with the request, like `stats`, so a `del backend`
+    /// cannot free it out from under it): `None` in a spare, and for a request queued for
+    /// the proxy rather than for one of its servers.
+    srv_q: Option<crate::srv_set::SrvQueue>,
 }
 
 alcyon_alloc::declare_pool!(
@@ -216,6 +220,9 @@ impl alcyon_alloc::Poolable for Box<QueueWait> {
         if let Some(stats) = self.stats.take() {
             stats[0].queue_cur.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             let (task, be) = (self.task, self.be_idx);
+            if let Some(q) = self.srv_q.take() {
+                q.dec();
+            }
             let _ = QUEUED.try_with(|q| q.borrow_mut().retain(|&(t, b, _)| !(t == task && b == be)));
         }
     }
@@ -257,15 +264,19 @@ impl QueueSlot {
 
     /// Puts the request of `task` in the queue of backend `be_idx` (`stats` are the
     /// backend's, where `qcur` and `qmax` are kept), waiting for server `srv` if it is
-    /// assigned one; returns its place in it, for `%bq`.
-    pub fn enter(&mut self, task: alcyon_sched::TaskRef, be_idx: usize, srv: Option<usize>, stats: Arc<Vec<crate::engine::ProxyStats>>, deadline: Tick) -> u32 {
+    /// assigned one (`srv_q` its queue counter, so it is counted there too); returns its
+    /// place in it, for `%bq`.
+    pub fn enter(&mut self, task: alcyon_sched::TaskRef, be_idx: usize, srv: Option<usize>, stats: Arc<Vec<crate::engine::ProxyStats>>, srv_q: Option<crate::srv_set::SrvQueue>, deadline: Tick) -> u32 {
         self.leave();
         let mut q = PENDCONN.take_raw(<Box<QueueWait> as alcyon_alloc::Poolable>::try_new).unwrap_or_else(QueueWait::blank);
         let st = &stats[0];
         let pos = st.queue_cur.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         st.queue_max.fetch_max(pos, std::sync::atomic::Ordering::Relaxed);
         QUEUED.with(|l| l.borrow_mut().push((task, be_idx, srv)));
-        *q = QueueWait { deadline, pos, task, stats: Some(stats), be_idx, srv };
+        if let Some(q) = srv_q.as_ref() {
+            q.inc();
+        }
+        *q = QueueWait { deadline, pos, task, stats: Some(stats), be_idx, srv, srv_q };
         self.0 = Some(q);
         pos
     }
@@ -294,7 +305,7 @@ pub fn queued_on(be: usize, srv: usize) -> usize {
 impl QueueWait {
     /// A box in no queue.
     fn blank() -> Box<QueueWait> {
-        Box::new(QueueWait { deadline: Tick::ETERNITY, pos: 0, task: alcyon_sched::TaskRef::NONE, stats: None, be_idx: 0, srv: None })
+        Box::new(QueueWait { deadline: Tick::ETERNITY, pos: 0, task: alcyon_sched::TaskRef::NONE, stats: None, be_idx: 0, srv: None, srv_q: None })
     }
 
     /// Whether anything is queued on this thread.
@@ -4999,13 +5010,13 @@ fn h3_log_line(line: &str, host: Option<&str>) -> String {
         let stats = Arc::new(vec![crate::engine::ProxyStats::default()]);
         let mut slot = QueueSlot::default();
         assert!(!slot.leave() && slot.deadline().is_none() && !QueueWait::any());
-        assert_eq!(slot.enter(alcyon_sched::TaskRef(1), 0, None, stats.clone(), Tick::ETERNITY), 1);
+        assert_eq!(slot.enter(alcyon_sched::TaskRef(1), 0, None, stats.clone(), None, Tick::ETERNITY), 1);
         assert!(slot.is_some() && QueueWait::any());
         assert_eq!(PENDCONN.local_count(), 0);
         assert!(slot.leave());
         assert!(!QueueWait::any());
         assert_eq!(PENDCONN.local_count(), 1, "the box went back to the pool");
-        assert_eq!(slot.enter(alcyon_sched::TaskRef(2), 0, None, stats.clone(), Tick::ETERNITY), 1, "the queue length went down with the first");
+        assert_eq!(slot.enter(alcyon_sched::TaskRef(2), 0, None, stats.clone(), None, Tick::ETERNITY), 1, "the queue length went down with the first");
         assert_eq!(PENDCONN.local_count(), 0, "the box came from the pool");
         drop(slot);
         assert!(!QueueWait::any());

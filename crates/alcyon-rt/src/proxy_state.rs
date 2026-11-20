@@ -97,6 +97,48 @@ impl ProxyState for ProxiesView<'_> {
         self.backend(backend).map(usable_servers)
     }
 
+    fn backend_queue(&self, backend: &str) -> Option<i64> {
+        let p = self.backend(backend)?;
+        // `px->totpend`: the requests queued in the backend's queue and in the queues of
+        // all its servers (`pendconn_add` counts both in it), over every worker.
+        Some(p.stats.iter().map(|s| i64::from(s.queue_cur.load(Ordering::Relaxed))).sum())
+    }
+
+    fn backend_avg_queue(&self, backend: &str) -> Option<i64> {
+        let p = self.backend(backend)?;
+        let nbsrv = usable_servers(p);
+        let totpend = p.stats.iter().map(|s| i64::from(s.queue_cur.load(Ordering::Relaxed))).sum::<i64>();
+        // `smp_fetch_avg_queue_size`: the queue rounded up over the usable servers, the
+        // queue doubled when there are none.
+        Some(if nbsrv > 0 { (totpend + nbsrv - 1) / nbsrv } else { totpend * 2 })
+    }
+
+    fn backend_connslots(&self, backend: &str) -> Option<i64> {
+        let p = self.backend(backend)?;
+        let mut slots = 0i64;
+        for i in 0..p.srv_set().len() {
+            // `SRV_ST_STOPPED`: `disabled` in the file, and the CLI's `set server-state`
+            // maintenance. A server down by its check alone is counted, as it still is in
+            // `HAProxy`, where the check and the lifecycle are apart.
+            if status(p, i) == ServerStatus::Maint {
+                continue;
+            }
+            let maxconn = p.srv_set().at(i).and_then(|s| s.maxconn()).unwrap_or(0);
+            let maxqueue = p.srv_set().maxqueue_at(i);
+            // "the configuration is stupid" (src/backend.c:3440): no way to tell.
+            if maxconn == 0 || maxqueue == 0 {
+                return Some(-1);
+            }
+            slots += i64::from(maxconn) - i64::from(cur_sess(p, i))
+                + i64::from(maxqueue) - i64::from(p.srv_set().queue_len(i));
+        }
+        Some(slots)
+    }
+
+    fn process_uptime(&self) -> i64 {
+        i64::try_from(crate::stats::process_start().elapsed().as_secs()).unwrap_or(i64::MAX)
+    }
+
     fn backend_conn_free(&self, backend: &str) -> Option<i64> {
         let p = self.backend(backend)?;
         let (act, fbck) = recount(p);
@@ -125,6 +167,7 @@ impl ProxyState for ProxiesView<'_> {
             weight: me.weight().unwrap_or(1),
             iweight: me.initial_weight().unwrap_or(1),
             uweight: me.weight().unwrap_or(1),
+            queue_len: p.srv_set().queue_len(i),
         })
     }
 

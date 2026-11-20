@@ -347,6 +347,7 @@ mod proc_var_converters;
 mod process_fetches;
 mod process_ids;
 mod cpu_lat_fetches;
+mod queue_fetches;
 mod protobuf_ungrpc;
 mod protocol_checks;
 mod proto_major;

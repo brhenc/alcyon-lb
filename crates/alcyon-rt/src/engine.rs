@@ -15828,7 +15828,8 @@ impl EngineDispatcher<'_> {
         let be = &proxies[be_idx];
         let mut pick = || be.pick_and_take(false, || be.select_server_with_key_abs_idx(source_ip, entry.sess.req_uri.as_deref(), entry.sess.req_abs(), lb_snap));
         let mut full;
-        let target = if let Some(idx) = cookie_server {
+        let mut cookie_server = cookie_server;
+        let mut target = if let Some(idx) = cookie_server {
             let t = be.take_server_slot(idx, false).map(|counted| ((Some(idx), be.srv_set().addr_at(idx)), counted));
             full = t.is_none();
             t
@@ -15845,6 +15846,60 @@ impl EngineDispatcher<'_> {
                 if t.is_some() || full || tries.next().is_none() || !limited() { break t; }
             }
         };
+
+        // The server persistence named is at its `maxconn` and the other entries fill its
+        // queue (`maxqueue`): `SRV_STATUS_FULL` (src/backend.c:1059-1062). `option redispatch`
+        // unassigns and asks the balancer again (`goto redispatch`); without it the stream
+        // ends with the `503` and the `sQ` term (`STRM_ET_QUEUE_ERR`). A server the balancer
+        // picked is never full here: the algorithms skip full servers, so only the assigned
+        // path reaches this check.
+        if target.is_none() && full {
+            if let Some(idx) = cookie_server {
+                let mq = be.srv_set().maxqueue_at(idx);
+                // A request woken out of `idx`'s queue is still counted in it until it
+                // leaves below; the check must not see itself. `HAProxy` unlinks the
+                // stream from its queue before re-checking it (`process_srv_queue` in
+                // src/queue.c), so its fullness is the other entries only.
+                let others = be.srv_set().queue_len(idx)
+                    .saturating_sub(u32::from(entry.sess.queue.server() == Some(idx)));
+                if mq > 0 && others >= mq {
+                    if be.redisp {
+                        let limited = || (0..be.srv_set().len()).any(|i| be.srv_set().maxconn_at(i).is_some_and(|m| m > 0));
+                        let mut tries = 0..3;
+                        loop {
+                            target = pick();
+                            full = target.is_none() && be.all_servers_full();
+                            if target.is_some() || full || tries.next().is_none() || !limited() { break; }
+                        }
+                        cookie_server = None;
+                        // `assign_server_and_queue` (src/backend.c:1004-1016): a successful
+                        // re-pick is by a different server -- the balancers skip a server at
+                        // its `maxconn` and a failed `take` is a `None` -- and it takes the
+                        // `SF_REDISP` flags and counts. The `HAProxy` same-server retry case
+                        // cannot happen here.
+                        if let Some(((opt_idx, _), _)) = &target {
+                            debug_assert!(*opt_idx != Some(idx), "a pick never returns a server at its maxconn");
+                            entry.sess.flags.set(sess_flags::REDISPATCHED);
+                            entry.sess.flags.set(sess_flags::LB_PICKED);
+                            be.srv_set().bump_retr(idx, (0, 1, 0));
+                            be.counters().redispatches.fetch_add(1, Ordering::Relaxed);
+                            entry.sess.strm.txn.iter_mut().for_each(|txn| {
+                                txn.ck.direct = false;
+                                // TX_CK_VALID (3) becomes TX_CK_DOWN (2).
+                                txn.ck.ck = if txn.ck.ck == 3 { 2 } else { txn.ck.ck };
+                            });
+                        }
+                    } else {
+                        be.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
+                        be.srv_set().bump_retr(idx, (0, 0, 1));
+                        entry.sess.strm.log.term = Some(*b"sQ");
+                        entry.sess.strm.log.queue.get_or_insert_with(crate::txnlog::loop_now);
+                        reply_error(entry, proxies, 503);
+                        return None;
+                    }
+                }
+            }
+        }
 
         let Some(((picked_idx, target_addr), counted)) = target else {
             if full {
@@ -16074,7 +16129,10 @@ impl EngineDispatcher<'_> {
         }
         let ms = entry.sess.queue_ms();
         let deadline = if ms == 0 { Tick::ETERNITY } else { now.add(ms) };
-        entry.sess.strm.log.be_queue = entry.sess.queue.enter(entry.task, be_idx, srv, proxies[be_idx].stats.clone(), deadline);
+        // `srv->queueslength`: the request counted on the server it waits for, not only on
+        // the backend's queue (`pendconn_add`).
+        let srv_q = srv.and_then(|i| proxies[be_idx].srv_set().queue_ref(i));
+        entry.sess.strm.log.be_queue = entry.sess.queue.enter(entry.task, be_idx, srv, proxies[be_idx].stats.clone(), srv_q, deadline);
         entry.sess.strm.log.queue_is_srv = srv.is_some();
         None
     }

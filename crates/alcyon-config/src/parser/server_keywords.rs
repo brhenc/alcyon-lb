@@ -72,7 +72,6 @@ const CHECK: Unimplemented = Refuse(
     "Alcyon does not implement it; the health check would silently test something else",
 );
 const ROUTE: Unimplemented = Refuse("Alcyon does not implement it; requests would be routed differently");
-const SENT: Unimplemented = Refuse("Alcyon does not implement it; the server would receive something else");
 
 /// Keywords `HAProxy` registers that the loops in `server.rs` do not handle.
 pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
@@ -85,8 +84,6 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("init-state", Arg::Word, Refuse("Alcyon does not implement it; the server would take traffic in a state it should not")),
     kw!("log-bufsize", Arg::Word, Ignore("log servers only")),
     kw!("log-proto", Arg::Word, Ignore("log servers only")),
-    // `atol`: 0 (or a word) is no limit, which is what Alcyon does; see `parse_unimplemented`.
-    kw!("maxqueue", Arg::Word, Refuse("Alcyon has no per-server queue (a request waits in its backend's queue); only 'maxqueue 0' is accepted")),
     kw!("max-reuse", Arg::Word, Ignore("handled with the other server keywords in parse_server (h2 only, T540)")),
     kw!("minconn", Arg::Word, Ignore("the dynamic connection limit")),
     kw!("namespace", Arg::Word, ROUTE),
@@ -181,9 +178,6 @@ pub(crate) fn unimplemented_server_keyword(tokens: &[Token], i: usize, server: O
             i + 1
         }
     };
-    if k.name == "maxqueue" && atol(&tokens[i + 1].text) <= 0 {
-        return Ok(last);
-    }
     if server.is_none() && !k.default_ok {
         super::warn::push_alert(tok.line, crate::ast::global::WarnStyle::At, &format!("'{}' option is not accepted in default-server sections", k.name));
         return Ok(last);
