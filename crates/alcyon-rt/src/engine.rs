@@ -3279,10 +3279,16 @@ pub fn set_config_files(files: Vec<(u32, String)>) {
 }
 
 /// `last_rule`, a line of the configuration text, as the file it is in and its line there.
+#[inline(always)]
 fn last_rule_at(line: u32) -> Option<(&'static str, u32)> {
     if line == 0 {
         return None;
     }
+    last_rule_lookup(line)
+}
+
+#[inline]
+fn last_rule_lookup(line: u32) -> Option<(&'static str, u32)> {
     let files = CONFIG_FILES.get()?;
     let (first, path) = files.iter().rev().find(|(first, _)| *first <= line)?;
     Some((path.as_str(), line - first + 1))
@@ -3394,7 +3400,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         server_addr: s.server_addr,
         fc_src: s.fc_src(),
         fc_dst: s.fc_dst(),
-        is_first_req: s.flags.has(sess_flags::IS_FIRST_REQ),
+        is_first_req: s.is_first_req,
         proxy_tlvs: s.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         saved_syn: s.saved_syn(),
         ssl_fc: crate::proxy::ssl_fc(&s.cli_xprt, s.h2_role.as_deref()),
@@ -7900,7 +7906,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 && e.sess.req.is_empty()
                 && e.sess.rep.is_empty()
                 && e.sess.req_headers.is_none()
-                && !e.sess.flags.has(sess_flags::HAS_HTX)
+                && !e.sess.has_htx
                 // Between requests a keep-alive client sits in `Ready`, not `Established`:
                 // T71 keeps it there across transactions. Matching only `Established` meant
                 // this closed nothing, and an idle client held the soft stop open until
@@ -7913,7 +7919,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 // (`H1C_F_WAIT_NEXT_REQ`, `src/mux_h1.c`) and serves the first one with
                 // `connection: close`; closing it lost requests on every reload under
                 // load (T252). An HTTP/2 connection is told with a GOAWAY either way.
-                && (!e.sess.flags.has(sess_flags::IS_FIRST_REQ) || e.sess.h2_ctx.is_some())
+                && (!e.sess.is_first_req || e.sess.h2_ctx.is_some())
                 // An HTTP/2 connection serving a stream is not idle (the stream is its child,
                 // T280).
                 && e.sess.h2_owner().is_none_or(|o| o.children.is_empty())
@@ -8446,12 +8452,12 @@ fn eval_tcp_req_content_rules(
 
     let req_bytes = sess.req.readable();
     // An HTTP/2 or HTTP/3 head in its HTX alone is content (X4).
-    let has_content = !req_bytes.is_empty() || sess.flags.has(sess_flags::REQ_HEAD_PENDING);
+    let has_content = !req_bytes.is_empty() || sess.req_head_pending;
     // A kept-alive connection closed by the client with no next request has no stream to
     // inspect: HAProxy runs nothing for it.
     if sess.mode == Mode::Http
-        && !sess.flags.has(sess_flags::IS_FIRST_REQ)
-        && !sess.flags.has(sess_flags::HAS_HTX)
+        && !sess.is_first_req
+        && !sess.has_htx
         && !has_content
         && matches!(sess.cli_state, ScState::ShutR | ScState::Closed)
     {
@@ -8488,7 +8494,7 @@ fn eval_tcp_req_content_rules(
         // In HTTP mode the request is parsed by the time these rules run, and `path`,
         // `hdr()` and the like read it, as they do in `HAProxy`. Built from the fields: the
         // rules change `vars` while this borrows.
-        htx_slice: sess.flags.has(sess_flags::HAS_HTX).then(|| alcyon_proto::htx::HtxSliceRef::new(sess.htx_buf.raw_slice(), sess.htx_blocks)),
+        htx_slice: sess.has_htx.then(|| alcyon_proto::htx::HtxSliceRef::new(sess.htx_buf.raw_slice(), sess.htx_blocks)),
         req_uri: sess.req_uri.as_deref(),
         req_method: sess.req_method.as_deref(),
         req_headers: sess.req_headers.as_deref(),
@@ -9298,7 +9304,7 @@ fn start_socks4_handshake(sess: &mut TcpSession, proxy: Option<SocketAddr>) {
 /// `bc_dst` the one the socket connects to.
 fn set_target(entry: &mut SessionEntry, target: SocketAddr) {
     entry.sess.target_addr = Some(target);
-    entry.sess.flags.clear(sess_flags::BC_IDLE);
+    entry.sess.bc_idle = false;
 }
 
 fn maybe_prepend_send_proxy(fe: &Proxy, proxy: &Proxy, proxies: &crate::table::Table, sess: &mut TcpSession, target_addr: SocketAddr) {
@@ -9447,7 +9453,7 @@ fn init_client_session(
     sess.tracked_sc = tracked_sc;
     sess.h2_flood_config = global_h2_flood_config;
     let fe = &proxies[proxy_idx];
-    sess.flags.set_to(sess_flags::ACCEPT_UNSAFE_REQUEST, fe.stats_config.accept_unsafe_request);
+    sess.accept_unsafe_request = fe.stats_config.accept_unsafe_request;
     sess.http_request_ms = fe.stats_config.raw_timeouts.http_request.map_or(0, millis_to_u32);
     sess.keep_alive_ms = fe.stats_config.raw_timeouts.http_keep_alive.map_or(0, millis_to_u32);
     sess.flags.set_to(sess_flags::CLOSE_CLIENT, client_close(proxies, proxy_idx));
@@ -10061,7 +10067,7 @@ fn move_server(from: &mut SessionEntry, to: &mut SessionEntry, fdtab: &mut FdTab
     t.flags.set_to(sess_flags::SRV_KEPT, f.flags.take(sess_flags::SRV_KEPT));
     t.srv_exp = std::mem::replace(&mut f.srv_exp, Tick::ETERNITY);
     t.conn_exp = std::mem::replace(&mut f.conn_exp, Tick::ETERNITY);
-    t.flags.set_to(sess_flags::SRV_CANT_RECV, f.flags.has(sess_flags::SRV_CANT_RECV));
+    t.srv_cant_recv = f.srv_cant_recv;
     t.flags.set_to(sess_flags::SEND_PROXY_PREPENDED, f.flags.take(sess_flags::SEND_PROXY_PREPENDED));
     t.send_proxy_header = std::mem::take(&mut f.send_proxy_header);
     t.target_addr = f.target_addr.take();
@@ -10116,7 +10122,7 @@ fn h2_child_start(
     // kept it for its next request.
     move_server(owner, child, fdtab);
     // It is not this stream's until a request takes it (`bc_idle`, T491).
-    child.sess.flags.set_to(sess_flags::BC_IDLE, child.sess.srv.is_some());
+    child.sess.bc_idle = child.sess.srv.is_some();
     crate::h2_bridge::start_request(&mut child.sess, d);
     // The stream's own `timeout client` starts with it (T300).
     child.sess.arm_client(now);
@@ -10146,7 +10152,7 @@ fn h2_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     if ch.reset || crate::h2_bridge::stream_is_reset(h2, ch.stream.id) {
         return false;
     }
-    ch.stream.body.drop_trailers = cs.flags.has(sess_flags::DROP_REQ_TRAILERS);
+    ch.stream.body.drop_trailers = cs.drop_req_trailers;
     let (mut moved, trailers) = crate::h2_bridge::pump_request_body(h2, &mut ch.stream, &mut cs.req);
     // A stream's entry has its transaction until it is freed.
     let Some(t) = cs.strm.txn.as_mut() else { return moved };
@@ -10232,7 +10238,7 @@ fn h3_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     if ch.reset || alcyon_proto::htx_mux::HtxMux::is_reset(mux, u64::from(ch.stream.id)) {
         return false;
     }
-    ch.stream.body.drop_trailers = cs.flags.has(sess_flags::DROP_REQ_TRAILERS);
+    ch.stream.body.drop_trailers = cs.drop_req_trailers;
     let (mut moved, trailers) = crate::h2_bridge::pump_request_body_mux(mux, &mut ch.stream, &mut cs.req);
     let Some(t) = cs.strm.txn.as_mut() else { return moved };
     if let Some(u) = t.req_htx.as_mut() {
@@ -10986,7 +10992,7 @@ impl EngineDispatcher<'_> {
             so_name: sess.so_name.as_deref(),
             so_id: sess.so_id_opt(),
             fc_dst: sess.fc_dst(),
-            is_first_req: sess.flags.has(sess_flags::IS_FIRST_REQ),
+            is_first_req: sess.is_first_req,
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
@@ -11233,7 +11239,7 @@ impl EngineDispatcher<'_> {
                 // `option http-ignore-probes` (`PR_O_IGNORE_PRB`): a new connection that sent
                 // nothing and closes or times out is a probe, sent nothing, not logged and
                 // not counted (`h1_process`, `h1_handle_req_tout`, T272).
-                if proxies[entry.proxy_idx].ignore_probes && entry.sess.flags.has(sess_flags::IS_FIRST_REQ) && entry.sess.req.is_empty() {
+                if proxies[entry.proxy_idx].ignore_probes && entry.sess.is_first_req && entry.sess.req.is_empty() {
                     close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
                     return None;
                 }
@@ -11249,7 +11255,7 @@ impl EngineDispatcher<'_> {
                 // kill, no page (measured: the oracle closes a silent client on an
                 // `accept-proxy` and an `accept-netscaler-cip` bind with no bytes).
                 if entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Client))
-                    && (!entry.sess.req.is_empty() || entry.sess.flags.has(sess_flags::IS_FIRST_REQ))
+                    && (!entry.sess.req.is_empty() || entry.sess.is_first_req)
                     && !entry.sess.handshake_pending()
                 {
                     let fe = &proxies[entry.proxy_idx];
@@ -11260,7 +11266,7 @@ impl EngineDispatcher<'_> {
                     entry.sess.strm.log.term = Some(*b"cR");
                     quiet = entry.sess.req.is_empty() && proxies[entry.proxy_idx].dont_log_null;
                 } else if !entry.sess.req.is_empty()
-                    || (entry.sess.flags.has(sess_flags::IS_FIRST_REQ) && matches!(entry.sess.ending, None | Some(crate::proxy::Ending::ClientAbort)))
+                    || (entry.sess.is_first_req && matches!(entry.sess.ending, None | Some(crate::proxy::Ending::ClientAbort)))
                 {
                     // Part of a request, or a new connection closed before its first byte,
                     // then the client left: `HAProxy` logs it as a 400 the client aborted
@@ -11441,7 +11447,7 @@ impl EngineDispatcher<'_> {
             }
         }
         if ran_out {
-            entry.sess.flags.set(sess_flags::PASSES_RAN_OUT);
+            entry.sess.passes_ran_out = true;
         }
 
         if Self::client_left(entry, proxies, fdtab, poller, idle_pool) {
@@ -12056,7 +12062,7 @@ impl EngineDispatcher<'_> {
         // session (`bc_idle`, set at the previous transaction's end and cleared where a request
         // connects or takes it back): HAProxy leaves it where it is, parked or in the idle
         // lists, for the next request (T491).
-        let untouched = txn.local && entry.sess.flags.has(sess_flags::BC_IDLE) && entry.sess.srv.is_some();
+        let untouched = txn.local && entry.sess.bc_idle && entry.sess.srv.is_some();
         if !untouched && !reusable {
             release_server(entry, proxies, fdtab, poller, idle_pool, false);
         } else if !untouched && entry.sess.req.is_empty() && !private {
@@ -12525,13 +12531,13 @@ impl EngineDispatcher<'_> {
             // A readiness event on either socket: reading it may make progress again.
             if let Some(sfd) = entry.srv_raw_fd {
                 if self.fdtab.ready(sfd).readable {
-                    entry.sess.flags.clear(sess_flags::SRV_CANT_RECV);
+                    entry.sess.srv_cant_recv = false;
                     self.fdtab.clear_ready(sfd, true, false);
                 }
             }
             if let Some(cfd) = entry.sess.cli_fd().map(|fd| fd.as_raw_fd()) {
                 if self.fdtab.ready(cfd).readable {
-                    entry.sess.flags.clear(sess_flags::CLI_CANT_RECV);
+                    entry.sess.cli_cant_recv = false;
                     self.fdtab.clear_ready(cfd, true, false);
                 }
             }
@@ -13894,7 +13900,7 @@ impl EngineDispatcher<'_> {
             (entry.sess.strm.log.res_captures.clone(), entry.sess.strm.log.res_captures.clone())
         };
 
-        let htx_slice = if entry.sess.flags.has(sess_flags::HAS_HTX) {
+        let htx_slice = if entry.sess.has_htx {
             Some(alcyon_proto::htx::HtxSliceRef::new(
                 entry.sess.htx_buf.raw_slice(),
                 entry.sess.htx_blocks,
@@ -13937,7 +13943,7 @@ impl EngineDispatcher<'_> {
             so_name: entry.sess.so_name.as_deref(),
             so_id: entry.sess.so_id_opt(),
             fc_dst: entry.sess.fc_dst(),
-            is_first_req: entry.sess.flags.has(sess_flags::IS_FIRST_REQ),
+            is_first_req: entry.sess.is_first_req,
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             saved_syn: entry.sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
             ssl_fc: crate::proxy::ssl_fc(&entry.sess.cli_xprt, entry.sess.h2_role.as_deref()),
@@ -14465,7 +14471,7 @@ impl EngineDispatcher<'_> {
             fc_src: sess.fc_src(),
             saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
             fc_dst: sess.fc_dst(),
-            is_first_req: sess.flags.has(sess_flags::IS_FIRST_REQ),
+            is_first_req: sess.is_first_req,
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
             quic_acks: sess.quic_facts(),
             fc_http_major: sess.fc_http_major(),
@@ -14720,7 +14726,7 @@ impl EngineDispatcher<'_> {
     ) -> Option<crate::stats_html::AdminAction> {
         entry.sess.strm.log.applet = true;
         // The applet reads the request's body behind its head in the buffer (X4).
-        if entry.sess.flags.has(sess_flags::REQ_HEAD_PENDING) {
+        if entry.sess.req_head_pending {
             crate::h2_bridge::write_pending_head(&mut entry.sess, false, None);
         }
         if Self::stats_rules_reply(entry, proxies, serving) {
@@ -15073,7 +15079,7 @@ impl EngineDispatcher<'_> {
                 fc_src: sess.fc_src(),
                 so_id: sess.so_id_opt(),
                 fc_dst: sess.fc_dst(),
-                is_first_req: sess.flags.has(sess_flags::IS_FIRST_REQ),
+                is_first_req: sess.is_first_req,
                 quic_acks: sess.quic_facts(),
                 fc_http_major: sess.fc_http_major(),
                 bc_http_major: sess.bc_http_major(),
@@ -16175,7 +16181,7 @@ impl EngineDispatcher<'_> {
         // X3b-2: not before the pick when the session's server connection speaks h2, which takes
         // the blocks: written at the send if the text goes after all (another server, a retry).
         let s = &mut entry.sess;
-        let names_done = if s.flags.has(sess_flags::HTX_MODIFIED) && s.flags.has(sess_flags::HAS_HTX) && !s.flags.has(sess_flags::REQ_HEAD_PENDING) && srv_table.is_none() && s.srv_xprt.h2().is_some() {
+        let names_done = if s.htx_modified && s.has_htx && !s.req_head_pending && srv_table.is_none() && s.srv_xprt.h2().is_some() {
             s.req_head_deferred = Some(lower);
             true
         } else {
@@ -16365,7 +16371,7 @@ impl EngineDispatcher<'_> {
                     server_actconn_add(entry, proxies, true);
                 }
                 mark_server_connected(entry, proxies, now);
-                entry.sess.flags.clear(sess_flags::BC_IDLE);
+                entry.sess.bc_idle = false;
                 if let Some(txn) = entry.sess.strm.txn.as_mut() {
                     txn.srv_reused = true;
                 }
@@ -16406,7 +16412,7 @@ impl EngineDispatcher<'_> {
             // and so is every HTTP/3 request, the relay's included (`qcs_new`, `mux_quic.c`): one
             // server connection per HTTP/3 request overflowed a small server's accept queue
             // under a burst of 200 (T523).
-            let first_req = entry.sess.flags.has(sess_flags::IS_FIRST_REQ) && !entry.sess.is_h2_child() && entry.sess.client_proto != ClientProto::H3;
+            let first_req = entry.sess.is_first_req && !entry.sess.is_h2_child() && entry.sess.client_proto != ClientProto::H3;
             if let Some((conn, safe, registered)) = key.and_then(|k| idle_pool.take(&k, first_req, proxies[be_idx].http_reuse, steal)) {
                 entry.srv_served = if safe { 2 } else { 1 };
                 reused = Some((conn, registered));
@@ -17742,7 +17748,7 @@ fn reread_request_length(sess: &mut TcpSession) -> bool {
 }
 
 fn set_req_header(sess: &mut TcpSession, name: &str, val: &str) {
-    if sess.flags.has(sess_flags::HAS_HTX) {
+    if sess.has_htx {
         sess.with_htx_mut(|htx| {
             let _ = htx.set_header(name, val);
         });
@@ -17752,7 +17758,7 @@ fn set_req_header(sess: &mut TcpSession, name: &str, val: &str) {
     hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
     hdrs.push((name.to_string(), val.to_string()));
     sess.req_headers = Some(hdrs);
-    sess.flags.set(sess_flags::HTX_MODIFIED);
+    sess.htx_modified = true;
 }
 
 /// [`add_req_header`] for a header `HAProxy` adds with `http_add_header` and fails the request
@@ -17795,7 +17801,7 @@ fn add_req_connection(sess: &mut TcpSession, tok: &str) {
 }
 
 fn add_req_header(sess: &mut TcpSession, name: &str, val: &str) {
-    if sess.flags.has(sess_flags::HAS_HTX) {
+    if sess.has_htx {
         sess.with_htx_mut(|htx| {
             let _ = htx.add_header(name, val);
         });
@@ -17804,14 +17810,14 @@ fn add_req_header(sess: &mut TcpSession, name: &str, val: &str) {
     let mut hdrs = sess.req_headers.take().unwrap_or_default();
     hdrs.push((name.to_string(), val.to_string()));
     sess.req_headers = Some(hdrs);
-    sess.flags.set(sess_flags::HTX_MODIFIED);
+    sess.htx_modified = true;
 }
 
 /// Whether the head in the request buffer is the HTX's (an HTTP/1 head nothing has edited
 /// since it was parsed, or an HTTP/2 one as the bridge wrote it): a text edit may then be
 /// made to both. An edited head is the HTX's alone until the send writes it (X2).
 fn req_text_is_htx(sess: &TcpSession) -> bool {
-    sess.flags.has(sess_flags::HAS_HTX) && !sess.flags.has(sess_flags::HTX_MODIFIED)
+    sess.has_htx && !sess.htx_modified
 }
 
 /// What a pass over a list of `http-request` rules came to.
@@ -17958,7 +17964,7 @@ fn txn_req_body(sess: &TcpSession) -> Option<&[u8]> {
 /// not yet whole.
 fn req_head_len(sess: &TcpSession) -> usize {
     let data = sess.req.readable();
-    if sess.flags.has(sess_flags::REQ_HEAD_PENDING) {
+    if sess.req_head_pending {
         0
     } else {
         crate::proxy::find_eoh(data).map_or(data.len(), |(h, e)| h + e)
@@ -17967,11 +17973,11 @@ fn req_head_len(sess: &TcpSession) -> usize {
 
 fn del_req_header(sess: &mut TcpSession, name: &str) {
     // `-m beg|end|sub|reg` names a set of headers: remove each that matches.
-    if !sess.flags.has(sess_flags::HAS_HTX) {
+    if !sess.has_htx {
         let mut hdrs = sess.req_headers.take().unwrap_or_default();
         hdrs.retain(|(k, _)| !header_name_matches(k, name));
         sess.req_headers = Some(hdrs);
-        sess.flags.set(sess_flags::HTX_MODIFIED);
+        sess.htx_modified = true;
         return;
     }
     if name.starts_with('\0') {
@@ -18009,7 +18015,7 @@ fn req_htx_init(sess: &TcpSession) {
     let data = sess.req.readable();
     // The head as it is in the buffer (an edited one is written at the send, an HTTP/2 one is
     // not there yet): what follows it is the body.
-    let head_len = if sess.flags.has(sess_flags::REQ_HEAD_PENDING) { 0 } else { sess.req.eoh().map_or(data.len(), |(h, e)| h + e) };
+    let head_len = if sess.req_head_pending { 0 } else { sess.req.eoh().map_or(data.len(), |(h, e)| h + e) };
     let body = data.len().saturating_sub(head_len);
     let line = 8 + 20 + line + 8;
     let head = line + hdrs + 9;
@@ -18041,7 +18047,7 @@ fn req_set_uri(sess: &mut TcpSession, uri: String) -> bool {
         let _ = htx.set_uri(&uri);
     });
     sess.req_uri.set(&uri);
-    sess.flags.set(sess_flags::HTX_MODIFIED);
+    sess.htx_modified = true;
     true
 }
 
@@ -18056,7 +18062,7 @@ fn req_set_method(sess: &mut TcpSession, method: String) -> bool {
         let _ = htx.set_method(&method);
     });
     sess.req_method.set(&method);
-    sess.flags.set(sess_flags::HTX_MODIFIED);
+    sess.htx_modified = true;
     true
 }
 
@@ -18304,7 +18310,7 @@ fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
     // are replaced or removed (a removal is a tombstone).
     let mut touched = false;
     let mut changed = false;
-    let was_modified = sess.flags.has(sess_flags::HTX_MODIFIED);
+    let was_modified = sess.htx_modified;
     crate::reuse::with_bytes(|scratch| {
         sess.with_htx_mut(|htx| {
             let n = htx.num_blocks();
@@ -18331,7 +18337,7 @@ fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
     });
     // Nothing in the `Cookie` headers changed: the head is left as it came (X2).
     if !changed {
-        sess.flags.set_to(sess_flags::HTX_MODIFIED, was_modified);
+        sess.htx_modified = was_modified;
     }
     if touched {
         if let Some(txn) = sess.strm.txn.as_mut() {
@@ -18349,12 +18355,12 @@ fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
 /// An HTTP/2 or HTTP/3 head is written here whatever edited it (X4: `req` holds none of it
 /// until now), its names as `lower` and `table` say; true when they are.
 fn encode_if_modified(sess: &mut TcpSession, lower: bool, table: Option<&std::collections::HashMap<String, String>>) -> bool {
-    if sess.flags.has(sess_flags::REQ_HEAD_PENDING) {
+    if sess.req_head_pending {
         return write_pending_req_head(sess, lower, table);
     }
-    if sess.flags.has(sess_flags::HTX_MODIFIED) {
+    if sess.htx_modified {
         write_req_head(sess);
-        sess.flags.clear(sess_flags::HTX_MODIFIED);
+        sess.htx_modified = false;
     }
     false
 }
@@ -18385,7 +18391,7 @@ pub(crate) fn write_req_head(sess: &mut TcpSession) {
     };
     let old = hdr_len + eoh_len;
     alcyon_sample::work::note(alcyon_sample::work::Op::ReqRebuild, 1);
-    if sess.flags.has(sess_flags::HAS_HTX) {
+    if sess.has_htx {
         // The HTX is in its own buffer: the request buffer is written while it is read.
         let htx = alcyon_proto::htx::HtxSliceRef::new(sess.htx_buf.raw_slice(), sess.htx_blocks);
         if !sess.req.replace_head_with(old, |out| htx.write_h1_wire(out).ok()) {
@@ -19764,7 +19770,7 @@ fn after_res_on_reply<'r>(
             so_name: sess.so_name.as_deref(),
             so_id: sess.so_id_opt(),
             fc_dst: sess.fc_dst(),
-            is_first_req: sess.flags.has(sess_flags::IS_FIRST_REQ),
+            is_first_req: sess.is_first_req,
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
             saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
@@ -19853,7 +19859,7 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &cra
                     so_name: sess.so_name.as_deref(),
                     so_id: sess.so_id_opt(),
                     fc_dst: sess.fc_dst(),
-                    is_first_req: sess.flags.has(sess_flags::IS_FIRST_REQ),
+                    is_first_req: sess.is_first_req,
                     ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
                     quic_acks: sess.quic_facts(),
                     fc_http_major: sess.fc_http_major(),
@@ -20888,7 +20894,7 @@ mod pending_req_head_tests {
             add_len: None,
         };
         crate::h2_bridge::start_request(&mut s, d);
-        assert!(s.flags.has(sess_flags::REQ_HEAD_PENDING) && s.req.readable().is_empty());
+        assert!(s.req_head_pending && s.req.readable().is_empty());
         (s, owner, peer)
     }
 
@@ -20906,7 +20912,7 @@ mod pending_req_head_tests {
         let data = s.req.readable();
         assert_eq!(&data[..want.len()], want.as_bytes());
         assert_eq!(data.len(), want.len() + free, "the body is kept behind the head");
-        assert!(!s.flags.has(sess_flags::REQ_HEAD_PENDING));
+        assert!(!s.req_head_pending);
     }
 
     /// The engine never sends a head the encoder refuses (a rule's non-numeric
