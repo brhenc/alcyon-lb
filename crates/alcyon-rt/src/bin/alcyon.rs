@@ -876,6 +876,31 @@ fn main() {
     // prints one alert per unresolvable profile and exits 1 (`postresolve_loggers`).
     {
         use alcyon_config::ast::ProxyKind;
+        let mut bad = false;
+        let mut check_logs = |logs: &[alcyon_config::LogConfig], section: Option<&str>| {
+            for log in logs {
+                let Some(profile) = log.profile.as_deref() else { continue };
+                if config.log_profiles.iter().any(|p| p.name == profile) {
+                    continue;
+                }
+                let (file, line) = locate(&config_starts, log.line);
+                let msg = match section {
+                    None => format!(
+                        "global log directive declared in file {file} at line '{line}' \
+                         unknown log-profile '{profile}'."
+                    ),
+                    Some(name) => format!(
+                        "log directive declared in proxy section '{name}' in file '{file}' \
+                         at line {line} unknown log-profile '{profile}'."
+                    ),
+                };
+                config_alert_plain(&msg);
+                bad = true;
+            }
+        };
+        if let Some(global) = &config.global {
+            check_logs(&global.logs, None);
+        }
         let order: Vec<(ProxyKind, usize)> = if config.proxy_order.is_empty() {
             (0..config.listens.len()).map(|i| (ProxyKind::Listen, i))
                 .chain((0..config.frontends.len()).map(|i| (ProxyKind::Frontend, i)))
@@ -884,25 +909,13 @@ fn main() {
         } else {
             config.proxy_order.clone()
         };
-        let mut bad = false;
         for (kind, idx) in order {
             let (name, logs) = match kind {
                 ProxyKind::Listen => (&config.listens[idx].name, &config.listens[idx].logs),
                 ProxyKind::Frontend => (&config.frontends[idx].name, &config.frontends[idx].logs),
                 ProxyKind::Backend => (&config.backends[idx].name, &config.backends[idx].logs),
             };
-            for log in logs {
-                if let Some(profile) = &log.profile {
-                    if !config.log_profiles.iter().any(|p| &p.name == profile) {
-                        let (file, line) = locate(&config_starts, log.line);
-                        config_alert_plain(&format!(
-                            "log directive declared in proxy section '{name}' in file '{file}' \
-                             at line {line} unknown log-profile '{profile}'."
-                        ));
-                        bad = true;
-                    }
-                }
-            }
+            check_logs(logs, Some(name));
         }
         if bad {
             process::exit(1);

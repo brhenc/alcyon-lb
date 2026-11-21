@@ -196,6 +196,36 @@ fn a_duplicate_log_profile_is_rejected_with_haproxy_message() {
     );
 }
 
+/// Writes `cfg` to a temp file, runs the binary with `-f <file>` and waits up to `timeout`
+/// for it to exit; kills it if it stays running so a missing startup refusal fails fast.
+fn run_cfg_exit(cfg: &str, timeout: Duration) -> (std::process::ExitStatus, String, String) {
+    let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+    f.write_all(cfg.as_bytes()).expect("write cfg");
+    let path = f.path().display().to_string();
+    let mut child = common::alcyon_command(bin())
+        .arg("-f")
+        .arg(f.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn binary");
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            let mut err = String::new();
+            if let Some(mut s) = child.stderr.take() {
+                let _ = s.read_to_string(&mut err);
+            }
+            return (status, err, path);
+        }
+        if Instant::now() >= deadline {
+            common::stop(&mut child);
+            panic!("binary did not exit within {timeout:?}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 #[test]
 fn a_log_directive_with_an_unknown_profile_is_refused() {
     // `profile <name>` precedes the facility; the name is checked at startup,
@@ -213,6 +243,30 @@ fn a_log_directive_with_an_unknown_profile_is_refused() {
             && err.contains("unknown log-profile 'nosuch'."),
         "stderr was: {err}"
     );
+}
+
+#[test]
+fn a_global_log_directive_with_an_unknown_profile_is_refused() {
+    // `global` `log ... profile <name>` is checked at startup too (not under `-c`),
+    // where the oracle prints (and exits 1):
+    // `global log directive declared in file <file> at line '2' unknown log-profile 'nosuch'.`
+    let addr = common::reserve_addr();
+    let cfg = format!(
+        "global\n  log 127.0.0.1:514 profile nosuch local0\ndefaults\n  mode http\n  timeout client 5s\nfrontend fe\n  bind {addr}\n"
+    );
+    let check_out = run_cfg(&["-c"], &cfg);
+    assert!(
+        check_out.status.success(),
+        "-c should accept unknown global log-profile: rc={:?} stderr={}",
+        check_out.status.code(),
+        String::from_utf8_lossy(&check_out.stderr)
+    );
+    let (status, err, path) = run_cfg_exit(&cfg, Duration::from_secs(3));
+    assert!(!status.success(), "rc={:?} stderr={err}", status.code());
+    let expected = format!(
+        "global log directive declared in file {path} at line '2' unknown log-profile 'nosuch'."
+    );
+    assert!(err.contains(&expected), "expected `{expected}`, stderr was: {err}");
 }
 
 #[test]
