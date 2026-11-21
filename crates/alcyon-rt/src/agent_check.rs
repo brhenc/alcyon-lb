@@ -502,8 +502,10 @@ fn apply_agent_reply(
 }
 
 fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
+    // Compare bytes, not a `str` slice: a multibyte char straddling `prefix.len()` must not panic.
+    let n = prefix.len();
+    if s.as_bytes().get(..n)?.eq_ignore_ascii_case(prefix.as_bytes()) {
+        s.get(n..)
     } else {
         None
     }
@@ -701,5 +703,13 @@ mod tests {
         agent.exp = Tick(900);
         let _ = on_connected(&mut agent, OwnedFd::from(listener), &mut fdtab, &mut poller, Tick(700), Tick(700), &proxies, &mut checks);
         assert_eq!(agent.last_status_code, "SOCKERR");
+    }
+
+    #[test]
+    fn strip_prefix_ignore_case_multibyte_at_prefix_end() {
+        // 'é' occupies bytes 7..9, so byte 8 (the length of "maxconn:") is not a char boundary.
+        assert_eq!(strip_prefix_ignore_case("aaaaaaa\u{e9}", "maxconn:"), None);
+        assert_eq!(strip_prefix_ignore_case("MAXCONN:\u{e9}", "maxconn:"), Some("\u{e9}"));
+        assert_eq!(strip_prefix_ignore_case("weight", "weight:"), None);
     }
 }
