@@ -132,7 +132,6 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("tls-tickets", Arg::None, TLS),
     // src/cfgparse-tcp.c
     kw!("cc", Arg::Word, Ignore("the TCP congestion control algorithm")),
-    kw!("tcp-md5sig", Arg::Word, Refuse("Alcyon does not implement it; connections would carry no TCP MD5 signature")),
     kw!("tcp-ut", Arg::Delay, Ignore("the TCP user timeout")),
     // src/tcpcheck.c
     kw!("healthcheck", Arg::Word, CHECK),

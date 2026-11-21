@@ -65,6 +65,7 @@ name = "alcyon-config"
 version = "0.1.0"
 dependencies = [
  "alcyon-crypt",
+ "alcyon-mmsg",
  "alcyon-regex",
  "nix",
  "thiserror 1.0.69",

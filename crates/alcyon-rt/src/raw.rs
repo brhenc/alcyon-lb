@@ -12,7 +12,7 @@ use rustix::net::{
 use std::cell::Cell;
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Outcome of a transport read or write.
@@ -212,15 +212,19 @@ pub fn from_any(a: &SocketAddrAny) -> Option<SocketAddr> {
 /// # Errors
 /// Returns an error if socket creation fails or if `connect` fails immediately with an error other than `EINPROGRESS`.
 pub fn connect(addr: SocketAddr) -> io::Result<(OwnedFd, bool)> {
-    connect_opts(addr, false)
+    connect_opts(addr, false, None)
 }
 
 /// [`connect`], with TCP Fast Open when `tfo` (server `tfo`): `TCP_FASTOPEN_CONNECT`, which
 /// makes the kernel send the first write in the SYN, as `HAProxy`'s `MSG_FASTOPEN` does.
+/// With `md5sig` (server `tcp-md5sig`), the RFC 2385 key is bound to `addr` on the
+/// socket before the `connect` that `HAProxy` runs in `proto_tcp_connect`; a peer with a
+/// different key, or none, cannot complete the handshake, and a failed `setsockopt`
+/// fails the connection, as `HAProxy` reports `SF_ERR_SRVCL`.
 ///
 /// # Errors
 /// As [`connect`].
-pub fn connect_opts(addr: SocketAddr, tfo: bool) -> io::Result<(OwnedFd, bool)> {
+pub fn connect_opts(addr: SocketAddr, tfo: bool, md5sig: Option<&[u8]>) -> io::Result<(OwnedFd, bool)> {
     let family = match addr {
         SocketAddr::V4(_) => AddressFamily::INET,
         SocketAddr::V6(_) => AddressFamily::INET6,
@@ -241,6 +245,11 @@ pub fn connect_opts(addr: SocketAddr, tfo: bool) -> io::Result<(OwnedFd, bool)> 
     if tfo {
         // Best effort, like HAProxy: without kernel support the connect is a plain one.
         let _ = nix::sys::socket::setsockopt(&fd, nix::sys::socket::sockopt::TcpFastOpenConnect, &true);
+    }
+    if let Some(key) = md5sig {
+        // Not best effort: `HAProxy` fails the connection when the kernel refuses the
+        // key (`proto_tcp.c`, `SF_ERR_SRVCL`), so the error is reported, not dropped.
+        alcyon_mmsg::set_tcp_md5sig(fd.as_fd(), addr, key)?;
     }
 
     let any = to_any(addr);

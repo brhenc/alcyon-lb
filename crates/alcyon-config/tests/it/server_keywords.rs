@@ -187,7 +187,10 @@ const KEYWORDS: &[(&str, Alcyon)] = &[
     ("verifyhost foo", Accepts),
     // src/cfgparse-tcp.c
     ("cc cubic", Accepts),
-    ("tcp-md5sig secret", Refuses),
+    // `tcp-md5sig` is implemented: the RFC 2385 key is bound to the server's address
+    // with `setsockopt(TCP_MD5SIG)` before `connect` (`alcyon-rt`); `HAProxy` stores no
+    // key for a name-based or `default-server` address, and Alcyon matches.
+    ("tcp-md5sig secret", Accepts),
     ("tcp-ut 5s", Accepts),
     // src/tcpcheck.c
     ("healthcheck hc1", Refuses),

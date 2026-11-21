@@ -72,6 +72,13 @@ struct ServerQueueState {
 #[derive(Debug, Default)]
 struct ServerCells {
     base: Box<[Cell]>,
+    /// Each server's `tcp-md5sig` key, in `base` order: the RFC 2385 signature set on the
+    /// outgoing socket before `connect` (`alcyon_mmsg::set_tcp_md5sig`). Built once at load
+    /// and read plain; absent when no server of the backend has a key, so a backend without
+    /// signatures allocates nothing here. Lives in the `Arc`'d cells (not in
+    /// [`ServerArrays`]) because `ServerArrays` sits inline in `Proxy`, whose size is
+    /// bounded in `struct_sizes.rs`.
+    md5sig: Option<Box<[Option<Arc<str>>]>>,
     queue_max: std::sync::OnceLock<Box<ServerQueueState>>,
 }
 
@@ -288,6 +295,17 @@ impl ServerArrays {
         // The `maxqueue` values, when any server has one: built once here, at load. A
         // proxy whose servers have no `maxqueue` and no queueing keeps no arrays at all.
         let n = servers.len();
+        // Each server's `tcp-md5sig` key, in `base` order; `None` when no server has one.
+        // `extras.md5sig` is sparse (server index, key), as `maxqueue` above is.
+        let md5sig = (!extras.md5sig.is_empty()).then(|| {
+            let mut keys = vec![None; n];
+            for &(i, ref key) in &extras.md5sig {
+                if let Some(slot) = keys.get_mut(i as usize) {
+                    *slot = Some(Arc::from(key.as_ref()));
+                }
+            }
+            keys.into_boxed_slice()
+        });
         let queue_max = extras.maxqueue.iter().any(|&(_, m)| m > 0).then(|| {
             let mut max = vec![0u32; n];
             for &(i, m) in &extras.maxqueue {
@@ -303,6 +321,7 @@ impl ServerArrays {
         Self {
             cells: Arc::new(ServerCells {
                 base,
+                md5sig,
                 queue_max: queue_max.map(std::sync::OnceLock::from).unwrap_or_default(),
             }),
             servers: servers.iter().map(|s| s.addr).collect(),
@@ -1019,6 +1038,22 @@ impl<'a> ServerSet<'a> {
     #[must_use]
     pub fn tfo_of(&self, addr: SocketAddr) -> bool {
         self.slot_of_addr(addr).and_then(|i| self.0.srv.server_tfo.get(i).copied()).unwrap_or(false)
+    }
+
+    /// Slot `i`'s server's `tcp-md5sig` key, set on the outgoing socket before `connect`;
+    /// `None` for a server without one (and for a backend whose servers have none, where
+    /// the lookup touches only the empty `Option`). By slot, not by address: two servers
+    /// may share an address with different keys, the `use-server` case of the reg-test,
+    /// and only the picked server's slot says which key is its own.
+    #[must_use]
+    pub fn md5sig_at(&self, i: usize) -> Option<&str> {
+        self.0
+            .srv
+            .cells
+            .md5sig
+            .as_ref()
+            .and_then(|v| v.get(i))
+            .and_then(Option::as_deref)
     }
 
     /// The server in slot `i`; `None` when there is no such slot or it is empty.
