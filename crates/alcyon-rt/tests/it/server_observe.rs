@@ -532,3 +532,99 @@ fn observe_tcp_mode_default_server_and_http_error_kinds() {
     assert_eq!(code, 504);
     assert_eq!(stat_col(&sock, "be_to", "status"), "DOWN");
 }
+
+#[test]
+fn observe_l4_connection_reuse_and_non_observed_backend() {
+    let sink = spawn_sink();
+    let conn_count = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ka");
+    let srv = listener.local_addr().expect("ka addr");
+    let conn_bg = conn_count.clone();
+    thread::spawn(move || {
+        for mut s in listener.incoming().flatten() {
+            conn_bg.fetch_add(1, Ordering::Relaxed);
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match s.read(&mut chunk) {
+                            Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                            _ => return,
+                        }
+                    }
+                    let pos = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                    buf.drain(..pos);
+                    if s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    let front = common::reserve_addr();
+    let cfg = format!(
+        "global\n\
+         \tstats socket __SOCK__ level admin\n\
+         defaults\n\
+         \tmode http\n\
+         \toption httpchk GET /\n\
+         \tretries 0\n\
+         \ttimeout connect 2s\n\
+         \ttimeout client 2s\n\
+         \ttimeout server 2s\n\
+         \ttimeout check 1h\n\
+         frontend fe\n\
+         \tbind {front}\n\
+         \tuse_backend be_kept if {{ path -m beg /kept }}\n\
+         \tuse_backend be_pool if {{ path -m beg /pool }}\n\
+         \tdefault_backend be_plain\n\
+         backend be_kept\n\
+         \thttp-reuse never\n\
+         \tserver s1 {srv} check addr {sink_ip} port {sink_port} inter 1h observe layer4 error-limit 2 on-error mark-down\n\
+         backend be_pool\n\
+         \thttp-reuse always\n\
+         \tserver s1 {srv} check addr {sink_ip} port {sink_port} inter 1h observe layer4 error-limit 2 on-error mark-down\n\
+         backend be_plain\n\
+         \tserver s1 {srv}\n",
+        sink_ip = sink.ip(),
+        sink_port = sink.port(),
+    );
+    let (_dir, sock, _proc) = spawn_proxy(&cfg);
+
+    // 1. Session-kept server connection reuse (`http-reuse never`) with `observe layer4`.
+    {
+        let mut s = TcpStream::connect_timeout(&front, Duration::from_secs(2)).expect("connect kept");
+        s.set_read_timeout(Some(Duration::from_secs(3))).ok();
+        write!(s, "GET /kept/1 HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("write kept 1");
+        let mut raw = Vec::new();
+        let mut tmp = [0u8; 1024];
+        while !raw.windows(6).any(|w| w == b"\r\n\r\nok") {
+            let n = s.read(&mut tmp).expect("read kept 1");
+            assert!(n > 0, "eof before kept 1 body");
+            raw.extend_from_slice(&tmp[..n]);
+        }
+        assert!(String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 200"));
+
+        write!(s, "GET /kept/2 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").expect("write kept 2");
+        let mut tail = String::new();
+        let _ = s.read_to_string(&mut tail);
+        assert!(tail.starts_with("HTTP/1.1 200") && tail.ends_with("ok"), "kept 2: {tail:?}");
+    }
+    assert!(stat_col(&sock, "be_kept", "status").starts_with("UP"));
+
+    // 2. Idle-pool server connection reuse (`http-reuse always`) with `observe layer4`.
+    let before_pool = conn_count.load(Ordering::Relaxed);
+    let (c1, _) = http_get(front, "/pool/1");
+    assert_eq!(c1, 200);
+    let (c2, _) = http_get(front, "/pool/2");
+    assert_eq!(c2, 200);
+    let after_pool = conn_count.load(Ordering::Relaxed);
+    assert_eq!(after_pool - before_pool, 1, "second /pool request should reuse the idle server connection");
+    assert!(stat_col(&sock, "be_pool", "status").starts_with("UP"));
+
+    // 3. Backend without `observe` when engine `has_observe` is true (`health_adjust` `!px.has_observe`).
+    let (c3, _) = http_get(front, "/plain");
+    assert_eq!(c3, 200);
+}

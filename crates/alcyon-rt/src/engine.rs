@@ -68,10 +68,7 @@ thread_local! {
     /// The response being rewritten by `http-response`/`http-after-response`, as the HTX
     /// message `HAProxy` holds it in: (bytes in use, size). See [`res_htx_init`].
     static RES_HTX: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
-    /// Tasks whose nice was updated during the current scheduler pass (`set-nice`).
-    static HAS_NICE_UPDATES: Cell<bool> = const { Cell::new(false) };
-    static NICE_UPDATES: std::cell::RefCell<Vec<(TaskRef, i16)>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// Nice value set by `http-response set-nice`, read once the list finishes.
+    /// Nice value set by `http-request`/`http-response set-nice`, read once `http_step` finishes.
     static PENDING_NICE: Cell<Option<i16>> = const { Cell::new(None) };
     /// Active stream log level during response-rule evaluation (`set-log-level`), and
     /// captured levels for `do-log` in `http-response` / `http-after-response`.
@@ -79,11 +76,6 @@ thread_local! {
     static DO_LOG_LEVEL: Cell<i8> = const { Cell::new(0) };
     static DO_LOG_RES_LEVEL: Cell<i8> = const { Cell::new(0) };
     static DO_LOG_AFTER_LEVEL: Cell<i8> = const { Cell::new(0) };
-}
-
-fn push_nice_update(task: TaskRef, nice: i16) {
-    HAS_NICE_UPDATES.set(true);
-    NICE_UPDATES.with(|v| v.borrow_mut().push((task, nice)));
 }
 
 /// What an idle server connection is pooled under. `HAProxy` keeps idle connections per
@@ -2747,6 +2739,8 @@ pub struct Engine {
     any_step_log: bool,
     /// Precomputed once at load from `proxies`: whether any proxy has a `log-profile` target.
     any_log_profile: bool,
+    /// Precomputed once at load from `proxies`: whether any proxy has a `set-nice` rule.
+    any_set_nice: bool,
 }
 
 /// A `stats socket` beyond the first: the first one keeps its fields on [`Engine`].
@@ -4124,6 +4118,13 @@ fn rule_step_log_flags(
     flags
 }
 
+fn any_proxy_set_nice(proxies: &crate::table::Table) -> bool {
+    proxies.iter().any(|p| {
+        p.rules.res_has_set_nice
+            || p.http_req_rules.iter().any(|r| matches!(r.action, alcyon_config::HttpReqAction::SetNice(_)))
+    })
+}
+
 /// Queues the stream's log line, with the level it goes out at, on `entry`.
 fn set_stream_log(entry: &mut SessionEntry, proxies: &crate::table::Table, pid: u32) {
     account_stream(entry, proxies);
@@ -4376,6 +4377,22 @@ fn emit_step_log_with(
     send_stream_log_profiled_ctx(proxy, emit, origin, level.unwrap(), &line, sd, Some((data, sc)));
     if !line.is_empty() {
         crate::logfmt::recycle_line(line);
+    }
+}
+
+/// Emits `Connect` if `connect` timestamp was just set on `entry`.
+#[inline(always)]
+fn log_if_newly_connected(
+    track_connect: bool,
+    was_connected: bool,
+    entry: &mut SessionEntry,
+    proxies: &crate::table::Table,
+    step_emit: Option<&LogEmit<'_>>,
+) {
+    if track_connect && !was_connected && entry.sess.strm.log.connect.is_some() {
+        if let Some(emit) = step_emit {
+            maybe_log_connect(entry, proxies, *emit);
+        }
     }
 }
 
@@ -6116,6 +6133,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             .filter(|p| matches!(p.balance, BalanceAlgorithm::Uri | BalanceAlgorithm::Source))
             .count();
         let has_observe = proxies.iter().any(|p| p.has_observe);
+        let any_set_nice = any_proxy_set_nice(&proxies);
 
         let any_targets = proxies.iter().any(|p| !p.log_target_idx.is_empty());
         let any_connect_log = any_targets && proxies.iter().any(|p| p.step_log_flags & STEP_LOG_CONNECT != 0);
@@ -6216,6 +6234,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             any_connect_log,
             any_step_log,
             any_log_profile,
+            any_set_nice,
         };
         Ok(engine)
     }
@@ -6354,6 +6373,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 crate::mailbox::Msg::Table(t, g) => {
                     g.reply(wid, t.epoch());
                     self.has_observe = t.iter().any(|p| p.has_observe);
+                    self.any_set_nice = any_proxy_set_nice(&t);
                     self.proxies = Proxies::from_table(t);
                 }
                 crate::mailbox::Msg::Shutdown(f, g) => {
@@ -7263,6 +7283,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             run_queue_len,
             now,
             timer_updates,
+            nice_updates: &mut self.nice_updates,
             wake_queue: std::mem::take(&mut self.wake_scratch),
             heavy: Vec::new(),
             h2_spawn: std::mem::take(&mut self.h2_spawn_scratch),
@@ -7276,6 +7297,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             worker_id: self.mailbox_wid,
             quic_listeners: &mut self.quic_listeners,
             has_observe: self.has_observe,
+            any_set_nice: self.any_set_nice,
             hk_due: 0,
             wake_now: std::mem::take(&mut self.wake_now_scratch),
             links: std::mem::take(&mut self.links_scratch),
@@ -7304,15 +7326,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
         // The nice a `set-nice` rule set this pass (`task_set_nice`): drain only when any
         // rule fired, so stale entries never leak or overwrite a later reused `TaskRef`.
-        if HAS_NICE_UPDATES.get() {
-            HAS_NICE_UPDATES.set(false);
-            NICE_UPDATES.with(|v| std::mem::swap(&mut self.nice_updates, &mut *v.borrow_mut()));
-            for (task_ref, nice) in self.nice_updates.drain(..) {
-                if self.scheduler.is_live(task_ref) {
-                    self.scheduler.set_nice(task_ref, nice);
-                }
-            }
-        }
         for &task_ref in &dispatcher.heavy {
             if self.scheduler.is_live(task_ref) {
                 self.scheduler.set_heavy(task_ref, true);
@@ -7321,6 +7334,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let mut h2_spawn = std::mem::take(&mut dispatcher.h2_spawn);
         let mut wake_queue = std::mem::take(&mut dispatcher.wake_queue);
         self.timer_updates = dispatcher.timer_updates;
+        if self.any_set_nice && !self.nice_updates.is_empty() {
+            self.apply_nice_updates();
+        }
         for (owner_idx, owner_task) in h2_spawn.drain(..) {
             self.spawn_h2_children(owner_idx, owner_task, &mut wake_queue);
         }
@@ -7348,6 +7364,18 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.wake_queued();
         self.resume_cli_after_close();
         Ok(tasks_run)
+    }
+
+    /// Applies deferred `set-nice` updates after the scheduler pass so stale entries never
+    /// leak or overwrite a later reused `TaskRef`.
+    #[cold]
+    #[inline(never)]
+    fn apply_nice_updates(&mut self) {
+        for (task_ref, nice) in self.nice_updates.drain(..) {
+            if self.scheduler.is_live(task_ref) {
+                self.scheduler.set_nice(task_ref, nice);
+            }
+        }
     }
 
     /// The streams of HTTP/2 connection `owner_idx` whose request heads are in get entries of
@@ -9508,9 +9536,7 @@ fn register_new_session(
         if flags & STEP_LOG_ACCEPT != 0 {
             emit_step_log_entry(entry, &engine.proxies, *emit, alcyon_config::ast::logging::LogProfileStepKind::Accept);
         }
-        if flags & STEP_LOG_CONNECT != 0 && entry.sess.strm.log.connect.is_some() {
-            maybe_log_connect(entry, &engine.proxies, *emit);
-        }
+        log_if_newly_connected(flags & STEP_LOG_CONNECT != 0, false, entry, &engine.proxies, Some(emit));
     }
 }
 
@@ -10084,6 +10110,7 @@ struct EngineDispatcher<'a> {
     run_queue_len: usize,
     now: Tick,
     timer_updates: Vec<(TaskRef, Tick)>,
+    nice_updates: &'a mut Vec<(TaskRef, i16)>,
     wake_queue: Vec<TaskRef>,
     /// The housekeeping concerns whose timers fired this pass (bit per `hk::*`), run by the
     /// engine after the pass.
@@ -10113,6 +10140,7 @@ struct EngineDispatcher<'a> {
     /// The QUIC listeners, which the owners of HTTP/3 connections read and write (T509).
     quic_listeners: &'a mut [crate::quic_listener::QuicListener],
     has_observe: bool,
+    any_set_nice: bool,
 }
 
 /// What a stream's release changes beside the entries of the stream and its connection: the
@@ -11246,6 +11274,14 @@ fn inject_connection_token_zero_alloc(buf: &mut crate::buf::Buf, token: &str, ca
     }
 }
 
+#[cold]
+#[inline(never)]
+fn flush_pending_nice(updates: &mut Vec<(TaskRef, i16)>, task: TaskRef) {
+    if let Some(n) = PENDING_NICE.take() {
+        updates.push((task, n));
+    }
+}
+
 impl EngineDispatcher<'_> {
     /// What the sample fetches of a request rule see: the session, the proxy whose rules
     /// run (for its counters), and the proxies' state.
@@ -11636,11 +11672,7 @@ impl EngineDispatcher<'_> {
             let (be_idx, srv) = (entry.backend_idx, entry.sess.queue.server());
             let was_connected = track_connect && entry.sess.strm.log.connect.is_some();
             admin = Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, srv, lb_snap);
-            if track_connect && !was_connected && entry.sess.strm.log.connect.is_some() {
-                if let Some(emit) = step_emit {
-                    maybe_log_connect(entry, proxies, *emit);
-                }
-            }
+            log_if_newly_connected(track_connect, was_connected, entry, proxies, step_emit);
         }
         if entry.sess.strm.txn.as_ref().is_some_and(|t| !t.req_rules_done) && entry.sess.flags.has(sess_flags::TCP_INSPECT_DONE) {
             if let Some(t) = entry.sess.strm.txn.as_mut() {
@@ -11648,11 +11680,7 @@ impl EngineDispatcher<'_> {
             }
             let was_connected = track_connect && entry.sess.strm.log.connect.is_some();
             admin = Self::connect_http_backend(entry, proxies, checks, pid, fdtab, poller, idle_pool, now, lb_snap, fc, step_emit);
-            if track_connect && !was_connected && entry.sess.strm.log.connect.is_some() {
-                if let Some(emit) = step_emit {
-                    maybe_log_connect(entry, proxies, *emit);
-                }
-            }
+            log_if_newly_connected(track_connect, was_connected, entry, proxies, step_emit);
             let sess = &mut entry.sess;
             if let Some(t) = sess.strm.txn.as_mut() {
                 if t.body_wait.is_some() {
@@ -12799,11 +12827,7 @@ impl EngineDispatcher<'_> {
             // Step 1: Server connect check if connecting
             let was_connected = self.any_connect_log && entry.sess.strm.log.connect.is_some();
             check_srv_connect(entry, self.proxies, self.fdtab, self.poller, now, self.lb_snap, self.has_observe);
-            if self.any_connect_log && !was_connected && entry.sess.strm.log.connect.is_some() {
-                if let Some(emit) = self.step_emit {
-                    maybe_log_connect(entry, self.proxies, *emit);
-                }
-            }
+            log_if_newly_connected(self.any_connect_log, was_connected, entry, self.proxies, self.step_emit);
 
             // A readiness event on either socket: reading it may make progress again.
             if let Some(sfd) = entry.srv_raw_fd {
@@ -12857,11 +12881,7 @@ impl EngineDispatcher<'_> {
             if !entry.sess.is_done() {
                 let was_connected = self.any_connect_log && entry.sess.strm.log.connect.is_some();
                 entry.sess.advance(now);
-                if self.any_connect_log && !was_connected && entry.sess.strm.log.connect.is_some() {
-                    if let Some(emit) = self.step_emit {
-                        maybe_log_connect(entry, self.proxies, *emit);
-                    }
-                }
+                log_if_newly_connected(self.any_connect_log, was_connected, entry, self.proxies, self.step_emit);
             }
             #[cfg(debug_assertions)]
             crate::crash::fault_point(false, entry.sess.req_uri.as_deref().filter(|_| entry.sess.strm.txn.is_some()));
@@ -13046,6 +13066,9 @@ impl EngineDispatcher<'_> {
                     fc,
                     self.has_observe,
                 );
+                if self.any_set_nice {
+                    flush_pending_nice(self.nice_updates, entry.task);
+                }
             }
 
             let log_line = entry
@@ -13081,11 +13104,7 @@ impl EngineDispatcher<'_> {
                 } else {
                     Self::connect_tcp_backend(entry, self.proxies, self.fdtab, self.poller, now, self.lb_snap, self.step_emit);
                 }
-                if self.any_connect_log && !was_connected && entry.sess.strm.log.connect.is_some() {
-                    if let Some(emit) = self.step_emit {
-                        maybe_log_connect(entry, self.proxies, *emit);
-                    }
-                }
+                log_if_newly_connected(self.any_connect_log, was_connected, entry, self.proxies, self.step_emit);
             }
 
             // A server connection parked after a response that no request has taken back
@@ -13390,6 +13409,7 @@ impl EngineDispatcher<'_> {
         // variables are dropped: no other stream may see them.
         stream_vars_leave(None);
         CURRENT_TIMEOUTS.set(None);
+        PENDING_NICE.set(None);
         crate::lb::clear_avoided();
         if let Some(what) = self.shared_state_poisoned() {
             crate::crash::abort_uncontained(&format!("left {what} half-changed"));
@@ -14486,11 +14506,6 @@ impl EngineDispatcher<'_> {
             }
             if do_log.as_ref().is_some_and(|d| d.res) {
                 DO_LOG_RES_LEVEL.set(DO_LOG_LEVEL.get());
-            }
-            if proxies[be_idx].rules.res_has_set_nice || proxies[fe_idx].rules.res_has_set_nice {
-                if let Some(n) = PENDING_NICE.take() {
-                    push_nice_update(entry.task, n);
-                }
             }
             if let Some(line) = LAST_RULE.take().filter(|&l| l != 0) {
                 entry.sess.strm.log.last_rule = line;
@@ -16160,7 +16175,7 @@ impl EngineDispatcher<'_> {
                     alcyon_config::HttpReqAction::SetNice(n) => {
                         // Applied once the pass is over; the scheduler reads it on the
                         // next wakeup (`task_set_nice`).
-                        push_nice_update(my_task, *n);
+                        PENDING_NICE.set(Some(*n));
                     }
                 }
             }
