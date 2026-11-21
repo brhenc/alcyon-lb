@@ -118,3 +118,14 @@ fn an_after_response_do_log_runs_on_a_reply_the_proxy_builds() {
     );
     assert_eq!(lines_for(&cfg), ["std http-after-res", "std txn_close"]);
 }
+
+#[test]
+fn an_after_response_do_log_runs_on_a_deny_and_a_redirect() {
+    for rule in ["http-request deny deny_status 403", "http-request redirect location /x"] {
+        let cfg = format!(
+            "{HEAD}frontend fe\n  bind {{f}}\n  log udp@{{c}} format rfc5424 local0\n  log-format \"std %OG\"\n  \
+             {rule}\n  http-after-response do-log\n  default_backend be\n\nbackend be\n  server app1 {{be}}\n"
+        );
+        assert_eq!(lines_for(&cfg), ["std http-after-res", "std txn_close"], "{rule}");
+    }
+}
