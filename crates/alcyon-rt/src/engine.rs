@@ -16241,23 +16241,25 @@ impl EngineDispatcher<'_> {
                             if target.is_some() || full || tries.next().is_none() || !limited() { break; }
                         }
                         cookie_server = None;
-                        // `assign_server_and_queue` (src/backend.c:1004-1016): a successful
-                        // re-pick is by a different server -- the balancers skip a server at
-                        // its `maxconn` and a failed `take` is a `None` -- and it takes the
-                        // `SF_REDISP` flags and counts. The `HAProxy` same-server retry case
-                        // cannot happen here.
+                        // `assign_server_and_queue` (src/backend.c:1001-1010): the target
+                        // changed from `idx` -- to another server (the balancers skip a server
+                        // at its `maxconn` and a failed `take` is a `None`), or to none when
+                        // no server is left -- so it takes the `SF_REDISP` flag, the cookie
+                        // downgrade and the counts either way; a failed re-pick still logs
+                        // `+` in `%rc`. The `HAProxy` same-server retry case cannot happen here.
                         if let Some(((opt_idx, _), _)) = &target {
                             debug_assert!(*opt_idx != Some(idx), "a pick never returns a server at its maxconn");
-                            entry.sess.flags.set(sess_flags::REDISPATCHED);
                             entry.sess.flags.set(sess_flags::LB_PICKED);
-                            be.srv_set().bump_retr(idx, (0, 1, 0));
-                            be.counters().redispatches.fetch_add(1, Ordering::Relaxed);
-                            entry.sess.strm.txn.iter_mut().for_each(|txn| {
-                                txn.ck.direct = false;
-                                // TX_CK_VALID (3) becomes TX_CK_DOWN (2).
-                                txn.ck.ck = if txn.ck.ck == 3 { 2 } else { txn.ck.ck };
-                            });
                         }
+                        entry.sess.flags.set(sess_flags::REDISPATCHED);
+                        entry.sess.strm.log.redispatched = true;
+                        be.srv_set().bump_retr(idx, (0, 1, 0));
+                        be.counters().redispatches.fetch_add(1, Ordering::Relaxed);
+                        entry.sess.strm.txn.iter_mut().for_each(|txn| {
+                            txn.ck.direct = false;
+                            // TX_CK_VALID (3) becomes TX_CK_DOWN (2).
+                            txn.ck.ck = if txn.ck.ck == 3 { 2 } else { txn.ck.ck };
+                        });
                     } else {
                         be.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
                         be.srv_set().bump_retr(idx, (0, 0, 1));
