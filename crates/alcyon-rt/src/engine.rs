@@ -21525,3 +21525,29 @@ mod nice_updates_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod status_line_tests {
+    use super::usual_status_line;
+
+    /// The byte-wise status line matches only `HTTP/1.1 <3 digits> <the usual reason>`, with an
+    /// optional `\r`; anything else is left to the text path.
+    #[test]
+    fn only_the_usual_line_takes_the_byte_path() {
+        assert_eq!(usual_status_line(b"HTTP/1.1 200 OK\r"), Some((200, "OK")));
+        assert_eq!(usual_status_line(b"HTTP/1.1 404 Not Found"), Some((404, "Not Found")));
+        for line in [
+            &b"HTTP/1.1 200 Okay"[..],
+            b"HTTP/1.1 200",
+            b"HTTP/1.1 20",
+            b"HTTP/1.0 200 OK",
+            b"HTTP/1.1 2x0 OK",
+            b"HTTP/1.1 200 OK ",
+            b"HTTP/1.1 200  OK",
+            b"HTTP/1.1 200\tOK",
+            b"",
+        ] {
+            assert_eq!(usual_status_line(line), None, "{:?}", String::from_utf8_lossy(line));
+        }
+    }
+}
