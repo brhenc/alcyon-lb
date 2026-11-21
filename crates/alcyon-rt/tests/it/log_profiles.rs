@@ -196,6 +196,36 @@ fn a_duplicate_log_profile_is_rejected_with_haproxy_message() {
     );
 }
 
+/// Writes `cfg` to a temp file, runs the binary with `-f <file>` and waits up to `timeout`
+/// for it to exit; kills it if it stays running so a missing startup refusal fails fast.
+fn run_cfg_exit(cfg: &str, timeout: Duration) -> (std::process::ExitStatus, String, String) {
+    let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+    f.write_all(cfg.as_bytes()).expect("write cfg");
+    let path = f.path().display().to_string();
+    let mut child = common::alcyon_command(bin())
+        .arg("-f")
+        .arg(f.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn binary");
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            let mut err = String::new();
+            if let Some(mut s) = child.stderr.take() {
+                let _ = s.read_to_string(&mut err);
+            }
+            return (status, err, path);
+        }
+        if Instant::now() >= deadline {
+            common::stop(&mut child);
+            panic!("binary did not exit within {timeout:?}");
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 #[test]
 fn a_log_directive_with_an_unknown_profile_is_refused() {
     // `profile <name>` precedes the facility; the name is checked at startup,
@@ -216,12 +246,139 @@ fn a_log_directive_with_an_unknown_profile_is_refused() {
 }
 
 #[test]
+fn a_global_log_directive_with_an_unknown_profile_is_refused() {
+    // `global` `log ... profile <name>` is checked at startup too (not under `-c`),
+    // where the oracle prints (and exits 1):
+    // `global log directive declared in file <file> at line '2' unknown log-profile 'nosuch'.`
+    let addr = common::reserve_addr();
+    let cfg = format!(
+        "global\n  log 127.0.0.1:514 profile nosuch local0\ndefaults\n  mode http\n  timeout client 5s\nfrontend fe\n  bind {addr}\n"
+    );
+    let check_out = run_cfg(&["-c"], &cfg);
+    assert!(
+        check_out.status.success(),
+        "-c should accept unknown global log-profile: rc={:?} stderr={}",
+        check_out.status.code(),
+        String::from_utf8_lossy(&check_out.stderr)
+    );
+    let (status, err, path) = run_cfg_exit(&cfg, Duration::from_secs(3));
+    assert!(!status.success(), "rc={:?} stderr={err}", status.code());
+    let expected = format!(
+        "global log directive declared in file {path} at line '2' unknown log-profile 'nosuch'."
+    );
+    assert!(err.contains(&expected), "expected `{expected}`, stderr was: {err}");
+}
+
+#[test]
 fn a_minimal_log_profile_is_accepted() {
     let out = run_cfg(
         &["-c"],
         "defaults\n  mode http\nlog-profile p1\n  on close format \"close\"\n",
     );
     assert!(out.status.success(), "rc={:?} stderr={}", out.status.code(), String::from_utf8_lossy(&out.stderr));
+}
+
+fn run_cfg_startup(cfg: &str) -> Output {
+    let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+    f.write_all(cfg.as_bytes()).expect("write cfg");
+    let mut child = Command::new(bin())
+        .arg("-f")
+        .arg(f.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn binary");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            return child.wait_with_output().expect("wait_with_output");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let out = child.wait_with_output().expect("wait_with_output");
+            panic!(
+                "binary did not exit on invalid config within 2s (stderr={})",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_bad_profile_step_format_or_sd_is_refused_at_load() {
+    let addr = common::reserve_addr();
+    let cases = [
+        (
+            "format bad alias",
+            format!(
+                "defaults\n  mode http\n  timeout client 5s\nlog-profile lp1\n  on close format \"%{{+X}}o %bogus\"\nfrontend fe\n  bind {addr}\n  log 127.0.0.1:514 profile lp1 local0\n"
+            ),
+            "no such format alias 'bogus'",
+            true,
+        ),
+        (
+            "sd bad alias",
+            format!(
+                "defaults\n  mode http\n  timeout client 5s\nlog-profile lp1\n  on close sd \"%{{+X}}o %bogus\"\nfrontend fe\n  bind {addr}\n  log 127.0.0.1:514 profile lp1 local0\n"
+            ),
+            "no such format alias 'bogus'",
+            true,
+        ),
+        (
+            "unused profile format",
+            "defaults\n  mode http\nlog-profile lp1\n  on close format \"%bogus\"\n".to_string(),
+            "no such format alias 'bogus'",
+            false,
+        ),
+        (
+            "unknown fetch in format",
+            "defaults\n  mode http\nlog-profile lp1\n  on http-req format \"%[nosuchfetch]\"\n".to_string(),
+            "unknown fetch method 'nosuchfetch'",
+            false,
+        ),
+        (
+            "unknown converter in sd",
+            "defaults\n  mode http\nlog-profile lp1\n  on any sd \"%[src,nosuchconv]\"\n".to_string(),
+            "unknown converter 'nosuchconv'",
+            false,
+        ),
+        (
+            "overridden bad format",
+            "defaults\n  mode http\nlog-profile lp1\n  on close format \"%bogus\"\n  on close format \"%ci\"\n".to_string(),
+            "no such format alias 'bogus'",
+            false,
+        ),
+    ];
+
+    for (label, cfg, expected_err, check_startup) in &cases {
+        let out = run_cfg(&["-c"], cfg);
+        assert!(
+            !out.status.success(),
+            "{label} (-c): expected failure, got rc={:?} stdout={} stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("failed to parse logformat") && err.contains(expected_err),
+            "{label} (-c): stderr was: {err}"
+        );
+        if *check_startup {
+            let out = run_cfg_startup(cfg);
+            assert!(
+                !out.status.success(),
+                "{label} (startup): expected failure, got rc={:?}",
+                out.status.code()
+            );
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                err.contains("failed to parse logformat") && err.contains(expected_err),
+                "{label} (startup): stderr was: {err}"
+            );
+        }
+    }
 }
 
 /// A thread draining one collector until `stop`.
@@ -729,3 +886,57 @@ backend be
     expect("fe_sample_err/err", &lines[3], &[]);
     expect("fe_sample_err/sample", &lines[4], &[&format!("{L}txn_close")]);
 }
+
+#[test]
+fn t644_17_a_global_log_directive_with_an_unknown_profile_is_refused() {
+    // Oracle (startup, not `-c`; rc=1):
+    // `global log directive declared in file <file> at line '2' unknown log-profile 'nosuch'.`
+    let addr = common::reserve_addr();
+    let cfg = format!(
+        "global\n  log 127.0.0.1:514 profile nosuch local0\ndefaults\n  mode http\n  timeout client 5s\n  timeout connect 5s\n  timeout server 5s\nfrontend fe\n  bind {addr}\n"
+    );
+    let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+    f.write_all(cfg.as_bytes()).expect("write cfg");
+    let mut child = Command::new(bin())
+        .arg("-f")
+        .arg(f.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    // The refusal is immediate; a process still running after 5 s accepted the config.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            break Some(st);
+        }
+        if Instant::now() > deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let Some(status) = status else {
+        common::stop(&mut child);
+        panic!("an unknown profile on a global log line was accepted: the process kept running");
+    };
+    let mut err = String::new();
+    child.stderr.take().expect("stderr").read_to_string(&mut err).expect("read stderr");
+    assert!(!status.success(), "rc={:?}", status.code());
+    assert!(
+        err.contains("global log directive declared in file") && err.contains("unknown log-profile 'nosuch'"),
+        "stderr was: {err}"
+    );
+}
+
+#[test]
+fn t644_15_a_log_profile_format_that_does_not_compile_is_refused_at_load() {
+    // Oracle, `-c`, rc=1: `Parsing [file:4]: failed to parse logformat: no such format alias 'bogus'. ...`
+    let out = run_cfg(
+        &["-c"],
+        "defaults\n  mode http\nlog-profile p\n  on close format \"%{+X}o %bogus\"\nfrontend fe\n  bind 127.0.0.1:18099\n  log 127.0.0.1:514 profile p local0\n",
+    );
+    assert!(!out.status.success(), "rc={:?}", out.status.code());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("failed to parse logformat: no such format alias 'bogus'"), "stderr was: {err}");
+}
+

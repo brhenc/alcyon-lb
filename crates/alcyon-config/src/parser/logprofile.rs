@@ -75,6 +75,7 @@ pub(crate) fn parse_log_profile_header(
         line: kw.line,
         log_tag: None,
         steps: Vec::new(),
+        format_strings: Vec::new(),
     })
 }
 
@@ -125,6 +126,7 @@ fn parse_on_line(
     let mut drop = false;
     let mut format = None;
     let mut sd = None;
+    let mut parsed_formats = Vec::new();
     let mut i = 2usize;
     // The loop `HAProxy` runs: `drop` only as the first word, then `format`/`sd`, each
     // clearing `drop`; anything else, or a `format`/`sd` with no string, ends it and is an
@@ -146,6 +148,7 @@ fn parse_on_line(
                         format!("'on {}' expects a logformat string.", step.name()),
                     ));
                 };
+                parsed_formats.push((tokens[i].line, fmt.text.clone()));
                 format = Some(fmt.text.clone());
                 drop = false;
                 i += 2;
@@ -158,6 +161,7 @@ fn parse_on_line(
                         format!("'on {}' expects a logformat string.", step.name()),
                     ));
                 };
+                parsed_formats.push((tokens[i].line, fmt.text.clone()));
                 sd = Some(fmt.text.clone());
                 drop = false;
                 i += 2;
@@ -173,6 +177,8 @@ fn parse_on_line(
             format!("'on {}' expects 'drop', 'format' or 'sd'.", step.name()),
         ));
     }
+
+    section.format_strings.extend(parsed_formats);
 
     // A step named again replaces what the earlier line set: `HAProxy` re-parses the step's
     // entry, so the fields the new line gives win and the ones it does not give are cleared.

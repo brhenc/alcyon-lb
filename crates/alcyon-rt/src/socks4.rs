@@ -21,9 +21,10 @@ pub const RSP_LEN: usize = 8;
 /// `CD` of a reply that grants the request (90; 91, 92 and 93 reject it).
 const RSP_GRANTED: u8 = 90;
 
-/// The 16-byte request for `target`, the address the proxy dials. A non-IPv4
-/// `target` names `0.0.0.0`, as `is_inet_addr` does for a destination that is not an
-/// IPv4 address.
+/// The 16-byte request for `target`, the address the proxy dials. `DSTIP` mirrors
+/// `HAProxy`'s `is_inet_addr` (`include/haproxy/tools.h:731-743`): for IPv4, the 4 IPv4
+/// bytes; for IPv6, the first non-zero 32-bit word of `sin6_addr` (or `0.0.0.0` if all
+/// zero).
 #[must_use]
 #[inline]
 pub fn request(target: SocketAddr) -> [u8; REQ_LEN] {
@@ -33,12 +34,53 @@ pub fn request(target: SocketAddr) -> [u8; REQ_LEN] {
     let port = target.port();
     req[2] = (port >> 8) as u8;
     req[3] = port as u8;
-    if let IpAddr::V4(ip) = target.ip() {
-        req[4..8].copy_from_slice(&ip.octets());
+    match target.ip() {
+        IpAddr::V4(ip) => req[4..8].copy_from_slice(&ip.octets()),
+        IpAddr::V6(ip) => {
+            if let Some(word) = ip.octets().chunks_exact(4).find(|w| *w != [0, 0, 0, 0]) {
+                req[4..8].copy_from_slice(word);
+            }
+        }
     }
     req[8..15].copy_from_slice(b"HAProxy");
     req[15] = 0;
     req
+}
+
+/// `true` when the SOCKS4 proxy and server have different IP address families
+/// (`AF_INET` vs `AF_INET6`), which `HAProxy`'s `sock_create_server_socket` +
+/// `tcp_connect_server` rejects with `EINVAL` (`CO_ER_SOCK_ERR`).
+#[must_use]
+#[inline]
+pub const fn family_mismatch(proxy: SocketAddr, target: SocketAddr) -> bool {
+    proxy.is_ipv6() != target.is_ipv6()
+}
+
+/// Connects to `target`, or through `proxy` when `Some(proxy)` (`socks4 <proxy>`).
+/// Refuses a proxy/target address-family mismatch with `EINVAL` before opening a socket
+/// (`HAProxy`'s `sock_create_server_socket` + `tcp_connect_server` open the socket in the
+/// server's family and fail `connect(&srv->socks4_addr)` with `EINVAL`, `CO_ER_SOCK_ERR`).
+///
+/// # Errors
+/// Returns `EINVAL` on a proxy/target address-family mismatch, or any error from
+/// [`crate::raw::connect_opts`].
+#[inline]
+pub fn connect_opts(
+    target: SocketAddr,
+    proxy: Option<SocketAddr>,
+    tfo: bool,
+    md5sig: Option<&[u8]>,
+) -> std::io::Result<(std::os::unix::io::OwnedFd, bool)> {
+    let dst = match proxy {
+        Some(p) => {
+            if family_mismatch(p, target) {
+                return Err(std::io::Error::from(rustix::io::Errno::INVAL));
+            }
+            p
+        }
+        None => target,
+    };
+    crate::raw::connect_opts(dst, tfo, md5sig)
 }
 
 /// The two phases of a handshake in flight, one per `CO_FL_SOCKS4_*`.
@@ -202,8 +244,28 @@ mod tests {
         );
         let v6: SocketAddr = "[::1]:443".parse().unwrap();
         let r6 = request(v6);
-        assert_eq!(&r6[..8], &[0x04, 0x01, 0x01, 0xbb, 0, 0, 0, 0]);
+        assert_eq!(&r6[..8], &[0x04, 0x01, 0x01, 0xbb, 0, 0, 0, 1]);
         assert_eq!(&r6[8..], b"HAProxy\0");
+
+        let v6_doc: SocketAddr = "[2001:db8::1:5]:8080".parse().unwrap();
+        let r6_doc = request(v6_doc);
+        assert_eq!(&r6_doc[..8], &[0x04, 0x01, 0x1f, 0x90, 0x20, 0x01, 0x0d, 0xb8]);
+        assert_eq!(&r6_doc[8..], b"HAProxy\0");
+
+        let v6_unspec: SocketAddr = "[::]:443".parse().unwrap();
+        let r6_unspec = request(v6_unspec);
+        assert_eq!(&r6_unspec[..8], &[0x04, 0x01, 0x01, 0xbb, 0, 0, 0, 0]);
+        assert_eq!(&r6_unspec[8..], b"HAProxy\0");
+
+        assert!(family_mismatch(v4, v6));
+        assert!(family_mismatch(v6, v4));
+        assert!(!family_mismatch(v4, v4));
+        assert!(!family_mismatch(v6, v6_doc));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_v4 = listener.local_addr().unwrap();
+        let err = connect_opts(v6, Some(proxy_v4), false, None).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(rustix::io::Errno::INVAL.raw_os_error()));
     }
 
     #[test]

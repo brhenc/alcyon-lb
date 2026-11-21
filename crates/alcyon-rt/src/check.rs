@@ -2719,13 +2719,11 @@ fn socks4_for_check(proxies: &crate::table::Table, check: &ServerCheckState) -> 
 fn connect_check(proxies: &crate::table::Table, check: &mut ServerCheckState, addr: Option<SocketAddr>, allow_socks4: bool) -> io::Result<(OwnedFd, bool)> {
     let addr = addr.unwrap_or_else(|| check_target(check));
     check.run.socks4 = if allow_socks4 { socks4_for_check(proxies, check) } else { None };
-    let (sock, mut immediate) = match check.run.socks4.as_mut() {
-        Some(c) => {
-            c.target = addr;
-            raw::connect(c.proxy_addr)?
-        }
-        None => raw::connect(addr)?,
-    };
+    let proxy = check.run.socks4.as_mut().map(|c| {
+        c.target = addr;
+        c.proxy_addr
+    });
+    let (sock, mut immediate) = crate::socks4::connect_opts(addr, proxy, false, None)?;
     if check.run.socks4.is_some() {
         immediate = false;
     }
