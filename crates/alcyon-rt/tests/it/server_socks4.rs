@@ -793,3 +793,33 @@ fn mismatched_address_family_between_server_and_socks4_fails_connect() {
     assert!(v4_events.lock().unwrap().is_empty(), "v4 proxy must receive no SOCKS4 request for v6 server");
     assert!(v6_events.lock().unwrap().is_empty(), "v6 proxy must receive no SOCKS4 request for v4 server");
 }
+
+
+/// Oracle (3.5-dev11, measured): a server with an IPv6 address behind `socks4` cannot be
+/// reached (SOCKS4 has no IPv6 form). The connect fails at once, no request is sent to the
+/// SOCKS4 proxy, the client gets 503 and the log shows termination `SC` with the general
+/// socket error (`bc_err` 6, `SOCK_ERR`), not a SOCKS4 request for 0.0.0.0.
+#[test]
+fn t644_33_an_ipv6_server_behind_socks4_fails_without_a_proxy_request() {
+    let dummy: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let socks = socks4_proxy_with_count(dummy, SOCKS4_OK, None, events.clone(), attempts.clone());
+    let fe = common::reserve_addr();
+    let (log_addr, logs) = start_syslog();
+    let cfg = format!(
+        "global\n  log {log_addr} local0\ndefaults\n  mode http\n  log global\n  \
+         log-format \"%ST %ts %rc %[bc_err] %[bc_err_name] %[bc_err_str]\"\n  \
+         timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend f\n  bind {fe}\n  default_backend b\n\
+         backend b\n  server s [::1]:9 socks4 {socks}\n"
+    );
+    let _p = start_raw(&cfg, &[fe]);
+    let body = get(fe);
+    assert_eq!(body.get(9..12).unwrap_or(""), "503", "client must get 503: {body:?}");
+    let line = wait_log(&logs, "503");
+    assert!(line.contains("503 SC") && line.contains("SOCK_ERR General socket error"), "unexpected log: {line:?}");
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(attempts.load(Ordering::Relaxed), 0, "the SOCKS4 proxy must not even be contacted for an IPv6 server");
+    assert!(events.lock().unwrap().is_empty(), "no SOCKS4 request may be sent: {:?}", events.lock().unwrap());
+}

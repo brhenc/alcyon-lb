@@ -280,6 +280,51 @@ fn netscaler_cip_is_per_connection() {
     common::stop(&mut child);
 }
 
+/// Oracle (3.5-dev11): the minimum CIP header is the IP header plus the 4 port bytes
+/// (`sizeof(struct my_tcphdr)`): 24 bytes for IPv4, 44 for IPv6, not IP + a full 20-byte
+/// TCP header. Such a header is accepted and the addresses/ports are taken from it.
+#[test]
+fn t644_20_a_ports_only_cip_header_is_accepted() {
+    let a = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend fe1\n  bind {a} accept-netscaler-cip 305419896\n\
+         \x20 http-request return status 200\n\
+         \x20 http-after-response set-header x-src \"%[src]:%[src_port]\"\n\
+         \x20 http-after-response set-header x-dst \"%[dst]:%[dst_port]\"\n"
+    );
+    let mut f = NamedTempFile::new().expect("tmp");
+    f.write_all(cfg.as_bytes()).expect("cfg");
+    let child = Command::new(bin())
+        .arg("-f")
+        .arg(f.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(common::Alcyon)
+        .expect("spawn");
+    assert!(common::wait_listening(a), "fe1 did not come up");
+
+    // IPv4: 12-byte prefix (announced header length 24), IPv4 header, then the 4 port bytes.
+    let full = cip_v4([0x12, 0x34, 0x56, 0x78]);
+    let mut v4 = full[..12 + 20 + 4].to_vec();
+    v4[10..12].copy_from_slice(&[0x00, 0x18]);
+    let r = talk(a, &v4, true);
+    assert!(r.starts_with("HTTP/1.1 200"), "ports-only IPv4 header: {r:?}");
+    assert!(r.contains("x-src: 192.168.0.1:1234\r\n"), "{r:?}");
+    assert!(r.contains("x-dst: 10.0.0.2:81\r\n"), "{r:?}");
+
+    // IPv6: 40-byte header + 4 port bytes (announced 44).
+    let full = cip_v6([0x12, 0x34, 0x56, 0x78]);
+    let mut v6 = full[..12 + 40 + 4].to_vec();
+    v6[10..12].copy_from_slice(&[0x00, 0x2c]);
+    let r = talk(a, &v6, true);
+    assert!(r.starts_with("HTTP/1.1 200"), "ports-only IPv6 header: {r:?}");
+    assert!(r.contains("x-src: 2001:db8::1:1234\r\n"), "{r:?}");
+    assert!(r.contains("x-dst: 2001:db8::2:81\r\n"), "{r:?}");
+    drop(child);
+}
+
 #[test]
 fn expect_netscaler_cip_arguments_are_checked_at_load() {
     let (c, o) = check("tcp-request connection expect-netscaler-cip");
