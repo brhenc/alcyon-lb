@@ -811,19 +811,19 @@ pub(crate) fn build_resolved_http_check(
     }
 
     let has_explicit_send = http_checks.iter().any(|a| matches!(a, HttpCheckAction::Send { .. }));
-    if !has_explicit_send && httpchk.is_some_and(|h| h.method.is_some()) {
+    // `parse_httpchk_option` sets the method, URI and version together (its defaults are
+    // `OPTIONS`, `/`, `HTTP/1.0`), and an inherited request is cleared as a whole, so the
+    // three are all present or all absent: no default is needed here.
+    let implicit = httpchk
+        .filter(|_| !has_explicit_send)
+        .and_then(|h| Some((h.method.clone()?, h.uri.clone()?, h.version.clone()?, h)));
+    if let Some((method, uri, version, h)) = implicit {
         steps.push(ResolvedHttpStep::Send(ResolvedHttpSend {
-            method: httpchk
-                .and_then(|h| h.method.clone())
-                .unwrap_or_else(|| "OPTIONS".to_string()),
-            uri: httpchk
-                .and_then(|h| h.uri.clone())
-                .unwrap_or_else(|| "/".to_string()),
+            method,
+            uri,
             uri_lf: false,
-            version: httpchk
-                .and_then(|h| h.version.clone())
-                .unwrap_or_else(|| "HTTP/1.0".to_string()),
-            host: httpchk.and_then(|h| h.host.clone()),
+            version,
+            host: h.host.clone(),
             headers: Vec::new(),
             body: None,
             body_lf: false,
