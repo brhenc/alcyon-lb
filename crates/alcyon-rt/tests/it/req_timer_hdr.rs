@@ -215,7 +215,7 @@ fn timer_hdr_spans_the_wait_between_header_lines() {
     assert!((0..=1000).contains(&v), "x-timeridle {v} with the first byte sent at once");
     // The header wait, as the access log writes it for this stream.
     let (th, ti) = log_fields(&p, "POST / HTTP/1.1");
-    assert!((300..=5000).contains(&th), "log %TR {th} for a 500 ms wait between the header lines");
+    assert!((470..=5000).contains(&th), "log %TR {th} for a 500 ms wait between the header lines");
     assert!((0..=1000).contains(&ti), "log %Ti {ti} with the first byte sent at once");
 }
 
