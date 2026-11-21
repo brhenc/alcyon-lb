@@ -469,3 +469,15 @@ fn bytes_out_fetches_are_refused_with_a_reason() {
         }
     }
 }
+
+/// TIMERFETCH: Alcyon does not time the client handshake (`logs->t_handshake`), so
+/// `fc.timer.handshake` was registered as a constant 0 (the oracle answers ~300 ms for a TLS
+/// or PROXY handshake). Refused with a reason until the handshake is timed.
+#[test]
+fn fc_timer_handshake_is_refused_with_a_reason() {
+    for rule in ["http-request set-header x \"%[fc.timer.handshake]\"", "log-format \"%[fc.timer.handshake]\""] {
+        let (code, out) = load(rule);
+        assert_ne!(code, Some(0), "{rule} loaded: {out}");
+        assert!(out.contains("'fc.timer.handshake' : not implemented in Alcyon"), "{rule}: {out}");
+    }
+}

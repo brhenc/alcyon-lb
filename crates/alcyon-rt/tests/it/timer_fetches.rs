@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
 //! The timer sample fetches `txn.timer.total`, `txn.timer.user`, `req.timer.queue`,
-//! `req.timer.tq`, `res.timer.data`, `fc.timer.handshake`, `fc.timer.total` and
+//! `req.timer.tq`, `res.timer.data`, `fc.timer.total` and
 //! `bc.timer.connect`, as `HAProxy` registers them in `src/sample.c`
 //! (`smp_fetch_txn_timers`, `smp_fetch_conn_timers`, `smp_fetch_reX_timers`).
 //!
@@ -12,8 +12,8 @@
 //! Measured on the oracle (3.5-dev11, plain TCP, backend answering its head at once and
 //! its body after 300 ms):
 //! - in an `http-request` rule, `req.timer.tq` answers `-1` (`s->logs.request_ts` is
-//!   stamped by `http_process_req_common` only after the rules ran) and
-//!   `fc.timer.handshake` answers `0` (no TLS on the client);
+//!   stamped by `http_process_req_common` only after the rules ran);
+//! - `fc.timer.handshake` is refused at load (`fetch_edge_cases::fc_timer_handshake_is_refused_with_a_reason`);
 //! - in an `http-response` rule, `fc.timer.total` is still `0`: `s->logs.t_close` starts
 //!   at `0` when the stream is created (`src/stream.c`) and is stamped only when it is
 //!   logged, so `txn.timer.total` / `txn.timer.user` read `0 - t_idle` there and
@@ -108,15 +108,13 @@ fn start() -> Proxy {
         cfg,
         "global\n  log stdout format raw local0\n\
          defaults\n  mode http\n  log global\n\
-         \x20 log-format \"hu=%HU tw=%[req.timer.queue] tc=%[bc.timer.connect] th=%[fc.timer.handshake] \
+         \x20 log-format \"hu=%HU tw=%[req.timer.queue] tc=%[bc.timer.connect] \
              tt=%[fc.timer.total] ta=%[txn.timer.total] tu=%[txn.timer.user] td=%[res.timer.data]\"\n\
          \x20 timeout connect 2s\n  timeout client 10s\n  timeout server 10s\n\
          frontend f\n  bind {fe}\n\
          \x20 http-request deny if {{ path /denied }}\n\
          \x20 http-request set-var(txn.tq) req.timer.tq unless {{ path /nope }}\n\
-         \x20 http-request set-var(txn.th) fc.timer.handshake unless {{ path /nope }}\n\
          \x20 http-response set-header x-tq %[var(txn.tq)] unless {{ path /nope }}\n\
-         \x20 http-response set-header x-th %[fc.timer.handshake] unless {{ path /nope }}\n\
          \x20 http-response set-header x-td %[res.timer.data] unless {{ path /nope }}\n\
          \x20 http-response set-header x-ta %[txn.timer.total] unless {{ path /nope }}\n\
          \x20 http-response set-header x-tt %[fc.timer.total] unless {{ path /nope }}\n\
@@ -195,16 +193,15 @@ fn value(headers: &[(String, String)], name: &str) -> i64 {
 }
 
 /// The slow request: every fetch an integer; the rule-time ones at the values the
-/// oracle measures (`req.timer.tq` is `-1`, `fc.timer.handshake` is `0`, and the
+/// oracle measures (`req.timer.tq` is `-1`, and the
 /// `t_close`-based ones read `0` there); the log's ones the shape the oracle writes.
 #[test]
 fn timer_fetches_slow_request() {
     let p = start();
     let (status, headers) = exchange(&p, "/slow");
     assert_eq!(status, 200);
-    // `http-request` rule: the request is not complete yet, the handshake never was.
+    // `http-request` rule: the request is not complete yet.
     assert_eq!(value(&headers, "x-tq"), -1, "req.timer.tq in an http-request rule");
-    assert_eq!(value(&headers, "x-th"), 0, "fc.timer.handshake in an http-request rule");
     // `http-response` rule: `t_close` is still 0; the head arrived at once.
     for (name, why) in [("x-td", "res.timer.data"), ("x-ta", "txn.timer.total"), ("x-tt", "fc.timer.total")] {
         let v = value(&headers, name);
@@ -221,7 +218,6 @@ fn timer_fetches_slow_request() {
     // and the queue/connect spans non-negative and below the total.
     let tw = log_field(&p, "/slow", "tw");
     let tc = log_field(&p, "/slow", "tc");
-    assert_eq!(log_field(&p, "/slow", "th"), 0, "fc.timer.handshake in the log");
     let tt = log_field(&p, "/slow", "tt");
     let ta = log_field(&p, "/slow", "ta");
     let tu = log_field(&p, "/slow", "tu");
@@ -245,7 +241,6 @@ fn timer_fetches_denied_request() {
     assert_eq!(log_field(&p, "/denied", "tw"), -1, "req.timer.queue of a denied request");
     assert_eq!(log_field(&p, "/denied", "tc"), -1, "bc.timer.connect of a denied request");
     assert_eq!(log_field(&p, "/denied", "td"), -1, "res.timer.data of a denied request");
-    assert_eq!(log_field(&p, "/denied", "th"), 0, "fc.timer.handshake of a denied request");
     for name in ["tt", "ta", "tu"] {
         let v = log_field(&p, "/denied", name);
         assert!((0..=5000).contains(&v), "{name} of a denied request is {v}");
@@ -294,7 +289,7 @@ fn tq_refused_in_log_format() {
 #[test]
 fn log_format_admits_the_rest() {
     let (code, err) = check_config(
-        "\x20 log-format \"a=%[req.timer.queue] b=%[bc.timer.connect] c=%[res.timer.data] d=%[txn.timer.total] e=%[txn.timer.user] f=%[fc.timer.handshake] g=%[fc.timer.total]\"\n",
+        "\x20 log-format \"a=%[req.timer.queue] b=%[bc.timer.connect] c=%[res.timer.data] d=%[txn.timer.total] e=%[txn.timer.user] g=%[fc.timer.total]\"\n",
         false,
     );
     assert_eq!(code, 0, "the log-format must load:\n{err}");
@@ -330,7 +325,7 @@ fn res_data_refused_in_request_rule() {
 /// the connection and the transaction as they go.
 #[test]
 fn request_rule_admits_the_rest() {
-    for fetch in ["req.timer.tq", "txn.timer.total", "txn.timer.user", "fc.timer.handshake", "fc.timer.total"] {
+    for fetch in ["req.timer.tq", "txn.timer.total", "txn.timer.user", "fc.timer.total"] {
         let (code, err) = check_config(&format!("\x20 http-request set-var(txn.a) {fetch} unless {{ path /nope }}\n"), false);
         assert_eq!(code, 0, "{fetch} in an http-request rule must load:\n{err}");
     }
@@ -363,7 +358,6 @@ fn response_rule_admits_the_rest() {
         "res.timer.data",
         "txn.timer.total",
         "txn.timer.user",
-        "fc.timer.handshake",
         "fc.timer.total",
     ] {
         let (code, err) = check_config(&format!("\x20 http-response set-var(txn.a) {fetch} unless {{ path /nope }}\n"), false);
@@ -396,8 +390,8 @@ fn tcp_request_session_connection_refuses() {
                 "{fetch} refused without the oracle's reason:\n{err}"
             );
         }
-        // The connection's own facts stay: the handshake and the stream's elapsed time.
-        for fetch in ["fc.timer.handshake", "fc.timer.total"] {
+        // The connection's own fact stays: the stream's elapsed time.
+        for fetch in ["fc.timer.total"] {
             let line = format!("\x20 tcp-request {ck} set-var(txn.a) {fetch} unless {{ path /nope }}\n");
             let (code, err) = check_config(&line, false);
             assert_eq!(code, 0, "{fetch} in a tcp-request {ck} rule must load:\n{err}");
@@ -437,7 +431,7 @@ fn tcp_request_content_split() {
             "the format refused without the oracle's reason:\n{err}"
         );
     }
-    for fetch in ["req.timer.tq", "txn.timer.total", "txn.timer.user", "fc.timer.handshake", "fc.timer.total"] {
+    for fetch in ["req.timer.tq", "txn.timer.total", "txn.timer.user", "fc.timer.total"] {
         let (code, err) = check_config(&format!("\x20 tcp-request content set-var(txn.a) {fetch} unless {{ path /nope }}\n"), false);
         assert_eq!(code, 0, "{fetch} in a tcp-request content rule must load:\n{err}");
     }
@@ -481,7 +475,7 @@ fn unique_id_format_refuses_final_statistics() {
             "refusal without the oracle's reason:\n{err}"
         );
     }
-    for fetch in ["req.timer.tq", "txn.timer.total", "txn.timer.user", "fc.timer.handshake", "fc.timer.total"] {
+    for fetch in ["req.timer.tq", "txn.timer.total", "txn.timer.user", "fc.timer.total"] {
         let (code, err) = check_config(&format!("\x20 unique-id-format %[{fetch}]\n"), false);
         assert_eq!(code, 0, "unique-id-format %[{fetch}] must load:\n{err}");
     }

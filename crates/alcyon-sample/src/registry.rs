@@ -1056,6 +1056,8 @@ pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     // BYTESFETCH: registered, and a copy of `req.bytes_in`/`res.bytes_in`.
     ("req.bytes_out", "Alcyon does not count the bytes it forwards after rewriting the message"),
     ("res.bytes_out", "Alcyon does not count the bytes it forwards after rewriting the message"),
+    // TIMERFETCH: registered, and always 0.
+    ("fc.timer.handshake", "Alcyon does not time the client handshake"),
 ];
 
 /// Why `name` -- a fetch or a converter -- is in [`NOT_IMPLEMENTED`].
@@ -2650,12 +2652,6 @@ impl Registry {
                 let data = timer_part(ctx, 4)?;
                 Some(Sample::Sint(if data >= 0 { ctx.t_close - data } else { -1 }))
             },
-        });
-        self.register_fetch(FetchDesc {
-            name: "fc.timer.handshake",
-            out_type: SampleType::Sint,
-            // `logs->t_handshake` (the session's, with no stream): 0, as the log's `%Th`.
-            func: |_ctx, _args| Some(Sample::Sint(0)),
         });
         self.register_fetch(FetchDesc {
             name: "fc.timer.total",

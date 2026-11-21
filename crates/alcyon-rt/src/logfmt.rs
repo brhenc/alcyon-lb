@@ -505,8 +505,8 @@ const NUMERIC: &[Alias] = &[
 
 /// The timer fetches that read the stream's logs (`smp_fetch_reX_timers`,
 /// `smp_fetch_txn_timers`, `smp_fetch_conn_timers`): a format carrying one needs the
-/// stream in its context. `fc.timer.handshake` is out: it reads the session's handshake,
-/// 0 in Alcyon, with or without a stream.
+/// stream in its context. `fc.timer.handshake` is out: Alcyon does not time the handshake, so the
+/// fetch is refused at load (`alcyon_sample::NOT_IMPLEMENTED`).
 pub const STREAM_TIMER_FETCHES: [&str; 7] = [
     "req.timer.tq",
     "req.timer.queue",
