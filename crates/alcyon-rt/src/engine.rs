@@ -11307,7 +11307,15 @@ impl EngineDispatcher<'_> {
 
         let view = ProxiesView(proxies);
         let stick = StickView::new(proxies, &entry.sess.tracked_sc);
-        let ctx = Self::request_ctx(&entry.sess, proxy, &view, &stick);
+        // The request's context is assembled only for a frontend that has a `use_backend` rule
+        // or a `force-be-switch` condition to evaluate: a `default_backend` alone reads none.
+        let built;
+        let ctx = if proxy.rules.use_backend.is_empty() && proxy.rules.force_be.is_empty() {
+            &alcyon_sample::PhaseCtx::EMPTY
+        } else {
+            built = Self::request_ctx(&entry.sess, proxy, &view, &stick);
+            &built
+        };
         let registry = sample_registry();
         // `lookup_fe_persist_rules`: the frontend's `force-be-switch` conditions.
         let forced = || {
