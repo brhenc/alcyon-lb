@@ -421,3 +421,36 @@ class TestH3Board(unittest.TestCase):
         self.assertEqual([(g["sha"], g["release-perf"]) for g in got], [("s1", 90), ("s2", 80)])
         self.assertIsNone(got[0]["pgo"])
         self.assertIn("-", render(got))
+
+
+class TestInsreqGateRef(unittest.TestCase):
+    """insreq_gate.pick_ref: the quick gate's baseline is the last clean, passing measurement."""
+
+    @staticmethod
+    def row(sha, ka, ka_ref, rules=50000, rules_ref=50000, **kw):
+        return dict(sha=sha, ins_per_req_keepalive=ka, ins_per_req_keepalive_ref=ka_ref,
+                    ins_per_req_rules=rules, ins_per_req_rules_ref=rules_ref, **kw)
+
+    def test_a_failed_measurement_is_not_the_baseline(self):
+        from insreq_gate import pick_ref
+        # 11-21: 2eea785f measured keepalive +1.8% over c246669a and failed.
+        rows = [self.row("c246669a", 35078, 35062), self.row("2eea785f", 35769, 35135)]
+        self.assertEqual(pick_ref(rows, lambda s: True), "c246669a")
+        rows.append(self.row("next", 35000, 35000, rules=51923, rules_ref=50644))
+        self.assertEqual(pick_ref(rows, lambda s: True), "c246669a")
+
+    def test_dirty_other_kinds_missing_counts_and_non_ancestors_are_skipped(self):
+        from insreq_gate import pick_ref
+        rows = [self.row("old", 35000, 35000),
+                self.row("dirty", 35000, 35000, dirty=True),
+                self.row("h3", 35000, 35000, kind="insreq-h3"),
+                {"sha": "nocount", "rps_1conn": 1},
+                self.row("branch", 35000, 35000)]
+        self.assertEqual(pick_ref(rows, lambda s: s != "branch"), "old")
+        self.assertIsNone(pick_ref(rows, lambda s: False))
+
+    def test_judge_is_the_rise_in_percent(self):
+        from insreq_gate import judge
+        r = judge({"keepalive": 35769, "rules": 50644}, {"keepalive": 35135, "rules": 50644})
+        self.assertAlmostEqual(r["keepalive"], 1.804, places=2)
+        self.assertEqual(r["rules"], 0.0)

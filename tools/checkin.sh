@@ -14,7 +14,8 @@
 # a flaky test, two uncovered lines, load noise in the measurement. Each stage's result is
 # kept per tree by harness/gatestate.py: the commit, a clean worktree (data/measurements.jsonl
 # apart) and the env that changes a verdict (COVERCHECK, ALCYON_GATE_SKIP_MEASURE, the
-# covercheck base). A result from another tree is never reused, and a dirty tree keeps
+# covercheck base, and when set ALCYON_GATE_SKIP_INSREQ=1, which skips insreq-quick, and
+# ALCYON_MEASURE_REF, its reference). A result from another tree is never reused, and a dirty tree keeps
 # nothing. The verdict is every stage's last attempt on this tree -- PASS only when each one
 # passed -- with every failed attempt before it listed: a stage that passed on a rerun is
 # reported as such, not hidden.
@@ -28,6 +29,8 @@
 #                          not hold one from this tree, a no-op when it does.
 #   measure                builds and times its own plain release alcyon, in the plain target
 #                          and the plain env (tools/measure/run.sh refuses an instrumented one).
+#   insreq-quick           builds its own release-perf alcyon in the plain target and env, and
+#                          the reference's in a cache of its own (tools/measure/insreq_gate.py).
 #   the rest               build what they test (cargo does), or need nothing.
 #
 # Uses its own target directory so it never contends with a build agy is running.
@@ -35,7 +38,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-STAGES=(tripwire harness-tests findings oracles suite covercheck smoke diff-fuzz haproxy lint measure surface stray)
+STAGES=(tripwire harness-tests findings oracles suite covercheck smoke diff-fuzz haproxy lint insreq-quick measure surface stray)
 declare -A TITLE=(
   [tripwire]="tripwire: the spec tests must not change"
   [harness-tests]="the harness's own tests"
@@ -47,6 +50,7 @@ declare -A TITLE=(
   [diff-fuzz]="differential fuzz against HAProxy, end to end, vs the known-differences baseline"
   [haproxy]="does HAProxy still behave as the tests record"
   [lint]="does the rest still build and lint (clippy, and the libFuzzer targets compile: T279)"
+  [insreq-quick]="instructions per request against the last measured main (slot B, +0.5%)"
   [measure]="continuous measurement"
   [surface]="new surface since the nudge, and whether it came with tests"
   [stray]="stray files (the supervisor's own are expected)"
@@ -404,6 +408,25 @@ stage_measure() {
   else
     run_plain tools/measure/run.sh --fast
     check "$?" "continuous measurement"
+  fi
+}
+
+stage_insreq-quick() {
+  # 11-21: only the exclusive gate measured ins/req, 32 merges went in unmeasured and the next
+  # measured gate found keepalive +1.8%, rules +2.5% (AGENTS.md section 8 allows +0.5%). This
+  # is the short count every other gate runs: release-perf of this tree against the reference
+  # (ALCYON_MEASURE_REF, else the last passing measured main), ab1 keepalive and rules, on
+  # counts slot B (/tmp/alcyon-load-n1.lock, CPUs 12-14). The exclusive gate measures in full
+  # (measure), so it skips this. Most of the time is the fat-LTO build of this tree.
+  if [ "${ALCYON_GATE_SKIP_INSREQ:-}" = 1 ]; then
+    echo "skipped (ALCYON_GATE_SKIP_INSREQ=1): ins/req not counted on this tree"
+    note_skip "ALCYON_GATE_SKIP_INSREQ=1"
+  elif [ "${ALCYON_GATE_SKIP_MEASURE:-}" != 1 ]; then
+    echo "skipped: the measure stage counts ins/req in full in this gate"
+    note_skip "measured in full by the measure stage"
+  else
+    run_plain python3 tools/measure/insreq_gate.py
+    check "$?" "insreq-quick (ins/req over budget, or not measured)"
   fi
 }
 
