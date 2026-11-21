@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Byte-count fetches: `bytes_in`, `bytes_out`, `req.bytes_in`, `req.bytes_out`,
-//! `res.bytes_in`, `res.bytes_out` (HAProxy `smp_fetch_bytes`, `src/sample.c`), read from a
-//! custom `log-format`.
+//! Byte-count fetches: `bytes_in`, `bytes_out`, `req.bytes_in` and `res.bytes_in` (HAProxy
+//! `smp_fetch_bytes`, `src/sample.c`), read from a custom `log-format`.
 //!
 //! Each counts the stream's bytes as the proxy sees them, in the HTX (parsed
 //! message) not the wire framing: `bytes_in`/`req.bytes_in` count the request the
-//! client sent, `req.bytes_out` the request the proxy sent to the server,
-//! `bytes_out`/`res.bytes_in` the response the server sent, `res.bytes_out` the
-//! response the client received. In an unedited relay the proxy forwards the same
-//! logical message, so each `*.bytes_out` equals the matching `*.bytes_in`; a
-//! chunked body is counted decoded, not as its chunk framing; and a request the
-//! proxy answers itself sends nothing to the server and receives nothing from it.
+//! client sent, `bytes_out`/`res.bytes_in` the response the server sent. A chunked
+//! body is counted decoded, not as its chunk framing, and a request the proxy answers
+//! itself receives nothing from a server. `req.bytes_out`/`res.bytes_out` are refused
+//! at load (`fetch_edge_cases::bytes_out_fetches_are_refused_with_a_reason`).
 //!
 //! Scenarios, one connection each (`Connection: close`, one log line per request):
 //! an HTTP/1.1 GET with no body, a POST with a 1000-byte body answered by a 5000-byte
@@ -57,7 +54,7 @@ defaults
   timeout connect 2s
   timeout http-request 2s
   timeout http-keep-alive 2s
-  log-format \"%[bytes_in] %[bytes_out] %[req.bytes_in] %[req.bytes_out] %[res.bytes_in] %[res.bytes_out] %r\"
+  log-format \"%[bytes_in] %[bytes_out] %[req.bytes_in] %[res.bytes_in] %r\"
 listen l
   bind {fe}
   bind {fe_h2} proto h2
@@ -115,7 +112,7 @@ listen l
 
     /// Drive the scenario on a fresh connection, then wait for the log line whose
     /// request URI is `uri`; return the six counts.
-    fn line_for(&self, fe: SocketAddr, path: &str, uri: &str) -> (i64, i64, i64, i64, i64, i64) {
+    fn line_for(&self, fe: SocketAddr, path: &str, uri: &str) -> (i64, i64, i64, i64) {
         match path {
             "/post" => post(fe),
             "/h2get" => h2_get(fe),
@@ -127,17 +124,17 @@ listen l
             while let Ok(l) = self.logs.try_recv() {
                 recent.push(l.clone());
                 let toks: Vec<&str> = l.split_whitespace().collect();
-                // The custom log-format prints the six counts then the request line
-                // (`METHOD SP URI SP VERSION`): match the URI, take the first six fields.
-                if toks.len() >= 9
+                // The custom log-format prints the four counts then the request line
+                // (`METHOD SP URI SP VERSION`): match the URI, take the first four fields.
+                if toks.len() >= 7
                     && toks[toks.len() - 2] == uri
-                    && (0..6).all(|i| toks[i].parse::<i64>().is_ok())
+                    && (0..4).all(|i| toks[i].parse::<i64>().is_ok())
                 {
-                    let mut v = [0i64; 6];
-                    for i in 0..6 {
+                    let mut v = [0i64; 4];
+                    for i in 0..4 {
                         v[i] = toks[i].parse().unwrap();
                     }
-                    return (v[0], v[1], v[2], v[3], v[4], v[5]);
+                    return (v[0], v[1], v[2], v[3]);
                 }
             }
             thread::sleep(Duration::from_millis(25));
@@ -294,35 +291,35 @@ fn h2_get(fe: SocketAddr) {
     }
 }
 
-fn check(name: &str, got: (i64, i64, i64, i64, i64, i64), want: (i64, i64, i64, i64, i64, i64)) {
+fn check(name: &str, got: (i64, i64, i64, i64), want: (i64, i64, i64, i64)) {
     assert_eq!(
         got,
         want,
-        "{name}: got (bytes_in, bytes_out, req.bytes_in, req.bytes_out, res.bytes_in, res.bytes_out) = {got:?}, want {want:?}",
+        "{name}: got (bytes_in, bytes_out, req.bytes_in, res.bytes_in) = {got:?}, want {want:?}",
     );
 }
 
 #[test]
-fn all_six_byte_fetches_match_the_oracle() {
+fn the_four_byte_fetches_match_the_oracle() {
     let be = common::reserve_addr();
     let _be = backend(be.port());
     let p = Proxy::start(be);
 
     // GET, no body. The request is counted as the HTX the proxy parsed of it,
     // `41` bytes; the response as `49`. In an unedited relay the proxy sends the
-    // same logical message on the server hop, so the `req.bytes_out` and
-    // `res.bytes_out` equal the `*_bytes_in` (measured on the oracle).
+    // same logical message on the server hop. (`req.bytes_out`/`res.bytes_out` are refused:
+    // `fetch_edge_cases::bytes_out_fetches_are_refused_with_a_reason`.)
     check(
         "h1 get",
         p.line_for(p.fe, "/get", "/get"),
-        (41, 49, 41, 41, 49, 49),
+        (41, 49, 41, 49),
     );
 
     // POST 1000-byte body -> 5000-byte response. Request counted `1061`, response `5052`.
     check(
         "h1 post",
         p.line_for(p.fe, "/post", "/post"),
-        (1061, 5052, 1061, 1061, 5052, 5052),
+        (1061, 5052, 1061, 5052),
     );
 
     // Chunked response: the proxy decodes the chunks, so the response counts as the
@@ -330,15 +327,14 @@ fn all_six_byte_fetches_match_the_oracle() {
     check(
         "h1 chunked",
         p.line_for(p.fe, "/chunked", "/chunked"),
-        (45, 70, 45, 45, 70, 70),
+        (45, 70, 45, 70),
     );
 
-    // The proxy answers itself: nothing went to the server (0) and nothing came back
-    // (0); the client received the proxy's own 200 page, counted `146`.
+    // The proxy answers itself: nothing came back from a server (0).
     check(
         "local return",
         p.line_for(p.fe, "/local", "/local"),
-        (43, 0, 43, 0, 0, 146),
+        (43, 0, 43, 0),
     );
 
     // One GET over HTTP/2 (client side); bridged to the HTTP/1.1 backend. The request
@@ -346,6 +342,6 @@ fn all_six_byte_fetches_match_the_oracle() {
     check(
         "h2 get",
         p.line_for(p.fe_h2, "/h2get", "http://x/h2get"),
-        (51, 49, 51, 51, 49, 49),
+        (51, 49, 51, 49),
     );
 }
