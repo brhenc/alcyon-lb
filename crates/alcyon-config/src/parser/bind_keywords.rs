@@ -54,7 +54,6 @@ pub(crate) const UNIMPLEMENTED_BIND_KEYWORDS: &[BindKeyword] = &[
     refuse!("severity-output", 1),
     refuse!("shards", 1),
     refuse!("tcp-md5sig", 1),
-    refuse!("tcp-ss", 1),
     refuse!("tfo", 0),
     refuse!("transparent", 0),
     refuse!("uid", 1),

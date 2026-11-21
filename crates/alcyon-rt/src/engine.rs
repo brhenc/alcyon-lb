@@ -3397,6 +3397,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         fc_dst: s.fc_dst(),
         is_first_req: s.flags.has(sess_flags::IS_FIRST_REQ),
         proxy_tlvs: s.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+        saved_syn: s.saved_syn(),
         ssl_fc: crate::proxy::ssl_fc(&s.cli_xprt, s.h2_role.as_deref()),
         quic_acks: s.quic_facts(),
         fc_http_major: s.fc_http_major(),
@@ -3452,6 +3453,9 @@ impl alcyon_sample::LiveReq for TcpSession {
     }
     fn proxy_tlvs(&self) -> Option<&[u8]> {
         self.proxy_info.as_ref().map(|p| p.tlv_data.as_slice())
+    }
+    fn saved_syn(&self) -> Option<&[u8]> {
+        self.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref())
     }
     fn ssl_fc(&self) -> alcyon_sample::SslFacts<'_> {
         crate::proxy::ssl_fc(&self.cli_xprt, self.h2_role.as_deref())
@@ -8241,7 +8245,11 @@ fn eval_tcp_req_session_rules(
     };
 
     for (rule, rc) in proxy.tcp_req_session_rules.iter().zip(&proxy.rules.tcp_req_session) {
-        let matches = rc.cond.as_ref().is_none_or(|c| c.eval(&ctx.as_ctx(), &proxy.acls, registry));
+        // `HAProxy` reads these fetches from the session (`smp->sess`), so the context is
+        // live, not the pre-loop snapshot: `set-src`/`set-dst` write the session's box
+        // while the rules run, and a reference taken before the loop could not outlive
+        // them (`fc_saved_syn` among them).
+        let matches = rc.cond.as_ref().is_none_or(|c| c.eval(&SampleContext::live(&ctx, &*sess), &proxy.acls, registry));
         if !matches {
             continue;
         }
@@ -8264,7 +8272,7 @@ fn eval_tcp_req_session_rules(
                 } else {
                     proxy.id as usize
                 };
-                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
                         // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
                         if sess.tracked_sc[0].is_none() {
@@ -8281,7 +8289,7 @@ fn eval_tcp_req_session_rules(
                 } else {
                     proxy.id as usize
                 };
-                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
                         // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
                         if sess.tracked_sc[1].is_none() {
@@ -8298,7 +8306,7 @@ fn eval_tcp_req_session_rules(
                 } else {
                     proxy.id as usize
                 };
-                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
                         // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
                         if sess.tracked_sc[2].is_none() {
@@ -8316,7 +8324,7 @@ fn eval_tcp_req_session_rules(
                 // The sample must convert to an address (`SMP_T_ADDR`, `c_str2addr`): a
                 // string that is not a bare IP converts to nothing and the action does
                 // nothing (`sample_fetch_as_type` returns null).
-                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp)).unwrap_or_default();
+                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &SampleContext::live(&ctx, &*sess))).map(|smp| sample_to_string(&smp)).unwrap_or_default();
                 if let Ok(ip) = val.parse::<IpAddr>() {
                     let port = sess.sess_src().or(sess.fc_src).map_or(0, |a| a.port());
                     let new_addr = SocketAddr::new(ip, port);
@@ -8326,7 +8334,7 @@ fn eval_tcp_req_session_rules(
                 }
             }
             alcyon_config::TcpReqSessionAction::SetDst { expr: _ } => {
-                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp)).unwrap_or_default();
+                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &SampleContext::live(&ctx, &*sess))).map(|smp| sample_to_string(&smp)).unwrap_or_default();
                 if let Ok(ip) = val.parse::<IpAddr>() {
                     let port = sess.sess_dst().or(sess.fc_dst).map_or(0, |a| a.port());
                     let new_addr = SocketAddr::new(ip, port);
@@ -8336,7 +8344,7 @@ fn eval_tcp_req_session_rules(
                 }
             }
             alcyon_config::TcpReqSessionAction::SetSrcPort { expr: _ } => {
-                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
+                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess)) {
                     let new_addr = with_port(sess.sess_src().or(sess.fc_src), port);
                     sess.sess_addr.get_or_insert_with(Box::default).src = Some(new_addr);
                     sess.client_addr = Some(new_addr);
@@ -8344,7 +8352,7 @@ fn eval_tcp_req_session_rules(
                 }
             }
             alcyon_config::TcpReqSessionAction::SetDstPort { expr: _ } => {
-                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
+                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess)) {
                     let new_addr = with_port(sess.sess_dst().or(sess.fc_dst), port);
                     sess.sess_addr.get_or_insert_with(Box::default).dst = Some(new_addr);
                     sess.server_addr = Some(new_addr);
@@ -8357,15 +8365,22 @@ fn eval_tcp_req_session_rules(
                 // fetched sets nothing.
                 // A constant (`str(hello)`) is copied in, with no allocation (T364 S6).
                 let e = rc.expr.as_ref();
-                let sc = ctx.as_ctx();
                 if let Some(c) = e.and_then(|e| e.constant(registry)) {
                     store_var_in(&mut sess.strm.vars, &rc.var(var_name), alcyon_sample::vars::In::Ref(c));
-                } else if let Some(val) = e.and_then(|e| e.eval_smp(registry, &sc)) {
-                    rc.var(var_name).store_smp(&mut sess.strm.vars, val);
+                } else {
+                    // The value borrows the session through the live context: the stream's
+                    // variables are taken out for the store (a swap of an empty `Vec`, no
+                    // allocation) and put back, as the `http-request` arm does.
+                    let mut vars = std::mem::take(&mut sess.strm.vars);
+                    let sc = SampleContext::live(&ctx, &*sess);
+                    if let Some(val) = e.and_then(|e| e.eval_smp(registry, &sc)) {
+                        rc.var(var_name).store_smp(&mut vars, val);
+                    }
+                    sess.strm.vars = vars;
                 }
             }
             alcyon_config::TcpReqSessionAction::SetVarFmt { var_name, fmt: _ } => {
-                let val = render_rule_fmt(rc, &ctx.as_ctx(), registry);
+                let val = render_rule_fmt(rc, &SampleContext::live(&ctx, &*sess), registry);
                 store_var(&mut sess.strm.vars, &rc.var(var_name), val);
             }
             alcyon_config::TcpReqSessionAction::UnsetVar { var_name } => {
@@ -8374,16 +8389,16 @@ fn eval_tcp_req_session_rules(
             alcyon_config::TcpReqSessionAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
             alcyon_config::TcpReqSessionAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
             alcyon_config::TcpReqSessionAction::ScSetGpt0 { sc, expr } => {
-                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx.as_ctx());
+                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess));
                 sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::SetTag(val));
             }
             alcyon_config::TcpReqSessionAction::ScIncGpc { idx, sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Inc),
             alcyon_config::TcpReqSessionAction::ScAddGpc { idx, sc, expr } => {
-                let n = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx.as_ctx());
+                let n = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess));
                 sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Add(u64::from(n)));
             }
             alcyon_config::TcpReqSessionAction::ScSetGpt { idx, sc, expr } => {
-                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx.as_ctx());
+                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess));
                 sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::SetTag(val));
             }
             alcyon_config::TcpReqSessionAction::DoLog => {
@@ -8455,6 +8470,7 @@ fn eval_tcp_req_content_rules(
         so_id: sess.so_id_opt(),
         fc_dst: sess.fc_dst(),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+        saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
         quic_acks: sess.quic_facts(),
         fc_http_major: sess.fc_http_major(),
@@ -8760,6 +8776,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &crate::table::Table, regi
         so_id: sess.so_id_opt(),
         fc_dst: sess.fc_dst(),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+        saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
         quic_acks: sess.quic_facts(),
         fc_http_major: sess.fc_http_major(),
@@ -9045,6 +9062,15 @@ fn register_new_session(
     // A client that reset while its connection waited at `maxconn`: `HAProxy` finds the
     // reset with the request, and the stream's state tells it (`client_left`, T231).
     let reset_pending = engine.backlog_waits && crate::raw::reset_pending(cli_fd.as_fd());
+    // `bind tcp-ss`: the kernel records the SYN of the connection and answers
+    // `getsockopt(TCP_SAVED_SYN)` with its bytes only once — the read consumes them — so
+    // it is made once here, at accept, and only for a bind that asked for the recording.
+    // The bytes are kept on the session behind the `sess_addr` box.
+    let saved_syn = listener_idx
+        .and_then(|i| engine.listeners.get(i))
+        .is_some_and(|l| l.tcp_save_syn != 0)
+        .then(|| crate::raw::saved_syn(cli_fd.as_fd()))
+        .flatten();
     let emit = LogEmit { targets: &engine.log_targets, tag: &engine.log_tag, pid: engine.pid };
     let Some((mut sess, target_addr, srv_raw_fd)) = init_client_session(
         &mut engine.proxies,
@@ -9088,6 +9114,9 @@ fn register_new_session(
     }
     sess.so_name = listener_idx.and_then(|i| engine.listeners.get(i)).and_then(|l| l.name.clone());
     sess.so_id = listener_idx.and_then(|i| engine.listeners.get(i)).map_or(0, |l| l.luid);
+    if let Some(syn) = saved_syn {
+        sess.sess_addr.get_or_insert_with(Box::default).saved_syn = Some(syn);
+    }
 
     let proxy = &engine.proxies[proxy_idx];
 
@@ -10921,6 +10950,7 @@ impl EngineDispatcher<'_> {
             fc_dst: sess.fc_dst(),
             is_first_req: sess.flags.has(sess_flags::IS_FIRST_REQ),
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+            saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
             quic_acks: sess.quic_facts(),
             fc_http_major: sess.fc_http_major(),
@@ -13869,6 +13899,7 @@ impl EngineDispatcher<'_> {
             fc_dst: entry.sess.fc_dst(),
             is_first_req: entry.sess.flags.has(sess_flags::IS_FIRST_REQ),
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+            saved_syn: entry.sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
             ssl_fc: crate::proxy::ssl_fc(&entry.sess.cli_xprt, entry.sess.h2_role.as_deref()),
             quic_acks: entry.sess.quic_facts(),
             fc_http_major: entry.sess.fc_http_major(),
@@ -14392,6 +14423,7 @@ impl EngineDispatcher<'_> {
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
             fc_src: sess.fc_src(),
+            saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
             fc_dst: sess.fc_dst(),
             is_first_req: sess.flags.has(sess_flags::IS_FIRST_REQ),
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
@@ -19680,6 +19712,7 @@ fn after_res_on_reply<'r>(
             fc_dst: sess.fc_dst(),
             is_first_req: sess.flags.has(sess_flags::IS_FIRST_REQ),
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+            saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
             quic_acks: sess.quic_facts(),
             fc_http_major: sess.fc_http_major(),
@@ -19762,6 +19795,7 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &cra
                     client_addr: sess.client_addr,
                     fc_src: sess.fc_src(),
                     proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+                    saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
                     so_name: sess.so_name.as_deref(),
                     so_id: sess.so_id_opt(),
                     fc_dst: sess.fc_dst(),

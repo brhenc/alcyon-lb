@@ -336,6 +336,10 @@ pub struct PhaseCtx<'a> {
     pub fc_src: Option<SocketAddr>,
     pub fc_dst: Option<SocketAddr>,
     pub proxy_tlvs: Option<&'a [u8]>,
+    /// The SYN the kernel recorded for the connection (`bind tcp-ss`), read once at
+    /// accept; `None` on a connection whose bind did not ask for it. What `fc_saved_syn`
+    /// reads.
+    pub saved_syn: Option<&'a [u8]>,
     pub htx: Option<&'a Htx>,
     pub htx_slice: Option<HtxSliceRef<'a>>,
     pub req_uri: Option<&'a str>,
@@ -471,6 +475,7 @@ impl PhaseCtx<'_> {
         fc_src: None,
         fc_dst: None,
         proxy_tlvs: None,
+        saved_syn: None,
         htx: None,
         htx_slice: None,
         req_uri: None,
@@ -562,6 +567,9 @@ pub trait LiveReq {
     fn so_name(&self) -> Option<&str>;
     /// The PROXY protocol TLVs the connection came with.
     fn proxy_tlvs(&self) -> Option<&[u8]>;
+    /// The SYN the kernel saved for the client connection (`bind tcp-ss`): read once at
+    /// accept, `None` on a connection whose bind did not ask for it.
+    fn saved_syn(&self) -> Option<&[u8]>;
     /// The client connection's TLS session.
     fn ssl_fc(&self) -> SslFacts<'_>;
     /// The request head as HTX, as the rules before have edited it.
@@ -652,6 +660,16 @@ impl<'a> SampleContext<'a> {
         match self.live {
             Some(l) => l.proxy_tlvs(),
             None => self.phase.proxy_tlvs,
+        }
+    }
+
+    /// [`LiveReq::saved_syn`] from the live request, else [`PhaseCtx::saved_syn`].
+    #[inline]
+    #[must_use]
+    pub fn saved_syn(&self) -> Option<&'a [u8]> {
+        match self.live {
+            Some(l) => l.saved_syn(),
+            None => self.phase.saved_syn,
         }
     }
 
@@ -2116,6 +2134,15 @@ impl Registry {
             name: "fc_rcvd_proxy",
             out_type: SampleType::Bool,
             func: fc_rcvd_proxy_fetch,
+        });
+        // `smp_fetch_fc_saved_syn` (`src/tcp_sample.c`): the SYN the kernel recorded for
+        // the client connection (`bind tcp-ss`), read once at accept and kept on the
+        // session; no sample on a connection without the recording.
+        let fc_saved_syn_fetch: FetchFn = |ctx, _args| ctx.saved_syn().map(|b| Sample::Bin(b.to_vec()));
+        self.register_fetch(FetchDesc {
+            name: "fc_saved_syn",
+            out_type: SampleType::Bin,
+            func: fc_saved_syn_fetch,
         });
 
         let http_first_req_fetch: FetchFn =

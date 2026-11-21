@@ -1318,9 +1318,10 @@ pub struct TcpSession {
     /// pointer that stays NULL until set): 8 bytes and no allocation on a connection that
     /// does not use it, one allocation on one that does. Not folded into `proxy_info`: a
     /// `tcp-request session set-src` sets it without any PROXY header. Read through
-    /// [`Self::sess_src`]/[`Self::sess_dst`], written through [`Self::sess_addr_mut`];
-    /// an HTTP/2 stream reads its connection's ([`Self::h2_child_init`]), so the box is
-    /// never cloned per stream.
+    /// [`Self::sess_src`]/[`Self::sess_dst`]/[`Self::saved_syn`], written through
+    /// [`Self::sess_addr_mut`] and, for the recorded SYN, once at accept; an HTTP/2 stream
+    /// reads its connection's ([`Self::h2_child_init`]), so the box is never cloned per
+    /// stream.
     pub sess_addr: Option<Box<SessAddr>>,
     /// Deadline for `tcp-request content` rules (`Tick::ETERNITY` when unset).
     pub inspect_exp: Tick,
@@ -1401,15 +1402,20 @@ pub struct CipState {
     pub err: Option<CipError>,
 }
 
-/// The session-level addresses (`HAProxy`'s `sess->src`/`sess->dst`), behind
-/// [`TcpSession::sess_addr`]'s one box. `None` in either is "not set at session level".
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The session-level facts: the addresses (`HAProxy`'s `sess->src`/`sess->dst`) and the
+/// SYN the kernel recorded for the connection (`bind tcp-ss`), behind
+/// [`TcpSession::sess_addr`]'s one box. `None` in either address is "not set at session
+/// level"; `saved_syn` is set only by a bind with `tcp-ss`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessAddr {
     pub src: Option<SocketAddr>,
     pub dst: Option<SocketAddr>,
     /// The expected NetScaler Client IP header, `None` on a connection that carries no
     /// one; the box holds only this when only the header sets the session's addresses.
     pub cip: Option<CipState>,
+    /// The SYN the kernel recorded for the connection (`bind tcp-ss`), read once at
+    /// accept; `None` on a connection whose bind did not ask for it.
+    pub saved_syn: Option<Box<[u8]>>,
 }
 
 /// TCP mode `tcp-response content` inspection state, held in a [`alcyon_alloc::ColdBox`] on
@@ -1487,6 +1493,15 @@ impl TcpSession {
     #[inline]
     pub fn sess_dst(&self) -> Option<SocketAddr> {
         self.sess_addr.as_deref().and_then(|a| a.dst)
+    }
+
+    /// The SYN the kernel recorded for the connection (`bind tcp-ss`), read once at accept;
+    /// `None` on a connection whose bind did not ask for it. What the `fc_saved_syn`
+    /// fetch reads.
+    #[inline]
+    #[must_use]
+    pub fn saved_syn(&self) -> Option<&[u8]> {
+        self.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref())
     }
 
     /// The session's addresses to write, boxed on first use (once per connection that sets
