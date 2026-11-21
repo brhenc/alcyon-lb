@@ -190,6 +190,13 @@ pub static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 pub static CPU_USAGE_SOURCE: std::sync::OnceLock<fn() -> u8> = std::sync::OnceLock::new();
 
 /// A stream is being processed (`smp->strm` is set).
+/// Timer fetches (`req.timer.*`, `res.timer.data`, `txn.timer.*`, `fc.timer.*`,
+/// `bc.timer.*`): the stream's five logs in `[t_idle, t_request, t_queue, t_connect,
+/// t_data]` order, `-1` where `HAProxy` stamps none, no sample without a stream.
+fn timer_part(ctx: &SampleContext<'_>, i: usize) -> Option<i64> {
+    ctx.stream?.timers?.get(i).copied()
+}
+
 fn has_stream(ctx: &SampleContext<'_>) -> bool {
     ctx.stream.is_some() || ctx.fe_id.is_some()
 }
@@ -224,6 +231,14 @@ pub struct StreamFacts {
     /// happened: the first byte, the request, the queue, the connect and the response
     /// (`%Ti`, `%TR`..., a rule's format reads them, T455). `None` where the caller has none.
     pub timers: Option<[i64; 5]>,
+    /// Position in the backend's queue when dequeued (`logs->prx_queue_pos`); 0 if not queued there.
+    pub be_queue: u32,
+    /// Position in the server's queue when dequeued (`logs->srv_queue_pos`); 0 if not queued there.
+    pub srv_queue: u32,
+    /// The request's bytes in (`logs.req_in`), the same the log's `%U` reads.
+    pub req_in: u64,
+    /// The response's bytes in (`logs.res_in`), the same the log's `%B` reads.
+    pub res_in: u64,
 }
 
 /// Why a client connection failed before a session began (`conn->err_code`): what
@@ -258,6 +273,42 @@ pub struct QuicAckFacts {
     pub excess: Option<u64>,
 }
 
+/// Read-only facts of a stream's front connection (`HAProxy`'s `MUX_CTL_GET_*` on `fc`),
+/// borrowed from the connection's owner session on the same worker thread.
+pub trait FrontConnState {
+    /// Live stream count (`MUX_CTL_GET_NBSTRM`): `1` on HTTP/1, `h2c->nb_streams` on HTTP/2.
+    fn nb_streams(&self) -> u32;
+    /// Advertised `SETTINGS_MAX_CONCURRENT_STREAMS` (`MUX_CTL_GET_MAXSTRM`): `1` on HTTP/1.
+    fn max_concurrent_streams(&self) -> u32;
+    /// Protocol glitches counted on the connection (`MUX_CTL_GET_GLITCHES`): `None` where not
+    /// counted (HTTP/1 in Alcyon), `Some(n)` on HTTP/2 / HTTP/3.
+    fn glitches(&self) -> Option<u64>;
+}
+
+impl std::fmt::Debug for dyn FrontConnState + '_ {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrontConnState")
+            .field("nb_streams", &self.nb_streams())
+            .field("max_concurrent_streams", &self.max_concurrent_streams())
+            .field("glitches", &self.glitches())
+            .finish()
+    }
+}
+
+/// What [`PhaseCtx::waiting_entity`] names: `HAProxy`'s `strm->waiting_entity`, the entity
+/// that holds the stream until it continues. `HAProxy`'s third kind, `STRM_ENTITY_FILTER`
+/// (a stream filter), has no value in this codebase, which has no stream filters -- the
+/// `waiting_entity` fetch therefore never claims one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitEntity<'a> {
+    /// `STRM_ENTITY_RULE`: the rule the stream stopped at, as its configuration file and
+    /// the line in the file (the `file:line` the fetch prints).
+    Rule(&'a str, u32),
+    /// `STRM_ENTITY_WREQ_BODY`: the implicit request-body wait of
+    /// `option http-buffer-request`, which `HAProxy` names for the option.
+    Body,
+}
+
 /// The facts a sample fetch reads, as one phase of the stream knows them (CP4a-2): built once
 /// for a rule phase and held across its rules, read through [`SampleContext::phase`]. The facts
 /// [`LiveReq`] gives are read from the live request instead where a context has one
@@ -270,11 +321,19 @@ pub struct PhaseCtx<'a> {
     /// Evaluated for the access log, after the request buffer is gone: `method` reads
     /// only the transaction's method enum then, so a method outside it has no value.
     pub at_log: bool,
+    /// The name `%OG` prints for the line being built (a `log-profile`'s step, as
+    /// [`crate`]'s `log_orig_to_str` names it): `txn_close`, `txn_connect`, ... . `None`
+    /// where the line is not tied to a log step and `%OG` has no value.
+    pub log_origin: Option<&'static str>,
     pub client_addr: Option<SocketAddr>,
     pub server_addr: Option<SocketAddr>,
     pub fc_src: Option<SocketAddr>,
     pub fc_dst: Option<SocketAddr>,
     pub proxy_tlvs: Option<&'a [u8]>,
+    /// The SYN the kernel recorded for the connection (`bind tcp-ss`), read once at
+    /// accept; `None` on a connection whose bind did not ask for it. What `fc_saved_syn`
+    /// reads.
+    pub saved_syn: Option<&'a [u8]>,
     pub htx: Option<&'a Htx>,
     pub htx_slice: Option<HtxSliceRef<'a>>,
     pub req_uri: Option<&'a str>,
@@ -340,6 +399,12 @@ pub struct PhaseCtx<'a> {
     /// The request's time to its first byte, in milliseconds, as the http-request rules find it
     /// (`s->logs.t_idle`, `%Ti`): what `req.timer.idle` reads. `0` where the phase has no stream.
     pub req_timer_idle: i64,
+    /// The stream's close time in milliseconds from its start (`s->logs.t_close`, `%Tt`), as
+    /// the phase finds it: `0` while the stream has not closed - what a rule finds, `HAProxy`
+    /// stamping `t_close` only when the stream is logged - and the line's own value at log
+    /// time: what `fc.timer.total` reads, and what `txn.timer.total`, `txn.timer.user` and
+    /// `res.timer.data` subtract from.
+    pub t_close: i64,
     /// What `when()` reads of the stream; `None` is a stream that has done nothing yet.
     pub stream: Option<StreamFacts>,
     /// The proxy's ACLs, for `when(acl,<name>)`; `None` where the caller has none, and the
@@ -375,8 +440,20 @@ pub struct PhaseCtx<'a> {
     /// The stream's tracked stick-table entries, for the `sc_*` and `src_*` fetches. `None`
     /// where the caller has none, and those fetches then give no sample.
     pub stick: Option<&'a dyn StickState>,
+    /// Read-only view of the stream's front connection (`fc_nb_streams`,
+    /// `fc_settings_streams_limit`, `fc_glitches`). `None` where no front connection is attached.
+    pub fc: Option<&'a dyn FrontConnState>,
     /// Counts the copies of the context ([`crate::work::Op::CtxClone`]).
     pub clones: crate::work::CloneCount,
+    /// The stream's transaction id, the process stream counter as the stream took it (the
+    /// `%rt` fetch prints it): what `txn.id32` reads (`smp_fetch_id32`). `None` where the
+    /// phase has no stream of its own (`!smp->strm`), and `txn.id32` then gives no sample.
+    pub uniq_id: Option<u64>,
+    /// The entity that holds the stream until it continues: what `waiting_entity` reads
+    /// (`smp_fetch_waiting_entity`); `None` where nothing is named (a `tarpit` waits in
+    /// its own analyser, an `inspect-delay` data wait holds no rule, no stream filters
+    /// exist), and the fetch then gives no sample.
+    pub waiting_entity: Option<WaitEntity<'a>>,
 }
 
 
@@ -386,11 +463,13 @@ impl PhaseCtx<'_> {
     pub const EMPTY: PhaseCtx<'static> = PhaseCtx {
         conn_err: None,
         at_log: false,
+        log_origin: None,
         client_addr: None,
         server_addr: None,
         fc_src: None,
         fc_dst: None,
         proxy_tlvs: None,
+        saved_syn: None,
         htx: None,
         htx_slice: None,
         req_uri: None,
@@ -430,6 +509,7 @@ impl PhaseCtx<'_> {
         accept_date: None,
         request_date: None,
         req_timer_idle: 0,
+        t_close: 0,
         stream: None,
         acls: None,
         is_first_req: false,
@@ -445,7 +525,10 @@ impl PhaseCtx<'_> {
         quic_acks: None,
         proxies: None,
         stick: None,
+        fc: None,
         clones: crate::work::CloneCount,
+        uniq_id: None,
+        waiting_entity: None,
     };
 }
 
@@ -478,6 +561,9 @@ pub trait LiveReq {
     fn so_name(&self) -> Option<&str>;
     /// The PROXY protocol TLVs the connection came with.
     fn proxy_tlvs(&self) -> Option<&[u8]>;
+    /// The SYN the kernel saved for the client connection (`bind tcp-ss`): read once at
+    /// accept, `None` on a connection whose bind did not ask for it.
+    fn saved_syn(&self) -> Option<&[u8]>;
     /// The client connection's TLS session.
     fn ssl_fc(&self) -> SslFacts<'_>;
     /// The request head as HTX, as the rules before have edited it.
@@ -568,6 +654,16 @@ impl<'a> SampleContext<'a> {
         match self.live {
             Some(l) => l.proxy_tlvs(),
             None => self.phase.proxy_tlvs,
+        }
+    }
+
+    /// [`LiveReq::saved_syn`] from the live request, else [`PhaseCtx::saved_syn`].
+    #[inline]
+    #[must_use]
+    pub fn saved_syn(&self) -> Option<&'a [u8]> {
+        match self.live {
+            Some(l) => l.saved_syn(),
+            None => self.phase.saved_syn,
         }
     }
 
@@ -763,6 +859,9 @@ pub struct ServerState {
     pub iweight: u32,
     /// T331: `srv_uweight`: the user weight as `set server weight` leaves it (`srv->uweight`).
     pub uweight: u32,
+    /// The requests queued on the server now (`srv->queueslength`), the one `maxqueue`
+    /// bounds.
+    pub queue_len: u32,
 }
 
 /// A frontend counter, for [`ProxyState::frontend_counter`].
@@ -874,6 +973,18 @@ pub trait ProxyState: std::fmt::Debug {
     /// in maintenance, weight above 0 -- or, when there are none, 1 if a backup is usable;
     /// `None` if no proxy with a backend named `backend` exists.
     fn usable_servers(&self, backend: &str) -> Option<i64>;
+    /// `smp_fetch_queue_size` (`px->totpend`): the streams queued in the backend's queue
+    /// and in the queues of all its servers (`pendconn_add` counts both in `totpend`);
+    /// `None` if there is no proxy named `backend`.
+    fn backend_queue(&self, backend: &str) -> Option<i64>;
+    /// `smp_fetch_avg_queue_size`: the backend's queue over its usable servers, rounded up;
+    /// the queue doubled when there are no usable servers.
+    fn backend_avg_queue(&self, backend: &str) -> Option<i64>;
+    /// `smp_fetch_connslots`: the free connection and queue slots over the servers that
+    /// are not stopped, `-1` when one of them has no `maxconn` or no `maxqueue`.
+    fn backend_connslots(&self, backend: &str) -> Option<i64>;
+    /// `smp_fetch_uptime`: the seconds since the process started.
+    fn process_uptime(&self) -> i64;
     /// `smp_fetch_be_conn_free`: the free connection slots over the servers that would take
     /// traffic, `-1` if one of them has no `maxconn`.
     fn backend_conn_free(&self, backend: &str) -> Option<i64>;
@@ -942,13 +1053,11 @@ pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     ("fc_rttvar", "Alcyon does not read TCP_INFO"),
     ("bc_rtt", "Alcyon does not read TCP_INFO"),
     ("bc_rttvar", "Alcyon does not read TCP_INFO"),
-    ("queue", "Alcyon has no server queues"),
-    ("avg_queue", "Alcyon has no server queues"),
-    ("srv_queue", "Alcyon has no server queues"),
-    // T331: `HAProxy` asks the front mux; an HTTP/2 stream's entry does not see its connection's.
-    ("fc_nb_streams", "a stream does not see its HTTP/2 connection's stream count"),
-    ("fc_settings_streams_limit", "a stream does not see its HTTP/2 connection's advertised SETTINGS_MAX_CONCURRENT_STREAMS"),
-    ("fc_glitches", "Alcyon counts no HTTP/1 glitches, and a stream does not see its HTTP/2 connection's count"),
+    // BYTESFETCH: registered, and a copy of `req.bytes_in`/`res.bytes_in`.
+    ("req.bytes_out", "Alcyon does not count the bytes it forwards after rewriting the message"),
+    ("res.bytes_out", "Alcyon does not count the bytes it forwards after rewriting the message"),
+    // TIMERFETCH: registered, and always 0.
+    ("fc.timer.handshake", "Alcyon does not time the client handshake"),
 ];
 
 /// Why `name` -- a fetch or a converter -- is in [`NOT_IMPLEMENTED`].
@@ -2025,6 +2134,15 @@ impl Registry {
             out_type: SampleType::Bool,
             func: fc_rcvd_proxy_fetch,
         });
+        // `smp_fetch_fc_saved_syn` (`src/tcp_sample.c`): the SYN the kernel recorded for
+        // the client connection (`bind tcp-ss`), read once at accept and kept on the
+        // session; no sample on a connection without the recording.
+        let fc_saved_syn_fetch: FetchFn = |ctx, _args| ctx.saved_syn().map(|b| Sample::Bin(b.to_vec()));
+        self.register_fetch(FetchDesc {
+            name: "fc_saved_syn",
+            out_type: SampleType::Bin,
+            func: fc_saved_syn_fetch,
+        });
 
         let http_first_req_fetch: FetchFn =
             |ctx, _args| Some(Sample::Bool(ctx.is_first_req));
@@ -2126,8 +2244,31 @@ impl Registry {
             func: fc_dst_is_local_fetch,
         });
 
-        // T331: `fc_nb_streams`, `fc_settings_streams_limit` and `fc_glitches` are refused
-        // instead ([`NOT_IMPLEMENTED`]): they were registered here as the constants 1, 1, 0.
+        // T331 / G3 CONNVIEW: `fc_nb_streams` (HTTP/1, HTTP/2, HTTP/3),
+        // `fc_settings_streams_limit` (HTTP/1 and HTTP/2) and `fc_glitches`
+        // (HTTP/2 only; HTTP/1 is refused at load and returns `None` here).
+        // `smp_fetch_fc_nb_streams` (src/connection.c): live stream count from `PhaseCtx::fc`.
+        self.register_fetch(FetchDesc {
+            name: "fc_nb_streams",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.fc.map(|fc| Sample::Sint(i64::from(fc.nb_streams()))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_settings_streams_limit",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| {
+                ctx.fc.map(|fc| Sample::Sint(i64::from(fc.max_concurrent_streams())))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_glitches",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| {
+                ctx.fc
+                    .and_then(|fc| fc.glitches())
+                    .map(|n| Sample::Sint(i64::try_from(n).unwrap_or(i64::MAX)))
+            },
+        });
         // T331: the backend connection (`SMP_USE_L4SRV`). Without one, none has a value;
         // `bc_reused` is 0 on any stream (`smp_fetch_reused`).
         self.register_fetch(FetchDesc {
@@ -2139,6 +2280,14 @@ impl Registry {
             name: "bc_err_str",
             out_type: SampleType::Str,
             func: |ctx, _args| ctx.bc_err.map(|e| Sample::Str(e.text.to_string())),
+        });
+        // `smp_fetch_fc_err_str` with the 'n' in the kw (`bc_err_name`): the name of the
+        // code, as `fc_err_name` reads the client connection's; empty on success, as
+        // `conn_err_code_name(CO_ER_NONE)`.
+        self.register_fetch(FetchDesc {
+            name: "bc_err_name",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.bc_err.map(|e| Sample::Str(e.name.to_string())),
         });
         self.register_fetch(FetchDesc {
             name: "bc_reused",
@@ -2158,6 +2307,22 @@ impl Registry {
             name: "bc_dst_port",
             out_type: SampleType::Sint,
             func: |ctx, _args| ctx.bc_dst.map(|sa| Sample::Sint(i64::from(sa.port()))),
+        });
+        // `smp_fetch_bc_src` / `smp_fetch_bc_src_port` (src/tcp_sample.c): the local
+        // address of the server connection, `None` before the stream has one.
+        self.register_fetch(FetchDesc {
+            name: "bc_src",
+            // An address, IPv4 or IPv6 (`SMP_T_ADDR`), typed as `bc_dst` is.
+            out_type: SampleType::Ipv4,
+            func: |ctx, _args| match ctx.bc_src?.ip() {
+                IpAddr::V4(v4) => Some(Sample::Ipv4(v4)),
+                IpAddr::V6(v6) => Some(Sample::Ipv6(v6)),
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_src_port",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.bc_src.map(|sa| Sample::Sint(i64::from(sa.port()))),
         });
 
         // --- 2. HTTP Request Line & URL Fetches ---
@@ -2294,6 +2459,30 @@ impl Registry {
             func: |ctx, _args| ctx.bc_http_major.map(|m| Sample::Sint(i64::from(m))),
         });
 
+        // `smp_fetch_bc_nb_streams` (src/connection.c): the stream's server connection
+        // carries the stream only: Alcyon has no multiplexed mux towards a server, so its
+        // mux serves one stream while there is an HTTP server connection, nothing before there
+        // is one.
+        self.register_fetch(FetchDesc {
+            name: "bc_nb_streams",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.bc_http_major.map(|_| Sample::Sint(1)),
+        });
+
+        // `smp_fetch_conn_queues` (src/sample.c): the stream's position in the backend's
+        // and the server's queues when dequeued (`logs->prx_queue_pos` / `srv_queue_pos`),
+        // 0 when it never queued there, and nothing where there is no stream.
+        self.register_fetch(FetchDesc {
+            name: "bc_be_queue",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::from(s.be_queue))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_srv_queue",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::from(s.srv_queue))),
+        });
+
         // `smp_fetch_rqver` / `smp_fetch_stver` (src/http_fetch.c): the version without
         // its "HTTP/" ("1.1"), and nothing when there is no message to read it from.
         let response_version_fetch: FetchFn = |ctx, _args| {
@@ -2420,6 +2609,73 @@ impl Registry {
             name: "req.timer.idle",
             out_type: SampleType::Sint,
             func: |ctx, _args| Some(Sample::Sint(ctx.req_timer_idle)),
+        });
+
+        // The timer fetches `HAProxy` computes from the stream's logs
+        // (`smp_fetch_reX_timers`, `smp_fetch_txn_timers`, `smp_fetch_conn_timers`,
+        // `src/sample.c`): each reads the same millisecond the access log writes for its
+        // alias - `StreamFacts::timers` is `[t_idle, t_request, t_queue, t_connect,
+        // t_data]`, `PhaseCtx::t_close` the stream's `t_close`, and Alcyon's handshake is
+        // the `0` the log prints for `%Th` (`session_log_data`). Without a stream
+        // `HAProxy` gives no sample, `fc.timer.handshake` the session's value (0) among them.
+        self.register_fetch(FetchDesc {
+            name: "req.timer.tq",
+            out_type: SampleType::Sint,
+            // `t_request`: `-1` while the request head is incomplete - the http-request
+            // rules find it that way, `request_ts` being stamped after they ran.
+            func: |ctx, _args| timer_part(ctx, 1).map(Sample::Sint),
+        });
+        self.register_fetch(FetchDesc {
+            name: "req.timer.queue",
+            out_type: SampleType::Sint,
+            // `t_queue - t_request`: the queue time since the request completed.
+            func: |ctx, _args| {
+                let queue = timer_part(ctx, 2)?;
+                Some(Sample::Sint(if queue >= 0 { queue - timer_part(ctx, 1).unwrap_or(-1) } else { -1 }))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc.timer.connect",
+            out_type: SampleType::Sint,
+            // `t_connect - t_queue`: the connect time since the stream was queued.
+            func: |ctx, _args| {
+                let connect = timer_part(ctx, 3)?;
+                Some(Sample::Sint(if connect >= 0 { connect - timer_part(ctx, 2).unwrap_or(-1) } else { -1 }))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "res.timer.data",
+            out_type: SampleType::Sint,
+            // `t_close - t_data`: the response's time after its head. `t_close` is 0 at
+            // rule time, so the fetch reads negative there once the head has arrived.
+            func: |ctx, _args| {
+                let data = timer_part(ctx, 4)?;
+                Some(Sample::Sint(if data >= 0 { ctx.t_close - data } else { -1 }))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc.timer.total",
+            out_type: SampleType::Sint,
+            // `logs->t_close`: 0 until the stream is logged.
+            func: |ctx, _args| ctx.stream.is_some().then_some(Sample::Sint(ctx.t_close)),
+        });
+        self.register_fetch(FetchDesc {
+            name: "txn.timer.total",
+            out_type: SampleType::Sint,
+            // `t_close - (t_idle >= 0 ? t_idle + t_handshake : 0)`.
+            func: |ctx, _args| {
+                let idle = timer_part(ctx, 0)?;
+                Some(Sample::Sint(ctx.t_close - idle.max(0)))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "txn.timer.user",
+            out_type: SampleType::Sint,
+            // `t_close - (t_idle >= 0 ? t_idle : 0)`.
+            func: |ctx, _args| {
+                let idle = timer_part(ctx, 0)?;
+                Some(Sample::Sint(ctx.t_close - idle.max(0)))
+            },
         });
 
         // `smp_fetch_proto_http` (`src/http_fetch.c`), registered as `req.proto_http` and, T326,
@@ -2950,6 +3206,33 @@ impl Registry {
             func: response_body_len_fetch,
         });
 
+        // The byte counters (`smp_fetch_bytes`, src/sample.c): `bytes_in` and `req.bytes_in`
+        // the request's bytes in (`%U`); `req.bytes_out` what a server counted of it (0 for a
+        // request the proxy answered itself); `bytes_out` and `res.bytes_in` the response's
+        // bytes in (`%B`); `res.bytes_out` what the client counted of it (twice the response
+        // for one the proxy made in place of the server's, measured on the oracle). The log's
+        // contexts have the finished stream the `SMP_USE_RQFIN`/`SMP_USE_RSFIN` fetches want.
+        self.register_fetch(FetchDesc {
+            name: "bytes_in",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::try_from(s.req_in).unwrap_or(i64::MAX))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bytes_out",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::try_from(s.res_in).unwrap_or(i64::MAX))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "req.bytes_in",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::try_from(s.req_in).unwrap_or(i64::MAX))),
+        });
+        self.register_fetch(FetchDesc {
+            name: "res.bytes_in",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(i64::try_from(s.res_in).unwrap_or(i64::MAX))),
+        });
+
         crate::rawpayload::register(self);
 
         fn request_payload_fetch(ctx: &SampleContext, args: &[String]) -> Option<Sample> {
@@ -3138,6 +3421,35 @@ impl Registry {
             out_type: SampleType::Sint,
             func: |ctx, _args| ctx.last_rule().map(|(_, line)| Sample::Sint(i64::from(line))),
         });
+        // `smp_fetch_last_entity` (src/stream.c): the rule that ended a rule set for the
+        // request, as `file:line`. No sample where no rule did; the filter branch of the
+        // C fetch never is -- this codebase has no stream filters, and the fetch never
+        // claims one.
+        self.register_fetch(FetchDesc {
+            name: "last_entity",
+            out_type: SampleType::Str,
+            func: |ctx, _args| ctx.last_rule().map(|(file, line)| Sample::Str(format!("{file}:{line}"))),
+        });
+        // `smp_fetch_waiting_entity` (src/stream.c): the entity that holds the stream:
+        // the rule it stopped at, as `file:line`, or `http-buffer-request` for the
+        // implicit request-body wait. The C fetch's filter branch has no value here --
+        // this codebase has no stream filters, and the fetch never claims one.
+        self.register_fetch(FetchDesc {
+            name: "waiting_entity",
+            out_type: SampleType::Str,
+            func: |ctx, _args| match ctx.waiting_entity {
+                Some(WaitEntity::Rule(file, line)) => Some(Sample::Str(format!("{file}:{line}"))),
+                Some(WaitEntity::Body) => Some(Sample::Str("http-buffer-request".to_string())),
+                None => None,
+            },
+        });
+        // `smp_fetch_id32` (src/stream.c): the stream's transaction id, the same counter
+        // `%rt` prints (`if (!smp->strm) return 0;`).
+        self.register_fetch(FetchDesc {
+            name: "txn.id32",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| ctx.uniq_id.map(|id| Sample::Sint(i64::try_from(id).unwrap_or(i64::MAX))),
+        });
 
         // --- 7. Captures ---
         self.register_fetch(FetchDesc {
@@ -3268,8 +3580,7 @@ impl Registry {
             },
         });
         // The server and backend state fetches (`src/backend.c`). Their arguments are
-        // resolved when the configuration loads; `queue`, `avg_queue` and `srv_queue` are
-        // refused there instead (see [`NOT_IMPLEMENTED`]).
+        // resolved when the configuration loads.
         self.register_fetch(FetchDesc {
             name: "srv_is_up",
             out_type: SampleType::Bool,
@@ -3347,6 +3658,36 @@ impl Registry {
             name: "be_conn_free",
             out_type: SampleType::Sint,
             func: |ctx, args| ctx.proxies?.backend_conn_free(backend_arg(ctx, args)?).map(Sample::Sint),
+        });
+        // `smp_fetch_queue_size`, `smp_fetch_avg_queue_size` and `smp_fetch_connslots`
+        // (src/backend.c): the backend's queue (its own and the servers', `totpend`),
+        // that queue over the usable servers, and the free connection and queue slots.
+        self.register_fetch(FetchDesc {
+            name: "queue",
+            out_type: SampleType::Sint,
+            func: |ctx, args| ctx.proxies?.backend_queue(backend_arg(ctx, args)?).map(Sample::Sint),
+        });
+        self.register_fetch(FetchDesc {
+            name: "avg_queue",
+            out_type: SampleType::Sint,
+            func: |ctx, args| ctx.proxies?.backend_avg_queue(backend_arg(ctx, args)?).map(Sample::Sint),
+        });
+        self.register_fetch(FetchDesc {
+            name: "connslots",
+            out_type: SampleType::Sint,
+            func: |ctx, args| ctx.proxies?.backend_connslots(backend_arg(ctx, args)?).map(Sample::Sint),
+        });
+        // `smp_fetch_srv_queue`: the server's own queue, the one `maxqueue` bounds.
+        self.register_fetch(FetchDesc {
+            name: "srv_queue",
+            out_type: SampleType::Sint,
+            func: |ctx, args| server_fetch(ctx, args, |s| Sample::Sint(i64::from(s.queue_len))),
+        });
+        // `smp_fetch_uptime`: the seconds since the process started.
+        self.register_fetch(FetchDesc {
+            name: "uptime",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| Some(Sample::Sint(ctx.proxies?.process_uptime())),
         });
         self.register_fetch(FetchDesc {
             name: "fe_conn",
@@ -5867,9 +6208,7 @@ impl Registry {
 
         // --- 8. Stick table, server and frontend converters ---
         //
-        // These read the runtime state, so they are context converters. The `table_*`
-        // family and `srv_queue` are not implemented and are refused at load
-        // ([`NOT_IMPLEMENTED`]); they used to be registered here returning 0.
+        // These read the runtime state, so they are context converters.
         self.register_ctx_converter(CtxConvDesc {
             name: "in_table",
             in_type: TypeSpec::Any,
@@ -6039,6 +6378,19 @@ impl Registry {
                 let name = input_str(smp)?;
                 let (be, srv) = server_arg(ctx, &name)?;
                 ctx.proxies?.server(be, srv).map(|s| Sample::Bool(s.is_up))
+            },
+        });
+
+        // `sample_conv_srv_queue`: `<backend>/<server>`, or `<server>` in the current
+        // backend; a name that resolves to nothing gives no sample.
+        self.register_ctx_converter(CtxConvDesc {
+            name: "srv_queue",
+            in_type: TypeSpec::Exact(SampleType::Str),
+            out_type: TypeSpec::Exact(SampleType::Sint),
+            func: |ctx, smp, _args| {
+                let name = input_str(smp)?;
+                let (be, srv) = server_arg(ctx, &name)?;
+                ctx.proxies?.server(be, srv).map(|s| Sample::Sint(i64::from(s.queue_len)))
             },
         });
 

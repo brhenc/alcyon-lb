@@ -125,7 +125,6 @@ fn unimplemented_security_keywords_are_refused_in_both_sections() {
         "maxconn 5",
         "transparent",
         "user nobody",
-        "accept-netscaler-cip 1",
     ];
     for b in refused {
         for f in [in_listen, in_frontend] {
@@ -133,6 +132,56 @@ fn unimplemented_security_keywords_are_refused_in_both_sections() {
             let named = b.split_whitespace().any(|w| err.contains(&format!("'{w}'")));
             assert!(named && err.contains("not supported"), "{b}: {err}");
         }
+    }
+}
+
+#[test]
+fn accept_netscaler_cip_is_read_with_its_magic() {
+    for f in [in_listen, in_frontend] {
+        let cfg = f("bind 127.0.0.1:8080 accept-netscaler-cip 305419896").unwrap();
+        let b = match (cfg.listens.first(), cfg.frontends.first()) {
+            (Some(l), _) => &l.binds[0],
+            (_, Some(fe)) => &fe.binds[0],
+            _ => unreachable!(),
+        };
+        assert_eq!(b.accept_netscaler_cip, Some(305419896), "the declared magic is kept");
+    }
+    // `bind_parse_accept_netscaler_cip`: a 0 value (including one `atol` makes 0) is
+    // refused, and the keyword without a value is.
+    for bad in [
+        "accept-netscaler-cip 0",
+        "accept-netscaler-cip abc",
+        "accept-netscaler-cip -4294967296",
+        // `atol` clamps to `LLONG_MIN` (2026-11-19, measured: the oracle refuses it as 0).
+        "accept-netscaler-cip -99999999999999999999",
+    ] {
+        for f in [in_listen, in_frontend] {
+            let err = f(&format!("bind 127.0.0.1:8080 {bad}")).unwrap_err().to_string();
+            assert!(err.contains("invalid value 0, must be >= 0"), "{bad}: {err}");
+        }
+    }
+    // `uint32_t val = atol(...)`: a negative wraps, a digit run with trailing garbage
+    // keeps the run, and an overflow clamps to `LLONG_MAX`, whose low 32 bits are all
+    // ones (measured on the oracle: `-1` is 0xFFFFFFFF, `123abc` is 123,
+    // `99999999999999999999` is accepted as 0xFFFFFFFF).
+    for (arg, magic) in [
+        ("accept-netscaler-cip -1", u32::MAX),
+        ("accept-netscaler-cip 123abc", 123u32),
+        ("accept-netscaler-cip 99999999999999999999", u32::MAX),
+    ] {
+        for f in [in_listen, in_frontend] {
+            let cfg = f(&format!("bind 127.0.0.1:8080 {arg}")).unwrap();
+            let b = match (cfg.listens.first(), cfg.frontends.first()) {
+                (Some(l), _) => &l.binds[0],
+                (_, Some(fe)) => &fe.binds[0],
+                _ => unreachable!(),
+            };
+            assert_eq!(b.accept_netscaler_cip, Some(magic), "{arg}: kept as {magic}");
+        }
+    }
+    for f in [in_listen, in_frontend] {
+        let err = f("bind 127.0.0.1:8080 accept-netscaler-cip").unwrap_err().to_string();
+        assert!(err.contains("missing value"), "{err}");
     }
 }
 
@@ -164,7 +213,7 @@ fn frontend_quic_bind_defaults_its_alpn_to_h3() {
 #[test]
 fn bind_keywords_that_would_be_dropped_are_refused() {
     for kw in [
-        "tfo", "defer-accept", "process 1", "thread 1", "nbconn 1", "nice 5", "shards 2", "tcp-ss 1",
+        "tfo", "defer-accept", "process 1", "thread 1", "nbconn 1", "nice 5", "shards 2",
         "idle-ping 1s", "label foo", "guid-prefix g",
     ] {
         let name = kw.split(' ').next().unwrap();
@@ -203,4 +252,21 @@ fn bind_mss_takes_an_absolute_value_between_1_and_65535() {
     }
     let err = in_frontend("bind 127.0.0.1:8080 mss").expect_err("missing").to_string();
     assert!(err.contains("'mss' : missing MSS value"), "{err}");
+}
+
+#[test]
+fn bind_tcp_ss_parses_the_save_mode() {
+    // 0 = off, 1 = save the SYN, 2 = save with the MAC header (`bind_parse_tcp_ss`).
+    for f in [in_listen, in_frontend] {
+        for (kw, mode) in [("tcp-ss 0", 0u8), ("tcp-ss 1", 1u8), ("tcp-ss 2", 2u8)] {
+            let cfg = f(&format!("bind 127.0.0.1:8080 {kw}")).unwrap_or_else(|e| panic!("{kw}: {e}"));
+            let b = cfg.listens.first().map(|l| &l.binds[0]).or_else(|| cfg.frontends.first().map(|fe| &fe.binds[0]))
+                .expect("bind");
+            assert_eq!(b.sock.as_ref().expect("tuning").tcp_save_syn, mode, "{kw}");
+        }
+    }
+    for bad in ["tcp-ss", "tcp-ss 3", "tcp-ss -1", "tcp-ss abc", "tcp-ss 99999999999999999999"] {
+        let err = in_frontend(&format!("bind 127.0.0.1:8080 {bad}")).expect_err(bad).to_string();
+        assert!(err.contains("'tcp-ss'"), "{bad}: {err}");
+    }
 }

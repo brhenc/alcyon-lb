@@ -35,10 +35,13 @@ fn soft_stop(child: &mut std::process::Child) {
 }
 
 fn alcyon_bin() -> std::path::PathBuf {
+    // The test binary sits in `<target>/debug/deps/` (cargo before 1.100) or deeper,
+    // `<target>/debug/build/<pkg>/<hash>/` (1.100's build-dir layout): the first ancestor
+    // holding an `alcyon` file is the profile directory.
     let exe = std::env::current_exe().expect("test executable");
-    let bin = exe.parent().and_then(std::path::Path::parent).expect("<target>/debug").join("alcyon");
-    assert!(bin.exists(), "{} is not built: run `cargo build --bin alcyon` with the same CARGO_TARGET_DIR", bin.display());
-    bin
+    let bin = exe.ancestors().skip(1).map(|d| d.join("alcyon")).find(|b| b.is_file());
+    assert!(bin.is_some(), "alcyon is not built above {}: run `cargo build --bin alcyon` with the same CARGO_TARGET_DIR", exe.display());
+    bin.unwrap()
 }
 
 fn find_free_port() -> u16 {

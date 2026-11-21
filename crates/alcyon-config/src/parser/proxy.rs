@@ -100,6 +100,7 @@ pub(crate) fn parse_listen_header(
         unique_id_format: defaults.and_then(|d| d.unique_id_format.clone()),
         error_log_format: defaults.and_then(|d| d.error_log_format.clone()),
         log_format_sd: defaults.and_then(|d| d.log_format_sd.clone()),
+        log_steps: None,
         unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
         req_header_captures: Vec::new(),
         res_header_captures: Vec::new(),
@@ -211,6 +212,7 @@ pub(crate) fn parse_frontend_header(
         unique_id_format: defaults.and_then(|d| d.unique_id_format.clone()),
         error_log_format: defaults.and_then(|d| d.error_log_format.clone()),
         log_format_sd: defaults.and_then(|d| d.log_format_sd.clone()),
+        log_steps: None,
         unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
         req_header_captures: Vec::new(),
         res_header_captures: Vec::new(),
@@ -287,6 +289,7 @@ pub(crate) fn parse_backend_header(
         log_tag: defaults.and_then(|d| d.log_tag.clone()),
         log_global: defaults.map_or(false, |d| d.log_global),
         log_format: defaults.and_then(|d| d.log_format.clone()),
+        log_steps: None,
         unique_id_format: defaults.and_then(|d| d.unique_id_format.clone()),
         unique_id_header: defaults.and_then(|d| d.unique_id_header.clone()),
         log_health_checks: defaults.map_or(false, |d| d.log_health_checks),
@@ -420,6 +423,7 @@ pub(crate) fn parse_listen_directive(
         ),
         "log" => parse_log(&mut proxy.logs, tokens, kw).map(|g| proxy.log_global |= g),
         "log-tag" => parse_log_tag(tokens, kw).map(|t| proxy.log_tag = Some(t)),
+        "log-steps" => parse_log_steps(&mut proxy.log_steps, tokens, kw),
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
         "balance" => {
@@ -607,6 +611,7 @@ pub(crate) fn parse_frontend_directive(
         "backlog" => super::parse_backlog(&mut fe.backlog, tokens, kw),
         "log" => parse_log(&mut fe.logs, tokens, kw).map(|g| fe.log_global |= g),
         "log-tag" => parse_log_tag(tokens, kw).map(|t| fe.log_tag = Some(t)),
+        "log-steps" => parse_log_steps(&mut fe.log_steps, tokens, kw),
         "acl" => parse_acl(&mut fe.acls, tokens, kw),
         "use_backend" => parse_use_backend(&mut fe.use_backends, tokens, kw),
         "force-be-switch" => parse_force_be_switch(&mut fe.force_be_switch, tokens, kw),
@@ -767,6 +772,7 @@ pub(crate) fn parse_backend_directive(
         // -- the health-check suites all declare their syslog target on the backend.
         "log" => parse_log(&mut be.logs, tokens, kw).map(|g| be.log_global |= g),
         "log-tag" => parse_log_tag(tokens, kw).map(|t| be.log_tag = Some(t)),
+        "log-steps" => parse_log_steps(&mut be.log_steps, tokens, kw),
         "http-check" => {
             take_own_http_check(&mut be.http_check_own, &mut be.httpchk, &mut be.http_checks);
             parse_http_check_directive(&mut be.http_checks, tokens, kw)?;
@@ -868,6 +874,7 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
         proto: None,
         accept_proxy: false,
         accept_proxy_v2: false,
+        accept_netscaler_cip: None,
         name: None,
         id: None,
         min_ver: None,
@@ -926,6 +933,30 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
                 bind.accept_proxy = true;
                 bind.accept_proxy_v2 = true;
             }
+            // `bind_parse_accept_netscaler_cip`: `uint32_t val = atol(arg)`, and
+            // `val <= 0` on the unsigned is `val == 0` -- so "abc" (atol 0) and
+            // "-4294967296" (wrapping to 0) are refused, "-1" is kept as 0xFFFFFFFF and
+            // "123abc" as 123 (measured). The refusal always prints 0, the val it holds.
+            "accept-netscaler-cip" => {
+                let a = arg(i, "missing value")?;
+                let t = a.text.trim();
+                let sign = usize::from(t.starts_with(['+', '-']));
+                let digits = t.get(sign..).map_or("", |s| s.split(|c: char| !c.is_ascii_digit()).next().unwrap_or(""));
+                // `atol` (glibc) clamps an overflow to `LLONG_MAX`/`LLONG_MIN`, not 0:
+                // `99999999999999999999` is 0x7FFFFFFFFFFFFFFF, and its low 32 bits are
+                // the magic 0xFFFFFFFF the oracle keeps (measured).
+                let value = if digits.is_empty() {
+                    0
+                } else {
+                    t[..sign + digits.len()].parse::<i64>().unwrap_or(if t.starts_with('-') { i64::MIN } else { i64::MAX })
+                };
+                let magic = value as u32;
+                if magic == 0 {
+                    return Err(ConfigError::new(a.line, a.col, format!("{prefix} : 'accept-netscaler-cip' : invalid value 0, must be >= 0")));
+                }
+                bind.accept_netscaler_cip = Some(magic);
+                i += 1;
+            }
             // Socket options: `Listener::bind_tuned` applies them to the listening socket.
             "backlog" => {
                 let a = arg(i, "expects an integer argument")?;
@@ -943,6 +974,24 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
                 bind.sock.get_or_insert_with(Default::default).tcp_user_timeout = Some(parse_timeout(a, "tcp-ut")?);
                 i += 1;
             }
+            // `bind_parse_tcp_ss`: 0 = off, 1 = save the SYN, 2 = with the MAC header.
+            // `HAProxy` `atoi`s the argument behind an `isdigit` gate, so a leading
+            // integer with trailing text is what it takes (`1.5` is 1); a longer digit
+            // run overflows `atoi` into out-of-range, as the oracle refuses.
+            "tcp-ss" => {
+                let a = arg(i, "a 0 to 2 value (0: off, 1: save the SYN, 2: save with the MAC header)")?;
+                let v = a.text.bytes().position(|b| !b.is_ascii_digit()).unwrap_or(a.text.len());
+                let v = a.text[..v].parse::<i32>().unwrap_or(i32::MAX);
+                if !(0..=2).contains(&v) {
+                    return Err(ConfigError::new(
+                        a.line,
+                        a.col,
+                        format!("{prefix} : 'tcp-ss' : TCP Save SYN option expects an integer argument from 0 to 2"),
+                    ));
+                }
+                bind.sock.get_or_insert_with(Default::default).tcp_save_syn = u8::try_from(v).unwrap();
+                i += 1;
+            }
             "mss" => {
                 let a = arg(i, "missing MSS value")?;
                 let v = a.text.parse::<i64>().unwrap_or(0).unsigned_abs();
@@ -958,6 +1007,23 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
             }
             "cc" => {
                 bind.sock.get_or_insert_with(Default::default).congestion = Some(arg(i, "expects a congestion control algorithm")?.text.clone());
+                i += 1;
+            }
+            // RFC 2385 signatures for the listening socket (`bind_parse_md5sig`): the key
+            // is stored on the socket tuning and `Listener::bind_tuned` sets it. A key
+            // longer than 80 characters is an alert, not an error: `HAProxy` keeps
+            // parsing, the socket listens without a signature.
+            "tcp-md5sig" => {
+                let a = arg(i, "missing TCP MD5 signature password")?;
+                if a.text.len() > alcyon_mmsg::TCP_MD5SIG_MAXKEYLEN {
+                    warn::push_alert(
+                        tokens[i].line,
+                        WarnStyle::Spaced,
+                        &format!("{prefix} : 'tcp-md5sig' : password too long (at most 80 characters expected)"),
+                    );
+                } else {
+                    bind.sock.get_or_insert_with(Default::default).md5sig = Some(a.text.clone());
+                }
                 i += 1;
             }
             // Threads are not numbered in Alcyon: the kernel spreads connections over the

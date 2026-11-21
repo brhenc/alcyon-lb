@@ -504,6 +504,38 @@ impl Scheduler {
         self.tasks.is_live(r) && self.tasks.get(r).state & state::HEAVY != 0
     }
 
+    /// Number of tasks currently in the run queue with a non-zero `nice`.
+    #[must_use]
+    #[inline]
+    pub const fn niced_tasks(&self) -> u32 {
+        self.niced_tasks
+    }
+
+    /// Sets a task's nice offset (clamped to `-1024..=1024`).
+    ///
+    /// If the task is currently in the run queue, it is unlinked under its previous nice
+    /// and re-inserted with the updated key so `rqueue` ordering and `niced_tasks`
+    /// accounting remain consistent.
+    pub fn set_nice(&mut self, r: TaskRef, nice: i16) {
+        if self.usable(r, "set_nice") {
+            self.set_nice_live(r, nice);
+        }
+    }
+
+    fn set_nice_live(&mut self, r: TaskRef, nice: i16) {
+        let nice = nice.clamp(-1024, 1024);
+        if self.tasks.get(r).in_run_queue() {
+            self.unlink_rq(r);
+            let t = self.tasks.get_mut(r);
+            t.nice = nice;
+            t.state &= !state::QUEUED;
+            let caller = t.caller;
+            self.wakeup_live(r, 0, caller);
+        } else {
+            self.tasks.get_mut(r).nice = nice;
+        }
+    }
+
     /// Sets a task's timeout.
     ///
     /// **This is the slowloris defence.** Mirrors `task_queue()`: if the task already
@@ -1053,5 +1085,40 @@ mod tests {
         assert!(d.runs.is_empty());
         assert_eq!(s.live_tasks(), 0);
         assert_eq!(s.run_queue_len(), 0);
+    }
+
+    #[test]
+    fn set_nice_clamps_and_keeps_niced_tasks_and_rqueue_consistent() {
+        let mut s = Scheduler::with_capacity(8);
+        let a = s.create(WorkKind::new(Kind::Synthetic, 1)).expect("alloc a");
+        let b = s.create(WorkKind::new(Kind::Synthetic, 2)).expect("alloc b");
+
+        s.wakeup(a, state::WOKEN_MSG, CallSite::UNKNOWN);
+        s.wakeup(b, state::WOKEN_MSG, CallSite::UNKNOWN);
+        assert_eq!(s.niced_tasks(), 0);
+
+        // Raise priority of `b` (negative nice, clamped to -1024) while already in `rqueue`.
+        s.set_nice(b, -5000);
+        assert_eq!(s.tasks.get(b).nice, -1024);
+        assert_eq!(s.niced_tasks(), 1);
+        assert!(s.tasks.get(b).in_run_queue());
+
+        // Clearing `b`'s nice back to 0 while queued decrements `niced_tasks`.
+        s.set_nice(b, 0);
+        assert_eq!(s.niced_tasks(), 0);
+
+        // Give `a` a positive nice (clamped to 1024) so `b` runs before `a`.
+        s.set_nice(a, 5000);
+        assert_eq!(s.tasks.get(a).nice, 1024);
+        assert_eq!(s.niced_tasks(), 1);
+
+        let mut d = Runner {
+            runs: Vec::new(),
+            outcome: Outcome::Done,
+        };
+        drain(&mut s, &mut d);
+        assert_eq!(d.runs, vec![2, 1]);
+        assert_eq!(s.niced_tasks(), 0);
+        assert_eq!(s.live_tasks(), 0);
     }
 }

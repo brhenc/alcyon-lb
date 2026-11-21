@@ -672,18 +672,6 @@ fn test_unsupported_actions_refusal() {
             "attach-srv",
         ),
         (
-            "frontend fe\n    bind :8080\n    tcp-request content do-log\n",
-            "do-log",
-        ),
-        (
-            "frontend fe\n    bind :8080\n    tcp-request session do-log\n",
-            "do-log",
-        ),
-        (
-            "frontend fe\n    bind :8080\n    tcp-request connection do-log\n",
-            "do-log",
-        ),
-        (
             "frontend fe\n    bind :8080\n    tcp-request content sc-inc-gpc0(99)\n",
             "stick counter index must be 0, 1, or 2",
         ),

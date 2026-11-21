@@ -12,7 +12,7 @@ use rustix::net::{
 use std::cell::Cell;
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Outcome of a transport read or write.
@@ -212,15 +212,19 @@ pub fn from_any(a: &SocketAddrAny) -> Option<SocketAddr> {
 /// # Errors
 /// Returns an error if socket creation fails or if `connect` fails immediately with an error other than `EINPROGRESS`.
 pub fn connect(addr: SocketAddr) -> io::Result<(OwnedFd, bool)> {
-    connect_opts(addr, false)
+    connect_opts(addr, false, None)
 }
 
 /// [`connect`], with TCP Fast Open when `tfo` (server `tfo`): `TCP_FASTOPEN_CONNECT`, which
 /// makes the kernel send the first write in the SYN, as `HAProxy`'s `MSG_FASTOPEN` does.
+/// With `md5sig` (server `tcp-md5sig`), the RFC 2385 key is bound to `addr` on the
+/// socket before the `connect` that `HAProxy` runs in `proto_tcp_connect`; a peer with a
+/// different key, or none, cannot complete the handshake, and a failed `setsockopt`
+/// fails the connection, as `HAProxy` reports `SF_ERR_SRVCL`.
 ///
 /// # Errors
 /// As [`connect`].
-pub fn connect_opts(addr: SocketAddr, tfo: bool) -> io::Result<(OwnedFd, bool)> {
+pub fn connect_opts(addr: SocketAddr, tfo: bool, md5sig: Option<&[u8]>) -> io::Result<(OwnedFd, bool)> {
     let family = match addr {
         SocketAddr::V4(_) => AddressFamily::INET,
         SocketAddr::V6(_) => AddressFamily::INET6,
@@ -241,6 +245,11 @@ pub fn connect_opts(addr: SocketAddr, tfo: bool) -> io::Result<(OwnedFd, bool)> 
     if tfo {
         // Best effort, like HAProxy: without kernel support the connect is a plain one.
         let _ = nix::sys::socket::setsockopt(&fd, nix::sys::socket::sockopt::TcpFastOpenConnect, &true);
+    }
+    if let Some(key) = md5sig {
+        // Not best effort: `HAProxy` fails the connection when the kernel refuses the
+        // key (`proto_tcp.c`, `SF_ERR_SRVCL`), so the error is reported, not dropped.
+        alcyon_mmsg::set_tcp_md5sig(fd.as_fd(), addr, key)?;
     }
 
     let any = to_any(addr);
@@ -287,6 +296,22 @@ pub fn reset_pending(fd: BorrowedFd<'_>) -> bool {
     use rustix::event::{poll, PollFd, PollFlags};
     let mut fds = [PollFd::new(&fd, PollFlags::empty())];
     matches!(poll(&mut fds, 0), Ok(n) if n > 0) && fds[0].revents().contains(PollFlags::ERR)
+}
+
+/// The SYN the kernel recorded for this connection (`bind tcp-ss`): `getsockopt` with
+/// `TCP_SAVED_SYN`. The kernel answers with the data only once — a second read has none —
+/// so the session reads it a single time at accept and keeps the bytes (`HAProxy` instead
+/// re-reads it at every fetch evaluation, `src/tcp_sample.c`).
+///
+/// 512 bytes is above the largest recording the kernel can make: 14 Ethernet (mode 2) +
+/// 20 IP + 60 TCP header-plus-options.
+#[must_use]
+pub fn saved_syn(fd: BorrowedFd<'_>) -> Option<Box<[u8]>> {
+    let mut buf = [0u8; 512];
+    alcyon_mmsg::get_saved_syn(fd, &mut buf)
+        .ok()
+        .filter(|&len| len > 0)
+        .map(|len| buf[..len].to_vec().into_boxed_slice())
 }
 
 /// Whether this process may put a TCP socket in repair mode (`CAP_NET_ADMIN`): probed once on a

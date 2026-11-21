@@ -315,6 +315,14 @@ pub enum HttpReqAction {
         file: String,
         key: String,
     },
+    /// `do-log`: send the stream's log line for the `http-req` step, with no argument.
+    DoLog,
+    /// `set-log-level <level|silent>`: the stream's log level, `silent` being -1 and a level
+    /// name its syslog number plus one (`emerg` 1 .. `debug` 8), as `s->logs.level`.
+    SetLogLevel(i8),
+    /// `set-nice <n>`: the stream's task nice, clamped to -1024..=1024 at load, as
+    /// `s->task->nice`.
+    SetNice(i16),
 }
 
 /// The argument of `set-retries`: an integer from 0 to 100, or an expression evaluated per
@@ -364,6 +372,12 @@ pub enum HttpResAction {
         lf_string: Option<String>,
         error_page: Option<ErrorPageSource>,
     },
+    /// `do-log`: send the stream's log line for the `http-res` step, with no argument.
+    DoLog,
+    /// `set-log-level <level|silent>`, as [`HttpReqAction::SetLogLevel`].
+    SetLogLevel(i8),
+    /// `set-nice <n>`, as [`HttpReqAction::SetNice`].
+    SetNice(i16),
 }
 
 /// The three kinds of `http-request redirect`.
@@ -440,6 +454,11 @@ pub enum HttpAfterResAction {
         file: String,
         key: String,
     },
+    /// `do-log`: send the stream's log line for the `http-after-res` step, with no argument.
+    DoLog,
+    /// `set-log-level <level|silent>`, as [`HttpReqAction::SetLogLevel`]. `HAProxy` lists it
+    /// for `http-after-response` (not `set-nice`).
+    SetLogLevel(i8),
 }
 
 /// Rule pairing an HTTP-after-response action with an optional condition.

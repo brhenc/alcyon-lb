@@ -412,6 +412,116 @@ pub fn set_ip_pktinfo(fd: BorrowedFd<'_>, value: bool) -> io::Result<()> {
     }
 }
 
+/// The kernel's `struct tcp_md5sig` (`include/uapi/linux/tcp.h`): the address
+/// the key is bound to, as a `sockaddr_storage` (128 bytes), two extension
+/// flag bytes, the key length in *host* byte order, an interface index
+/// (unused), and the key itself. `setsockopt(TCP_MD5SIG)` takes this layout
+/// on current kernels; the old `tcp_md5sig_req` (key pointer) is refused with
+/// `EINVAL` there (measured on Linux 7.3, as in `HAProxy` 3.5-dev11, which
+/// compiles against the same header). `libc` exposes the `TCP_MD5SIG` and
+/// `TCP_MD5SIG_MAXKEYLEN` constants but not the struct, so its stable ABI
+/// layout is mirrored here.
+/// The longest key the kernel takes (`TCP_MD5SIG_MAXKEYLEN`, 80 bytes); `HAProxy`'s
+/// parser alerts on anything longer and stores nothing.
+pub const TCP_MD5SIG_MAXKEYLEN: usize = libc::TCP_MD5SIG_MAXKEYLEN;
+
+#[repr(C)]
+struct TcpMd5sig {
+    /// A zeroed `sockaddr_storage` holding a `sockaddr_in` (v4) or
+    /// `sockaddr_in6` (v6): `ss_family` (host order, it is a `sa_family_t`
+    /// value, not bytes on the wire), the port (network order), then the
+    /// address at offset 4 (v4) or 8 (v6).
+    addr: [u8; 128],
+    flags: u8,
+    prefixlen: u8,
+    keylen: u16,
+    ifindex: libc::c_int,
+    key: [u8; libc::TCP_MD5SIG_MAXKEYLEN],
+}
+
+/// Sets a TCP MD5 signature (RFC 2385) on the socket, binding `key` to
+/// `addr`. `key` must be at most `libc::TCP_MD5SIG_MAXKEYLEN` (80) bytes;
+/// longer keys are the caller's problem (the parser refuses them). `HAProxy`
+/// calls this on the listening socket (bound address) for a `bind` and on
+/// the outgoing socket (peer address) before `connect` for a `server`; a
+/// peer that presents no key, or a different one, cannot complete the
+/// handshake.
+pub fn set_tcp_md5sig(fd: BorrowedFd<'_>, addr: SocketAddr, key: &[u8]) -> io::Result<()> {
+    assert!(key.len() <= libc::TCP_MD5SIG_MAXKEYLEN, "tcp-md5sig key is 80 bytes at most");
+    // The address, in the place `sockaddr_in`/`sockaddr_in6` keep it: offset 4
+    // (v4) or 8 (v6), `len` bytes long, the rest of the 16 zero.
+    let (family, offset, len, ip) = match addr {
+        SocketAddr::V4(v4) => (libc::AF_INET as u16, 4usize, 4usize, {
+            let mut a = [0u8; 16];
+            a[..4].copy_from_slice(&v4.ip().octets());
+            a
+        }),
+        SocketAddr::V6(v6) => (libc::AF_INET6 as u16, 8usize, 16usize, v6.ip().octets()),
+    };
+    let mut req = TcpMd5sig {
+        addr: [0u8; 128],
+        flags: 0,
+        prefixlen: 0,
+        keylen: 0,
+        ifindex: 0,
+        key: [0u8; libc::TCP_MD5SIG_MAXKEYLEN],
+    };
+    req.addr[0..2].copy_from_slice(&family.to_ne_bytes());
+    req.addr[2..4].copy_from_slice(&addr.port().to_be_bytes());
+    req.addr[offset..offset + len].copy_from_slice(&ip[..len]);
+    req.keylen = key.len() as u16;
+    req.key[..key.len()].copy_from_slice(key);
+    // SAFETY: `req` is a valid `struct tcp_md5sig` for `size_of_val(&req)`
+    // bytes, its address bytes are a well-formed `sockaddr_in`/`sockaddr_in6`
+    // in an otherwise-zeroed `sockaddr_storage`, and `fd` is a valid TCP
+    // socket; the kernel copies the key during the call.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_MD5SIG,
+            std::ptr::addr_of!(req).cast::<libc::c_void>(),
+            std::mem::size_of_val(&req) as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether the kernel accepts `setsockopt(TCP_MD5SIG)`: `HAProxy`'s
+/// `__proto_tcp_init` registers `HAVE_WORKING_TCP_MD5SIG` exactly when a key can
+/// be set on a fresh socket. Probes once, the way `HAProxy` does at startup.
+pub fn probe_tcp_md5sig() -> bool {
+    // SAFETY: `socket()` with a valid family/type/protocol; on success the fd is
+    // a valid TCP socket that `probe_fd` closes before returning.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    probe_fd(fd)
+}
+
+/// The probe's body for one fd. `fd < 0` means `socket()` itself failed (the
+/// process is out of descriptors) and nothing can be verified, so it answers
+/// "no", the same as a kernel refusing the key.
+fn probe_fd(fd: i32) -> bool {
+    if fd < 0 {
+        return false;
+    }
+    let addr = SocketAddr::new(IpAddr::from(Ipv4Addr::new(127, 0, 0, 1)), 0);
+    let ok = set_tcp_md5sig(
+        // SAFETY: `fd` is valid for the duration of this call and is not used
+        // by anyone else; it is closed below.
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
+        addr,
+        b"foobar",
+    )
+    .is_ok();
+    // SAFETY: `fd` is valid and exclusively owned here.
+    unsafe { libc::close(fd) };
+    ok
+}
+
 /// Sets or unsets the `IPV6_RECVPKTINFO` socket option.
 ///
 /// # Errors
@@ -433,6 +543,60 @@ pub fn set_ipv6_recvpktinfo(fd: BorrowedFd<'_>, value: bool) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+/// Sets the mode of `TCP_SAVE_SYN` on a listening socket: 0 turns the recording
+/// off, 1 makes the kernel record the SYN of every accepted connection, 2 records
+/// it with its Ethernet header.
+///
+/// # Errors
+///
+/// Returns an error if the underlying `setsockopt` syscall fails.
+pub fn set_tcp_save_syn(fd: BorrowedFd<'_>, mode: u8) -> io::Result<()> {
+    const TCP_SAVE_SYN: libc::c_int = 27; // linux/tcp.h
+    let val: libc::c_int = i32::from(mode);
+    // SAFETY: the pointer passed to setsockopt is valid for `size_of_val(&val)` bytes.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            TCP_SAVE_SYN,
+            std::ptr::addr_of!(val).cast::<libc::c_void>(),
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Reads back the SYN the kernel recorded for this connection (`TCP_SAVED_SYN`).
+/// The kernel answers with the data only once per connection; a second read has
+/// none (`buf` comes back with a length of 0).
+///
+/// # Errors
+///
+/// Returns an error if the underlying `getsockopt` syscall fails.
+pub fn get_saved_syn(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
+    const TCP_SAVED_SYN: libc::c_int = 28; // linux/tcp.h
+    let mut len = buf.len() as libc::socklen_t;
+    // SAFETY: `buf` is valid for `len` bytes and `getsockopt` writes back the length it used.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            TCP_SAVED_SYN,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(len as usize)
     }
 }
 
@@ -478,6 +642,17 @@ mod tests {
         }
     }
 
+    /// `TCP_SAVE_SYN` and `TCP_SAVED_SYN` are TCP options: on a non-TCP socket the kernel
+    /// refuses them (`EPROTONOPT`/`EOPNOTSUPP`), and the wrappers must surface that refusal
+    /// instead of pretending to have set or read a SYN.
+    #[test]
+    fn the_saved_syn_options_refuse_a_non_tcp_socket() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(set_tcp_save_syn(sock.as_fd(), 1).is_err(), "setsockopt must refuse IPPROTO_TCP on a UDP socket");
+        let mut buf = [0u8; 64];
+        assert!(get_saved_syn(sock.as_fd(), &mut buf).is_err(), "getsockopt must refuse TCP_SAVED_SYN on a UDP socket");
+    }
+
     /// The control message `set_src_cmsg` builds, read back by `extract_dst_addr` and by hand,
     /// with no socket (so Miri can run it).
     #[test]
@@ -511,5 +686,41 @@ mod tests {
         // SAFETY: set_src_cmsg wrote a header at the start of `space`.
         unsafe { (*libc::CMSG_FIRSTHDR(&hdr)).cmsg_len = 8 };
         assert_eq!(extract_dst_addr(&hdr), None);
+    }
+
+    /// `set_tcp_md5sig` succeeds on a socket whose family matches the address
+    /// (both v4 and v6) and fails when the kernel refuses the option: a v6
+    /// address on a v4 socket (`EINVAL`) and a non-TCP socket at all
+    /// (`ENOPROTOOPT`). Measured on Linux 7.3, as in the `HAProxy` source's
+    /// `tcp_md5sig` handling, which checks the result and reports it.
+    #[test]
+    fn md5sig_follows_the_socket_family_and_reports_kernel_refusals() {
+        use std::net::{SocketAddrV6, TcpListener};
+        let key = b"mypass";
+
+        let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let v4addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        assert!(set_tcp_md5sig(v4.as_fd(), v4addr, key).is_ok());
+
+        // A v6 address on a v4 socket is refused (`EINVAL`).
+        let v6addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 0));
+        assert!(set_tcp_md5sig(v4.as_fd(), v6addr, key).is_err());
+
+        // A socket that does not speak TCP refuses the option (`ENOPROTOOPT`).
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(set_tcp_md5sig(udp.as_fd(), v4addr, key).is_err());
+
+        // An unconditional bind: the suite assumes an ipv6 loopback, as
+        // `reload.rs` does.
+        let v6 = TcpListener::bind("[::1]:0").expect("an ipv6 loopback");
+        assert!(set_tcp_md5sig(v6.as_fd(), v6addr, key).is_ok());
+        assert!(set_tcp_md5sig(v6.as_fd(), v4addr, key).is_err());
+    }
+
+    /// A negative fd means `socket()` failed; the probe answers "no" without
+    /// touching any descriptor.
+    #[test]
+    fn md5sig_probe_with_a_failed_socket_answers_no() {
+        assert!(!probe_fd(-1));
     }
 }

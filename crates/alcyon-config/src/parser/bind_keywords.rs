@@ -36,7 +36,6 @@ macro_rules! refuse {
 }
 
 pub(crate) const UNIMPLEMENTED_BIND_KEYWORDS: &[BindKeyword] = &[
-    refuse!("accept-netscaler-cip", 1),
     refuse!("defer-accept", 0),
     refuse!("expose-fd", 1),
     refuse!("gid", 1),
@@ -54,8 +53,6 @@ pub(crate) const UNIMPLEMENTED_BIND_KEYWORDS: &[BindKeyword] = &[
     refuse!("process", 1),
     refuse!("severity-output", 1),
     refuse!("shards", 1),
-    refuse!("tcp-md5sig", 1),
-    refuse!("tcp-ss", 1),
     refuse!("tfo", 0),
     refuse!("transparent", 0),
     refuse!("uid", 1),

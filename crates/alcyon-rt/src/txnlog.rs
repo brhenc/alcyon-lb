@@ -60,10 +60,15 @@ pub struct StreamLog {
     pub unique_id: Option<String>,
     /// The configuration line of the last rule that ended a rule set for this request
     /// (`s->last_rule_line`), for `last_rule_file` and `last_rule_line`.
-    pub last_rule: Option<u32>,
+    /// `0` means unset (configuration line numbers are 1-based).
+    pub last_rule: u32,
     /// `set-priority-class` and `set-priority-offset` (`s->priority_class`, `priority_offset`).
     pub prio_class: i32,
     pub prio_offset: i32,
+    /// `set-log-level` (`s->logs.level`): 0 when no rule set one, -1 for `silent` (the
+    /// stream's lines are not sent), else the level's syslog number plus one (1 `emerg` .. 8
+    /// `debug`).
+    pub log_level: i8,
     /// `%rt`.
     pub uniq_id: u64,
     /// The termination state, when the proxy itself ended the stream: `PR` for a denied
@@ -76,9 +81,11 @@ pub struct StreamLog {
     pub redispatched: bool,
     /// The stream was answered by an applet (the stats page): `when(toapplet)`.
     pub applet: bool,
-    /// How many requests were in the backend's queue, this one among them, when it joined
-    /// it (`%bq`); 0 for one that never queued.
+    /// How many requests were in the queue, this one among them, when it joined it
+    /// (`%bq` or `%sq`); 0 for one that never queued. `queue_is_srv` distinguishes
+    /// the server queue (`%sq` / `bc_srv_queue`) from the backend queue (`%bq` / `bc_be_queue`).
     pub be_queue: u32,
+    pub queue_is_srv: bool,
     /// `option logasap`: the line went out with the response head; none follows.
     pub asap_done: bool,
     /// The status of the response a server sent for this stream (`txn->server_status`), 0 when
@@ -236,9 +243,10 @@ impl StreamLog {
             req_captures: Vec::new(),
             res_captures: Vec::new(),
             unique_id: None,
-            last_rule: None,
+            last_rule: 0,
             prio_class: 0,
             prio_offset: 0,
+            log_level: 0,
             uniq_id: STREAM_COUNTER.fetch_add(1, Ordering::Relaxed),
             term: None,
             status: None,
@@ -247,6 +255,7 @@ impl StreamLog {
             asap_done: false,
             srv_status: 0,
             be_queue: 0,
+            queue_is_srv: false,
         }
     }
 
@@ -276,12 +285,14 @@ impl StreamLog {
             last_rule,
             prio_class,
             prio_offset,
+            log_level,
             uniq_id,
             term,
             status,
             redispatched,
             applet,
             be_queue,
+            queue_is_srv,
             asap_done,
             srv_status,
         } = self;
@@ -301,15 +312,17 @@ impl StreamLog {
         release_captures(req_captures);
         release_captures(res_captures);
         *unique_id = None;
-        *last_rule = None;
+        *last_rule = 0;
         *prio_class = 0;
         *prio_offset = 0;
+        *log_level = 0;
         *uniq_id = STREAM_COUNTER.fetch_add(1, Ordering::Relaxed);
         *term = None;
         *status = None;
         *redispatched = false;
         *applet = false;
         *be_queue = 0;
+        *queue_is_srv = false;
         *asap_done = false;
         *srv_status = 0;
     }
@@ -340,12 +353,14 @@ impl StreamLog {
             last_rule,
             prio_class,
             prio_offset,
+            log_level,
             uniq_id,
             term,
             status,
             redispatched,
             applet,
             be_queue,
+            queue_is_srv,
             asap_done,
             srv_status,
         } = self;
@@ -358,9 +373,9 @@ impl StreamLog {
         copy_captures(req_captures, &src.req_captures);
         copy_captures(res_captures, &src.res_captures);
         unique_id.clone_from(&src.unique_id);
-        (*last_rule, *prio_class, *prio_offset, *uniq_id) = (src.last_rule, src.prio_class, src.prio_offset, src.uniq_id);
+        (*last_rule, *prio_class, *prio_offset, *log_level, *uniq_id) = (src.last_rule, src.prio_class, src.prio_offset, src.log_level, src.uniq_id);
         (*term, *status) = (src.term, src.status);
-        (*redispatched, *applet, *be_queue, *asap_done, *srv_status) = (src.redispatched, src.applet, src.be_queue, src.asap_done, src.srv_status);
+        (*redispatched, *applet, *be_queue, *queue_is_srv, *asap_done, *srv_status) = (src.redispatched, src.applet, src.be_queue, src.queue_is_srv, src.asap_done, src.srv_status);
     }
 
     /// Milliseconds from the stream's start to `t`, -1 if it never happened.
@@ -447,7 +462,7 @@ mod tests {
         l.res_captures = vec![None];
         set_capture(&mut l.res_captures[0], b"y");
         l.unique_id = Some("id".into());
-        (l.last_rule, l.prio_class, l.prio_offset) = (Some(4), 5, 6);
+        (l.last_rule, l.prio_class, l.prio_offset) = (4, 5, 6);
         (l.term, l.status, l.redispatched, l.applet, l.be_queue, l.asap_done, l.srv_status) = (Some(*b"PR"), Some(400), true, true, 7, true, 200);
         let _ = l.date();
         let id = l.uniq_id;

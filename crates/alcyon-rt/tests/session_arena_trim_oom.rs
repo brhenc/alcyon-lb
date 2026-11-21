@@ -50,6 +50,7 @@ fn entry() -> SessionEntry {
         srv_served: 0,
         log_line: None,
         log_err: false,
+        log_level: alcyon_config::LogLevel::Info,
         log_sd: 0,
         buf_wait: alcyon_rt::buf_wait::WaitState::default(),
         parked: false,

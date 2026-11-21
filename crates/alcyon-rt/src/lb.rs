@@ -804,9 +804,10 @@ fn gcd2(mut a: u32, mut b: u32) -> u32 {
 /// consistent` alone means `sdbm avalanche` (`cfgparse-listen.c`) -- and the server is the one owning the
 /// ring point nearest to it. A server at `maxconn` is passed over for the next point
 /// round the ring: that is `hash-preserve-affinity maxconn`. `HAProxy`'s default, `always`,
-/// would instead queue the request on the full server; Alcyon has no server queue and never
-/// sends a server more than its `maxconn`, so `always` walks the same way once the server
-/// is full. `None` when no server is up, or every candidate is full.
+/// queues the request on the full server only when persistence assigned it
+/// (`SF_DIRECT`); a hash is not such an assignment, and the hash itself never picks a
+/// full server, so `always` walks the same way once the server is full. `None` when no
+/// server is up, or every candidate is full.
 fn balance_uri_consistent(proxy: &Proxy, uri: &str, abs: Option<&str>, cache: &mut LbSnapCache) -> Option<usize> {
     consistent_pick(proxy, |_| full_hash(hash_uri(uri, abs, proxy.chash.2)), cache)
 }

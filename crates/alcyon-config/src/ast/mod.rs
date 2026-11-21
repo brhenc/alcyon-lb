@@ -73,6 +73,8 @@ pub struct Config {
     pub rings: Vec<RingSection>,
     /// `log-forward` sections.
     pub log_forwards: Vec<LogForwardSection>,
+    /// `log-profile` sections, in the order written.
+    pub log_profiles: Vec<LogProfileSection>,
     /// `resolvers` sections, in the order written.
     pub resolvers: Vec<ResolversSection>,
     /// Every ACL and log-format sample expression in the proxy and defaults sections, in

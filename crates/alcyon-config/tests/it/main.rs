@@ -39,6 +39,7 @@ mod gpc_array_actions;
 mod http_codes;
 mod http_reject_silent_drop;
 mod rst_ttl;
+mod txn_log_actions_parse;
 mod rule_trailing_words;
 mod http_rule_keywords;
 mod if_conditions;

@@ -274,19 +274,9 @@ pub(crate) fn parse_http_check_directive(
         return Err(check_err(kw, "http-check requires a subcommand"));
     }
     let sub = tokens[1].text.as_str();
-    let has_send = rules.iter().any(|r| matches!(r, HttpCheckAction::Send { .. }));
 
     match sub {
         "send" => {
-            // Alcyon runs one request per check: a second `send` (a script of several
-            // requests, with their `expect` rules between) would have to be merged into
-            // the first, and `HAProxy` does not merge them.
-            if has_send {
-                return Err(check_err(
-                    kw,
-                    "a second 'http-check send' is not supported: Alcyon runs one request per check",
-                ));
-            }
             let mut method = None;
             let mut uri = None;
             let mut uri_lf = false;
@@ -484,15 +474,6 @@ pub(crate) fn parse_http_check_directive(
         "connect" => {
             // The connection options that change where or how Alcyon connects are the ones
             // implemented; each other is refused rather than dropped.
-            if rules
-                .iter()
-                .any(|r| !matches!(r, HttpCheckAction::Comment(_) | HttpCheckAction::SetVar { .. } | HttpCheckAction::UnsetVar { .. }))
-            {
-                return Err(check_err(
-                    kw,
-                    "only one 'http-check connect', before the request, is supported: Alcyon runs one request per check",
-                ));
-            }
             let mut addr = None;
             let mut port = None;
             let mut send_proxy = false;
@@ -801,31 +782,54 @@ pub(crate) fn build_resolved_http_check(
     http_checks: &[HttpCheckAction],
     server: &Server,
 ) -> ResolvedHttpCheck {
-    let mut method = httpchk
-        .and_then(|h| h.method.clone())
-        .unwrap_or_else(|| "OPTIONS".to_string());
-    let mut uri = httpchk
-        .and_then(|h| h.uri.clone())
-        .unwrap_or_else(|| "/".to_string());
-    let mut version = httpchk
-        .and_then(|h| h.version.clone())
-        .unwrap_or_else(|| "HTTP/1.0".to_string());
-    let host = httpchk.and_then(|h| h.host.clone());
-    let mut headers = Vec::new();
-    let mut uri_lf = false;
-    let mut body = None;
-    let mut body_lf = false;
+    let mut steps = Vec::new();
     let mut send_state = false;
-    // `option httpchk` carries a request; the empty one a section keeps from the defaults
-    // (see `take_own_http_check`) only says the checks are HTTP.
-    let mut has_send = httpchk.is_some_and(|h| h.method.is_some());
-    let mut pre_rules = Vec::new();
-    let mut rules = Vec::new();
-    let mut check_port = server.check_port;
-    let mut connect_addr = None;
-    let mut send_proxy = server.send_proxy || server.send_proxy_v2;
     let mut pending_comment: Option<&String> = None;
-    let mut seen_expect = false;
+    let server_send_proxy = server.send_proxy || server.send_proxy_v2;
+
+    // HAProxy adds an implicit initial connect if the ruleset does not start with one
+    // (ignoring comments, send-state, and variable rules).
+    let starts_with_connect = http_checks
+        .iter()
+        .find(|a| {
+            !matches!(
+                a,
+                HttpCheckAction::Comment(_)
+                    | HttpCheckAction::SendState
+                    | HttpCheckAction::SetVar { .. }
+                    | HttpCheckAction::UnsetVar { .. }
+            )
+        })
+        .is_some_and(|a| matches!(a, HttpCheckAction::Connect { .. }));
+
+    if !starts_with_connect {
+        steps.push(ResolvedHttpStep::Connect {
+            addr: None,
+            port: server.check_port,
+            send_proxy: server_send_proxy,
+        });
+    }
+
+    let has_explicit_send = http_checks.iter().any(|a| matches!(a, HttpCheckAction::Send { .. }));
+    // `parse_httpchk_option` sets the method, URI and version together (its defaults are
+    // `OPTIONS`, `/`, `HTTP/1.0`), and an inherited request is cleared as a whole, so the
+    // three are all present or all absent: no default is needed here.
+    let implicit = httpchk
+        .filter(|_| !has_explicit_send)
+        .and_then(|h| Some((h.method.clone()?, h.uri.clone()?, h.version.clone()?, h)));
+    if let Some((method, uri, version, h)) = implicit {
+        steps.push(ResolvedHttpStep::Send(ResolvedHttpSend {
+            method,
+            uri,
+            uri_lf: false,
+            version,
+            host: h.host.clone(),
+            headers: Vec::new(),
+            body: None,
+            body_lf: false,
+        }));
+    }
+
     // `HAProxy` numbers each `http-check` line it keeps as a rule (all but `send-state`
     // and `disable-on-404`, which are flags) from 0, in order.
     let mut rule_index = 0usize;
@@ -845,26 +849,28 @@ pub(crate) fn build_resolved_http_check(
                 body: req_body,
                 body_lf: req_body_lf,
             } => {
-                has_send = true;
-                if let Some(m) = req_method {
-                    method.clone_from(m);
-                }
-                if let Some(u) = req_uri {
-                    uri.clone_from(u);
-                    uri_lf = *req_uri_lf;
-                }
-                if let Some(v) = req_version {
-                    version.clone_from(v);
-                }
-                headers.extend(req_headers.iter().cloned());
-                if let Some(b) = req_body {
-                    body = Some(b.clone());
-                    body_lf = *req_body_lf;
-                }
+                steps.push(ResolvedHttpStep::Send(ResolvedHttpSend {
+                    method: req_method
+                        .clone()
+                        .or_else(|| httpchk.and_then(|h| h.method.clone()))
+                        .unwrap_or_else(|| "OPTIONS".to_string()),
+                    uri: req_uri
+                        .clone()
+                        .or_else(|| httpchk.and_then(|h| h.uri.clone()))
+                        .unwrap_or_else(|| "/".to_string()),
+                    uri_lf: *req_uri_lf,
+                    version: req_version
+                        .clone()
+                        .or_else(|| httpchk.and_then(|h| h.version.clone()))
+                        .unwrap_or_else(|| "HTTP/1.0".to_string()),
+                    host: httpchk.and_then(|h| h.host.clone()),
+                    headers: req_headers.clone(),
+                    body: req_body.clone(),
+                    body_lf: *req_body_lf,
+                }));
             }
             HttpCheckAction::Expect { pattern, negate, min_recv, comment } => {
-                seen_expect = true;
-                rules.push(ResolvedHttpRule::Expect(ResolvedHttpExpectRule {
+                steps.push(ResolvedHttpStep::Expect(ResolvedHttpExpectRule {
                     pattern: pattern.clone(),
                     negate: *negate,
                     min_recv: *min_recv,
@@ -873,19 +879,22 @@ pub(crate) fn build_resolved_http_check(
                 }));
             }
             HttpCheckAction::SetVar { var_name, expr } => {
-                let rule = ResolvedHttpRule::SetVar { var_name: var_name.clone(), expr: expr.clone() };
-                if seen_expect { rules.push(rule) } else { pre_rules.push(rule) }
+                steps.push(ResolvedHttpStep::SetVar {
+                    var_name: var_name.clone(),
+                    expr: expr.clone(),
+                });
             }
             HttpCheckAction::UnsetVar { var_name } => {
-                let rule = ResolvedHttpRule::UnsetVar { var_name: var_name.clone() };
-                if seen_expect { rules.push(rule) } else { pre_rules.push(rule) }
+                steps.push(ResolvedHttpStep::UnsetVar {
+                    var_name: var_name.clone(),
+                });
             }
             HttpCheckAction::Connect { addr, port, send_proxy: sp } => {
-                connect_addr = *addr;
-                if port.is_some() {
-                    check_port = *port;
-                }
-                send_proxy |= *sp;
+                steps.push(ResolvedHttpStep::Connect {
+                    addr: *addr,
+                    port: port.or(server.check_port),
+                    send_proxy: *sp || server_send_proxy,
+                });
             }
             HttpCheckAction::Comment(c) => {
                 pending_comment = Some(c);
@@ -898,8 +907,14 @@ pub(crate) fn build_resolved_http_check(
         pending_comment = None;
     }
 
-    if !rules.iter().any(|r| matches!(r, ResolvedHttpRule::Expect(_))) {
-        rules.push(ResolvedHttpRule::Expect(ResolvedHttpExpectRule {
+    let needs_implicit_expect = !steps
+        .iter()
+        .rev()
+        .take_while(|s| !matches!(s, ResolvedHttpStep::Send(_)))
+        .any(|s| matches!(s, ResolvedHttpStep::Expect(_)));
+
+    if needs_implicit_expect {
+        steps.push(ResolvedHttpStep::Expect(ResolvedHttpExpectRule {
             pattern: HttpCheckExpectPattern::Status(vec![(200, 399)]),
             negate: false,
             min_recv: -1,
@@ -910,23 +925,7 @@ pub(crate) fn build_resolved_http_check(
         }));
     }
 
-    ResolvedHttpCheck {
-        method,
-        uri,
-        uri_lf,
-        version,
-        host,
-        headers,
-        body,
-        body_lf,
-        has_send,
-        send_state,
-        pre_rules,
-        rules,
-        check_port,
-        send_proxy,
-        connect_addr,
-    }
+    ResolvedHttpCheck { send_state, steps }
 }
 
 pub(crate) fn build_resolved_tcp_steps(

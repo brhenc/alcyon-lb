@@ -34,11 +34,21 @@ pub const REPORTED_VERSION: &str = "3.5.0";
 
 /// Answers one `feature(X)` predicate.
 fn feature(name: &str) -> bool {
-    // OPENSSL is answered true because the suite uses it to mean "this build terminates
-    // TLS", not "OpenSSL is linked in" -- see the module comment. RUSTLS names the
-    // backend so a condition can ask which one directly. THREAD is what `-vv` of the
-    // reference says ("+THREAD"): Alcyon runs worker threads.
-    matches!(name, "OPENSSL" | "RUSTLS" | "THREAD" | "QUIC")
+    match name {
+        // OPENSSL is answered true because the suite uses it to mean "this build
+        // terminates TLS", not "OpenSSL is linked in" -- see the module comment.
+        // RUSTLS names the backend so a condition can ask which one directly. THREAD
+        // is what `-vv` of the reference says ("+THREAD"): Alcyon runs worker threads.
+        "OPENSSL" | "RUSTLS" | "THREAD" | "QUIC" => true,
+        // `TCP_MD5SIG` is a Linux kernel extension; `HAProxy` guards both the keyword
+        // and the feature names with `#if defined(__linux__) && defined(TCP_MD5SIG)`.
+        "HAVE_TCP_MD5SIG" => cfg!(target_os = "linux"),
+        // `HAVE_WORKING_TCP_MD5SIG` is what `HAProxy`'s `__proto_tcp_init` registers:
+        // a real `setsockopt(TCP_MD5SIG)` on a fresh socket must succeed. The probe
+        // runs once per process.
+        "HAVE_WORKING_TCP_MD5SIG" => cfg!(target_os = "linux") && alcyon_mmsg::probe_tcp_md5sig(),
+        _ => false,
+    }
 }
 
 /// Compares dotted version strings, ignoring any `-dev`/`-rc` suffix.

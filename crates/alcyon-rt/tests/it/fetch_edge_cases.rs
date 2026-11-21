@@ -455,3 +455,29 @@ frontend fe
     let r = get(fe, "");
     assert_eq!(header(&r, "x-z").as_deref(), Some("f=[0] g=[] h=[] i=[0]"), "{r}");
 }
+
+/// BYTESFETCH: Alcyon has no count of the bytes it forwards after rewriting, so `req.bytes_out`
+/// and `res.bytes_out` were registered and copied `req.bytes_in`/`res.bytes_in` (the oracle
+/// answers 198/228 where those give 92/122 once a header is added). Refused with a reason.
+#[test]
+fn bytes_out_fetches_are_refused_with_a_reason() {
+    for f in ["req.bytes_out", "res.bytes_out"] {
+        for rule in [format!("http-request set-header x \"%[{f}]\""), format!("log-format \"%[{f}]\"")] {
+            let (code, out) = load(&rule);
+            assert_ne!(code, Some(0), "{rule} loaded: {out}");
+            assert!(out.contains(&format!("'{f}' : not implemented in Alcyon")), "{rule}: {out}");
+        }
+    }
+}
+
+/// TIMERFETCH: Alcyon does not time the client handshake (`logs->t_handshake`), so
+/// `fc.timer.handshake` was registered as a constant 0 (the oracle answers ~300 ms for a TLS
+/// or PROXY handshake). Refused with a reason until the handshake is timed.
+#[test]
+fn fc_timer_handshake_is_refused_with_a_reason() {
+    for rule in ["http-request set-header x \"%[fc.timer.handshake]\"", "log-format \"%[fc.timer.handshake]\""] {
+        let (code, out) = load(rule);
+        assert_ne!(code, Some(0), "{rule} loaded: {out}");
+        assert!(out.contains("'fc.timer.handshake' : not implemented in Alcyon"), "{rule}: {out}");
+    }
+}

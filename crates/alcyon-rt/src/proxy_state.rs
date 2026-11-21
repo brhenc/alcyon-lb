@@ -97,6 +97,48 @@ impl ProxyState for ProxiesView<'_> {
         self.backend(backend).map(usable_servers)
     }
 
+    fn backend_queue(&self, backend: &str) -> Option<i64> {
+        let p = self.backend(backend)?;
+        // `px->totpend`: the requests queued in the backend's queue and in the queues of
+        // all its servers (`pendconn_add` counts both in it), over every worker.
+        Some(p.stats.iter().map(|s| i64::from(s.queue_cur.load(Ordering::Relaxed))).sum())
+    }
+
+    fn backend_avg_queue(&self, backend: &str) -> Option<i64> {
+        let p = self.backend(backend)?;
+        let nbsrv = usable_servers(p);
+        let totpend = p.stats.iter().map(|s| i64::from(s.queue_cur.load(Ordering::Relaxed))).sum::<i64>();
+        // `smp_fetch_avg_queue_size`: the queue rounded up over the usable servers, the
+        // queue doubled when there are none.
+        Some(if nbsrv > 0 { (totpend + nbsrv - 1) / nbsrv } else { totpend * 2 })
+    }
+
+    fn backend_connslots(&self, backend: &str) -> Option<i64> {
+        let p = self.backend(backend)?;
+        let mut slots = 0i64;
+        for i in 0..p.srv_set().len() {
+            // `SRV_ST_STOPPED` (`src/backend.c` `smp_fetch_connslots`): skip servers in
+            // maintenance (`disabled` / `Maint`) and servers stopped by health check
+            // (`Down`), matching `is_up`.
+            if !is_up(p, i) {
+                continue;
+            }
+            let maxconn = p.srv_set().at(i).and_then(|s| s.maxconn()).unwrap_or(0);
+            let maxqueue = p.srv_set().maxqueue_at(i);
+            // "the configuration is stupid" (src/backend.c:3440): no way to tell.
+            if maxconn == 0 || maxqueue == 0 {
+                return Some(-1);
+            }
+            slots += i64::from(maxconn) - i64::from(cur_sess(p, i))
+                + i64::from(maxqueue) - i64::from(p.srv_set().queue_len(i));
+        }
+        Some(slots)
+    }
+
+    fn process_uptime(&self) -> i64 {
+        i64::try_from(crate::stats::process_start().elapsed().as_secs()).unwrap_or(i64::MAX)
+    }
+
     fn backend_conn_free(&self, backend: &str) -> Option<i64> {
         let p = self.backend(backend)?;
         let (act, fbck) = recount(p);
@@ -125,6 +167,7 @@ impl ProxyState for ProxiesView<'_> {
             weight: me.weight().unwrap_or(1),
             iweight: me.initial_weight().unwrap_or(1),
             uweight: me.weight().unwrap_or(1),
+            queue_len: p.srv_set().queue_len(i),
         })
     }
 
@@ -821,6 +864,8 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
                 .unwrap_or_else(|| crate::rule_exprs::check_sample_expr(&r.expr, registry))
                 .map_err(|e| in_line(format!("failed to parse sample expression <{}> : {e}", r.expr)))?;
         }
+        crate::rule_exprs::check_fc_glitches(config, r.section, r.proxy.as_deref(), &r.directive, crate::rule_exprs::leading_fetch(&r.expr))
+            .map_err(&in_line)?;
         // A fetch of the response where the stream has none would read the response of
         // whatever stream ran last on the thread (T156): in a request rule, and for the
         // headers in a log-format, rendered once they are gone. `HAProxy` refuses both.
@@ -829,6 +874,32 @@ pub fn check_sample_refs(config: &Config, registry: &Registry) -> Result<(), Str
         // `error-log-format`, `log-format-sd`): `hdr` needs both, and a request fetch the
         // request's. `HAProxy` refuses them all at load (3.5-dev8-885761-29, T286); the
         // captures (`%hr`, `capture.req.hdr`) are what a log line reads headers with.
+        // The timer fetches of a `tcp-request` or `tcp-response` rule's format (a
+        // `set-var-fmt`'s `%[...]`, this ref): `HAProxy` compiles the format with the
+        // request's sources still missing (`tcp-request session`/`connection`), the head
+        // not parsed (`tcp-request content` has its bytes, but not the server or the
+        // response) or the request's headers gone (`tcp-response`), and refuses the fetch
+        // in the bare `log.c` words. Its bare expressions are refused wider still
+        // (`rule_exprs::tcp_request_part`); an ACL is only warned about there.
+        if !r.acl && !r.whole_format {
+            let fetch = crate::rule_exprs::leading_fetch(&r.expr);
+            let (directive, action) = (r.directive.as_str(), r.action.as_str());
+            let part = match (directive, fetch) {
+                ("tcp-request", "req.timer.queue" | "bc.timer.connect") => Some("server address"),
+                ("tcp-request", "res.timer.data") => Some("response buffer statistics"),
+                ("tcp-request", f @ ("req.timer.tq" | "txn.timer.total" | "txn.timer.user"))
+                    if action == "session" || action == "connection" => {
+                    Some(if f == "req.timer.tq" { "HTTP request headers" } else { "transaction statistics" })
+                }
+                ("tcp-response", "req.timer.tq") => Some("HTTP request headers"),
+                _ => None,
+            };
+            if let Some(part) = part {
+                return Err(in_line(format!(
+                    "sample fetch <{fetch}> may not be reliably used here because it needs '{part}' which is not available here"
+                )));
+            }
+        }
         let in_log = matches!(r.directive.as_str(), "log-format" | "error-log-format" | "log-format-sd");
         let part_missing = |fetch: &str| match r.directive.as_str() {
             "http-response" | "http-after-response" => crate::rule_exprs::request_part(fetch, false),

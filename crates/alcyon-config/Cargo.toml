@@ -10,6 +10,9 @@ autotests = false
 [dependencies]
 alcyon-regex = { workspace = true }
 alcyon-crypt = { path = "../alcyon-crypt" }
+# `set_tcp_md5sig` behind `feature(HAVE_WORKING_TCP_MD5SIG)`: the parser's
+# `tcp-md5sig` keyword and the probe both need the kernel call.
+alcyon-mmsg = { path = "../alcyon-mmsg" }
 thiserror = "1.0"
 # `getpwnam_r` / `getgrnam_r` for `user` and `group`, as HAProxy resolves them while parsing.
 nix = { version = "0.31", default-features = false, features = ["user"] }

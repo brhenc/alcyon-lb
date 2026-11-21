@@ -25,7 +25,7 @@ use crate::syslog::SyslogTarget;
 use crate::srv_set::{ServerArrays, ServerIdArrays};
 use alcyon_config::LogLevel;
 use crate::txn::MsgState;
-use crate::proxy::{TcpSession, Timeouts};
+use crate::proxy::{sess_flags, ClientProto, TcpSession, Timeouts};
 use crate::raw;
 use alcyon_config::{BalanceAlgorithm, Config, Mode, StickRule, UseBackendRule};
 use alcyon_proto::endpoint::ScState;
@@ -1337,7 +1337,8 @@ fn attach_server_to(
     let (fe, be) = (&proxies[fe_idx], &proxies[be_idx]);
     let stick = StickView::new(proxies, &sess.tracked_sc);
     let ip = s_idx.and_then(|i| be.srv_set().addr_get(i)).map_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), |a| a.ip());
-    let mut xprt = tls.with_sni(sample_registry(), &stream_sample_ctx(sess, fe, be, &ProxiesView(proxies), &stick).as_ctx(), |sni| {
+    let fc = crate::proxy::ConnView::from_conn(sess);
+    let mut xprt = tls.with_sni(sample_registry(), &stream_sample_ctx(sess, fe, be, &ProxiesView(proxies), &stick, fc.as_ref()).as_ctx(), |sni| {
         tls.connect(&srv_fd, sni, ip)
     });
     // A PROXY header (`send-proxy*`) was put at the head of the request; to a TLS
@@ -1346,7 +1347,7 @@ fn attach_server_to(
     // reads it. So it leaves the stream for the transport's prefix.
     let n = sess.send_proxy_header.len();
     if let (true, crate::xprt::ServerXprt::Tls(t)) = (
-        sess.send_proxy_prepended && n > 0 && sess.req.readable().get(..n) == Some(&sess.send_proxy_header[..]),
+        sess.flags.has(sess_flags::SEND_PROXY_PREPENDED) && n > 0 && sess.req.readable().get(..n) == Some(&sess.send_proxy_header[..]),
         &mut xprt,
     ) {
         t.set_plain_prefix(sess.req.readable()[..n].to_vec());
@@ -1439,7 +1440,8 @@ fn with_server_sni<R>(
         return f(None);
     };
     let stick = StickView::new(proxies, &sess.tracked_sc);
-    tls.with_sni(sample_registry(), &stream_sample_ctx(sess, &proxies[fe_idx], &proxies[be_idx], &ProxiesView(proxies), &stick).as_ctx(), f)
+    let fc = crate::proxy::ConnView::from_conn(sess);
+    tls.with_sni(sample_registry(), &stream_sample_ctx(sess, &proxies[fe_idx], &proxies[be_idx], &ProxiesView(proxies), &stick, fc.as_ref()).as_ctx(), f)
 }
 
 /// The pool key of a connection to `addr` for server `s_idx` of backend `be_idx`, opened
@@ -2018,6 +2020,14 @@ pub struct Proxy {
     /// `option dontlog-normal`, `option log-separate-errors`, `option logasap`: the
     /// `alcyon_config::LOG_OPT_*` bits.
     pub log_opts: u8,
+    /// `log-steps` mask for this proxy: the standard stream steps it logs (accept/request/
+    /// connect/response/close). `None` = no `log-steps` directive (log at close/error only,
+    /// as before); `Some(mask)` = the listed steps plus close. Set at load; read only.
+    pub log_steps: Option<u8>,
+    /// True when any of this proxy's log targets carries a `log-profile`. Computed once at
+    /// load; when it is `false` the stream's line is built and sent exactly as before, so a
+    /// proxy without profiles pays nothing for the machinery.
+    pub any_log_profile: bool,
     /// `unique-id-format`, compiled.
     pub unique_id_format: Option<Arc<crate::logfmt::LogFormat>>,
     /// `unique-id-header`: the request header the unique ID is sent to the server in (a
@@ -2251,6 +2261,9 @@ pub struct SessionEntry {
     pub log_line: Option<Vec<u8>>,
     /// `log_line` is a failed stream's: `option log-separate-errors` sends it at `err`.
     pub log_err: bool,
+    /// `log_line`'s level, fixed when the line was built (a later `set-log-level` may not
+    /// change a line already queued, `HAProxy` sends each line at its own level).
+    pub log_level: LogLevel,
     /// The first `log_sd` bytes of `log_line` are its STRUCTURED-DATA (`log-format-sd`).
     pub log_sd: u32,
     /// Its place in the buffer wait queue (S6, [`crate::buf_wait`]).
@@ -2403,6 +2416,34 @@ impl SessionArena {
         self.entries.get_mut(idx as usize)?.as_mut().filter(|e| !e.parked)
     }
 
+    /// Borrows `idx` mutably and, if it is an HTTP/2 child whose owner is a different live slot
+    /// in this arena, borrows that owner immutably (`split_at_mut`, no allocation or atomics).
+    pub fn get_mut_with_owner(&mut self, idx: u32) -> Option<(&mut SessionEntry, Option<&SessionEntry>)> {
+        let owner_ref = {
+            let e = self.entries.get(idx as usize)?.as_ref().filter(|e| !e.parked)?;
+            match e.sess.h2_role.as_deref() {
+                Some(crate::proxy::H2Role::Child(c)) => c.owner.filter(|&(oi, _)| oi != idx),
+                _ => None,
+            }
+        };
+        if let Some((owner_idx, owner_task)) = owner_ref
+            .filter(|&(oi, ot)| self.entries.get(oi as usize).and_then(|s| s.as_ref()).is_some_and(|o| !o.parked && o.task == ot))
+        {
+            let (a, b) = (idx as usize, owner_idx as usize);
+            if a < b {
+                let (lo, hi) = self.entries.split_at_mut(b);
+                let entry = lo[a].as_mut()?;
+                let owner = hi[0].as_ref()?;
+                return Some((entry, Some(owner)));
+            }
+            let (lo, hi) = self.entries.split_at_mut(a);
+            let owner = lo[b].as_ref()?;
+            let entry = hi[0].as_mut()?;
+            return Some((entry, Some(owner)));
+        }
+        Some((self.entries.get_mut(idx as usize)?.as_mut().filter(|e| !e.parked)?, None))
+    }
+
     /// The entry that [`EngineDispatcher::reset_parked`] marked parked, in its slot (O1b, CP3), is
     /// counted so: the session of an HTTP/2 stream that is over, which its connection keeps for
     /// its next stream ([`Self::unpark`]). Not seen by `get`, `iter` or `live`.
@@ -2547,6 +2588,7 @@ pub struct Engine {
     /// inside each `Proxy` (T177).
     pub proxies: Proxies,
     pub checks: Vec<ServerCheckState>,
+    pub agent_checks: Vec<crate::agent_check::AgentCheckState>,
     /// The `resolvers` sections the servers use, on worker 0 with the checks they change
     /// (`crate::resolvers`); empty elsewhere.
     resolvers: Vec<crate::resolvers::Section>,
@@ -2618,6 +2660,10 @@ pub struct Engine {
     pub worker_id: usize,
     events: Vec<crate::poller::Event>,
     timer_updates: Vec<(TaskRef, Tick)>,
+    /// The tasks a pass's `set-nice` action set the nice of, with the value, kept from one
+    /// pass to the next, as `timer_updates`. The dispatcher reaches the tasks only through
+    /// the scheduler, which owns the pass, so the writes go out after it.
+    nice_updates: Vec<(TaskRef, i16)>,
     /// The tasks a pass wakes and the HTTP/2 connections whose streams it spawns, kept
     /// from one pass to the next, as `timer_updates` (T437: a `Vec` each pass allocated as
     /// soon as anything was pushed).
@@ -3209,7 +3255,7 @@ fn begin_http_stream(entry: &mut SessionEntry, proxies: &crate::table::Table, fe
             let data = stream_log_data(entry, std::slice::from_ref(fe), 0, pid);
             let view = ProxiesView(proxies);
             let stick = StickView::new(proxies, &entry.sess.tracked_sc);
-            let ctx = stream_sample_ctx(&entry.sess, fe, fe, &view, &stick);
+            let ctx = stream_sample_ctx(&entry.sess, fe, fe, &view, &stick, None);
             fmt.render(&data, sample_registry(), &ctx.as_ctx())
         };
         if let Some(h) = fe.unique_id_header.as_deref() {
@@ -3230,8 +3276,10 @@ pub fn set_config_files(files: Vec<(u32, String)>) {
 }
 
 /// `last_rule`, a line of the configuration text, as the file it is in and its line there.
-fn last_rule_at(line: Option<u32>) -> Option<(&'static str, u32)> {
-    let line = line?;
+fn last_rule_at(line: u32) -> Option<(&'static str, u32)> {
+    if line == 0 {
+        return None;
+    }
     let files = CONFIG_FILES.get()?;
     let (first, path) = files.iter().rev().find(|(first, _)| *first <= line)?;
     Some((path.as_str(), line - first + 1))
@@ -3241,8 +3289,37 @@ fn last_rule_at(line: Option<u32>) -> Option<(&'static str, u32)> {
 /// proxy made up, is not one.
 fn note_last_rule(sess: &mut TcpSession, line: u32) {
     if line != 0 {
-        sess.strm.log.last_rule = Some(line);
+        sess.strm.log.last_rule = line;
     }
+}
+
+/// What `waiting_entity` names of a held wait (`HAProxy`'s `strm->waiting_entity`): the
+/// rule that holds the stream (`STRM_ENTITY_RULE`, as `file:line`), or the request body
+/// (`STRM_ENTITY_WREQ_BODY`, the implicit wait of `option http-buffer-request`, named for
+/// the option). `None` where `HAProxy` names nothing: the `inspect-delay` data wait holds
+/// no rule; a `tarpit` is denied (`ACT_RET_DENY`) and then waits in its own analyser,
+/// where no `waiting_entity` is set; and this codebase has no stream filters, so
+/// `STRM_ENTITY_FILTER` is a claim the fetch never makes. `rules` is the list the wait's
+/// `rule` indexes and `stage` its stage, as `w.backend` says.
+fn waiting_entity_of(w: &crate::txn::BodyWait, rules: &[alcyon_config::HttpReqRule], stage: bool) -> Option<alcyon_sample::WaitEntity<'static>> {
+    if w.inspect || w.backend != stage {
+        return None;
+    }
+    let rule = rules.get(w.rule)?;
+    if w.tarpit {
+        // `pause` yields, so the rule is the entity; `tarpit` denies and holds the
+        // client in its own analyser, where `HAProxy` sets no `waiting_entity`.
+        return matches!(rule.action, alcyon_config::HttpReqAction::Pause { .. })
+            .then(|| last_rule_at(rule.line))
+            .flatten()
+            .map(|(file, line)| alcyon_sample::WaitEntity::Rule(file, line));
+    }
+    if rule.line == 0 {
+        // The implicit `option http-buffer-request` wait is not a rule in `HAProxy`
+        // (`http_wait_for_request_body`); it is named for the option.
+        return Some(alcyon_sample::WaitEntity::Body);
+    }
+    last_rule_at(rule.line).map(|(file, line)| alcyon_sample::WaitEntity::Rule(file, line))
 }
 
 /// What `when()` reads of a stream (`sample_conv_when`): an error is a 5xx status; a
@@ -3252,15 +3329,37 @@ fn note_last_rule(sess: &mut TcpSession, line: u32) {
 fn stream_facts(sess: &TcpSession, status: Option<u16>, timers: bool) -> alcyon_sample::StreamFacts {
     let log = &sess.strm.log;
     let used = sess.max_retries.saturating_sub(sess.conn_retries);
+    // The byte counters `bytes_in`/`bytes_out`/`req.bytes_in`/`res.bytes_in` read (`logs`,
+    // stream.c): the same `%U` and `%B` the log prints. `req.bytes_out`/`res.bytes_out` are
+    // refused (`NOT_IMPLEMENTED`): Alcyon does not count what it forwards after rewriting.
+    let req_in = stream_bytes_in(sess);
+    let res_in = stream_bytes_out(sess);
     alcyon_sample::StreamFacts {
         error: used > 0 || status.is_some_and(|s| s >= 500),
         forwarded: log.queue.is_some() || log.connect.is_some(),
         toapplet: log.applet,
         retries: u32::from(used),
-        redispatched: sess.redispatched,
+        redispatched: sess.flags.has(sess_flags::REDISPATCHED),
         // Only for a rule whose format prints them: five clock reads are not free (T455).
         timers: timers.then(|| [log.ms(log.first_byte), log.ms(log.request), log.ms(log.queue), log.ms(log.connect), log.ms(log.data)]),
+        be_queue: if log.queue_is_srv { 0 } else { log.be_queue },
+        srv_queue: if log.queue_is_srv { log.be_queue } else { 0 },
+        req_in,
+        res_in,
     }
+}
+
+/// `stream_facts` for the `http-request` rules: `t_request` is still `-1` there, as the
+/// oracle answers (measured, `req.timer.tq` in a rule after a `wait-for-body` too) -
+/// `HAProxy` stamps `logs.request_ts` only once the request's analysis ends
+/// (`src/http_ana.c`), after the rules ran. `Alcyon` stamps its `request` at parse for
+/// the log's `%Tq`, which the log's contexts read.
+fn request_phase_facts(sess: &TcpSession) -> alcyon_sample::StreamFacts {
+    let mut facts = stream_facts(sess, None, true);
+    if let Some(timers) = facts.timers.as_mut() {
+        timers[1] = -1;
+    }
+    facts
 }
 
 /// `request_date`: the accept date plus the idle time before the request's first byte
@@ -3275,17 +3374,26 @@ fn request_date(log: &crate::txnlog::StreamLog) -> (i64, u32) {
     (secs, ms % 1000)
 }
 
+/// Whether `s` currently has an active stream (`smp->strm` in HAProxy): TCP sessions
+/// always do once accepted; HTTP sessions do only once a request head was parsed (not
+/// `<BADREQ>` or idle/aborted pre-head connections).
+fn stream_has_strm(s: &TcpSession) -> bool {
+    s.mode == Mode::Tcp || s.strm.txn.as_ref().is_some_and(|t| t.req_len_hdrs.is_some())
+}
+
 /// The sample context a log line's `%[...]` reads.
-fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>) -> alcyon_sample::PhaseCtx<'a> {
+fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>, fc: Option<&'a crate::proxy::ConnView<'a>>) -> alcyon_sample::PhaseCtx<'a> {
     alcyon_sample::PhaseCtx {
         proxies: Some(view),
         stick: Some(stick),
+        fc: fc.map(|c| c as &dyn alcyon_sample::FrontConnState),
         client_addr: s.client_addr,
         server_addr: s.server_addr,
         fc_src: s.fc_src(),
         fc_dst: s.fc_dst(),
-        is_first_req: s.is_first_req,
+        is_first_req: s.flags.has(sess_flags::IS_FIRST_REQ),
         proxy_tlvs: s.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+        saved_syn: s.saved_syn(),
         ssl_fc: crate::proxy::ssl_fc(&s.cli_xprt, s.h2_role.as_deref()),
         quic_acks: s.quic_facts(),
         fc_http_major: s.fc_http_major(),
@@ -3301,7 +3409,7 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         be_name: Some(&be.name),
         be_id: Some(be.ids.iid),
         so_name: s.so_name.as_deref(),
-        so_id: s.so_id,
+        so_id: s.so_id_opt(),
         captures_req_hdr: Some(&s.strm.log.req_captures),
         captures_res_hdr: Some(&s.strm.log.res_captures),
         unique_id: s.strm.log.unique_id.as_deref(),
@@ -3314,6 +3422,15 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         term_state: Some(sess_term_state(s)),
         bc_dst: s.bc_dst(),
         bc_src: s.bc_src(),
+        // The stream's five logs ride with every stream context: the timer fetches
+        // (`req.timer.tq`, `res.timer.data`, ...) read them, and they are `duration_since`
+        // on instants the stream already holds, not clock reads.
+        stream: Some(stream_facts(s, None, true)),
+        uniq_id: stream_has_strm(s).then_some(s.strm.log.uniq_id),
+        waiting_entity: s.strm.txn.as_ref().and_then(|t| t.body_wait).and_then(|w| {
+            let (rules, stage) = if w.backend { (&be.http_req_rules, true) } else { (&fe.http_req_rules, false) };
+            waiting_entity_of(&w, rules, stage)
+        }),
         ..Default::default()
     }
 }
@@ -3332,6 +3449,9 @@ impl alcyon_sample::LiveReq for TcpSession {
     }
     fn proxy_tlvs(&self) -> Option<&[u8]> {
         self.proxy_info.as_ref().map(|p| p.tlv_data.as_slice())
+    }
+    fn saved_syn(&self) -> Option<&[u8]> {
+        self.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref())
     }
     fn ssl_fc(&self) -> alcyon_sample::SslFacts<'_> {
         crate::proxy::ssl_fc(&self.cli_xprt, self.h2_role.as_deref())
@@ -3563,7 +3683,7 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         frontend_addr: s.server_addr,
         frontend: &fe.name,
         // QUIC is TLS, though the relayed stream the engine reads is not (T130).
-        frontend_ssl: s.cli_is_tls() || s.h3,
+        frontend_ssl: s.cli_is_tls() || s.client_proto == ClientProto::H3,
         ssl_cipher: crate::proxy::ssl_fc(&s.cli_xprt, s.h2_role.as_deref()).cipher,
         ssl_version: crate::proxy::ssl_fc(&s.cli_xprt, s.h2_role.as_deref()).protocol,
         backend: &be.name,
@@ -3590,7 +3710,8 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         retries: i64::from(s.max_retries.saturating_sub(s.conn_retries)),
         redispatched: s.strm.log.redispatched,
         uniq_id: l.uniq_id,
-        be_queue: u64::from(l.be_queue),
+        be_queue: u64::from(if l.queue_is_srv { 0 } else { l.be_queue }),
+        srv_queue: u64::from(if l.queue_is_srv { l.be_queue } else { 0 }),
         log_counter: fe.log_count.load(Ordering::Relaxed),
         pid,
         hostname: log_hostname(),
@@ -3755,7 +3876,7 @@ fn account_rows<'a, R: crate::statcnt::Rows<'a>>(entry: &SessionEntry, proxies: 
         w.max(&c.rate_max, rate);
     };
     let be = &proxies[be_idx];
-    let picked = srv_idx.is_some() && entry.sess.lb_picked;
+    let picked = srv_idx.is_some() && entry.sess.flags.has(sess_flags::LB_PICKED);
     if let Some((c, cold)) = rows.obj(be, crate::statcnt::BE) {
         if picked {
             w.add(&c.lbtot, 1);
@@ -3813,7 +3934,32 @@ impl Proxy {
 /// With it, whether the stream failed (`strm_log`'s `err`): a redispatch or a retry, a
 /// termination state that names a fault (anything but `-` and `L`), or a 5xx status. A
 /// stream that did not fail has no line under `option dontlog-normal`.
-fn stream_log_line(entry: &SessionEntry, proxies: &crate::table::Table, pid: u32) -> Option<(Vec<u8>, u32, bool)> {
+/// The level a stream's line goes out at, with `set-log-level` (`s->logs.level`) applied on
+/// top (`strm_log`, `do_log_ctx`): `silent` (-1) sends nothing, a named level (its syslog
+/// number plus one) beats the line's own, and 0 (no rule ran) keeps it: `info`, or `err` for
+/// a failed line under `option log-separate-errors`.
+fn stream_log_level(log_level: i8, fe: &Proxy, err: bool) -> Option<LogLevel> {
+    match log_level {
+        0 => Some(if err && fe.log_opts & alcyon_config::LOG_OPT_SEPARATE_ERRORS != 0 {
+            LogLevel::Err
+        } else {
+            LogLevel::Info
+        }),
+        -1 => None,
+        n => Some(match n {
+            1 => LogLevel::Emerg,
+            2 => LogLevel::Alert,
+            3 => LogLevel::Crit,
+            4 => LogLevel::Err,
+            5 => LogLevel::Warning,
+            6 => LogLevel::Notice,
+            7 => LogLevel::Info,
+            _ => LogLevel::Debug,
+        }),
+    }
+}
+
+fn stream_log_line(entry: &SessionEntry, proxies: &crate::table::Table, pid: u32) -> Option<(Vec<u8>, u32, bool, LogLevel)> {
     let fe = &proxies[entry.proxy_idx];
     // A request the mux refused (400, 408, 501: `<BADREQ>`) never became a stream, and
     // `HAProxy` logs it with `error-log-format` when there is one (`_sess_log`, not
@@ -3843,6 +3989,13 @@ fn stream_log_line(entry: &SessionEntry, proxies: &crate::table::Table, pid: u32
     if !err && fe.log_opts & alcyon_config::LOG_OPT_DONTLOG_NORMAL != 0 {
         return None;
     }
+    // `set-log-level silent` (`s->logs.level == -1`, `strm_log`): the stream's lines are not
+    // sent. A built line always goes out at this level -- the one `set-log-level` had set
+    // when the line was built, the way `HAProxy` sends each line at its own `s->logs.level`
+    // -- so a later rule may not change the level of a line already queued.
+    let Some(level) = stream_log_level(entry.sess.strm.log.log_level, fe, err) else {
+        return None;
+    };
     // `%sc` counts the other streams on the server: `HAProxy` logs after this one has
     // let go of it (measured: `1/1/0/0/0` for a lone request on a one-server backend).
     let mut data = stream_log_data(entry, proxies, entry.proxy_idx, pid);
@@ -3855,10 +4008,27 @@ fn stream_log_line(entry: &SessionEntry, proxies: &crate::table::Table, pid: u32
     CURRENT_SRV_STATUS.set(entry.sess.strm.log.srv_status);
     let tr = entry.sess.strm.log.data.zip(entry.sess.strm.log.connect).map(|(d, c)| d.saturating_duration_since(c).as_millis());
     CURRENT_RES_TR.set(tr.map_or(-1, |ms| i64::try_from(ms).unwrap_or(i64::MAX)));
-    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, res_status: txn_status, ..stream_sample_ctx(&entry.sess, fe, be, &view, &stick) }, live: None };
+    let origin = stream_log_origin(entry, err);
+    // `t_close` is the same value the line's `%Tt` prints (`session_log_data` stamped it
+    // into `data`), so `fc.timer.total` in the log-format reads the log's number.
+    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, log_origin: Some(origin.og_name()), res_status: txn_status, t_close: data.t_close, ..stream_sample_ctx(&entry.sess, fe, be, &view, &stick, None) }, live: None };
     let (line, sd) = with_sd(fe.log_format_sd(), fmt, &data, &ctx);
     fe.log_count.fetch_add(1, Ordering::Relaxed);
-    Some((line, sd, err))
+    Some((line, sd, err, level))
+}
+
+/// The step a stream's line is the log of, for a `log-profile`'s step lookup: `logasap`'s
+/// connect (TCP) or response head (HTTP); a session that failed before an HTTP request was
+/// parsed (`_sess_log`); else the stream's close.
+fn stream_log_origin(e: &SessionEntry, err: bool) -> alcyon_config::ast::logging::LogProfileStepKind {
+    use alcyon_config::ast::logging::LogProfileStepKind as K;
+    if e.sess.strm.log.asap_done {
+        K::Response
+    } else if err && e.sess.mode == Mode::Http && e.sess.strm.log.request.is_none() {
+        K::Error
+    } else {
+        K::Close
+    }
 }
 
 /// `fmt` rendered, after the frontend's `log-format-sd` when it has one to send: one buffer,
@@ -3881,11 +4051,276 @@ fn set_stream_log(entry: &mut SessionEntry, proxies: &crate::table::Table, pid: 
     if entry.sess.strm.log.asap_done {
         return;
     }
-    match stream_log_line(entry, proxies, pid) {
-        Some((line, sd, err)) => (entry.log_line, entry.log_sd, entry.log_err) = (Some(line), sd, err),
-        None => entry.log_line = None,
+    let fe = &proxies[entry.proxy_idx];
+    // Under `log-steps`, `close` is logged only when the `close` step is enabled (`strm_log`
+    // at `LOG_ORIG_TXN_CLOSE`); a session error before any request (`_sess_log`) still logs.
+    let skip_close = fe.log_steps.is_some_and(|m| m & alcyon_config::LOG_STEP_CLOSE == 0)
+        && !(entry.sess.mode == Mode::Http && entry.sess.strm.log.request.is_none());
+    if !skip_close {
+        match stream_log_line(entry, proxies, pid) {
+            Some((line, sd, err, level)) => (entry.log_line, entry.log_sd, entry.log_err, entry.log_level) = (Some(line), sd, err, level),
+            None => entry.log_line = None,
+        }
     }
     leave_backend(entry, proxies);
+}
+
+#[derive(Clone, Copy)]
+struct LogEmit<'a> {
+    targets: &'a [crate::syslog::SyslogTarget],
+    tag: &'a str,
+    pid: u32,
+}
+
+fn target_admits(
+    target: &crate::syslog::SyslogTarget,
+    level: LogLevel,
+    cursor: Option<&std::sync::atomic::AtomicU64>,
+) -> bool {
+    // Level first: a line the logger filters out does not take a sampling slot.
+    target.accepts(level)
+        && match (target.sample(), cursor) {
+            (Some(sample), Some(c)) => crate::syslog::sample_admits(sample, c),
+            _ => true,
+        }
+}
+
+fn send_log_targets(
+    proxy: &Proxy,
+    emit: LogEmit<'_>,
+    level: LogLevel,
+    sd: &[u8],
+    msg: &[u8],
+) {
+    let tag = proxy.log_tag.as_deref().unwrap_or(emit.tag);
+    for (k, target) in proxy
+        .log_target_idx
+        .iter()
+        .enumerate()
+        .filter_map(|(k, &i)| emit.targets.get(i).map(|t| (k, t)))
+    {
+        if !target_admits(target, level, proxy.log_cursors.get(k)) {
+            continue;
+        }
+        // Discarded deliberately: syslog over UDP is fire-and-forget, and a
+        // collector that is down must not slow or fail the data path.
+        // No hostname in the header: `HAProxy` sends one only with
+        // `log-send-hostname`, which Alcyon does not have.
+        let _ = target.send_sd(level, tag, "", sd, msg);
+    }
+}
+
+/// Sends a pre-rendered stream line through `send_stream_log_profiled_ctx`, lazily building
+/// `LogData` + `SampleContext` from `entry` only if a target overrides `format` or `sd`.
+#[allow(clippy::too_many_arguments)]
+fn send_entry_log_profiled(
+    proxies: &crate::table::Table,
+    emit: LogEmit<'_>,
+    proxy_idx: usize,
+    origin: alcyon_config::ast::logging::LogProfileStepKind,
+    level: LogLevel,
+    line: &[u8],
+    sd: u32,
+    entry: Option<&SessionEntry>,
+) {
+    let proxy = &proxies[proxy_idx];
+    let needs_override = proxy.log_target_idx.iter().any(|&i| {
+        emit.targets
+            .get(i)
+            .and_then(|t| t.profile())
+            .is_some_and(|p| matches!(p.resolve(origin), crate::syslog::StepResolution::Override { .. }))
+    });
+    if let Some(e) = entry.filter(|_| needs_override) {
+        let be = proxies.get(e.backend_idx).unwrap_or(proxy);
+        let data = stream_log_data(e, proxies, proxy_idx, emit.pid);
+        let (view, stick) = (ProxiesView(proxies), StickView::new(proxies, &e.sess.tracked_sc));
+        let phase = alcyon_sample::PhaseCtx {
+            at_log: true,
+            log_origin: Some(origin.og_name()),
+            ..stream_sample_ctx(&e.sess, proxy, be, &view, &stick, None)
+        };
+        let sc = SampleContext { phase: &phase, live: None };
+        send_stream_log_profiled_ctx(proxy, emit, origin, level, line, sd, Some((&data, &sc)));
+    } else {
+        send_stream_log_profiled_ctx(proxy, emit, origin, level, line, sd, None);
+    }
+}
+
+/// Emits a `log-steps` or `do-log` step for `entry` (`do_log_ctx`).
+fn emit_step_log_entry(
+    entry: &SessionEntry,
+    proxies: &crate::table::Table,
+    emit: LogEmit<'_>,
+    origin: alcyon_config::ast::logging::LogProfileStepKind,
+) {
+    emit_step_log_entry_level(entry, proxies, emit, origin, entry.sess.strm.log.log_level);
+}
+
+/// Emits a `log-steps` or `do-log` step for `entry` with an explicit `log_level`
+/// (the `s->logs.level` active when `do-log` ran).
+fn emit_step_log_entry_level(
+    entry: &SessionEntry,
+    proxies: &crate::table::Table,
+    emit: LogEmit<'_>,
+    origin: alcyon_config::ast::logging::LogProfileStepKind,
+    log_level: i8,
+) {
+    let fe = &proxies[entry.proxy_idx];
+    if fe.log_target_idx.is_empty() {
+        return;
+    }
+    let be = proxies.get(entry.backend_idx).unwrap_or(fe);
+    let data = stream_log_data(entry, proxies, entry.proxy_idx, emit.pid);
+    let (view, stick) = (ProxiesView(proxies), StickView::new(proxies, &entry.sess.tracked_sc));
+    let phase = alcyon_sample::PhaseCtx {
+        at_log: true,
+        log_origin: Some(origin.og_name()),
+        ..stream_sample_ctx(&entry.sess, fe, be, &view, &stick, None)
+    };
+    let sc = SampleContext { phase: &phase, live: None };
+    emit_step_log_with(fe, emit, origin, stream_log_level(log_level, fe, false), &data, &sc);
+}
+
+/// Emits a `log-steps` or `do-log` step with prebuilt `data` and `sc`, at `level` (`None`
+/// being a stream silenced by `set-log-level silent`, `do_log_ctx`).
+fn emit_step_log_with(
+    proxy: &Proxy,
+    emit: LogEmit<'_>,
+    origin: alcyon_config::ast::logging::LogProfileStepKind,
+    level: Option<LogLevel>,
+    data: &crate::logfmt::LogData<'_>,
+    sc: &SampleContext<'_>,
+) {
+    if proxy.log_target_idx.is_empty() || level.is_none() {
+        return;
+    }
+    if !proxy.any_log_profile {
+        let Some(fmt) = proxy.log_format.as_deref() else {
+            return;
+        };
+        let (line, sd) = with_sd(proxy.log_format_sd(), fmt, data, sc);
+        let (sd_slice, msg_slice) = line.split_at(usize::try_from(sd).unwrap_or(0).min(line.len()));
+        if !msg_slice.is_empty() {
+            send_log_targets(proxy, emit, level.unwrap(), sd_slice, msg_slice);
+        }
+        crate::logfmt::recycle_line(line);
+        return;
+    }
+    let needs_proxy_fmt = proxy.log_target_idx.iter().any(|&i| {
+        emit.targets.get(i).is_some_and(|t| match t.profile() {
+            None => true,
+            Some(p) => matches!(
+                p.resolve(origin),
+                crate::syslog::StepResolution::Normal | crate::syslog::StepResolution::Override { format: None, .. }
+            ),
+        })
+    });
+    let (line, sd) = if needs_proxy_fmt {
+        match proxy.log_format.as_deref() {
+            Some(fmt) => with_sd(proxy.log_format_sd(), fmt, data, sc),
+            None => (Vec::new(), 0),
+        }
+    } else {
+        (Vec::new(), 0)
+    };
+    // `level` is `Some` here: the guard above returned on `None` (a silenced stream).
+    send_stream_log_profiled_ctx(proxy, emit, origin, level.unwrap(), &line, sd, Some((data, sc)));
+    if !line.is_empty() {
+        crate::logfmt::recycle_line(line);
+    }
+}
+
+/// Emits `Connect` if `connect` timestamp was just set on `entry`.
+fn log_if_newly_connected(
+    was_connected: bool,
+    entry: &mut SessionEntry,
+    proxies: &crate::table::Table,
+    emit: LogEmit<'_>,
+) {
+    if !was_connected && entry.sess.strm.log.connect.is_some() {
+        maybe_log_connect(entry, proxies, emit);
+    }
+}
+
+/// Emits `Connect` when a server connection just completed and `log-steps connect` or
+/// TCP `option logasap` requires it (`sess_established` in `src/stream.c`).
+fn maybe_log_connect(
+    entry: &mut SessionEntry,
+    proxies: &crate::table::Table,
+    emit: LogEmit<'_>,
+) {
+    let fe = &proxies[entry.proxy_idx];
+    if fe.log_target_idx.is_empty() {
+        return;
+    }
+    let step_connect = fe.log_steps.is_some_and(|m| m & alcyon_config::LOG_STEP_CONNECT != 0);
+    let tcp_asap = entry.sess.mode == Mode::Tcp
+        && fe.log_steps.is_none()
+        && fe.log_opts & alcyon_config::LOG_OPT_ASAP != 0
+        && !entry.sess.strm.log.asap_done;
+    if step_connect || tcp_asap {
+        emit_step_log_entry(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::Connect);
+        if tcp_asap {
+            entry.sess.strm.log.asap_done = true;
+        }
+    }
+}
+
+/// The profile-aware send: each profiled target sends its profile's format for `origin`,
+/// or nothing when `drop`; an unnamed step (with no `on any`) sends the proxy's own line.
+fn send_stream_log_profiled_ctx(
+    proxy: &Proxy,
+    emit: LogEmit<'_>,
+    origin: alcyon_config::ast::logging::LogProfileStepKind,
+    level: LogLevel,
+    line: &[u8],
+    sd: u32,
+    ctx_data: Option<(&crate::logfmt::LogData<'_>, &SampleContext<'_>)>,
+) {
+    let (sd, msg) = line.split_at(usize::try_from(sd).unwrap_or(0).min(line.len()));
+    let min_phase = alcyon_sample::PhaseCtx { log_origin: Some(origin.og_name()), ..alcyon_sample::PhaseCtx::EMPTY };
+    let min_ctx = SampleContext { phase: &min_phase, live: None };
+    let default_data = crate::logfmt::LogData::default();
+    let (data, sc) = ctx_data.unwrap_or((&default_data, &min_ctx));
+    for (k, target) in proxy
+        .log_target_idx
+        .iter()
+        .enumerate()
+        .filter_map(|(k, &i)| emit.targets.get(i).map(|t| (k, t)))
+    {
+        if !target_admits(target, level, proxy.log_cursors.get(k)) {
+            continue;
+        }
+        let prof = target.profile();
+        let tag = prof
+            .and_then(|p| p.log_tag.as_deref())
+            .or(proxy.log_tag.as_deref())
+            .unwrap_or(emit.tag);
+        match match prof {
+            Some(p) => p.resolve(origin),
+            None => crate::syslog::StepResolution::Normal,
+        } {
+            crate::syslog::StepResolution::Drop => {}
+            crate::syslog::StepResolution::Normal => {
+                if !msg.is_empty() {
+                    let _ = target.send_sd(level, tag, "", sd, msg);
+                }
+            }
+            crate::syslog::StepResolution::Override { format, sd: psd } => {
+                let pmsg = format.map(|f| f.render_line(data, sample_registry(), sc));
+                let msg_bytes = pmsg.as_deref().unwrap_or(msg);
+                if !msg_bytes.is_empty() {
+                    let psd_buf = psd.map(|f| f.render_line(data, sample_registry(), sc));
+                    let sd_bytes = psd_buf.as_deref().unwrap_or(sd);
+                    let _ = target.send_sd(level, tag, "", sd_bytes, msg_bytes);
+                    if let Some(b) = psd_buf { crate::logfmt::recycle_line(b); }
+                }
+                if let Some(b) = pmsg {
+                    crate::logfmt::recycle_line(b);
+                }
+            }
+        }
+    }
 }
 
 /// How an HTTP/2 connection that ends without ever opening a stream is logged, as
@@ -3922,7 +4357,7 @@ fn h2_no_stream_end(s: &TcpSession, fe: &Proxy) -> Option<bool> {
     if !s.h2_preface_pending() {
         return None;
     }
-    let read0 = !s.cli_failed && matches!(s.ending, None | Some(crate::proxy::Ending::ClientAbort));
+    let read0 = !s.flags.has(sess_flags::CLI_FAILED) && matches!(s.ending, None | Some(crate::proxy::Ending::ClientAbort));
     Some(read0 && !(s.req.is_empty() && (fe.dont_log_null || fe.ignore_probes)))
 }
 
@@ -3934,11 +4369,29 @@ fn proxy_header_failure(s: &TcpSession) -> Option<crate::proxy::ProxyHdrError> {
     if s.proxy_hdr_err.is_some() {
         return s.proxy_hdr_err;
     }
-    if !s.accept_proxy || s.proxy_handshake_done {
+    if !s.accept_proxy.is_pending() {
         return None;
     }
     // The header's reads end in `proxy_hdr_err` themselves; what is left is the timer.
     matches!(s.ending?, Ending::Timeout(crate::proxy::Which::Client)).then_some(ProxyHdrError::Timeout)
+}
+
+/// Why a connection that was to open with a NetScaler Client IP header did not get past
+/// it, if that is what happened: the parser's refusal, or the client closing, resetting
+/// or timing out before sending one.
+fn cip_header_failure(s: &TcpSession) -> Option<crate::proxy::CipError> {
+    use crate::proxy::{CipError, Ending};
+    let Some(c) = s.cip_state() else {
+        return None;
+    };
+    if c.done {
+        return None;
+    }
+    if let Some(e) = c.err {
+        return Some(e);
+    }
+    // The header's reads end in the refusal themselves; what is left is the timer.
+    matches!(s.ending?, Ending::Timeout(crate::proxy::Which::Client)).then_some(CipError::Timeout)
 }
 
 /// Why a connection ended before a session began: the message of `HAProxy`'s line, whether
@@ -3971,6 +4424,17 @@ impl EmbryonicFailure {
 /// header, or a TLS handshake that failed.
 fn embryonic_failure(s: &TcpSession) -> Option<EmbryonicFailure> {
     if let Some(why) = proxy_header_failure(s) {
+        return Some(EmbryonicFailure {
+            message: why.message().to_string(),
+            null: why.is_null(),
+            code: why.code(),
+            name: why.name(),
+            text: why.message(),
+            tls: false,
+            ssl: None,
+        });
+    }
+    if let Some(why) = cip_header_failure(s) {
         return Some(EmbryonicFailure {
             message: why.message().to_string(),
             null: why.is_null(),
@@ -4019,15 +4483,16 @@ fn proxy_header_error_line(entry: &SessionEntry, proxies: &crate::table::Table, 
         ..session_log_data(s, fe, fe, pid)
     };
     let (view, stick) = (ProxiesView(proxies), StickView::new(proxies, &s.tracked_sc));
-    // No stream, so no backend either: `be_name` has no value in `HAProxy`'s line.
-    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, conn_err: Some(failure.conn_err()), be_name: None, be_id: None, ..stream_sample_ctx(s, fe, fe, &view, &stick) }, live: None };
+    // No stream, so no backend either: `be_name` and `txn.id32` have no value in `HAProxy`'s line.
+    let fc = crate::proxy::ConnView::from_conn(s);
+    let ctx = SampleContext { phase: &alcyon_sample::PhaseCtx { at_log: true, conn_err: Some(failure.conn_err()), be_name: None, be_id: None, t_close: data.t_close, uniq_id: None, ..stream_sample_ctx(s, fe, fe, &view, &stick, fc.as_ref()) }, live: None };
     let line = match fe.error_log_format() {
         Some(elf) => with_sd(fe.log_format_sd(), elf, &data, &ctx),
         None => {
             // The plain line has the frontend's `log-format-sd` in front of it too.
             let mut line = fe.log_format_sd().map_or_else(Vec::new, |sd| sd.render_bytes(&data, sample_registry(), &ctx));
             let sd_len = u32::try_from(line.len()).unwrap_or(0);
-            let listener = s.so_name.as_deref().map_or_else(|| s.so_id.unwrap_or(0).to_string(), str::to_string);
+            let listener = s.so_name.as_deref().map_or_else(|| s.so_id.to_string(), str::to_string);
             line.extend_from_slice(crate::logfmt::connection_error_line(s.client_addr, s.strm.log.date(), &fe.name, &listener, &failure.message).as_bytes());
             (line, sd_len)
         }
@@ -4056,14 +4521,19 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
     let intern = |cfg: &alcyon_config::LogConfig, targets: &mut Vec<SyslogTarget>| -> usize {
         // Interned by target and facility, so two sections naming the same collector
         // share one socket. `stdout` and `stderr` intern too: a descriptor written from
-        // two places interleaves partial lines.
+        // two places interleaves partial lines. The profile is part of the logger: two `log`
+        // lines to one collector under different profiles are different loggers.
+        let profile = cfg
+            .profile
+            .as_deref()
+            .and_then(|n| config.log_profiles.iter().find(|p| p.name == n));
         if let Some(i) = targets
             .iter()
             .position(|t| t.same_logger(cfg))
         {
             return i;
         }
-        targets.push(SyslogTarget::new(cfg));
+        targets.push(SyslogTarget::new(cfg, profile));
         targets.len() - 1
     };
 
@@ -4118,6 +4588,10 @@ fn resolve_log_targets(config: &Config, proxies: &mut [Proxy]) -> Vec<SyslogTarg
         if proxy.log_cursors.len() != resolved.len() {
             proxy.log_cursors = Arc::new(resolved.iter().map(|_| AtomicU64::new(0)).collect());
         }
+        // True when any resolved target carries a `log-profile`; the stream's line is sent
+        // through the profile-aware path only then, so a profile-less proxy is unchanged.
+        // Read before `resolved` moves into the proxy.
+        proxy.any_log_profile = resolved.iter().any(|&i| targets[i].profile().is_some());
         proxy.log_target_idx = resolved;
         // `log-format-sd` fills only an rfc5424 header's STRUCTURED-DATA: a proxy none of
         // whose targets writes one never renders it. A frontend with such a target and no
@@ -4454,6 +4928,7 @@ fn frontend_binds(frontend: &alcyon_config::FrontendSection) -> Vec<alcyon_confi
                 proto: None,
                 accept_proxy: frontend.accept_proxy,
                 accept_proxy_v2: frontend.accept_proxy_v2,
+                accept_netscaler_cip: None,
                 name: None,
                 id: None,
                 min_ver: None,
@@ -4509,6 +4984,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         force_be: crate::rule_compiled::force_be(&listen.force_be_switch, &acls),
         reply_pages: crate::rule_compiled::reply_pages(&listen.error_replies),
         res_stream: false,
+        req_stream: false,
     }.finish());
     Ok(Proxy {
         id: usize_to_u32(proxy_idx),
@@ -4591,6 +5067,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         dont_log_null: listen.dontlognull,
         ignore_probes: listen.http_ignore_probes,
         log_opts: listen.log_opts,
+        log_steps: listen.log_steps,
+        any_log_profile: false,
         unique_id_format: listen.unique_id_format.as_deref().and_then(compile_unique_id_format),
         extra_log: extra_log_formats(listen.error_log_format.as_deref(), listen.log_format_sd.as_deref()),
         unique_id_header: listen.unique_id_header.as_deref().map(Box::from),
@@ -4648,6 +5126,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         force_be: crate::rule_compiled::force_be(&fe.force_be_switch, &acls),
         reply_pages: crate::rule_compiled::reply_pages(&fe.error_replies),
         res_stream: false,
+        req_stream: false,
     }.finish());
     Ok(Proxy {
         id: usize_to_u32(proxy_idx),
@@ -4728,6 +5207,8 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         dont_log_null: fe.dontlognull,
         ignore_probes: fe.http_ignore_probes,
         log_opts: fe.log_opts,
+        log_steps: fe.log_steps,
+        any_log_profile: false,
         unique_id_format: fe.unique_id_format.as_deref().and_then(compile_unique_id_format),
         extra_log: extra_log_formats(fe.error_log_format.as_deref(), fe.log_format_sd.as_deref()),
         unique_id_header: fe.unique_id_header.as_deref().map(Box::from),
@@ -4778,6 +5259,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         force_be: crate::rule_compiled::force_be(&[], &acls),
         reply_pages: crate::rule_compiled::reply_pages(&be.error_replies),
         res_stream: false,
+        req_stream: false,
     }.finish());
     Ok(Proxy {
         id: usize_to_u32(proxy_idx),
@@ -4861,6 +5343,8 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         dont_log_null: false,
         ignore_probes: false,
         log_opts: 0,
+        log_steps: be.log_steps,
+        any_log_profile: false,
         unique_id_format: be.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: be.unique_id_header.as_deref().map(Box::from),
         req_capture_slots: Arc::from([]),
@@ -4874,6 +5358,31 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
     })
 }
 
+fn init_agent_checks(
+    proxies: &crate::table::Table,
+    scheduler: &mut Scheduler,
+    now: Tick,
+) -> Vec<crate::agent_check::AgentCheckState> {
+    let mut agent_checks = Vec::new();
+    for (proxy_idx, proxy) in proxies.iter().enumerate() {
+        for (server_idx, srv_addr) in proxy.srv_set().addrs().enumerate() {
+            let Some(cfg) = proxy.server_agent_config(server_idx).filter(|a| a.enabled).cloned() else {
+                continue;
+            };
+            let mut agent = crate::agent_check::AgentCheckState::new(proxy_idx, server_idx, srv_addr, cfg, now);
+            let idx = usize_to_u32(agent_checks.len());
+            if let Some(task_ref) = scheduler.create(WorkKind::new(Kind::AgentCheck, idx)) {
+                agent.task = task_ref;
+                let initial_delay = 50u32.saturating_add(idx.saturating_mul(50));
+                scheduler.queue_timer(task_ref, now.add(initial_delay));
+            }
+            crate::track::publish_agent_view(proxy, &agent);
+            agent_checks.push(agent);
+        }
+    }
+    agent_checks
+}
+
 fn init_checks(proxies: &crate::table::Table, scheduler: &mut Scheduler, now: Tick) -> Vec<ServerCheckState> {
     let mut checks = Vec::with_capacity(proxies.iter().map(|p| p.srv_set().checked_count()).sum());
     // One task and one timer per check.
@@ -4885,6 +5394,9 @@ fn init_checks(proxies: &crate::table::Table, scheduler: &mut Scheduler, now: Ti
             };
             let mut check = ServerCheckState::new(proxy_idx, server_idx, srv_addr, check_cfg, now);
             check.tls = proxy.srv_set().check_tls_at(server_idx).cloned();
+            // `check-via-socks4` rides the same tunnel as traffic (HAProxy
+            // `srv->check.via_socks4`); it is set up at check start (`step_check`), where
+            // the proxy and target addresses are read from the server state.
             if let Some(r) = proxy.ids.restored(server_idx) {
                 // What the server-state file said (T490), already in `server_statuses`.
                 let published = proxy.srv_set().status_cell(server_idx).map_or(0, |s| s.load(Ordering::Relaxed));
@@ -5288,6 +5800,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     proto: None,
                     accept_proxy: listen.accept_proxy,
                     accept_proxy_v2: listen.accept_proxy_v2,
+                    accept_netscaler_cip: None,
                     name: None,
                     id: None,
                     min_ver: None,
@@ -5309,6 +5822,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     listener.name = b.name.as_deref().map(Into::into);
                     listener.accept_proxy = b.accept_proxy || b.accept_proxy_v2;
                     listener.accept_proxy_v2 = b.accept_proxy_v2;
+                    listener.accept_netscaler_cip = b.accept_netscaler_cip;
                     listener.proto_h2 = b.proto.as_deref() == Some("h2");
                     listener.tls.clone_from(&tls);
                     let l_idx = listeners.len();
@@ -5343,9 +5857,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
                         listener.maxconn = proxies[proxy_idx].maxconn.clone();
                         listener.name = b.name.as_deref().map(Into::into);
-                    listener.accept_proxy = b.accept_proxy || b.accept_proxy_v2;
-                    listener.accept_proxy_v2 = b.accept_proxy_v2;
-                    listener.proto_h2 = b.proto.as_deref() == Some("h2");
+                        listener.accept_proxy = b.accept_proxy || b.accept_proxy_v2;
+                        listener.accept_proxy_v2 = b.accept_proxy_v2;
+                        listener.accept_netscaler_cip = b.accept_netscaler_cip;
+                        listener.proto_h2 = b.proto.as_deref() == Some("h2");
                         listener.tls.clone_from(&tls);
                         let l_idx = listeners.len();
                         let lfd = listener.raw_fd();
@@ -5370,6 +5885,11 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         
         let checks = if worker_id == 0 {
             init_checks(&proxies, &mut scheduler, now)
+        } else {
+            Vec::new()
+        };
+        let agent_checks = if worker_id == 0 {
+            init_agent_checks(&proxies, &mut scheduler, now)
         } else {
             Vec::new()
         };
@@ -5407,6 +5927,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             listeners,
             proxies,
             checks,
+            agent_checks,
             resolvers,
             sessions,
             applets,
@@ -5435,6 +5956,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             worker_id,
             events: Vec::with_capacity(capacity * 2),
             timer_updates: Vec::with_capacity(capacity * 2),
+            nice_updates: Vec::with_capacity(capacity * 2),
             wake_scratch: Vec::new(),
             wake_now_scratch: Vec::new(),
             links_scratch: Vec::new(),
@@ -5998,8 +6520,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 let ql = &mut self.quic_listeners[q_idx];
                 let (peer, local) = (ql.peer_of(conn), ql.addr());
                 let mut tracked: [Option<(usize, StickKey)>; 3] = [None, None, None];
-                let admitted = match eval_tcp_req_conn_rules(&self.proxies[proxy_idx], &self.proxies, sample_registry(), peer, local, Some(&mut tracked)) {
-                    ConnEvalOutcome::Accept(c, s, fs, fd, _) => Some((c, s, fs, fd)),
+                let emit = LogEmit { targets: &self.log_targets, tag: &self.log_tag, pid: self.pid };
+                let admitted = match eval_tcp_req_conn_rules(&self.proxies[proxy_idx], &self.proxies, sample_registry(), peer, local, Some(&mut tracked), emit) {
+                    ConnEvalOutcome::Accept(c, s, fs, fd, _, _) => Some((c, s, fs, fd)),
                     ConnEvalOutcome::Reject | ConnEvalOutcome::SilentDrop(_) => {
                         self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
                         None
@@ -6034,8 +6557,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         maxrewrite,
                         flood,
                         false,
-                        (false, false),
+                        false,
+                        (false, false, None),
                         lb_snap,
+                        emit,
                     )
                     .map(|(sess, _, _)| (sess, mux))
                 });
@@ -6044,13 +6569,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     self.quic_listeners[q_idx].owner_close(conn);
                     continue;
                 };
-                sess.h3 = true;
+                sess.client_proto = ClientProto::H3;
                 // Admitted during a soft stop (its handshake ended after it began, T558): its
                 // streams are served as those of the sessions the stop found (`begin_soft_stop`),
                 // their server connections not kept for a request that will not come.
                 if self.stopping {
-                    sess.stopping = true;
-                    sess.close_client = true;
+                    sess.flags.set(sess_flags::STOPPING);
+                    sess.flags.set(sess_flags::CLOSE_CLIENT);
                 }
                 sess.cli_state = ScState::Established;
                 sess.cli_exp = Tick::ETERNITY;
@@ -6082,6 +6607,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     srv_served: 0,
                     log_line: None,
                     log_err: false,
+                    log_level: LogLevel::Info,
                     log_sd: 0,
                     buf_wait: crate::buf_wait::WaitState::default(),
                     parked: false,
@@ -6505,6 +7031,8 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
         let mut timer_updates = std::mem::take(&mut self.timer_updates);
         timer_updates.clear();
+        let mut nice_updates = std::mem::take(&mut self.nice_updates);
+        nice_updates.clear();
 
         let mut dispatcher = EngineDispatcher {
             sessions: &mut self.sessions,
@@ -6512,6 +7040,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             lb_snap: &mut self.lb_snap,
             proxies: &mut self.proxies,
             checks: &mut self.checks,
+            agent_checks: &mut self.agent_checks,
             resolvers: &mut self.resolvers,
             fdtab: &mut self.fdtab,
             poller: &mut self.poller,
@@ -6522,6 +7051,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             run_queue_len,
             now,
             timer_updates,
+            nice_updates,
             wake_queue: std::mem::take(&mut self.wake_scratch),
             heavy: Vec::new(),
             h2_spawn: std::mem::take(&mut self.h2_spawn_scratch),
@@ -6557,6 +7087,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 self.scheduler.queue_timer(task_ref, expiry);
             }
         }
+        // The nice a `set-nice` rule set this pass (`task_set_nice`): drain so stale
+        // entries never leak or overwrite a later connection that reuses the `TaskRef`.
+        for (task_ref, nice) in dispatcher.nice_updates.drain(..) {
+            if self.scheduler.is_live(task_ref) {
+                self.scheduler.set_nice(task_ref, nice);
+            }
+        }
         for &task_ref in &dispatcher.heavy {
             if self.scheduler.is_live(task_ref) {
                 self.scheduler.set_heavy(task_ref, true);
@@ -6565,6 +7102,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let mut h2_spawn = std::mem::take(&mut dispatcher.h2_spawn);
         let mut wake_queue = std::mem::take(&mut dispatcher.wake_queue);
         self.timer_updates = dispatcher.timer_updates;
+        self.nice_updates = dispatcher.nice_updates;
         for (owner_idx, owner_task) in h2_spawn.drain(..) {
             self.spawn_h2_children(owner_idx, owner_task, &mut wake_queue);
         }
@@ -6608,7 +7146,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             {
                 return;
             }
-            let keep = owner.sess.keep_request_line;
+            let keep = owner.sess.flags.has(sess_flags::KEEP_REQUEST_LINE);
             let d = match owner.sess.h3_owner_mut() {
                 Some(h3) => crate::h2_bridge::dispatch_mux(&mut *h3.mux, keep, "HTTP/3.0"),
                 None => owner.sess.h2_ctx.as_deref_mut().and_then(|h2| crate::h2_bridge::dispatch_next(h2, keep)),
@@ -6648,6 +7186,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 srv_served: 0,
                 log_line: None,
                 log_err: false,
+                log_level: LogLevel::Info,
                 log_sd: 0,
                 buf_wait: crate::buf_wait::WaitState::default(),
                 parked: false,
@@ -7028,15 +7567,17 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             }
 
             // 2. `tcp-request connection` rules, `track-sc*` among them, in rule order.
-            let (client_addr, server_addr, fc_src, fc_dst, expect_proxy) = match eval_tcp_req_conn_rules(
+            let emit = LogEmit { targets: &self.log_targets, tag: &self.log_tag, pid: self.pid };
+            let (client_addr, server_addr, fc_src, fc_dst, expect_proxy, expect_cip) = match eval_tcp_req_conn_rules(
                 &self.proxies[proxy_idx],
                 &self.proxies,
                 sample_registry(),
                 peer_addr,
                 local_addr,
                 Some(&mut tracked_sc),
+                emit,
             ) {
-                ConnEvalOutcome::Accept(c, s, fs, fd, ep) => (c, s, fs, fd, ep),
+                ConnEvalOutcome::Accept(c, s, fs, fd, ep, ec) => (c, s, fs, fd, ep, ec),
                 ConnEvalOutcome::Reject => {
                     raw::abort_with_rst(cli_fd.as_fd());
                     self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
@@ -7123,6 +7664,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 fc_dst,
                 tracked_sc,
                 expect_proxy,
+                expect_cip,
                 quic_ack,
             );
         }
@@ -7265,13 +7807,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     t.close_after = true;
                     t.close_opt = false;
                 }
-                e.sess.stopping = true;
+                e.sess.flags.set(sess_flags::STOPPING);
                 // And so does every transaction it starts from here on: a request read
                 // after the stop is answered with `Connection: close`, as HAProxy switches
                 // a keep-alive stream to close mode once its frontend is stopping
                 // (`src/mux_h1.c`, `h1_set_cli_conn_mode`). Without it the client is told
                 // to reuse a connection the next loop closes under it (T166).
-                e.sess.close_client = true;
+                e.sess.flags.set(sess_flags::CLOSE_CLIENT);
                 if let Some(ref mut h2_ctx) = e.sess.h2_ctx {
                     h2_ctx.send_graceful_goaway();
                     // Wake up the task so the mux can flush the frame. No liveness check:
@@ -7348,7 +7890,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 && e.sess.req.is_empty()
                 && e.sess.rep.is_empty()
                 && e.sess.req_headers.is_none()
-                && !e.sess.has_htx
+                && !e.sess.flags.has(sess_flags::HAS_HTX)
                 // Between requests a keep-alive client sits in `Ready`, not `Established`:
                 // T71 keeps it there across transactions. Matching only `Established` meant
                 // this closed nothing, and an idle client held the soft stop open until
@@ -7361,7 +7903,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 // (`H1C_F_WAIT_NEXT_REQ`, `src/mux_h1.c`) and serves the first one with
                 // `connection: close`; closing it lost requests on every reload under
                 // load (T252). An HTTP/2 connection is told with a GOAWAY either way.
-                && (!e.sess.is_first_req || e.sess.h2_ctx.is_some())
+                && (!e.sess.flags.has(sess_flags::IS_FIRST_REQ) || e.sess.h2_ctx.is_some())
                 // An HTTP/2 connection serving a stream is not idle (the stream is its child,
                 // T280).
                 && e.sess.h2_owner().is_none_or(|o| o.children.is_empty())
@@ -7480,8 +8022,9 @@ fn with_port(addr: Option<SocketAddr>, port: u16) -> SocketAddr {
 
 #[derive(Debug)]
 enum ConnEvalOutcome {
-    /// Client, server, `fc_src`, `fc_dst`, and whether `expect-proxy` matched.
-    Accept(SocketAddr, SocketAddr, SocketAddr, SocketAddr, bool),
+    /// Client, server, `fc_src`, `fc_dst`, and whether `expect-proxy` or
+    /// `expect-netscaler-cip` matched.
+    Accept(SocketAddr, SocketAddr, SocketAddr, SocketAddr, bool, bool),
     Reject,
     /// `silent-drop`; the TTL of the RST (`rst-ttl`, 0 without it: `TCP_REPAIR` first, then 1).
     SilentDrop(u8),
@@ -7500,12 +8043,12 @@ enum SessionEvalOutcome {
 /// before a byte of it. Runs inside the stream's run (`step_stream`), where its variables
 /// and timeouts are. A refusal has the connection-error line of a bad header, with the
 /// text "Success" (`ProxyHdrError::SessionRefused`).
-fn run_deferred_session_rules(proxy_idx: usize, proxies: &crate::table::Table, sess: &mut TcpSession) {
-    if !sess.session_rules_pending || !sess.proxy_handshake_done || sess.is_done() {
+fn run_deferred_session_rules(proxy_idx: usize, proxies: &crate::table::Table, sess: &mut TcpSession, emit: LogEmit<'_>) {
+    if !sess.flags.has(sess_flags::SESSION_RULES_PENDING) || sess.handshake_pending() || sess.is_done() {
         return;
     }
-    sess.session_rules_pending = false;
-    match eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, sample_registry(), sess) {
+    sess.flags.clear(sess_flags::SESSION_RULES_PENDING);
+    match eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, sample_registry(), sess, emit) {
         SessionEvalOutcome::Accept => return,
         SessionEvalOutcome::Reject => sess.abort_client(),
         SessionEvalOutcome::SilentDrop(ttl) => {
@@ -7517,7 +8060,7 @@ fn run_deferred_session_rules(proxy_idx: usize, proxies: &crate::table::Table, s
     sess.proxy_hdr_err = Some(crate::proxy::ProxyHdrError::SessionRefused);
     sess.cli_state = ScState::Closed;
     sess.srv_state = ScState::Closed;
-    sess.tcp_inspect_done = true;
+    sess.flags.set(sess_flags::TCP_INSPECT_DONE);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7528,12 +8071,14 @@ fn eval_tcp_req_conn_rules(
     peer_addr: SocketAddr,
     local_addr: SocketAddr,
     mut tracked: Option<&mut [Option<(usize, StickKey)>; 3]>,
+    emit: LogEmit<'_>,
 ) -> ConnEvalOutcome {
     let mut client_addr = peer_addr;
     let mut server_addr = local_addr;
     let mut fc_src = peer_addr;
     let mut fc_dst = local_addr;
     let mut expect_proxy = false;
+    let mut expect_cip = false;
 
     let stick = StickView::new(proxies, tracked.as_deref().unwrap_or(&[None, None, None]));
     let mut ctx = alcyon_sample::PhaseCtx {
@@ -7567,6 +8112,9 @@ fn eval_tcp_req_conn_rules(
             }
             alcyon_config::TcpReqConnAction::ExpectProxy => {
                 expect_proxy = true;
+            }
+            alcyon_config::TcpReqConnAction::ExpectNetscalerCip => {
+                expect_cip = true;
             }
             // In rule order: an earlier `accept` or `reject` ends the list before it, and the
             // key is read from the address as the rules before it left it. A slot that tracks an
@@ -7631,10 +8179,30 @@ fn eval_tcp_req_conn_rules(
                     ctx.fc_dst = Some(fc_dst);
                 }
             }
+            alcyon_config::TcpReqConnAction::DoLog => {
+                let data = crate::logfmt::LogData {
+                    client: Some(client_addr),
+                    frontend_addr: Some(server_addr),
+                    frontend: &proxy.name,
+                    backend: &proxy.name,
+                    backend_http: proxy.mode == Mode::Http,
+                    actconn: u64::from(crate::globalconn::current()),
+                    feconn: proxy.stats.iter().map(|st| u64::from(st.act_conn.load(Ordering::Relaxed))).sum(),
+                    pid: emit.pid,
+                    hostname: log_hostname(),
+                    ..crate::logfmt::LogData::default()
+                };
+                ctx.log_origin = Some(alcyon_config::ast::logging::LogProfileStepKind::TcpReqConn.og_name());
+                let sc = SampleContext { phase: &ctx, live: None };
+                // No set-log-level can have run yet on this path (tcp-request connection
+                // rules do not accept it), so the level is the unset default.
+                emit_step_log_with(proxy, emit, alcyon_config::ast::logging::LogProfileStepKind::TcpReqConn, stream_log_level(0, proxy, false), &data, &sc);
+                ctx.log_origin = None;
+            }
             _ => {}
         }
     }
-    ConnEvalOutcome::Accept(client_addr, server_addr, fc_src, fc_dst, expect_proxy)
+    ConnEvalOutcome::Accept(client_addr, server_addr, fc_src, fc_dst, expect_proxy, expect_cip)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7643,6 +8211,7 @@ fn eval_tcp_req_session_rules(
     proxies: &crate::table::Table,
     registry: &Registry,
     sess: &mut TcpSession,
+    emit: LogEmit<'_>,
 ) -> SessionEvalOutcome {
     let stick = StickView::new(proxies, &sess.tracked_sc);
     let mut ctx = alcyon_sample::PhaseCtx {
@@ -7652,7 +8221,7 @@ fn eval_tcp_req_session_rules(
         server_addr: sess.server_addr,
         fc_src: sess.fc_src(),
         so_name: sess.so_name.as_deref(),
-        so_id: sess.so_id,
+        so_id: sess.so_id_opt(),
         fe_id: Some(proxy.ids.iid),
         fc_dst: sess.fc_dst(),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
@@ -7665,11 +8234,18 @@ fn eval_tcp_req_session_rules(
         accept_date: Some(sess.strm.log.date()),
         captures_req_hdr: Some(&sess.strm.log.req_captures),
         captures_res_hdr: Some(&sess.strm.log.res_captures),
+        // The stream exists by the time these rules run: `fc.timer.total` reads its
+        // `t_close` (0 until the stream is logged) and `fc.timer.handshake` rides with it.
+        stream: Some(stream_facts(sess, None, true)),
         ..Default::default()
     };
 
     for (rule, rc) in proxy.tcp_req_session_rules.iter().zip(&proxy.rules.tcp_req_session) {
-        let matches = rc.cond.as_ref().is_none_or(|c| c.eval(&ctx.as_ctx(), &proxy.acls, registry));
+        // `HAProxy` reads these fetches from the session (`smp->sess`), so the context is
+        // live, not the pre-loop snapshot: `set-src`/`set-dst` write the session's box
+        // while the rules run, and a reference taken before the loop could not outlive
+        // them (`fc_saved_syn` among them).
+        let matches = rc.cond.as_ref().is_none_or(|c| c.eval(&SampleContext::live(&ctx, &*sess), &proxy.acls, registry));
         if !matches {
             continue;
         }
@@ -7692,7 +8268,7 @@ fn eval_tcp_req_session_rules(
                 } else {
                     proxy.id as usize
                 };
-                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
                         // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
                         if sess.tracked_sc[0].is_none() {
@@ -7709,7 +8285,7 @@ fn eval_tcp_req_session_rules(
                 } else {
                     proxy.id as usize
                 };
-                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
                         // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
                         if sess.tracked_sc[1].is_none() {
@@ -7726,7 +8302,7 @@ fn eval_tcp_req_session_rules(
                 } else {
                     proxy.id as usize
                 };
-                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &ctx.as_ctx(), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
+                if let Some(key) = resolve_stick_key(rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess), proxies.get(t_idx).and_then(|p| p.stick_table.as_ref())) {
                     if let Some(tbl) = proxies.get(t_idx).and_then(|p| p.stick_table.as_ref()) {
                         // A slot that tracks an entry already keeps it (`stream_track_stkctr` is not called again).
                         if sess.tracked_sc[2].is_none() {
@@ -7744,7 +8320,7 @@ fn eval_tcp_req_session_rules(
                 // The sample must convert to an address (`SMP_T_ADDR`, `c_str2addr`): a
                 // string that is not a bare IP converts to nothing and the action does
                 // nothing (`sample_fetch_as_type` returns null).
-                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp)).unwrap_or_default();
+                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &SampleContext::live(&ctx, &*sess))).map(|smp| sample_to_string(&smp)).unwrap_or_default();
                 if let Ok(ip) = val.parse::<IpAddr>() {
                     let port = sess.sess_src().or(sess.fc_src).map_or(0, |a| a.port());
                     let new_addr = SocketAddr::new(ip, port);
@@ -7754,7 +8330,7 @@ fn eval_tcp_req_session_rules(
                 }
             }
             alcyon_config::TcpReqSessionAction::SetDst { expr: _ } => {
-                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp)).unwrap_or_default();
+                let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &SampleContext::live(&ctx, &*sess))).map(|smp| sample_to_string(&smp)).unwrap_or_default();
                 if let Ok(ip) = val.parse::<IpAddr>() {
                     let port = sess.sess_dst().or(sess.fc_dst).map_or(0, |a| a.port());
                     let new_addr = SocketAddr::new(ip, port);
@@ -7764,7 +8340,7 @@ fn eval_tcp_req_session_rules(
                 }
             }
             alcyon_config::TcpReqSessionAction::SetSrcPort { expr: _ } => {
-                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
+                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess)) {
                     let new_addr = with_port(sess.sess_src().or(sess.fc_src), port);
                     sess.sess_addr.get_or_insert_with(Box::default).src = Some(new_addr);
                     sess.client_addr = Some(new_addr);
@@ -7772,7 +8348,7 @@ fn eval_tcp_req_session_rules(
                 }
             }
             alcyon_config::TcpReqSessionAction::SetDstPort { expr: _ } => {
-                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
+                if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess)) {
                     let new_addr = with_port(sess.sess_dst().or(sess.fc_dst), port);
                     sess.sess_addr.get_or_insert_with(Box::default).dst = Some(new_addr);
                     sess.server_addr = Some(new_addr);
@@ -7785,15 +8361,22 @@ fn eval_tcp_req_session_rules(
                 // fetched sets nothing.
                 // A constant (`str(hello)`) is copied in, with no allocation (T364 S6).
                 let e = rc.expr.as_ref();
-                let sc = ctx.as_ctx();
                 if let Some(c) = e.and_then(|e| e.constant(registry)) {
                     store_var_in(&mut sess.strm.vars, &rc.var(var_name), alcyon_sample::vars::In::Ref(c));
-                } else if let Some(val) = e.and_then(|e| e.eval_smp(registry, &sc)) {
-                    rc.var(var_name).store_smp(&mut sess.strm.vars, val);
+                } else {
+                    // The value borrows the session through the live context: the stream's
+                    // variables are taken out for the store (a swap of an empty `Vec`, no
+                    // allocation) and put back, as the `http-request` arm does.
+                    let mut vars = std::mem::take(&mut sess.strm.vars);
+                    let sc = SampleContext::live(&ctx, &*sess);
+                    if let Some(val) = e.and_then(|e| e.eval_smp(registry, &sc)) {
+                        rc.var(var_name).store_smp(&mut vars, val);
+                    }
+                    sess.strm.vars = vars;
                 }
             }
             alcyon_config::TcpReqSessionAction::SetVarFmt { var_name, fmt: _ } => {
-                let val = render_rule_fmt(rc, &ctx.as_ctx(), registry);
+                let val = render_rule_fmt(rc, &SampleContext::live(&ctx, &*sess), registry);
                 store_var(&mut sess.strm.vars, &rc.var(var_name), val);
             }
             alcyon_config::TcpReqSessionAction::UnsetVar { var_name } => {
@@ -7802,17 +8385,24 @@ fn eval_tcp_req_session_rules(
             alcyon_config::TcpReqSessionAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
             alcyon_config::TcpReqSessionAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
             alcyon_config::TcpReqSessionAction::ScSetGpt0 { sc, expr } => {
-                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx.as_ctx());
+                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess));
                 sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::SetTag(val));
             }
             alcyon_config::TcpReqSessionAction::ScIncGpc { idx, sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Inc),
             alcyon_config::TcpReqSessionAction::ScAddGpc { idx, sc, expr } => {
-                let n = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx.as_ctx());
+                let n = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess));
                 sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Add(u64::from(n)));
             }
             alcyon_config::TcpReqSessionAction::ScSetGpt { idx, sc, expr } => {
-                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx.as_ctx());
+                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &SampleContext::live(&ctx, &*sess));
                 sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::SetTag(val));
+            }
+            alcyon_config::TcpReqSessionAction::DoLog => {
+                let data = session_log_data(sess, proxy, proxy, emit.pid);
+                ctx.log_origin = Some(alcyon_config::ast::logging::LogProfileStepKind::TcpReqSess.og_name());
+                let sc = SampleContext { phase: &ctx, live: None };
+                emit_step_log_with(proxy, emit, alcyon_config::ast::logging::LogProfileStepKind::TcpReqSess, stream_log_level(sess.strm.log.log_level, proxy, false), &data, &sc);
+                ctx.log_origin = None;
             }
             _ => {}
         }
@@ -7829,6 +8419,7 @@ enum ContentEvalResult {
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn eval_tcp_req_content_rules(
     proxy: &Proxy,
     fe_idx: usize,
@@ -7837,6 +8428,7 @@ fn eval_tcp_req_content_rules(
     sess: &mut TcpSession,
     now: Tick,
     start: usize,
+    emit: LogEmit<'_>,
 ) -> ContentEvalResult {
     if proxy.tcp_req_content_rules.is_empty() {
         return ContentEvalResult::Done;
@@ -7844,20 +8436,20 @@ fn eval_tcp_req_content_rules(
 
     let req_bytes = sess.req.readable();
     // An HTTP/2 or HTTP/3 head in its HTX alone is content (X4).
-    let has_content = !req_bytes.is_empty() || sess.req_head_pending;
+    let has_content = !req_bytes.is_empty() || sess.flags.has(sess_flags::REQ_HEAD_PENDING);
     // A kept-alive connection closed by the client with no next request has no stream to
     // inspect: HAProxy runs nothing for it.
     if sess.mode == Mode::Http
-        && !sess.is_first_req
-        && !sess.has_htx
+        && !sess.flags.has(sess_flags::IS_FIRST_REQ)
+        && !sess.flags.has(sess_flags::HAS_HTX)
         && !has_content
         && matches!(sess.cli_state, ScState::ShutR | ScState::Closed)
     {
         return ContentEvalResult::Done;
     }
-    let expired = sess.inspect_exp.is_some_and(|exp| exp.is_expired(now));
+    let expired = sess.inspect_exp.is_expired(now);
     let client_closed = sess.cli_state == ScState::ShutR || sess.cli_state == ScState::Closed;
-    let can_wait = sess.inspect_exp.is_some() && !expired && !client_closed;
+    let can_wait = sess.inspect_exp.is_set() && !expired && !client_closed;
 
     if !has_content && (can_wait || (sess.mode == Mode::Http && !client_closed)) {
         return ContentEvalResult::Waiting;
@@ -7871,9 +8463,10 @@ fn eval_tcp_req_content_rules(
         server_addr: sess.server_addr,
         fc_src: sess.fc_src(),
         so_name: sess.so_name.as_deref(),
-        so_id: sess.so_id,
+        so_id: sess.so_id_opt(),
         fc_dst: sess.fc_dst(),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+        saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
         quic_acks: sess.quic_facts(),
         fc_http_major: sess.fc_http_major(),
@@ -7885,7 +8478,7 @@ fn eval_tcp_req_content_rules(
         // In HTTP mode the request is parsed by the time these rules run, and `path`,
         // `hdr()` and the like read it, as they do in `HAProxy`. Built from the fields: the
         // rules change `vars` while this borrows.
-        htx_slice: sess.has_htx.then(|| alcyon_proto::htx::HtxSliceRef::new(sess.htx_buf.raw_slice(), sess.htx_blocks)),
+        htx_slice: sess.flags.has(sess_flags::HAS_HTX).then(|| alcyon_proto::htx::HtxSliceRef::new(sess.htx_buf.raw_slice(), sess.htx_blocks)),
         req_uri: sess.req_uri.as_deref(),
         req_method: sess.req_method.as_deref(),
         req_headers: sess.req_headers.as_deref(),
@@ -7896,6 +8489,10 @@ fn eval_tcp_req_content_rules(
         prio: (sess.strm.log.prio_class, sess.strm.log.prio_offset),
         captures_req_hdr: Some(&sess.strm.log.req_captures),
         captures_res_hdr: Some(&sess.strm.log.res_captures),
+        // The stream exists by the time these rules run: the timer fetches read its logs,
+        // `-1` where nothing is stamped yet.
+        stream: Some(stream_facts(sess, None, true)),
+        uniq_id: Some(sess.strm.log.uniq_id),
         ..Default::default()
     };
 
@@ -8003,7 +8600,7 @@ fn eval_tcp_req_content_rules(
                         if let Some(slot) = sess.strm.log.req_captures.get_mut(*id) {
                             *slot = Some(cut_at(&val, *len).into_owned());
                         }
-                        return eval_tcp_req_content_rules(proxy, fe_idx, proxies, registry, sess, now, rule_idx + 1);
+                        return eval_tcp_req_content_rules(proxy, fe_idx, proxies, registry, sess, now, rule_idx + 1, emit);
                     }
                 }
             }
@@ -8101,6 +8698,13 @@ fn eval_tcp_req_content_rules(
                 sess.mode = Mode::Http;
                 sess.cli_state = ScState::Ready;
             }
+            alcyon_config::TcpReqContentAction::DoLog => {
+                let data = session_log_data(sess, &proxies[fe_idx], proxy, emit.pid);
+                ctx.log_origin = Some(alcyon_config::ast::logging::LogProfileStepKind::TcpReqCont.og_name());
+                let sc = SampleContext { phase: &ctx, live: None };
+                emit_step_log_with(&proxies[fe_idx], emit, alcyon_config::ast::logging::LogProfileStepKind::TcpReqCont, stream_log_level(sess.strm.log.log_level, &proxies[fe_idx], false), &data, &sc);
+                ctx.log_origin = None;
+            }
             _ => {}
         }
     }
@@ -8153,7 +8757,8 @@ fn res_sample_may_change(expr: &Expr, rep: &[u8]) -> bool {
 /// `tcp-response inspect-delay` runs out, when they decide on what is there.
 fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &crate::table::Table, registry: &Registry, sess: &mut TcpSession, now: Tick) -> ContentEvalResult {
     let server_closed = matches!(sess.srv_state, ScState::ShutR | ScState::Closed | ScState::Error);
-    let expired = sess.res_inspect_exp.is_none_or(|exp| exp.is_expired(now));
+    let res_exp = sess.res_inspect.as_ref().map_or(Tick::ETERNITY, |r| r.exp);
+    let expired = !res_exp.is_set() || res_exp.is_expired(now);
     let final_ = server_closed || sess.rep.is_full() || expired;
     let rep_bytes = sess.rep.readable();
     let stick = StickView::new(proxies, &sess.tracked_sc);
@@ -8164,9 +8769,10 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &crate::table::Table, regi
         server_addr: sess.server_addr,
         fc_src: sess.fc_src(),
         so_name: sess.so_name.as_deref(),
-        so_id: sess.so_id,
+        so_id: sess.so_id_opt(),
         fc_dst: sess.fc_dst(),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+        saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
         quic_acks: sess.quic_facts(),
         fc_http_major: sess.fc_http_major(),
@@ -8185,6 +8791,8 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &crate::table::Table, regi
         term_state: Some(sess_term_state(sess)),
         bc_dst: sess.bc_dst(),
         bc_src: sess.bc_src(),
+        last_rule: last_rule_at(sess.strm.log.last_rule),
+        uniq_id: Some(sess.strm.log.uniq_id),
         ..Default::default()
     }, live: None };
     for (rule, rc) in proxy.tcp_res_content_rules.iter().zip(&proxy.rules.tcp_res_content) {
@@ -8403,8 +9011,10 @@ fn stream_timeouts_enter(proxies: &crate::table::Table, fe_idx: usize, be_idx: u
 /// Readies a TCP-mode stream for `proxy`'s `tcp-response content` rules, if it has any
 /// (`AN_RES_INSPECT`, set with the backend); they start when the server connects.
 fn arm_res_inspect(proxy: &Proxy, sess: &mut TcpSession) {
-    sess.res_inspect_armed = (sess.mode == Mode::Tcp && !proxy.tcp_res_content_rules.is_empty())
-        .then(|| proxy.tcp_res_inspect_delay.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
+    if sess.mode == Mode::Tcp && !proxy.tcp_res_content_rules.is_empty() {
+        let Some(r) = sess.res_inspect.get_or_init(&crate::proxy::RES_INSPECT_POOL) else { return };
+        r.armed = Some(proxy.tcp_res_inspect_delay.map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
+    }
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -8436,6 +9046,7 @@ fn register_new_session(
     fc_dst: SocketAddr,
     tracked_sc: [Option<(usize, StickKey)>; 3],
     expect_proxy: bool,
+    expect_cip: bool,
     quic_ack: Option<crate::proxy::QuicAckSrc>,
 ) {
     // Cloned out before `proxies` is borrowed mutably. TLS belongs to the bind that
@@ -8447,6 +9058,16 @@ fn register_new_session(
     // A client that reset while its connection waited at `maxconn`: `HAProxy` finds the
     // reset with the request, and the stream's state tells it (`client_left`, T231).
     let reset_pending = engine.backlog_waits && crate::raw::reset_pending(cli_fd.as_fd());
+    // `bind tcp-ss`: the kernel records the SYN of the connection and answers
+    // `getsockopt(TCP_SAVED_SYN)` with its bytes only once — the read consumes them — so
+    // it is made once here, at accept, and only for a bind that asked for the recording.
+    // The bytes are kept on the session behind the `sess_addr` box.
+    let saved_syn = listener_idx
+        .and_then(|i| engine.listeners.get(i))
+        .is_some_and(|l| l.tcp_save_syn != 0)
+        .then(|| crate::raw::saved_syn(cli_fd.as_fd()))
+        .flatten();
+    let emit = LogEmit { targets: &engine.log_targets, tag: &engine.log_tag, pid: engine.pid };
     let Some((mut sess, target_addr, srv_raw_fd)) = init_client_session(
         &mut engine.proxies,
         proxy_idx,
@@ -8465,23 +9086,33 @@ fn register_new_session(
         engine.global_maxrewrite,
         engine.global_h2_flood_config,
         expect_proxy,
+        expect_cip,
         listener_idx
             .and_then(|i| engine.listeners.get(i))
-            .map_or((false, false), |l| (l.accept_proxy, l.accept_proxy_v2)),
+            .map_or((false, false, None), |l| (l.accept_proxy, l.accept_proxy_v2, l.accept_netscaler_cip)),
         &mut engine.lb_snap,
+        emit,
     ) else {
         // TLS setup failed; the fd is dropped with the session and the connection closes.
         return;
     };
     // Without a listener, the client is an HTTP/3 request stream (`adopt_quic_streams`).
-    sess.reset_with_request = reset_pending;
-    sess.h3 = listener_idx.is_none();
+    sess.flags.set_to(sess_flags::RESET_WITH_REQUEST, reset_pending);
+    sess.client_proto = if listener_idx.is_none() {
+        ClientProto::H3
+    } else if listener_idx.and_then(|i| engine.listeners.get(i)).is_some_and(|l| l.proto_h2) {
+        ClientProto::H2
+    } else {
+        ClientProto::Auto
+    };
     if let Some(q) = quic_ack {
         sess.h2_role = Some(crate::proxy::relay_role(q));
     }
-    sess.proto_h2 = listener_idx.and_then(|i| engine.listeners.get(i)).is_some_and(|l| l.proto_h2);
     sess.so_name = listener_idx.and_then(|i| engine.listeners.get(i)).and_then(|l| l.name.clone());
-    sess.so_id = listener_idx.and_then(|i| engine.listeners.get(i)).map(|l| l.luid).filter(|&id| id != 0);
+    sess.so_id = listener_idx.and_then(|i| engine.listeners.get(i)).map_or(0, |l| l.luid);
+    if let Some(syn) = saved_syn {
+        sess.sess_addr.get_or_insert_with(Box::default).saved_syn = Some(syn);
+    }
 
     let proxy = &engine.proxies[proxy_idx];
 
@@ -8490,7 +9121,7 @@ fn register_new_session(
         count_connect(&engine.proxies, proxy_idx, target_server_idx, false);
     }
     // A balanced pick counted its server when it took the slot (`init_client_session`).
-    if let Some(idx) = target_server_idx.filter(|_| !sess.lb_picked) {
+    if let Some(idx) = target_server_idx.filter(|_| !sess.flags.has(sess_flags::LB_PICKED)) {
         proxy.srv_set().actconn_inc(idx);
     }
 
@@ -8521,11 +9152,12 @@ fn register_new_session(
         actconn_reclaimed: false,
         stats_done: false,
         be_counted: std::cell::Cell::new(NO_BACKEND),
-        connect_log_due: proxy.log_format.is_none() && !proxy.log_target_idx.is_empty(),
+        connect_log_due: proxy.log_format.is_none() && proxy.log_steps.is_none() && !proxy.log_target_idx.is_empty(),
         rate_max_due: true,
         srv_served: 0,
         log_line: None,
         log_err: false,
+        log_level: LogLevel::Info,
         log_sd: 0,
         buf_wait: crate::buf_wait::WaitState::default(),
         parked: false,
@@ -8610,6 +9242,10 @@ fn register_new_session(
     engine
         .scheduler
         .tasklet_wakeup(task_ref, Class::Urgent, state::WOKEN_IO);
+    if engine.proxies[proxy_idx].log_steps.is_some_and(|m| m & alcyon_config::LOG_STEP_ACCEPT != 0) {
+        emit_step_log_entry(entry, &engine.proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::Accept);
+    }
+    log_if_newly_connected(false, entry, &engine.proxies, emit);
 }
 
 /// Whether a server written without a port, or without an address, takes them from the
@@ -8630,15 +9266,33 @@ pub(crate) fn connect_addr(server: SocketAddr, dst: Option<SocketAddr>) -> Socke
     SocketAddr::new(ip, port)
 }
 
+/// The `socks4 <proxy>` address of slot `s_idx`'s server, if any: the socket then
+/// connects to the proxy, and the server's own address rides in the 16-byte SOCKS4
+/// request the tunnel sends first (`srv_parse_socks4`, `src/server.c`).
+fn socks4_proxy_of(proxies: &crate::table::Table, be_idx: usize, s_idx: Option<usize>) -> Option<SocketAddr> {
+    s_idx.and_then(|i| proxies[be_idx].srv_set().socks4_at(i))
+}
+
+/// Opens the SOCKS4 handshake on a server socket that went out through the slot's
+/// `socks4` proxy: the `CO_FL_SOCKS4_*` flags start the request out and the reply owed.
+/// The request itself is rebuilt on the stack by `process_srv_io` from the (fixed)
+/// target the socket is dialing, so nothing is stored on the session.
+fn start_socks4_handshake(sess: &mut TcpSession, proxy: Option<SocketAddr>) {
+    sess.clear_socks4();
+    if proxy.is_some() {
+        sess.flags.set(sess_flags::SOCKS4_SEND | sess_flags::SOCKS4_RECV);
+    }
+}
+
 /// The stream connects to `target` now: `%si` and the stats read the configured address,
 /// `bc_dst` the one the socket connects to.
 fn set_target(entry: &mut SessionEntry, target: SocketAddr) {
     entry.sess.target_addr = Some(target);
-    entry.sess.bc_idle = false;
+    entry.sess.flags.clear(sess_flags::BC_IDLE);
 }
 
 fn maybe_prepend_send_proxy(fe: &Proxy, proxy: &Proxy, proxies: &crate::table::Table, sess: &mut TcpSession, target_addr: SocketAddr) {
-    if sess.send_proxy_prepended {
+    if sess.flags.has(sess_flags::SEND_PROXY_PREPENDED) {
         return;
     }
     let before = sess.req.len();
@@ -8660,7 +9314,7 @@ fn maybe_prepend_send_proxy(fe: &Proxy, proxy: &Proxy, proxies: &crate::table::T
 fn prepend_send_proxy(fe: &Proxy, proxy: &Proxy, proxies: &crate::table::Table, sess: &mut TcpSession, target_addr: SocketAddr) {
     if let Some(hdr) = proxy_header(fe, proxy, proxies, sess, target_addr) {
         sess.req.replace_prefix(0, &hdr);
-        sess.send_proxy_prepended = true;
+        sess.flags.set(sess_flags::SEND_PROXY_PREPENDED);
         sess.send_proxy_header = hdr;
     }
 }
@@ -8676,13 +9330,42 @@ fn proxy_header(fe: &Proxy, proxy: &Proxy, proxies: &crate::table::Table, sess: 
         let src = sess.client_addr;
         let dst = sess.server_addr.or(Some(proxy.addr));
         let mut tlv_data = sess.proxy_info.as_ref().map_or_else(Vec::new, |p| p.tlv_data.clone());
+        if let Some(tlvs) = proxy.srv_set().pp_tlv_fmts_at(idx) {
+            // `make_proxy_line_v2` appends the server's `pp_tlvs` first, in the order the
+            // lines gave them (the `default-server` ones before its own), before the
+            // unique-id TLV: type, length, the rendered value.
+            let mut append_tlvs = |render: Option<(&_, &_)>| {
+                for (id, fmt) in &tlvs.tlvs {
+                    tlv_data.push(*id);
+                    tlv_data.extend_from_slice(&0u16.to_be_bytes());
+                    if let (Some(fmt), Some((data, ctx))) = (fmt, render) {
+                        let start = tlv_data.len();
+                        fmt.render_value_append(&mut tlv_data, data, sample_registry(), ctx);
+                        let len = u16::try_from(tlv_data.len() - start).unwrap_or(u16::MAX);
+                        tlv_data[start - 2..start].copy_from_slice(&len.to_be_bytes());
+                    }
+                }
+            };
+            if tlvs.tlvs.iter().any(|(_, fmt)| fmt.is_some()) {
+                let view = ProxiesView(proxies);
+                let stick = StickView::new(proxies, &sess.tracked_sc);
+                let fc = crate::proxy::ConnView::from_conn(sess);
+                let phase = stream_sample_ctx(sess, fe, proxy, &view, &stick, fc.as_ref());
+                let ctx = phase.as_ctx();
+                let data = session_log_data(sess, fe, proxy, std::process::id());
+                append_tlvs(Some((&data, &ctx)));
+            } else {
+                append_tlvs(None);
+            }
+        }
         if proxy.srv_set().pp_unique_id_at(idx) {
             // `PP2_TYPE_UNIQUE_ID`: the stream's ID, built now if nothing has yet (a TCP
             // stream), from the frontend's format; without one, an empty TLV
             // (`stream_generate_unique_id`, `make_proxy_line_v2`).
             if sess.strm.log.unique_id.is_none() {
                 if let Some(fmt) = fe.unique_id_format.as_ref() {
-                    let id = fmt.render(&session_log_data(sess, fe, proxy, std::process::id()), sample_registry(), &stream_sample_ctx(sess, fe, proxy, &ProxiesView(proxies), &StickView::new(proxies, &sess.tracked_sc)).as_ctx());
+                    let fc = crate::proxy::ConnView::from_conn(sess);
+                    let id = fmt.render(&session_log_data(sess, fe, proxy, std::process::id()), sample_registry(), &stream_sample_ctx(sess, fe, proxy, &ProxiesView(proxies), &StickView::new(proxies, &sess.tracked_sc), fc.as_ref()).as_ctx());
                     sess.strm.log.unique_id = Some(id);
                 }
             }
@@ -8721,8 +9404,10 @@ fn init_client_session(
     global_maxrewrite: usize,
     global_h2_flood_config: alcyon_proto::H2FloodConfig,
     expect_proxy: bool,
-    bind_proxy: (bool, bool),
+    expect_cip: bool,
+    bind_proxy: (bool, bool, Option<u32>),
     lb_snap: &mut crate::lb::LbSnapCache,
+    emit: LogEmit<'_>,
 ) -> Option<(TcpSession, Option<SocketAddr>, Option<RawFd>)> {
     let mode = proxies[proxy_idx].mode;
     let timeouts = proxies[proxy_idx].timeouts;
@@ -8752,14 +9437,17 @@ fn init_client_session(
     sess.tracked_sc = tracked_sc;
     sess.h2_flood_config = global_h2_flood_config;
     let fe = &proxies[proxy_idx];
-    sess.accept_unsafe_request = fe.stats_config.accept_unsafe_request;
+    sess.flags.set_to(sess_flags::ACCEPT_UNSAFE_REQUEST, fe.stats_config.accept_unsafe_request);
     sess.http_request_ms = fe.stats_config.raw_timeouts.http_request.map_or(0, millis_to_u32);
     sess.keep_alive_ms = fe.stats_config.raw_timeouts.http_keep_alive.map_or(0, millis_to_u32);
-    sess.close_client = client_close(proxies, proxy_idx);
-    sess.drop_rsp_trailers = fe.h1_adjust & alcyon_config::H1_DROP_RES_TRAILERS != 0;
+    sess.flags.set_to(sess_flags::CLOSE_CLIENT, client_close(proxies, proxy_idx));
+    sess.flags.set_to(sess_flags::DROP_RSP_TRAILERS, fe.h1_adjust & alcyon_config::H1_DROP_RES_TRAILERS != 0);
     sess.arm_request(now);
-    sess.keep_request_line = (!fe.log_target_idx.is_empty() && fe.log_format.as_ref().is_some_and(|f| f.uses_request_line()))
-        || fe.unique_id_format.as_ref().is_some_and(|f| f.uses_request_line());
+    sess.flags.set_to(
+        sess_flags::KEEP_REQUEST_LINE,
+        (!fe.log_target_idx.is_empty() && (fe.any_log_profile || fe.log_format.as_ref().is_some_and(|f| f.uses_request_line())))
+            || fe.unique_id_format.as_ref().is_some_and(|f| f.uses_request_line()),
+    );
     // Use per-engine values rather than the global `BUFSIZE_STANDARD` atomic so that
     // multiple Engine instances running in the same process (e.g. parallel tests) do not
     // race each other's configuration.
@@ -8784,16 +9472,23 @@ fn init_client_session(
         // `tcp-request connection expect-proxy layer4` matched: v1 or v2, as `accept-proxy`.
         sess.enable_accept_proxy(false);
     }
+    // `accept-netscaler-cip` belongs to the bind that accepted, likewise; a
+    // `tcp-request connection expect-netscaler-cip` that matched reads the magic the
+    // bind declares, 0 when it declares none.
+    if bind_proxy.2.is_some() || expect_cip {
+        sess.enable_accept_netscaler_cip(bind_proxy.2.unwrap_or(0));
+    }
 
     let registry = sample_registry();
-    // With a PROXY header to come, the rules wait for it (`run_deferred_session_rules`).
-    let session_rules = if sess.accept_proxy {
-        sess.session_rules_pending = true;
-        sess.rare_armed = true;
+    // With a PROXY header or a NetScaler Client IP header to come, the rules wait for
+    // it (`run_deferred_session_rules`).
+    let session_rules = if sess.handshake_pending() {
+        sess.flags.set(sess_flags::SESSION_RULES_PENDING);
+        sess.flags.set(sess_flags::RARE_ARMED);
         SessionEvalOutcome::Accept
     } else {
         stream_timeouts_enter(proxies, proxy_idx, proxy_idx, &sess);
-        let out = with_stream_vars(&mut sess, &proxies[proxy_idx], |sess| eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, sess));
+        let out = with_stream_vars(&mut sess, &proxies[proxy_idx], |sess| eval_tcp_req_session_rules(&proxies[proxy_idx], proxies, registry, sess, emit));
         CURRENT_TIMEOUTS.set(None);
         out
     };
@@ -8819,7 +9514,7 @@ fn init_client_session(
     let use_server = use_server.or_else(|| {
         let p = &proxies[proxy_idx];
         let direct = mode == Mode::Tcp
-            && !sess.accept_proxy
+            && !sess.handshake_pending()
             && p.tcp_req_inspect_delay.is_none()
             && p.tcp_req_content_rules.is_empty()
             && p.use_backends.is_empty()
@@ -8830,11 +9525,11 @@ fn init_client_session(
 
     let has_inspect = proxy.tcp_req_inspect_delay.is_some() || !proxy.tcp_req_content_rules.is_empty();
     if has_inspect {
-        sess.tcp_inspect_done = false;
-        sess.rare_armed = true;
+        sess.flags.clear(sess_flags::TCP_INSPECT_DONE);
+        sess.flags.set(sess_flags::RARE_ARMED);
         if let Some(delay) = proxy.tcp_req_inspect_delay {
             let ms = u32::try_from(delay.as_millis()).unwrap_or(u32::MAX);
-            sess.inspect_exp = Some(now.add(ms));
+            sess.inspect_exp = now.add(ms);
         }
     }
 
@@ -8850,24 +9545,33 @@ fn init_client_session(
         sess.cli_state = ScState::ShutR;
         sess.srv_state = ScState::Closed;
     } else if mode == Mode::Tcp
-        && !sess.accept_proxy
-        && sess.tcp_inspect_done
+        && !sess.handshake_pending()
+        && sess.flags.has(sess_flags::TCP_INSPECT_DONE)
         // A proxy that routes (`use_backend`, `default_backend`) connects once the backend
         // is resolved (`connect_tcp_backend`): its own server list is not the one to use.
         && proxy.use_backends.is_empty()
         && proxy.default_backend.is_none()
     {
-        sess.lb_picked = use_server.is_none();
+        sess.flags.set_to(sess_flags::LB_PICKED, use_server.is_none());
         // A balanced pick takes its server's slot with it (T590), on the index the session
-        // is counted on (`register_new_session`); `use-server` is counted there.
+        // is counted on (`register_new_session`); `use-server` is counted there. The slot
+        // (not just the address) is kept: two servers may share an address with different
+        // `tcp-md5sig` keys, and the key is the picked server's.
+        let mut target_slot = None;
         target_addr = match use_server {
-            Some(i) => Some(proxy.srv_set().addr_at(i)),
+            Some(i) => {
+                target_slot = Some(i);
+                Some(proxy.srv_set().addr_at(i))
+            }
             None => proxy
                 .pick_and_take(true, || {
                     let a = proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()), sess.req_uri.as_deref(), lb_snap)?;
                     Some((proxy.srv_set().slot_of_addr(a), a))
                 })
-                .map(|((_, a), _)| a),
+                .map(|((i, a), _)| {
+                    target_slot = i;
+                    a
+                }),
         };
         if let Some(target) = target_addr {
             let proxies: &crate::table::Table = proxies;
@@ -8877,12 +9581,20 @@ fn init_client_session(
             sess.set_backend_timeouts(proxy);
 
             sess.target_addr = Some(target);
-            let connected = raw::connect_opts(connect_addr(target, sess.server_addr), proxy.srv_set().tfo_of(target))
-                .inspect_err(|e| sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)));
+            let srv_set = proxy.srv_set();
+            let s_idx = srv_set.slot_of_addr(target);
+            let real = connect_addr(target, sess.server_addr);
+            let socks4 = socks4_proxy_of(proxies, proxy_idx, s_idx);
+            let connected = raw::connect_opts(
+                socks4.unwrap_or(real),
+                srv_set.tfo_of(target),
+                target_slot.and_then(|i| srv_set.md5sig_at(i)).map(str::as_bytes),
+            )
+            .inspect_err(|e| sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)));
             if let Ok((srv_fd, immediate)) = connected {
                 let sfd = srv_fd.as_raw_fd();
-                let s_idx = proxy.srv_set().slot_of_addr(target);
                 attach_server_to(&mut sess, proxies, proxy_idx, proxy_idx, s_idx, srv_fd, now);
+                start_socks4_handshake(&mut sess, socks4);
                 srv_raw_fd = Some(sfd);
                 if immediate {
                     sess.server_connected(now);
@@ -8893,6 +9605,7 @@ fn init_client_session(
                 proxy.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
                 if let Some(i) = proxy.srv_set().slot_of_addr(target) {
                     proxy.srv_set().bump_retr(i, (0, 0, 1));
+                    crate::check::health_adjust(proxies, proxy_idx, i, crate::check::HanaStatus::L4Err);
                 }
                 sess.srv_state = ScState::Error;
             }
@@ -8923,7 +9636,7 @@ pub fn shutdown_session_entry(
         let proxy_idx = entry.proxy_idx;
         // A stream of an HTTP/2 connection holds no connection slot (T280).
         // ... nor does an HTTP/3 request stream (T504): its connection does.
-        if proxy_idx < proxies.len() && !entry.sess.is_h2_child() && !entry.sess.h3 {
+        if proxy_idx < proxies.len() && !entry.sess.is_h2_child() && entry.sess.client_proto != ClientProto::H3 {
             proxies[proxy_idx].counters().act_conn.fetch_sub(1, Ordering::Relaxed);
             crate::globalconn::release();
         }
@@ -9091,6 +9804,7 @@ struct EngineDispatcher<'a> {
     lb_snap: &'a mut crate::lb::LbSnapCache,
     proxies: &'a mut Proxies,
     checks: &'a mut [ServerCheckState],
+    agent_checks: &'a mut [crate::agent_check::AgentCheckState],
     resolvers: &'a mut [crate::resolvers::Section],
     fdtab: &'a mut FdTab,
     poller: &'a mut Poller,
@@ -9101,6 +9815,7 @@ struct EngineDispatcher<'a> {
     run_queue_len: usize,
     now: Tick,
     timer_updates: Vec<(TaskRef, Tick)>,
+    nice_updates: Vec<(TaskRef, i16)>,
     wake_queue: Vec<TaskRef>,
     /// The housekeeping concerns whose timers fired this pass (bit per `hk::*`), run by the
     /// engine after the pass.
@@ -9226,8 +9941,10 @@ fn release_server(
         entry.srv_raw_fd = None;
         let reusable = reusable
             && matches!(entry.sess.srv_state, ScState::Ready | ScState::Established)
+            // A tunnel whose SOCKS4 handshake has not finished cannot be pooled.
+            && !entry.sess.socks4_active()
             // A connection that opened with a PROXY header speaks for this client only.
-            && !entry.sess.send_proxy_prepended
+            && !entry.sess.flags.has(sess_flags::SEND_PROXY_PREPENDED)
             // A TLS session goes to the pool with its socket, once it is established.
             && entry.sess.srv_xprt.is_ready()
             // An h2 connection with no stream open and no GOAWAY (T540).
@@ -9287,8 +10004,9 @@ fn release_server(
     }
     entry.srv_raw_fd = None;
     entry.sess.srv_park_exp = Tick::ETERNITY;
-    entry.sess.srv_kept = false;
+    entry.sess.flags.clear(sess_flags::SRV_KEPT);
     entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
+    entry.sess.clear_socks4();
     if !actconn_released {
         release_server_actconn(entry, proxies, parked);
     }
@@ -9300,7 +10018,7 @@ fn release_server(
     entry.sess.srv_state = ScState::Init;
     // The next server connection is a new one and gets its own PROXY header.
     if entry.sess.mode == Mode::Http {
-        entry.sess.send_proxy_prepended = false;
+        entry.sess.flags.clear(sess_flags::SEND_PROXY_PREPENDED);
     }
 }
 
@@ -9327,11 +10045,11 @@ fn move_server(from: &mut SessionEntry, to: &mut SessionEntry, fdtab: &mut FdTab
     t.srv_xprt = std::mem::replace(&mut f.srv_xprt, crate::xprt::ServerXprt::Plain);
     t.srv_state = std::mem::replace(&mut f.srv_state, ScState::Init);
     t.srv_park_exp = std::mem::replace(&mut f.srv_park_exp, Tick::ETERNITY);
-    t.srv_kept = std::mem::take(&mut f.srv_kept);
+    t.flags.set_to(sess_flags::SRV_KEPT, f.flags.take(sess_flags::SRV_KEPT));
     t.srv_exp = std::mem::replace(&mut f.srv_exp, Tick::ETERNITY);
     t.conn_exp = std::mem::replace(&mut f.conn_exp, Tick::ETERNITY);
-    t.srv_cant_recv = f.srv_cant_recv;
-    t.send_proxy_prepended = std::mem::take(&mut f.send_proxy_prepended);
+    t.flags.set_to(sess_flags::SRV_CANT_RECV, f.flags.has(sess_flags::SRV_CANT_RECV));
+    t.flags.set_to(sess_flags::SEND_PROXY_PREPENDED, f.flags.take(sess_flags::SEND_PROXY_PREPENDED));
     t.send_proxy_header = std::mem::take(&mut f.send_proxy_header);
     t.target_addr = f.target_addr.take();
     t.bc_src = f.bc_src.take();
@@ -9349,7 +10067,9 @@ fn move_server(from: &mut SessionEntry, to: &mut SessionEntry, fdtab: &mut FdTab
 /// What the session of a stream of an HTTP/3 connection `owner` takes of it as the stream
 /// starts; nothing for an HTTP/2 one.
 fn h3_child_facts(sess: &mut TcpSession, owner: &TcpSession, quic_listeners: &[crate::quic_listener::QuicListener]) {
-    sess.h3 = owner.h3;
+    if owner.client_proto == ClientProto::H3 {
+        sess.client_proto = ClientProto::H3;
+    }
     // T569: the connection's acknowledgement counts as this request found them.
     if let Some(h3) = owner.h3_owner() {
         let facts = quic_listeners.get(h3.listener as usize).and_then(|ql| ql.ack_facts(h3.conn));
@@ -9361,7 +10081,7 @@ fn h3_child_facts(sess: &mut TcpSession, owner: &TcpSession, quic_listeners: &[c
     // one reads no bytes of its own. The stream's request head is in, which is where
     // its idle time (`Ti`, since the connection's previous stream ended) stops and
     // its own `TR` and `Ta` start (T529). Left unset, `TR` and `Ta` held the idle gap.
-    if owner.h3 {
+    if owner.client_proto == ClientProto::H3 {
         sess.strm.log.first_byte_now();
     }
 }
@@ -9383,7 +10103,7 @@ fn h2_child_start(
     // kept it for its next request.
     move_server(owner, child, fdtab);
     // It is not this stream's until a request takes it (`bc_idle`, T491).
-    child.sess.bc_idle = child.sess.srv.is_some();
+    child.sess.flags.set_to(sess_flags::BC_IDLE, child.sess.srv.is_some());
     crate::h2_bridge::start_request(&mut child.sess, d);
     // The stream's own `timeout client` starts with it (T300).
     child.sess.arm_client(now);
@@ -9413,7 +10133,7 @@ fn h2_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     if ch.reset || crate::h2_bridge::stream_is_reset(h2, ch.stream.id) {
         return false;
     }
-    ch.stream.body.drop_trailers = cs.drop_req_trailers;
+    ch.stream.body.drop_trailers = cs.flags.has(sess_flags::DROP_REQ_TRAILERS);
     let (mut moved, trailers) = crate::h2_bridge::pump_request_body(h2, &mut ch.stream, &mut cs.req);
     // A stream's entry has its transaction until it is freed.
     let Some(t) = cs.strm.txn.as_mut() else { return moved };
@@ -9499,7 +10219,7 @@ fn h3_bridge_moves(o: &mut SessionEntry, c: &mut SessionEntry, now: Tick) -> boo
     if ch.reset || alcyon_proto::htx_mux::HtxMux::is_reset(mux, u64::from(ch.stream.id)) {
         return false;
     }
-    ch.stream.body.drop_trailers = cs.drop_req_trailers;
+    ch.stream.body.drop_trailers = cs.flags.has(sess_flags::DROP_REQ_TRAILERS);
     let (mut moved, trailers) = crate::h2_bridge::pump_request_body_mux(mux, &mut ch.stream, &mut cs.req);
     let Some(t) = cs.strm.txn.as_mut() else { return moved };
     if let Some(u) = t.req_htx.as_mut() {
@@ -9725,6 +10445,23 @@ fn count_redispatch_pick_on<'a, R: crate::statcnt::Rows<'a>>(rows: R, be: &'a Pr
 /// A connect attempt to the stream's server failed (`back_handle_st_cer`): while retries
 /// remain, connect again -- after the turnaround (`SC_ST_TAR`) when `wait`, an asynchronous
 /// connect error, and the server is the same one; at once after a connect refused at once.
+fn observe_http(entry: &SessionEntry, proxies: &crate::table::Table, status: crate::check::HanaStatus) {
+    observe_http_ids(proxies, entry.srv_backend_idx, entry.target_server_idx, status);
+}
+
+fn observe_http_ids(proxies: &crate::table::Table, srv_backend_idx: usize, target_server_idx: Option<usize>, status: crate::check::HanaStatus) {
+    if let Some(i) = target_server_idx {
+        crate::check::health_adjust(proxies, srv_backend_idx, i, status);
+    }
+}
+
+fn mark_server_connected(entry: &mut SessionEntry, proxies: &crate::table::Table, now: Tick) {
+    entry.sess.server_connected(now);
+    if let Some(i) = entry.target_server_idx {
+        crate::check::health_adjust(proxies, entry.srv_backend_idx, i, crate::check::HanaStatus::L4Ok);
+    }
+}
+
 /// Out of retries, the failure counts in `econ` on the backend and on the server tried
 /// last (once per stream, not per attempt: measured on `HAProxy`, `retries 2` shows
 /// `wretr` 2, `econ` 1) and the stream ends, with a 503 in HTTP.
@@ -9748,6 +10485,7 @@ fn server_connect_failed(
             be.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
             if let Some(i) = entry.target_server_idx {
                 be.srv_set().bump_retr(i, (0, 0, 1));
+                crate::check::health_adjust(proxies, entry.srv_backend_idx, i, crate::check::HanaStatus::L4Err);
             }
             entry.sess.srv_state = ScState::Error;
             if entry.sess.mode == Mode::Http {
@@ -9794,6 +10532,7 @@ fn retry_server_connect(
 ) -> bool {
     release_failed_server(entry, fdtab, poller);
     entry.sess.srv = None;
+    entry.sess.clear_socks4();
 
     // The slot the failed attempt held stays the stream's while it retries the same server,
     // the turnaround included (`s->srv_conn` is kept: `assign_server_and_queue` returns at
@@ -9878,15 +10617,15 @@ fn retry_server_connect(
     // balancer gave the same one again (`assign_server_and_queue`).
     if !resuming && moved {
         entry.sess.strm.log.redispatched = true;
-        entry.sess.redispatched = true;
+        entry.sess.flags.set(sess_flags::REDISPATCHED);
         count_on_server(true);
         stats.redispatches.fetch_add(1, Ordering::Relaxed);
         // The server left was a pick too, if the balancer made it (`cum_lbconn` counts each
         // pick of a server other than the last); the next one is the balancer's.
-        if entry.sess.lb_picked {
+        if entry.sess.flags.has(sess_flags::LB_PICKED) {
             count_redispatch_pick(proxies, be_idx, entry.srv_backend_idx, old_idx);
         }
-        entry.sess.lb_picked = true;
+        entry.sess.flags.set(sess_flags::LB_PICKED);
         entry.sess.strm.txn.iter_mut().for_each(|txn| {
             txn.ck.direct = false;
             // TX_CK_VALID (3) becomes TX_CK_DOWN (2).
@@ -9930,11 +10669,19 @@ fn retry_server_connect(
     maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
     set_target(entry, target_addr);
-    if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].srv_set().tfo_of(target_addr))
-        .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
+    let be_srv = proxies[be_idx].srv_set();
+    let real = connect_addr(target_addr, entry.sess.server_addr);
+    let socks4 = socks4_proxy_of(proxies, be_idx, s_idx);
+    if let Ok((srv_fd, immediate)) = raw::connect_opts(
+        socks4.unwrap_or(real),
+        be_srv.tfo_of(target_addr),
+        s_idx.and_then(|i| be_srv.md5sig_at(i)).map(str::as_bytes),
+    )
+    .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
     {
         let sfd = srv_fd.as_raw_fd();
         attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
+        start_socks4_handshake(&mut entry.sess, socks4);
         entry.srv_raw_fd = Some(sfd);
         if immediate {
             entry.sess.server_connected(now);
@@ -9997,7 +10744,7 @@ fn check_srv_connect(
                 );
 
                 if let Ok(None) = conn_err {
-                    entry.sess.server_connected(now);
+                    mark_server_connected(entry, proxies, now);
                     let (_, srv_want) = entry.sess.interests();
                     let new_interest = Interest {
                         readable: srv_want.read,
@@ -10029,7 +10776,7 @@ fn check_srv_connect(
 /// Whether one of the checks behind [`TcpSession::rare_armed`] is armed (T599).
 fn rare_check_armed(entry: &SessionEntry) -> bool {
     let s = &entry.sess;
-    entry.connect_log_due || entry.rate_max_due || s.session_rules_pending || !s.tcp_inspect_done || s.res_inspect_pending
+    entry.connect_log_due || entry.rate_max_due || s.flags.has(sess_flags::SESSION_RULES_PENDING) || !s.flags.has(sess_flags::TCP_INSPECT_DONE) || s.res_inspect_pending()
 }
 
 fn update_interests(entry: &mut SessionEntry, fdtab: &mut FdTab, poller: &mut Poller) {
@@ -10126,7 +10873,7 @@ fn cleanup_done(
     let proxy_idx = entry.proxy_idx;
     proxies[proxy_idx].counters().bytes_in.fetch_add(entry.sess.bytes_in, Ordering::Relaxed);
     proxies[proxy_idx].counters().bytes_out.fetch_add(entry.sess.bytes_out, Ordering::Relaxed);
-    if !entry.actconn_reclaimed && !entry.sess.h3 {
+    if !entry.actconn_reclaimed && entry.sess.client_proto != ClientProto::H3 {
         proxies[proxy_idx].counters().act_conn.fetch_sub(1, Ordering::Relaxed);
         crate::globalconn::release();
 
@@ -10145,7 +10892,7 @@ fn cleanup_done(
     });
 
     // An HTTP/3 request stream took no listener slot (`admit_connection`).
-    if let Some(l) = listeners.iter_mut().filter(|_| !entry.sess.h3).find(|l| l.proxy == usize_to_u32(proxy_idx)) {
+    if let Some(l) = listeners.iter_mut().filter(|_| entry.sess.client_proto != ClientProto::H3).find(|l| l.proxy == usize_to_u32(proxy_idx)) {
         l.maxconn.dec();
         let lfd = l.raw_fd();
         if !l.is_full() && fdtab.interest(lfd).is_none() {
@@ -10214,10 +10961,11 @@ impl EngineDispatcher<'_> {
             server_addr: sess.server_addr,
             fc_src: sess.fc_src(),
             so_name: sess.so_name.as_deref(),
-            so_id: sess.so_id,
+            so_id: sess.so_id_opt(),
             fc_dst: sess.fc_dst(),
-            is_first_req: sess.is_first_req,
+            is_first_req: sess.flags.has(sess_flags::IS_FIRST_REQ),
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+            saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
             quic_acks: sess.quic_facts(),
             fc_http_major: sess.fc_http_major(),
@@ -10241,6 +10989,8 @@ impl EngineDispatcher<'_> {
             accept_date: Some(sess.strm.log.date()),
             captures_req_hdr: Some(&sess.strm.log.req_captures),
             captures_res_hdr: Some(&sess.strm.log.res_captures),
+            last_rule: last_rule_at(sess.strm.log.last_rule),
+            uniq_id: Some(sess.strm.log.uniq_id),
             ..Default::default()
         }
     }
@@ -10412,6 +11162,7 @@ impl EngineDispatcher<'_> {
     /// for an unparsable request, request rules and routing (once per transaction), the
     /// response head, how each side ended, and the end of the transaction.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn http_step(
         entry: &mut SessionEntry,
         proxies: &mut Proxies,
@@ -10423,6 +11174,10 @@ impl EngineDispatcher<'_> {
         wake_queue: &mut Vec<TaskRef>,
         now: Tick,
         lb_snap: &mut crate::lb::LbSnapCache,
+        log_targets: &[crate::syslog::SyslogTarget],
+        log_tag: &str,
+        fc: Option<crate::proxy::ConnView<'_>>,
+        nice_updates: &mut Vec<(TaskRef, i16)>,
     ) -> Option<crate::stats_html::AdminAction> {
         // An HTTP/2 connection serving a stream is not between requests: the stream is its
         // child's, which ends it (T280).
@@ -10455,7 +11210,7 @@ impl EngineDispatcher<'_> {
                 // `option http-ignore-probes` (`PR_O_IGNORE_PRB`): a new connection that sent
                 // nothing and closes or times out is a probe, sent nothing, not logged and
                 // not counted (`h1_process`, `h1_handle_req_tout`, T272).
-                if proxies[entry.proxy_idx].ignore_probes && entry.sess.is_first_req && entry.sess.req.is_empty() {
+                if proxies[entry.proxy_idx].ignore_probes && entry.sess.flags.has(sess_flags::IS_FIRST_REQ) && entry.sess.req.is_empty() {
                     close_http_session(entry, proxies, fdtab, poller, idle_pool, true);
                     return None;
                 }
@@ -10465,9 +11220,14 @@ impl EngineDispatcher<'_> {
                 // `timeout client` before a request head is complete: HAProxy answers 408
                 // (`h1_handle_req_tout`, `src/mux_h1.c`) from the frontend's pages, also on
                 // a new connection that sent nothing. Only a keep-alive connection waiting
-                // for its next request, with nothing of one on it, closes silently.
+                // for its next request, with nothing of one on it, closes silently. A
+                // connection still waiting for its PROXY or NetScaler Client IP header is
+                // embryonic for `HAProxy` (no session yet): its timeout is the embryonic
+                // kill, no page (measured: the oracle closes a silent client on an
+                // `accept-proxy` and an `accept-netscaler-cip` bind with no bytes).
                 if entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Client))
-                    && (!entry.sess.req.is_empty() || entry.sess.is_first_req)
+                    && (!entry.sess.req.is_empty() || entry.sess.flags.has(sess_flags::IS_FIRST_REQ))
+                    && !entry.sess.handshake_pending()
                 {
                     let fe = &proxies[entry.proxy_idx];
                     let mut page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
@@ -10477,7 +11237,7 @@ impl EngineDispatcher<'_> {
                     entry.sess.strm.log.term = Some(*b"cR");
                     quiet = entry.sess.req.is_empty() && proxies[entry.proxy_idx].dont_log_null;
                 } else if !entry.sess.req.is_empty()
-                    || (entry.sess.is_first_req && matches!(entry.sess.ending, None | Some(crate::proxy::Ending::ClientAbort)))
+                    || (entry.sess.flags.has(sess_flags::IS_FIRST_REQ) && matches!(entry.sess.ending, None | Some(crate::proxy::Ending::ClientAbort)))
                 {
                     // Part of a request, or a new connection closed before its first byte,
                     // then the client left: `HAProxy` logs it as a 400 the client aborted
@@ -10525,6 +11285,22 @@ impl EngineDispatcher<'_> {
         if entry.sess.ending == Some(crate::proxy::Ending::Timeout(crate::proxy::Which::Client))
             && entry.sess.strm.txn.as_ref().is_some_and(|t| t.body_wait.is_some_and(|w| !w.tarpit && !w.inspect))
         {
+            // `timeout client` resumes the wait with `ACT_OPT_FINAL`, and a wait a rule asked
+            // for answers it with `ACT_RET_ABRT`: the rule is the last entity. The implicit
+            // `http-buffer-request` wait has no rule, and `note_last_rule` of line 0 is a no-op.
+            if let Some(line) = entry.sess.strm.txn.as_ref()
+                .and_then(|t| t.body_wait)
+                .and_then(|w| {
+                    let rules = if w.backend {
+                        proxies.get(entry.backend_idx).map(|p| &p.http_req_rules)
+                    } else {
+                        Some(&proxies[entry.proxy_idx].http_req_rules)
+                    };
+                    rules.and_then(|r| r.get(w.rule)).map(|rule| rule.line)
+                })
+            {
+                note_last_rule(&mut entry.sess, line);
+            }
             let fe = &proxies[entry.proxy_idx];
             let mut page = proxy_error_response(&entry.sess, fe, fe, proxies, 408);
             // The request is an HTX message here (its head was accepted and the wait holds
@@ -10550,18 +11326,30 @@ impl EngineDispatcher<'_> {
             return None;
         }
 
+        let emit = LogEmit { targets: log_targets, tag: log_tag, pid };
         let mut admin = None;
         // A request in the queue goes on when a slot is free, or ends when its time is up;
         // one assigned a server waits for that one.
         if entry.sess.queue.is_some() {
             let (be_idx, srv) = (entry.backend_idx, entry.sess.queue.server());
+            let was_connected = entry.sess.strm.log.connect.is_some();
             admin = Self::route_to_server(entry, proxies, fdtab, poller, idle_pool, now, be_idx, srv, lb_snap);
+            log_if_newly_connected(was_connected, entry, proxies, emit);
         }
-        if entry.sess.strm.txn.as_ref().is_some_and(|t| !t.req_rules_done) && entry.sess.tcp_inspect_done {
+        if entry.sess.strm.txn.as_ref().is_some_and(|t| !t.req_rules_done) && entry.sess.flags.has(sess_flags::TCP_INSPECT_DONE) {
             if let Some(t) = entry.sess.strm.txn.as_mut() {
                 t.req_rules_done = true;
             }
-            admin = Self::connect_http_backend(entry, proxies, checks, pid, fdtab, poller, idle_pool, now, lb_snap);
+            let was_connected = entry.sess.strm.log.connect.is_some();
+            // `set-nice` of the `http-request` rules: applied once the pass is over; the
+            // scheduler reads it on the task's next wakeup (`task_set_nice` shows nothing
+            // while the task runs either).
+            let mut set_nice_req = None;
+            admin = Self::connect_http_backend(entry, proxies, checks, pid, fdtab, poller, idle_pool, now, lb_snap, fc, emit, &mut set_nice_req);
+            if let Some(n) = set_nice_req {
+                nice_updates.push((entry.task, n));
+            }
+            log_if_newly_connected(was_connected, entry, proxies, emit);
             let sess = &mut entry.sess;
             if let Some(t) = sess.strm.txn.as_mut() {
                 if t.body_wait.is_some() {
@@ -10583,6 +11371,9 @@ impl EngineDispatcher<'_> {
         // (`wants_rerun`): nothing else wakes it, as everything is already read, and the
         // heads behind waited for `timeout server`, or for ever (T248).
         let mut ran_out = true;
+        // `set-nice` of the `http-response`/`http-after-response` rules: applied once the
+        // pass wrote it; the scheduler reads it on the task's next wakeup.
+        let mut set_nice_res = None;
         let snapshot = |entry: &SessionEntry| {
             (entry.sess.req.len(), entry.sess.rep.len(), entry.sess.strm.txn.as_ref().map(|t| (t.req, t.rsp)))
         };
@@ -10594,8 +11385,11 @@ impl EngineDispatcher<'_> {
                 if Self::l7_retry(entry, proxies, fdtab, poller, now, lb_snap) {
                     continue;
                 }
-                if !Self::apply_http_response_rules(entry, proxies, now) {
+                if !Self::apply_http_response_rules(entry, proxies, now, pid, log_targets, log_tag, fc, &mut set_nice_res) {
                     Self::write_response_head_names(entry, proxies);
+                }
+                if let Some(n) = set_nice_res.take() {
+                    nice_updates.push((entry.task, n));
                 }
             }
             if Self::l7_retry_failure(entry, proxies, fdtab, poller, now, lb_snap) {
@@ -10624,7 +11418,7 @@ impl EngineDispatcher<'_> {
             }
         }
         if ran_out {
-            entry.sess.passes_ran_out = true;
+            entry.sess.flags.set(sess_flags::PASSES_RAN_OUT);
         }
 
         if Self::client_left(entry, proxies, fdtab, poller, idle_pool) {
@@ -10769,7 +11563,7 @@ impl EngineDispatcher<'_> {
             // A reset that came with the request (the client left while its connection
             // waited to be accepted, at `maxconn`) is the last phase for `HAProxy`: the 400
             // it answers is a whole response (`CL`, T231).
-            let phase = if entry.sess.reset_with_request { b'L' } else { b'D' };
+            let phase = if entry.sess.flags.has(sess_flags::RESET_WITH_REQUEST) { b'L' } else { b'D' };
             entry.sess.strm.log.term = Some(if reset { [b'C', phase] } else { *b"CH" });
             // Nothing more is read from the server, nor sent to it.
             entry.sess.srv_state = ScState::Closed;
@@ -10820,7 +11614,7 @@ impl EngineDispatcher<'_> {
         poller: &mut Poller,
         idle_pool: &mut IdlePool,
     ) -> bool {
-        if entry.sess.is_h2() || entry.sess.h3 {
+        if entry.sess.is_h2() || entry.sess.client_proto == ClientProto::H3 {
             return false;
         }
         let Some(txn) = entry.sess.strm.txn.as_ref().filter(|t| {
@@ -10948,7 +11742,7 @@ impl EngineDispatcher<'_> {
                 entry.sess.srv_state = ScState::Closed;
                 entry.sess.cli_state = ScState::Ready;
                 entry.sess.ending = None;
-                entry.sess.cli_linger = true;
+                entry.sess.flags.set(sess_flags::CLI_LINGER);
                 entry.sess.req.clear();
                 entry.sess.arm_client(now);
                 return;
@@ -10986,6 +11780,8 @@ impl EngineDispatcher<'_> {
         let srv_eof = matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed);
         let srv_err = entry.sess.srv_state == ScState::Error;
         let h2_child = entry.sess.is_h2_child();
+        let srv_be_idx = entry.srv_backend_idx;
+        let target_srv_idx = entry.target_server_idx;
         let Some(txn) = entry.sess.strm.txn.as_mut() else {
             return;
         };
@@ -11002,7 +11798,7 @@ impl EngineDispatcher<'_> {
         // the stream then lives out `timeout client`, `cL`.
         if entry.sess.strm.log.term == Some(*b"SL")
             && !h2_child
-            && !entry.sess.h3
+            && entry.sess.client_proto != ClientProto::H3
             && !txn.local
             && !txn.aborted
             && txn.rsp.is_done()
@@ -11043,6 +11839,7 @@ impl EngineDispatcher<'_> {
                 crate::txn::BodyCheck::Fine => false,
             };
             if refused {
+                observe_http_ids(proxies, srv_be_idx, target_srv_idx, crate::check::HanaStatus::HttpRsp);
                 txn.srv_reusable = false;
                 entry.sess.rep.clear();
                 entry.sess.strm.log.term = Some(*b"PH");
@@ -11056,6 +11853,7 @@ impl EngineDispatcher<'_> {
         if !(srv_eof || srv_err) && !txn.local && !txn.aborted && matches!(txn.rsp, MsgState::Body(_)) && !h2_child {
             let check = txn.rsp.check_body(entry.sess.rep.readable());
             if check.stuck(entry.sess.rep.len(), entry.sess.bufsize) {
+                observe_http_ids(proxies, srv_be_idx, target_srv_idx, crate::check::HanaStatus::HttpRsp);
                 txn.srv_reusable = false;
                 txn.close_after = true;
                 txn.aborted = true;
@@ -11090,6 +11888,14 @@ impl EngineDispatcher<'_> {
                 // An h2 server's malformed response is the server's fault, not a lost
                 // connection: `PH--` whether or not it was reused (T540).
                 let bad = entry.sess.srv_xprt.bad_response();
+                let hana = if status == 504 {
+                    crate::check::HanaStatus::HttpReadTimeout
+                } else if bad {
+                    crate::check::HanaStatus::HttpHdrRsp
+                } else {
+                    crate::check::HanaStatus::HttpBrokenPipe
+                };
+                observe_http_ids(proxies, srv_be_idx, target_srv_idx, hana);
                 if status == 502 && txn.srv_reused && entry.sess.rep.is_empty() && !bad {
                     // `abort_keep_alive`: a keep-alive request lost to a network error,
                     // nothing of a response received. The client retries only if it
@@ -11219,7 +12025,7 @@ impl EngineDispatcher<'_> {
         // header (it names this client's addresses), which the pool does not key by.
         // So is an h2 server connection under `safe` (`MX_FL_HOL_RISK` -> `session_add_conn`,
         // `backend.c`: measured, 26 server connections for 26 client sessions, T533).
-        let private = entry.sess.send_proxy_prepended
+        let private = entry.sess.flags.has(sess_flags::SEND_PROXY_PREPENDED)
             || proxies.get(entry.srv_backend_idx).is_some_and(|p| {
                 p.http_reuse == alcyon_config::HttpReuse::Never || (p.http_reuse == alcyon_config::HttpReuse::Safe && entry.sess.srv_xprt.is_h2())
             });
@@ -11227,7 +12033,7 @@ impl EngineDispatcher<'_> {
         // session (`bc_idle`, set at the previous transaction's end and cleared where a request
         // connects or takes it back): HAProxy leaves it where it is, parked or in the idle
         // lists, for the next request (T491).
-        let untouched = txn.local && entry.sess.bc_idle && entry.sess.srv.is_some();
+        let untouched = txn.local && entry.sess.flags.has(sess_flags::BC_IDLE) && entry.sess.srv.is_some();
         if !untouched && !reusable {
             release_server(entry, proxies, fdtab, poller, idle_pool, false);
         } else if !untouched && entry.sess.req.is_empty() && !private {
@@ -11235,7 +12041,7 @@ impl EngineDispatcher<'_> {
             // An HTTP/3 request relayed over a socket pair is its session's only one: there is
             // no next request to keep the connection for, and parked it is no other stream's
             // (T523: 150 server connections for a burst of 200 where HAProxy opened 115).
-            let relayed = entry.sess.h3 && !entry.sess.is_h2_child();
+            let relayed = entry.sess.client_proto == ClientProto::H3 && !entry.sess.is_h2_child();
             if keeps && idle_pool.total() == 0 && entry.sess.srv.is_some() && !relayed {
                 entry.sess.srv_park_exp = now.add(SRV_PARK_MS);
                 // Idle, it is not one of the server's connections in use (`scur`, and
@@ -11258,7 +12064,7 @@ impl EngineDispatcher<'_> {
         // session ended, a `maxconn 1` server queued that client's next request behind its
         // own idle connection (T592).
         if !untouched && entry.sess.srv.is_some() && !entry.sess.srv_uncounted() {
-            entry.sess.srv_kept = true;
+            entry.sess.flags.set(sess_flags::SRV_KEPT);
             server_actconn_add(entry, proxies, false);
         }
         // A stream of an HTTP/2 connection ends with its transaction: its entry is freed, and
@@ -11284,11 +12090,11 @@ impl EngineDispatcher<'_> {
         // yet used to be thrown away here, and they never ran again after the first request.
         let proxy = &proxies[entry.proxy_idx];
         if !proxy.tcp_req_content_rules.is_empty() {
-            entry.sess.tcp_inspect_done = false;
-            entry.sess.rare_armed = true;
+            entry.sess.flags.clear(sess_flags::TCP_INSPECT_DONE);
+            entry.sess.flags.set(sess_flags::RARE_ARMED);
             entry.sess.inspect_exp = proxy
                 .tcp_req_inspect_delay
-                .map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
+                .map_or(Tick::ETERNITY, |d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
         }
     }
 
@@ -11548,7 +12354,7 @@ impl EngineDispatcher<'_> {
             }
             move_server(child, owner, env.fdtab);
             let fe = &env.proxies[owner.proxy_idx];
-            let inspect = (!fe.tcp_req_content_rules.is_empty()).then(|| fe.tcp_req_inspect_delay.map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX))));
+            let inspect = (!fe.tcp_req_content_rules.is_empty()).then(|| fe.tcp_req_inspect_delay.map_or(Tick::ETERNITY, |d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX))));
             owner.sess.h2_child_done(&mut child.sess, inspect, keep);
             owner.sess.arm_request(now);
             // The connection's own timer runs again once no stream is attached (T300).
@@ -11646,7 +12452,7 @@ impl EngineDispatcher<'_> {
             return out;
         }
         let mut connect_line: Option<(usize, String)> = None;
-        let mut owner_wake: Option<TaskRef> = None;
+        let mut owner_ref: Option<(u32, TaskRef)> = None;
         {
             let Some(entry) = self.sessions.get_mut(session_idx) else {
                 return Outcome::Done;
@@ -11655,16 +12461,16 @@ impl EngineDispatcher<'_> {
             alcyon_sample::work::note(alcyon_sample::work::Op::StreamRun, 1);
             // A source that armed a rare check and not `rare_armed` would have it skipped:
             // every test run in debug says so here (T599).
-            debug_assert!(entry.sess.rare_armed || !rare_check_armed(entry), "a rare check armed without `rare_armed`");
+            debug_assert!(entry.sess.flags.has(sess_flags::RARE_ARMED) || !rare_check_armed(entry), "a rare check armed without `rare_armed`");
             // A frontend that logs and has no `log-format` (no `option httplog`, `tcplog`) says
             // only that it took the connection, once, and nothing when the request or the
             // connection ends (`frontend_accept`, `frontend.c`): after the PROXY header and
             // the TLS handshake, which a connection that fails never gets past.
             #[cfg(debug_assertions)]
-            if entry.sess.rare_armed {
+            if entry.sess.flags.has(sess_flags::RARE_ARMED) {
                 alcyon_sample::work::note(alcyon_sample::work::Op::RareCheck, 1);
             }
-            if entry.sess.rare_armed && entry.connect_log_due && (!entry.sess.accept_proxy || entry.sess.proxy_handshake_done) && entry.sess.cli_xprt.is_ready() {
+            if entry.sess.flags.has(sess_flags::RARE_ARMED) && entry.connect_log_due && !entry.sess.handshake_pending() && entry.sess.cli_xprt.is_ready() {
                 entry.connect_log_due = false;
                 let fe = &self.proxies[entry.proxy_idx];
                 let unknown = SocketAddr::from(([0, 0, 0, 0], 0));
@@ -11681,25 +12487,28 @@ impl EngineDispatcher<'_> {
                 connect_line = Some((entry.proxy_idx, line));
             }
 
-            if entry.sess.rare_armed && entry.rate_max_due && entry.sess.cli_xprt.is_ready() {
+            if entry.sess.flags.has(sess_flags::RARE_ARMED) && entry.rate_max_due && entry.sess.cli_xprt.is_ready() {
                 entry.rate_max_due = false;
                 let rate = self.proxies[entry.proxy_idx].counters().fe_sess_rate.rate();
                 self.proxies[entry.proxy_idx].txn_counters().fe.hot.rate_max.fetch_max(u32::try_from(rate).unwrap_or(u32::MAX), Ordering::Relaxed);
             }
 
             // Step 1: Server connect check if connecting
+            let was_connected = entry.sess.strm.log.connect.is_some();
             check_srv_connect(entry, self.proxies, self.fdtab, self.poller, now, self.lb_snap);
+            let emit = LogEmit { targets: &self.log_targets, tag: &self.log_tag, pid: self.pid };
+            log_if_newly_connected(was_connected, entry, self.proxies, emit);
 
             // A readiness event on either socket: reading it may make progress again.
             if let Some(sfd) = entry.srv_raw_fd {
                 if self.fdtab.ready(sfd).readable {
-                    entry.sess.srv_cant_recv = false;
+                    entry.sess.flags.clear(sess_flags::SRV_CANT_RECV);
                     self.fdtab.clear_ready(sfd, true, false);
                 }
             }
             if let Some(cfd) = entry.sess.cli_fd().map(|fd| fd.as_raw_fd()) {
                 if self.fdtab.ready(cfd).readable {
-                    entry.sess.cli_cant_recv = false;
+                    entry.sess.flags.clear(sess_flags::CLI_CANT_RECV);
                     self.fdtab.clear_ready(cfd, true, false);
                 }
             }
@@ -11740,7 +12549,9 @@ impl EngineDispatcher<'_> {
 
             // Step 3: Stream engine process pass
             if !entry.sess.is_done() {
+                let was_connected = entry.sess.strm.log.connect.is_some();
                 entry.sess.advance(now);
+                log_if_newly_connected(was_connected, entry, self.proxies, emit);
             }
             #[cfg(debug_assertions)]
             crate::crash::fault_point(false, entry.sess.req_uri.as_deref().filter(|_| entry.sess.strm.txn.is_some()));
@@ -11751,7 +12562,8 @@ impl EngineDispatcher<'_> {
             self.h2_owner_pass(session_idx, now);
         }
         let (is_done, pending_admin, log_line, checkcache_alert) = {
-            let Some(entry) = self.sessions.get_mut(session_idx) else { return Outcome::Done };
+            let Some((entry, owner)) = self.sessions.get_mut_with_owner(session_idx) else { return Outcome::Done };
+            let fc = crate::proxy::ConnView::from_stream(&entry.sess, owner.map(|o| &o.sess));
             // The glitches the HTTP/2 connection counted since the last pass go to the entries
             // its stream counters track (`glitch_cnt`, `glitch_rate`); while a stream is served,
             // the owner pass credits them, to the counters as the stream tracks them.
@@ -11771,30 +12583,33 @@ impl EngineDispatcher<'_> {
                 commit_stick_stores(stores.into_iter(), self.proxies, entry.srv_backend_idx, entry.target_server_idx);
             }
 
-            // Step 3.1: a TLS handshake with the server that failed (certificate refused,
-            // a peer not speaking TLS) is a connect failure: `HAProxy` retries it and,
-            // out of retries, answers 503 `SC` (measured: `ssl verify required` against
-            // a certificate the SNI does not match, "0/0/-1/-1/1 503 ... SC-- ... /3").
-            if entry.sess.srv_state == ScState::Error && entry.sess.srv_xprt.handshake_failed() {
+            // Step 3.1: a TLS or SOCKS4 handshake with the server that failed is a connect
+            // failure: `HAProxy` retries it and, out of retries, answers 503 `SC`.
+            let socks4_failed = entry.sess.socks4_failed();
+            if entry.sess.srv_state == ScState::Error && (entry.sess.srv_xprt.handshake_failed() || socks4_failed) {
                 if let (Some(fd), Some(sfd)) = (entry.sess.srv.as_ref(), entry.srv_raw_fd.take()) {
                     let _ = self.poller.delete(fd.as_fd());
                     self.fdtab.remove(sfd);
                 }
                 entry.sess.srv_xprt = crate::xprt::ServerXprt::Plain;
+                entry.sess.flags.clear(sess_flags::SOCKS4_FAILED);
                 entry.sess.ending = None;
-                // `HAProxy` records a `CO_ER_SSL_*` code here, which Alcyon does not tell
-                // apart yet: no `bc_err` rather than the 0 of the TCP connect.
-                entry.sess.bc_err = None;
+                if !socks4_failed {
+                    // `HAProxy` records a `CO_ER_SSL_*` code here, which Alcyon does not tell
+                    // apart yet: no `bc_err` rather than the 0 of the TCP connect.
+                    entry.sess.bc_err = None;
+                }
                 server_connect_failed(entry, self.proxies, self.fdtab, self.poller, now, true, self.lb_snap);
             }
 
             // Steps 3.3 to 3.45, the rare checks of the request's start, behind one bit (T599).
-            if entry.sess.rare_armed {
+            if entry.sess.flags.has(sess_flags::RARE_ARMED) {
+                let emit = LogEmit { targets: &self.log_targets, tag: &self.log_tag, pid: self.pid };
                 // Step 3.3: `tcp-request session` rules that waited for the PROXY header.
-                run_deferred_session_rules(entry.proxy_idx, self.proxies, &mut entry.sess);
+                run_deferred_session_rules(entry.proxy_idx, self.proxies, &mut entry.sess, emit);
 
                 // Step 3.4: Content inspection for TCP rules (or before HTTP request parsing)
-                if !entry.sess.tcp_inspect_done && !entry.sess.is_done() {
+                if !entry.sess.flags.has(sess_flags::TCP_INSPECT_DONE) && !entry.sess.is_done() {
                     let proxy_idx = entry.proxy_idx;
                     // The request's capture slots exist from the first rule that can fill one:
                     // `begin_http_stream` keeps what these rules wrote in the slots no header fills.
@@ -11811,10 +12626,11 @@ impl EngineDispatcher<'_> {
                         &mut entry.sess,
                         now,
                         0,
+                        emit,
                     ) {
                         ContentEvalResult::Done => {
-                            entry.sess.tcp_inspect_done = true;
-                            entry.sess.inspect_exp = None;
+                            entry.sess.flags.set(sess_flags::TCP_INSPECT_DONE);
+                            entry.sess.inspect_exp = Tick::ETERNITY;
                             // `switch-mode http` made the first request's head a thing to wait
                             // for: `timeout http-request` starts now, not at the next event.
                             entry.sess.arm_request(now);
@@ -11824,7 +12640,7 @@ impl EngineDispatcher<'_> {
                             self.proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                             entry.sess.cli_state = ScState::Closed;
                             entry.sess.srv_state = ScState::Closed;
-                            entry.sess.tcp_inspect_done = true;
+                            entry.sess.flags.set(sess_flags::TCP_INSPECT_DONE);
                         }
                         ContentEvalResult::SilentDrop(ttl) => {
                             let is_ipv6 = entry.sess.client_addr.is_some_and(|a| a.is_ipv6());
@@ -11832,19 +12648,18 @@ impl EngineDispatcher<'_> {
                             self.proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                             entry.sess.cli_state = ScState::Closed;
                             entry.sess.srv_state = ScState::Closed;
-                            entry.sess.tcp_inspect_done = true;
+                            entry.sess.flags.set(sess_flags::TCP_INSPECT_DONE);
                         }
                         ContentEvalResult::Waiting => {}
                     }
                 }
 
                 // Step 3.45: TCP mode, `tcp-response content` rules over the response so far.
-                if entry.sess.res_inspect_pending && !entry.sess.is_done() {
+                if entry.sess.res_inspect_pending() && !entry.sess.is_done() {
                     let be_idx = entry.backend_idx;
                     let res = eval_tcp_res_content_rules(&self.proxies[be_idx], &self.proxies, sample_registry(), &mut entry.sess, now);
                     if res != ContentEvalResult::Waiting {
-                        entry.sess.res_inspect_pending = false;
-                        entry.sess.res_inspect_exp = None;
+                        entry.sess.res_inspect.reset(&crate::proxy::RES_INSPECT_POOL);
                     }
                     match res {
                         ContentEvalResult::Waiting => {}
@@ -11877,7 +12692,7 @@ impl EngineDispatcher<'_> {
                     }
                 }
                 if !rare_check_armed(entry) {
-                    entry.sess.rare_armed = false;
+                    entry.sess.flags.clear(sess_flags::RARE_ARMED);
                 }
             }
 
@@ -11918,10 +12733,20 @@ impl EngineDispatcher<'_> {
                     &mut self.wake_queue,
                     now,
                     self.lb_snap,
+                    &self.log_targets,
+                    &self.log_tag,
+                    fc,
+                    &mut self.nice_updates,
                 );
             }
 
-            let log_line = entry.log_line.take().filter(|_| embryonic_failure(&entry.sess).is_none()).map(|l| (l, entry.log_sd, entry.log_err));
+            let log_line = entry
+                .log_line
+                .take()
+                .filter(|_| embryonic_failure(&entry.sess).is_none())
+                // The level was fixed when the line was built (`set_stream_log`): a
+                // `set-log-level` that runs after it may not relabel a line that is queued.
+                .map(|l| (l, entry.log_sd, entry.log_level, stream_log_origin(entry, entry.log_err)));
             // `option checkcache` blocked a response: the alert goes to the backend's loggers,
             // before the stream's own line (rare: the message is built here, not on the path).
             let checkcache_alert = std::mem::take(&mut entry.sess.strm.log.checkcache_blocked).then(|| {
@@ -11934,19 +12759,22 @@ impl EngineDispatcher<'_> {
             // Step 3.6: If in TCP mode and server not yet connected (e.g. deferred on accept-proxy or inspect), connect once ready
             if entry.sess.mode == Mode::Tcp
                 && entry.sess.srv_state == ScState::Init
-                && (!entry.sess.accept_proxy || entry.sess.proxy_handshake_done)
-                && entry.sess.tcp_inspect_done
+                && !entry.sess.handshake_pending()
+                && entry.sess.flags.has(sess_flags::TCP_INSPECT_DONE)
                 && !entry.sess.is_done()
                 // A retry waiting out its turnaround connects in step 2 when it is over.
                 && !entry.sess.retry_after.is_set()
             {
+                let was_connected = entry.sess.strm.log.connect.is_some();
+                let emit = LogEmit { targets: &self.log_targets, tag: &self.log_tag, pid: self.pid };
                 if entry.sess.target_addr.is_some() {
                     // The connect made at accept was refused at once, retries remain: this
                     // is the retry (`wretr`, or `wredis` redispatched), at once.
                     retry_now(entry, self.proxies, self.fdtab, self.poller, now, self.lb_snap);
                 } else {
-                    Self::connect_tcp_backend(entry, self.proxies, self.fdtab, self.poller, now, self.lb_snap);
+                    Self::connect_tcp_backend(entry, self.proxies, self.fdtab, self.poller, now, self.lb_snap, emit);
                 }
+                log_if_newly_connected(was_connected, entry, self.proxies, emit);
             }
 
             // A server connection parked after a response that no request has taken back
@@ -11985,8 +12813,8 @@ impl EngineDispatcher<'_> {
             // what it produced (its response, room for more of its request) and sees how it
             // ended (T280).
             // An HTTP/3 owner too (L2): its second run in a pass sends what this one moved.
-            if let Some((_, owner_task)) = entry.sess.h2_child().and_then(|c| c.owner) {
-                owner_wake = Some(owner_task);
+            if let Some(o) = entry.sess.h2_child().and_then(|c| c.owner) {
+                owner_ref = Some(o);
             }
 
             // Step 5: Update timer. Not for a stream that has ended: its task is freed when
@@ -12006,10 +12834,25 @@ impl EngineDispatcher<'_> {
             (entry.sess.is_done(), pending_admin, log_line, checkcache_alert)
         };
 
-        if let Some(owner_task) = owner_wake {
+        if let Some((owner_idx, owner_task)) = owner_ref {
             #[cfg(debug_assertions)]
-            if self.sessions.get(session_idx).and_then(|e| e.sess.h2_child()).and_then(|c| c.owner).and_then(|(i, _)| self.sessions.get(i)).is_some_and(|o| o.sess.h3_owner().is_some()) {
+            if self.sessions.get(owner_idx).is_some_and(|o| o.sess.h3_owner().is_some()) {
                 alcyon_sample::work::note(alcyon_sample::work::Op::H3OwnerWakeNow, 1);
+            }
+            // Frame a ready response into the owner's h2 mux right away so sibling streams in
+            // the same pass see the live stream count drop as each finishes, matching HAProxy's
+            // synchronous mux send (`h2_snd_buf` -> `h2s_close`).
+            if !is_done {
+                if let Some((o, c)) = self
+                    .sessions
+                    .get2_mut(owner_idx, session_idx)
+                    .filter(|(o, _)| o.task == owner_task && o.sess.h2_ctx.is_some())
+                {
+                    if !c.sess.rep.is_empty() && h2_bridge_moves(o, c, now) {
+                        let pending = o.sess.h2_ctx.as_deref().is_some_and(|h| h.tx_consumed < h.tx_buf.len());
+                        if let Some(ch) = c.sess.h2_child_mut() { ch.owner_tx_pending = pending; }
+                    }
+                }
             }
             self.wake_now.push(owner_task);
         }
@@ -12019,9 +12862,14 @@ impl EngineDispatcher<'_> {
         if let Some((be, msg)) = checkcache_alert {
             self.send_log(be, LogLevel::Alert, b"", msg.as_bytes());
         }
-        if let Some((line, sd, err)) = log_line {
+        if let Some((line, sd, level, origin)) = log_line {
             let fe = self.sessions.get(session_idx).map_or(0, |e| e.proxy_idx);
-            self.send_stream_log(fe, err, &line, sd);
+            let entry = self.sessions.get(session_idx);
+            if self.proxies[fe].any_log_profile {
+                self.send_stream_log_profiled(fe, origin, &line, sd, entry, level);
+            } else {
+                self.send_stream_log(fe, level, &line, sd);
+            }
             crate::logfmt::recycle_line(line);
         }
 
@@ -12069,18 +12917,27 @@ impl EngineDispatcher<'_> {
                 }
                 // `session_kill_embryonic`: `err` with `log-separate-errors`, else `info`.
                 let err = self.proxies[e.proxy_idx].log_opts & alcyon_config::LOG_OPT_SEPARATE_ERRORS != 0;
-                return proxy_header_error_line(e, self.proxies, self.pid).map(|(l, sd)| (e.proxy_idx, l, sd, err));
+                let level = if err { LogLevel::Err } else { LogLevel::Info };
+                return proxy_header_error_line(e, self.proxies, self.pid)
+                    .map(|(l, sd)| (e.proxy_idx, l, sd, level, alcyon_config::ast::logging::LogProfileStepKind::Error));
             }
             if e.sess.mode == Mode::Tcp || e.sess.strm.txn.is_some() {
                 account_stream(e, self.proxies);
             }
-            let queued = e.log_line.take().map(|l| (l, e.log_sd, e.log_err));
+            let queued = e.log_line.take().map(|l| (l, e.log_sd, e.log_err, e.log_level));
+            let skip_close = self.proxies[e.proxy_idx].log_steps.is_some_and(|m| m & alcyon_config::LOG_STEP_CLOSE == 0)
+                && !(e.sess.mode == Mode::Http && e.sess.strm.log.request.is_none());
             queued
-                .or_else(|| (e.sess.mode == Mode::Tcp || e.sess.strm.txn.is_some()).then(|| stream_log_line(e, self.proxies, self.pid)).flatten())
-                .map(|(l, sd, err)| (e.proxy_idx, l, sd, err))
+                .or_else(|| (!skip_close && (e.sess.mode == Mode::Tcp || e.sess.strm.txn.is_some())).then(|| stream_log_line(e, self.proxies, self.pid)).flatten())
+                .map(|(l, sd, err, level)| (e.proxy_idx, l, sd, level, stream_log_origin(e, err)))
         });
-        if let Some((fe, line, sd, err)) = line {
-            self.send_stream_log(fe, err, &line, sd);
+        if let Some((fe, line, sd, level, origin)) = line {
+            let entry = self.sessions.get(session_idx);
+            if self.proxies[fe].any_log_profile {
+                self.send_stream_log_profiled(fe, origin, &line, sd, entry, level);
+            } else {
+                self.send_stream_log(fe, level, &line, sd);
+            }
             crate::logfmt::recycle_line(line);
         }
         // A stream over as its transaction ended (not reset, not ending its connection, not a
@@ -12187,6 +13044,7 @@ impl EngineDispatcher<'_> {
             srv_served,
             log_line,
             log_err,
+            log_level,
             log_sd,
             buf_wait,
             parked,
@@ -12203,7 +13061,7 @@ impl EngineDispatcher<'_> {
         (*connect_log_due, *rate_max_due) = (false, false);
         *srv_served = 0;
         *log_line = None;
-        (*log_err, *log_sd) = (false, 0);
+        (*log_err, *log_level, *log_sd) = (false, LogLevel::Info, 0);
         *buf_wait = crate::buf_wait::WaitState::default();
         *parked = true;
     }
@@ -12376,17 +13234,56 @@ impl EngineDispatcher<'_> {
     /// The response head's rules, framing and `Connection`. True when the head's names are
     /// in lower case already, from its index (E2), and [`Self::write_response_head_names`]
     /// has nothing to do.
-    fn apply_http_response_rules(entry: &mut SessionEntry, proxies: &crate::table::Table, now: Tick) -> bool {
+    fn apply_http_response_rules(
+        entry: &mut SessionEntry,
+        proxies: &crate::table::Table,
+        now: Tick,
+        pid: u32,
+        log_targets: &[crate::syslog::SyslogTarget],
+        log_tag: &str,
+        fc: Option<crate::proxy::ConnView<'_>>,
+        set_nice: &mut Option<i16>,
+    ) -> bool {
         if let Some(c) = entry.sess.h2_child_mut() {
             c.rsp_head = None;
         }
         let mut lowered = false;
-        Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered);
+        let mut do_log_res = None;
+        let mut do_log_after = None;
+        let was_waiting = entry.sess.strm.txn.as_ref().is_some_and(|t| t.rsp == MsgState::Waiting);
+        Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered, pid, &mut do_log_res, &mut do_log_after, fc, set_nice);
+        // A `do-log` at `http-response`/`http-after-response` (and `log-steps response`) sends
+        // the stream's line for its step. The response head is borrowed by the rules' context
+        // inside the `_in` function, so the send runs here, once that context is gone.
+        let fe_idx = entry.proxy_idx;
+        let emit = LogEmit { targets: log_targets, tag: log_tag, pid };
+        if let Some(level) = do_log_res {
+            emit_step_log_entry_level(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::HttpRes, level);
+        }
+        if was_waiting
+            && proxies[fe_idx].log_steps.is_some_and(|m| m & alcyon_config::LOG_STEP_RESPONSE != 0)
+            && entry.sess.strm.txn.as_ref().is_some_and(|t| t.rsp != MsgState::Waiting)
+        {
+            emit_step_log_entry(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::Response);
+        }
+        if let Some(level) = do_log_after {
+            emit_step_log_entry_level(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::HttpAfterRes, level);
+        }
         lowered
     }
 
     #[allow(clippy::too_many_lines)]
-    fn apply_http_response_rules_in(entry: &mut SessionEntry, proxies: &crate::table::Table, now: Tick, lowered: &mut bool) {
+    fn apply_http_response_rules_in(
+        entry: &mut SessionEntry,
+        proxies: &crate::table::Table,
+        now: Tick,
+        lowered: &mut bool,
+        _pid: u32,
+        do_log_res: &mut Option<i8>,
+        do_log_after: &mut Option<i8>,
+        fc: Option<crate::proxy::ConnView<'_>>,
+        set_nice: &mut Option<i16>,
+    ) {
         let threshold = entry.sess.bufsize.saturating_sub(entry.sess.maxrewrite);
         // Empty lines ahead of a status line are skipped (`H1_MSG_RPBEFORE`), so that the
         // end of the head is not looked for in them (T275).
@@ -12402,6 +13299,7 @@ impl EngineDispatcher<'_> {
             // No end of head and no room for more: as for a request, from `bufsize - 56`
             // (T265).
             if entry.sess.rep.readable().len() > threshold || entry.sess.rep.readable().len() + 56 >= entry.sess.bufsize {
+                observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
                 entry.sess.rep.clear();
                 reply_error(entry, proxies, 502);
             }
@@ -12451,6 +13349,7 @@ impl EngineDispatcher<'_> {
             }
             match checked {
                 alcyon_proto::response_head::ResponseHead::Invalid => {
+                    observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
                     entry.sess.rep.clear();
                     entry.sess.strm.log.term.get_or_insert(*b"PH");
                     entry.sess.strm.log.bytes_from_server = 0;
@@ -12458,6 +13357,12 @@ impl EngineDispatcher<'_> {
                     return;
                 }
                 alcyon_proto::response_head::ResponseHead::Valid { status, rewrite, close_server: close, index: ix } => {
+                    let hana = if status >= 100 && (status < 500 || status == 501 || status == 505) {
+                        crate::check::HanaStatus::HttpOk
+                    } else {
+                        crate::check::HanaStatus::HttpSts
+                    };
+                    observe_http(entry, proxies, hana);
                     close_server = close;
                     index = ix;
                     if let Some(r) = rewrite {
@@ -12483,6 +13388,7 @@ impl EngineDispatcher<'_> {
                     match verdict {
                         crate::websocket::Verdict::Keep => {}
                         crate::websocket::Verdict::Refuse => {
+                            observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
                             entry.sess.rep.clear();
                             entry.sess.strm.log.term.get_or_insert(*b"PH");
                             entry.sess.strm.log.bytes_from_server = 0;
@@ -12755,7 +13661,10 @@ impl EngineDispatcher<'_> {
             sess.rewrite_rep_chunk_framing();
             // `option logasap`: the line goes out with the response head (`http_process_res_common`),
             // with what has come from the server so far, and the end of the stream logs nothing.
-            if proxies[fe_idx].log_opts & alcyon_config::LOG_OPT_ASAP != 0 && !entry.sess.strm.log.asap_done {
+            if proxies[fe_idx].log_steps.is_none()
+                && proxies[fe_idx].log_opts & alcyon_config::LOG_OPT_ASAP != 0
+                && !entry.sess.strm.log.asap_done
+            {
                 set_stream_log(entry, proxies, std::process::id());
                 entry.sess.strm.log.asap_done = true;
             }
@@ -12960,7 +13869,7 @@ impl EngineDispatcher<'_> {
             (entry.sess.strm.log.res_captures.clone(), entry.sess.strm.log.res_captures.clone())
         };
 
-        let htx_slice = if entry.sess.has_htx {
+        let htx_slice = if entry.sess.flags.has(sess_flags::HAS_HTX) {
             Some(alcyon_proto::htx::HtxSliceRef::new(
                 entry.sess.htx_buf.raw_slice(),
                 entry.sess.htx_blocks,
@@ -12996,14 +13905,16 @@ impl EngineDispatcher<'_> {
         let mut ctx = alcyon_sample::PhaseCtx {
             proxies: Some(&ProxiesView(proxies)),
             stick: Some(&stick),
+            fc: fc.as_ref().map(|c| c as &dyn alcyon_sample::FrontConnState),
             client_addr: entry.sess.client_addr,
             server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src(),
             so_name: entry.sess.so_name.as_deref(),
-            so_id: entry.sess.so_id,
+            so_id: entry.sess.so_id_opt(),
             fc_dst: entry.sess.fc_dst(),
-            is_first_req: entry.sess.is_first_req,
+            is_first_req: entry.sess.flags.has(sess_flags::IS_FIRST_REQ),
             proxy_tlvs: entry.sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+            saved_syn: entry.sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
             ssl_fc: crate::proxy::ssl_fc(&entry.sess.cli_xprt, entry.sess.h2_role.as_deref()),
             quic_acks: entry.sess.quic_facts(),
             fc_http_major: entry.sess.fc_http_major(),
@@ -13040,6 +13951,7 @@ impl EngineDispatcher<'_> {
             srv_name: entry
                 .target_server_idx
                 .and_then(|i| proxies.get(entry.srv_backend_idx)?.srv_set().name_at(i)),
+            uniq_id: Some(entry.sess.strm.log.uniq_id),
             ..Default::default()
         };
         let rh = RepHead {
@@ -13125,11 +14037,15 @@ impl EngineDispatcher<'_> {
                 }
                 match &rule.action {
                     alcyon_config::TcpResAction::Accept => {
-                        entry.sess.strm.log.last_rule = Some(rule.line);
+                        if rule.line != 0 {
+                            entry.sess.strm.log.last_rule = rule.line;
+                        }
                         break;
                     }
                     alcyon_config::TcpResAction::Reject | alcyon_config::TcpResAction::SilentDrop => {
-                        entry.sess.strm.log.last_rule = Some(rule.line);
+                        if rule.line != 0 {
+                            entry.sess.strm.log.last_rule = rule.line;
+                        }
                         rejected = true;
                         break 'tcp true;
                     }
@@ -13150,6 +14066,7 @@ impl EngineDispatcher<'_> {
             if tcp_stop {
                 break 'rules None;
             }
+            ctx.last_rule = last_rule_at(entry.sess.strm.log.last_rule);
             CURRENT_RES_STATUS.set(status);
 
             // 1. The backend's `http-response` rules, then the frontend's when it is another
@@ -13214,6 +14131,9 @@ impl EngineDispatcher<'_> {
                     registry,
                     &mut entry.sess.strm.vars,
                     Some(ResWait { start, check: &mut check }),
+                    do_log_res,
+                    &mut entry.sess.strm.log.log_level,
+                    set_nice,
                 ) {
                     Err(stop) => {
                         stopped = Some(stop);
@@ -13223,8 +14143,9 @@ impl EngineDispatcher<'_> {
                     Ok(None) => {}
                 }
             }
-            if let Some(line) = LAST_RULE.take() {
-                entry.sess.strm.log.last_rule = Some(line);
+            if let Some(line) = LAST_RULE.take().filter(|&l| l != 0) {
+                entry.sess.strm.log.last_rule = line;
+                ctx.last_rule = last_rule_at(line);
             }
             // What the rules captured is what the log line shows, and what the rules after
             // them (`http-after-response`) read.
@@ -13289,6 +14210,9 @@ impl EngineDispatcher<'_> {
                 Some(&mut res_caps),
                 registry,
                 &mut entry.sess.strm.vars,
+                do_log_after,
+                &mut entry.sess.strm.log.log_level,
+                set_nice,
             );
             if !res_caps.is_empty() || !entry.sess.strm.log.res_captures.is_empty() {
                 note_res_caps_clone();
@@ -13479,9 +14403,10 @@ impl EngineDispatcher<'_> {
                         trimmed_uri
                     };
                     if base == "/" {
-                        req_uri == "/"
-                            || req_uri.starts_with("/;csv")
-                            || req_uri.starts_with("/api/data")
+                        // `http_stats_check_uri` compares the prefix against the request's
+                        // *path*: with the prefix `/`, every path holds it, so the applet
+                        // takes every request of the section (`/?;csv;scope=b1`, `/api/data`).
+                        req_uri.starts_with('/')
                     } else {
                         req_uri == base
                             || req_uri.starts_with(&format!("{base}/"))
@@ -13513,8 +14438,9 @@ impl EngineDispatcher<'_> {
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
             fc_src: sess.fc_src(),
+            saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
             fc_dst: sess.fc_dst(),
-            is_first_req: sess.is_first_req,
+            is_first_req: sess.flags.has(sess_flags::IS_FIRST_REQ),
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
             quic_acks: sess.quic_facts(),
             fc_http_major: sess.fc_http_major(),
@@ -13528,6 +14454,7 @@ impl EngineDispatcher<'_> {
             be_name: Some(name),
             be_id: Some(proxies[serving].ids.iid),
             acls: Some(&proxies[serving].acls),
+            uniq_id: Some(sess.strm.log.uniq_id),
             ..Default::default()
         }
     }
@@ -13613,6 +14540,38 @@ impl EngineDispatcher<'_> {
         link
     }
 
+    /// The `scope=` text of the part of the request URI after the section's prefix, as
+    /// `http_handle_stats` keeps it (`STAT_SCOPE_INPUT_NAME`): at most 20 bytes, to the next
+    /// `;`, `&` or space, and none at all when one of those bytes is one `HAProxy` refuses
+    /// (`invalid_char`, `[A-Za-z0-9_:.-]`) or the `scope=` sits within the URI's last 8
+    /// bytes (the scan's `h <= end - 8`). Borrowed from `rest`, no copy.
+    fn stats_scope(rest: &str) -> &str {
+        let Some(at) = rest.find("scope=") else {
+            return "";
+        };
+        // `http_handle_stats` scans `for (h = lookup; h <= end - 8; h++)`: a `scope=` that
+        // starts fewer than 8 bytes before the end of the URI is never found (measured on
+        // the oracle: `GET /;scope=a` unscoped, `GET /;scope=ab` scoped).
+        if at + 8 > rest.len() {
+            return "";
+        }
+        let text = &rest[at + 6..];
+        let end = text.find(|c| c == ';' || c == '&' || c == ' ').unwrap_or(text.len());
+        // `STAT_SCOPE_TXT_MAXLEN` (20): the oracle keeps the first 20 *bytes* and validates
+        // exactly those (`memcpy(scope_txt, h2, itx)`). Work in bytes, where no cut can land
+        // mid-character: a byte the allowed set refuses clears the scope, as the oracle's
+        // `invalid_char` does (`isalnum` in the C locale, i.e. ASCII).
+        let bytes = &text.as_bytes()[..end.min(20)];
+        if bytes
+            .iter()
+            .any(|c| !matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b':' | b'.' | b'-'))
+        {
+            return "";
+        }
+        // The allowed set is ASCII, so the kept bytes are valid UTF-8.
+        std::str::from_utf8(bytes).unwrap()
+    }
+
     /// `stats_send_http_redirect`: the answer to an admin POST, whatever came of it.
     fn stats_redirect(entry: &mut SessionEntry, proxies: &Proxies, serving: usize, code: crate::stats_post::StCode) {
         let req_uri = entry.sess.req_uri.as_deref().unwrap_or("/");
@@ -13626,8 +14585,17 @@ impl EngineDispatcher<'_> {
         if cfg.refresh.is_some() && rest.contains(";norefresh") {
             loc.push_str(";norefresh");
         }
+        // The page the browser lands on keeps the request's search text (`?scope=`), as the
+        // redirect the applet sends.
+        let scope = Self::stats_scope(rest);
+        if !scope.is_empty() {
+            loc.push_str("?scope=");
+            loc.push_str(scope);
+        }
+        // No `Connection: close`: the applet answers like any other HTTP response and the
+        // browser's next request rides the same connection (`stats_send_http_redirect`).
         let resp = format!(
-            "HTTP/1.1 303 See Other\r\ncache-control: no-cache\r\ncontent-type: text/plain\r\ncontent-length: 0\r\nlocation: {loc}\r\nconnection: close\r\n\r\n"
+            "HTTP/1.1 303 See Other\r\ncache-control: no-cache\r\ncontent-type: text/plain\r\ncontent-length: 0\r\nlocation: {loc}\r\n\r\n"
         );
         stats_write_reply(entry, proxies, resp.as_bytes());
     }
@@ -13667,7 +14635,20 @@ impl EngineDispatcher<'_> {
         if !crate::stats_post::fits_buffer(entry.sess.bufsize, head_len, nhdr, body.len().max(declared)) {
             return StCode::Excd;
         }
-        let mut backend = |name: &str| proxies.iter().position(|p| p.has_backend && p.name == name);
+        // The form's `b`: the backend's name or `#<id>` (`proxy_be_by_name`, the id being the
+        // proxy's `iid`, the sections numbered from 2).
+        let mut backend = |name: &str| {
+            let found = if let Some(digits) = name.strip_prefix('#') {
+                let id = digits
+                    .bytes()
+                    .take_while(|c| c.is_ascii_digit())
+                    .fold(0u32, |a, c| a.saturating_mul(10).saturating_add((c - b'0') as u32));
+                proxies.iter().position(|p| p.has_backend && p.ids.iid == id)
+            } else {
+                proxies.iter().position(|p| p.has_backend && p.name == name)
+            };
+            found
+        };
         let mut apply = |p: usize, verb: Verb, name: &str| -> Option<bool> {
             let s = proxies[p].srv_set().find(name).map(|s| s.index())?;
             let cur = proxies[p].srv_set().status_cell(s).map_or(0, |a| a.load(Ordering::Relaxed));
@@ -13714,7 +14695,7 @@ impl EngineDispatcher<'_> {
     ) -> Option<crate::stats_html::AdminAction> {
         entry.sess.strm.log.applet = true;
         // The applet reads the request's body behind its head in the buffer (X4).
-        if entry.sess.req_head_pending {
+        if entry.sess.flags.has(sess_flags::REQ_HEAD_PENDING) {
             crate::h2_bridge::write_pending_head(&mut entry.sess, false, None);
         }
         if Self::stats_rules_reply(entry, proxies, serving) {
@@ -13785,21 +14766,30 @@ impl EngineDispatcher<'_> {
             return None;
         }
         if req_uri.contains(";json") {
-            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(crate::stats::StatFormat::Json, proxies[serving].stats_config.show_legends));
+            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(
+                crate::stats::StatFormat::Json,
+                proxies[serving].stats_config.show_legends,
+                Self::stats_scope(req_uri.get(proxies[serving].stats_config.uri.as_deref().unwrap_or("/haproxy?stats").len()..).unwrap_or(""))));
             stats_stream_page(entry, proxies, checks, pid, serving, "application/json", &refresh, page);
             return None;
         }
 
         // `;typed` (`stats-html.c`): the CLI's `show stat typed` rows; after `;json`, before `;csv`.
         if req_uri.contains(";typed") {
-            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(crate::stats::StatFormat::Typed, proxies[serving].stats_config.show_legends));
+            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(
+                crate::stats::StatFormat::Typed,
+                proxies[serving].stats_config.show_legends,
+                Self::stats_scope(req_uri.get(proxies[serving].stats_config.uri.as_deref().unwrap_or("/haproxy?stats").len()..).unwrap_or(""))));
             stats_stream_page(entry, proxies, checks, pid, serving, "text/plain", &refresh, page);
             return None;
         }
 
         // 1. CSV telemetry
         if req_uri.contains(";csv") || req_uri.ends_with("/csv") {
-            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(crate::stats::StatFormat::Csv, proxies[serving].stats_config.show_legends));
+            let page = crate::stats_stream::Page::Rows(crate::stats::StatCursor::page(
+                crate::stats::StatFormat::Csv,
+                proxies[serving].stats_config.show_legends,
+                Self::stats_scope(req_uri.get(proxies[serving].stats_config.uri.as_deref().unwrap_or("/haproxy?stats").len()..).unwrap_or(""))));
             stats_stream_page(entry, proxies, checks, pid, serving, "text/plain", &refresh, page);
             return None;
         }
@@ -13935,6 +14925,9 @@ impl EngineDispatcher<'_> {
         idle_pool: &mut IdlePool,
         now: Tick,
         lb_snap: &mut crate::lb::LbSnapCache,
+        fc: Option<crate::proxy::ConnView<'_>>,
+        emit: LogEmit<'_>,
+        set_nice: &mut Option<i16>,
     ) -> Option<crate::stats_html::AdminAction> {
         let proxy_idx = entry.proxy_idx;
         // A request held for its body (`wait-for-body`) comes back here when the body is
@@ -13960,6 +14953,9 @@ impl EngineDispatcher<'_> {
         // The stream's variables are in `CURRENT_VARS` for this whole run (`step_stream`).
         if resume.is_none() {
             begin_http_stream(entry, proxies, proxy_idx, pid);
+            if proxies[proxy_idx].log_steps.is_some_and(|m| m & alcyon_config::LOG_STEP_REQUEST != 0) {
+                emit_step_log_entry(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::Request);
+            }
         }
         // Until a backend is chosen the frontend's timeouts are the backend's too.
         stream_timeouts_enter(proxies, proxy_idx, entry.backend_idx, &entry.sess);
@@ -14048,10 +15044,11 @@ impl EngineDispatcher<'_> {
             // context is this and the live session, read at the fetch (`LiveReq`).
             let phase = alcyon_sample::PhaseCtx {
                 proxies: Some(&ProxiesView(proxies)),
+                fc: fc.as_ref().map(|c| c as &dyn alcyon_sample::FrontConnState),
                 fc_src: sess.fc_src(),
-                so_id: sess.so_id,
+                so_id: sess.so_id_opt(),
                 fc_dst: sess.fc_dst(),
-                is_first_req: sess.is_first_req,
+                is_first_req: sess.flags.has(sess_flags::IS_FIRST_REQ),
                 quic_acks: sess.quic_facts(),
                 fc_http_major: sess.fc_http_major(),
                 bc_http_major: sess.bc_http_major(),
@@ -14068,10 +15065,20 @@ impl EngineDispatcher<'_> {
                 // The request's time to its first byte (`s->logs.t_idle`, `%Ti`), as
                 // `req.timer.idle` reads it in a request rule.
                 req_timer_idle: sess.strm.log.ms(sess.strm.log.first_byte),
+                // The stream exists by the time the request rules run (`smp->strm`): a rule
+                // that reads a timer fetch carries the stream's logs, `-1` where nothing is
+                // stamped yet (`request_phase_facts` keeps `t_request` at `-1` for the whole
+                // phase); the clock reads run only when a rule needs them (T455).
+                stream: proxies[pages_idx].rules.req_stream.then(|| request_phase_facts(sess)),
                 be_max_retries: Some(be_retries),
                 acls: Some(acls),
                 act_conn,
                 stick: Some(&stick),
+                uniq_id: Some(sess.strm.log.uniq_id),
+                // The wait these rules run to clear (`body_wait`), as `waiting_entity`
+                // names it: `rules` is the list its `rule` indexes and `be_stage` its
+                // stage, so the two never disagree.
+                waiting_entity: sess.strm.txn.as_ref().and_then(|t| t.body_wait).and_then(|w| waiting_entity_of(&w, rules, be_stage)),
                 ..Default::default()
             };
             macro_rules! make_ctx {
@@ -14092,8 +15099,7 @@ impl EngineDispatcher<'_> {
                 }
                 if matches!(
                     rule.action,
-                    alcyon_config::HttpReqAction::Return { .. }
-                        | alcyon_config::HttpReqAction::UseServicePrometheus
+                    alcyon_config::HttpReqAction::UseServicePrometheus
                         | alcyon_config::HttpReqAction::Deny { .. }
                         | alcyon_config::HttpReqAction::Allow
                         | alcyon_config::HttpReqAction::Auth { .. }
@@ -14132,6 +15138,10 @@ impl EngineDispatcher<'_> {
                                 }
                             }
                         });
+                        // `http_req_get_intercept_rule` sets `last_entity` once `http_action_return`
+                        // returns, so `http-after-response` inside `return` sees nothing, while the
+                        // log line sees the rule.
+                        note_last_rule(sess, rule.line);
                         return Ok(RuleFlow::Replied);
                     }
                     // `use-service prometheus-exporter`: the metrics page answers the request and
@@ -14704,6 +15714,9 @@ impl EngineDispatcher<'_> {
                             BodyWait::Ready => {}
                             BodyWait::Pending => return Ok(RuleFlow::Suspend),
                             BodyWait::TimedOut => {
+                                // The wait ended in `ACT_RET_ABRT`, so the rule is the
+                                // entity that ended the rule set: `last_entity` names it.
+                                note_last_rule(sess, rule.line);
                                 sess.strm.log.term.get_or_insert(*b"cR");
                                 return Err(408);
                             }
@@ -14723,7 +15736,12 @@ impl EngineDispatcher<'_> {
                                 }
                                 sess.strm.log.term.get_or_insert(*b"CR");
                             }
-                            BodyWait::Malformed => return Err(400),
+                            // A broken `at_least` expression is an `ACT_RET_INV`: the rule
+                            // is the one that ended the set, so `last_entity` names it.
+                            BodyWait::Malformed => {
+                                note_last_rule(sess, rule.line);
+                                return Err(400);
+                            }
                         }
                     }
                     alcyon_config::HttpReqAction::Capture { len, id, .. } => {
@@ -14773,7 +15791,25 @@ impl EngineDispatcher<'_> {
                             }
                         }
                     }
-                    _ => {}
+                    alcyon_config::HttpReqAction::DoLog => {
+                        let phase_og = alcyon_sample::PhaseCtx {
+                            log_origin: Some(alcyon_config::ast::logging::LogProfileStepKind::HttpReq.og_name()),
+                            ..phase.clone()
+                        };
+                        let sc = SampleContext::live(&phase_og, &*sess);
+                        let data = session_log_data(sess, &proxies[proxy_idx], &proxies[pages_idx], emit.pid);
+                        emit_step_log_with(&proxies[proxy_idx], emit, alcyon_config::ast::logging::LogProfileStepKind::HttpReq, stream_log_level(sess.strm.log.log_level, &proxies[proxy_idx], false), &data, &sc);
+                    }
+                    alcyon_config::HttpReqAction::SetLogLevel(l) => {
+                        // As the rule fires: the stream's lines from here on (later
+                        // `do-log`s, the end line) are at this level (`s->logs.level`).
+                        sess.strm.log.log_level = *l;
+                    }
+                    alcyon_config::HttpReqAction::SetNice(n) => {
+                        // The caller sets the task's nice once the pass is over; the
+                        // scheduler reads it on the next wakeup (`task_set_nice`).
+                        *set_nice = Some(*n);
+                    }
                 }
             }
             Ok(RuleFlow::Next)
@@ -14793,7 +15829,7 @@ impl EngineDispatcher<'_> {
         };
         // The rules edit the HTX alone: the head is written out of it once, at the server send
         // (`encode_if_modified`, X2).
-        let eval_http_rules = eval_http_rules_held;
+        let mut eval_http_rules = eval_http_rules_held;
 
         // Execute frontend rules
         if !resume_be && !proxies[proxy_idx].http_req_rules.is_empty() {
@@ -14889,7 +15925,7 @@ impl EngineDispatcher<'_> {
         };
         entry.backend_idx = be_idx;
         enter_backend(entry, proxies, be_idx);
-        entry.sess.retry_conn = proxies[be_idx].ids.retry_on & alcyon_config::RE_CONN_FAILED != 0;
+        entry.sess.flags.set_to(sess_flags::RETRY_CONN, proxies[be_idx].ids.retry_on & alcyon_config::RE_CONN_FAILED != 0);
         // `option http-drop-request-trailers` is the backend's (`h1_snd_buf`, on the server connection).
         entry.sess.set_drop_req_trailers(proxies[be_idx].h1_adjust & alcyon_config::H1_DROP_REQ_TRAILERS != 0);
         // `stream_set_backend` counts the stream for the backend (`proxy_inc_be_ctr`).
@@ -14920,9 +15956,10 @@ impl EngineDispatcher<'_> {
         let inspect_wait = resume.filter(|w| w.inspect);
         if (!resume_be || inspect_wait.is_some()) && !proxies[be_idx].tcp_req_content_rules.is_empty() {
             // The backend's own `inspect-delay`, from the first pass over its rules.
-            let deadline = inspect_wait.map(|w| w.deadline).or_else(|| {
-                proxies[be_idx].tcp_req_inspect_delay.map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)))
-            });
+            let deadline = inspect_wait.map_or_else(
+                || proxies[be_idx].tcp_req_inspect_delay.map_or(Tick::ETERNITY, |d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX))),
+                |w| w.deadline,
+            );
             entry.sess.inspect_exp = deadline;
             crate::resolvers::dr_set_task(entry.task);
             let res = eval_tcp_req_content_rules(
@@ -14933,12 +15970,13 @@ impl EngineDispatcher<'_> {
                 &mut entry.sess,
                 now,
                 0,
+                emit,
             );
-            entry.sess.inspect_exp = None;
-            let wait = (res == ContentEvalResult::Waiting).then(|| crate::txn::BodyWait {
+            entry.sess.inspect_exp = Tick::ETERNITY;
+            let wait = (res == ContentEvalResult::Waiting).then_some(crate::txn::BodyWait {
                 backend: true,
                 rule: 0,
-                deadline: deadline.unwrap_or(Tick::ETERNITY),
+                deadline,
                 tarpit: false,
                 inspect: true,
                 resolve: false,
@@ -15076,7 +16114,7 @@ impl EngineDispatcher<'_> {
         // at the end of the last `Forwarded` header.
         if let Some(fwd) = proxies[be_idx].stats_config.forwarded.clone() {
             let stick = StickView::new(proxies, &entry.sess.tracked_sc);
-            let element = forwarded_element(&fwd, &entry.sess, &stream_sample_ctx(&entry.sess, &proxies[proxy_idx], &proxies[be_idx], &ProxiesView(proxies), &stick).as_ctx());
+            let element = forwarded_element(&fwd, &entry.sess, &stream_sample_ctx(&entry.sess, &proxies[proxy_idx], &proxies[be_idx], &ProxiesView(proxies), &stick, None).as_ctx());
             if !append_forwarded_element(&mut entry.sess, &element) {
                 return Self::request_no_room(entry, proxies);
             }
@@ -15112,7 +16150,7 @@ impl EngineDispatcher<'_> {
         // X3b-2: not before the pick when the session's server connection speaks h2, which takes
         // the blocks: written at the send if the text goes after all (another server, a retry).
         let s = &mut entry.sess;
-        let names_done = if s.htx_modified && s.has_htx && !s.req_head_pending && srv_table.is_none() && s.srv_xprt.h2().is_some() {
+        let names_done = if s.flags.has(sess_flags::HTX_MODIFIED) && s.flags.has(sess_flags::HAS_HTX) && !s.flags.has(sess_flags::REQ_HEAD_PENDING) && srv_table.is_none() && s.srv_xprt.h2().is_some() {
             s.req_head_deferred = Some(lower);
             true
         } else {
@@ -15148,7 +16186,7 @@ impl EngineDispatcher<'_> {
         lb_snap: &mut crate::lb::LbSnapCache,
     ) -> Option<crate::stats_html::AdminAction> {
         let source_ip = entry.sess.client_addr.map(|a| a.ip());
-        entry.sess.lb_picked = cookie_server.is_none();
+        entry.sess.flags.set_to(sess_flags::LB_PICKED, cookie_server.is_none());
         // The server's slot is taken with the pick (T590): checked apart, two workers both
         // took a `maxconn 1` server's last one. A server persistence or `use-server` names
         // (`SF_ASSIGNED`) takes one too, or the request waits for it (`pendconn_add` with the
@@ -15159,7 +16197,8 @@ impl EngineDispatcher<'_> {
         let be = &proxies[be_idx];
         let mut pick = || be.pick_and_take(false, || be.select_server_with_key_abs_idx(source_ip, entry.sess.req_uri.as_deref(), entry.sess.req_abs(), lb_snap));
         let mut full;
-        let target = if let Some(idx) = cookie_server {
+        let mut cookie_server = cookie_server;
+        let mut target = if let Some(idx) = cookie_server {
             let t = be.take_server_slot(idx, false).map(|counted| ((Some(idx), be.srv_set().addr_at(idx)), counted));
             full = t.is_none();
             t
@@ -15176,6 +16215,62 @@ impl EngineDispatcher<'_> {
                 if t.is_some() || full || tries.next().is_none() || !limited() { break t; }
             }
         };
+
+        // The server persistence named is at its `maxconn` and the other entries fill its
+        // queue (`maxqueue`): `SRV_STATUS_FULL` (src/backend.c:1059-1062). `option redispatch`
+        // unassigns and asks the balancer again (`goto redispatch`); without it the stream
+        // ends with the `503` and the `sQ` term (`STRM_ET_QUEUE_ERR`). A server the balancer
+        // picked is never full here: the algorithms skip full servers, so only the assigned
+        // path reaches this check.
+        if target.is_none() && full {
+            if let Some(idx) = cookie_server {
+                let mq = be.srv_set().maxqueue_at(idx);
+                // A request woken out of `idx`'s queue is still counted in it until it
+                // leaves below; the check must not see itself. `HAProxy` unlinks the
+                // stream from its queue before re-checking it (`process_srv_queue` in
+                // src/queue.c), so its fullness is the other entries only.
+                let others = be.srv_set().queue_len(idx)
+                    .saturating_sub(u32::from(entry.sess.queue.server() == Some(idx)));
+                if mq > 0 && others >= mq {
+                    if be.redisp {
+                        let limited = || (0..be.srv_set().len()).any(|i| be.srv_set().maxconn_at(i).is_some_and(|m| m > 0));
+                        let mut tries = 0..3;
+                        loop {
+                            target = pick();
+                            full = target.is_none() && be.all_servers_full();
+                            if target.is_some() || full || tries.next().is_none() || !limited() { break; }
+                        }
+                        cookie_server = None;
+                        // `assign_server_and_queue` (src/backend.c:1001-1010): the target
+                        // changed from `idx` -- to another server (the balancers skip a server
+                        // at its `maxconn` and a failed `take` is a `None`), or to none when
+                        // no server is left -- so it takes the `SF_REDISP` flag, the cookie
+                        // downgrade and the counts either way; a failed re-pick still logs
+                        // `+` in `%rc`. The `HAProxy` same-server retry case cannot happen here.
+                        if let Some(((opt_idx, _), _)) = &target {
+                            debug_assert!(*opt_idx != Some(idx), "a pick never returns a server at its maxconn");
+                            entry.sess.flags.set(sess_flags::LB_PICKED);
+                        }
+                        entry.sess.flags.set(sess_flags::REDISPATCHED);
+                        entry.sess.strm.log.redispatched = true;
+                        be.srv_set().bump_retr(idx, (0, 1, 0));
+                        be.counters().redispatches.fetch_add(1, Ordering::Relaxed);
+                        entry.sess.strm.txn.iter_mut().for_each(|txn| {
+                            txn.ck.direct = false;
+                            // TX_CK_VALID (3) becomes TX_CK_DOWN (2).
+                            txn.ck.ck = if txn.ck.ck == 3 { 2 } else { txn.ck.ck };
+                        });
+                    } else {
+                        be.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
+                        be.srv_set().bump_retr(idx, (0, 0, 1));
+                        entry.sess.strm.log.term = Some(*b"sQ");
+                        entry.sess.strm.log.queue.get_or_insert_with(crate::txnlog::loop_now);
+                        reply_error(entry, proxies, 503);
+                        return None;
+                    }
+                }
+            }
+        }
 
         let Some(((picked_idx, target_addr), counted)) = target else {
             if full {
@@ -15209,7 +16304,7 @@ impl EngineDispatcher<'_> {
                 // A connection opened with a PROXY header carries only requests that would
                 // send that same header: HAProxy hashes it into the reuse key, so a
                 // per-request unique-id TLV gets a connection of its own.
-                && (!entry.sess.send_proxy_prepended
+                && (!entry.sess.flags.has(sess_flags::SEND_PROXY_PREPENDED)
                     || proxy_header(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr)
                         .is_some_and(|h| h == entry.sess.send_proxy_header));
             // Under `http-reuse` other than `never` the connection goes back to the server's
@@ -15240,12 +16335,12 @@ impl EngineDispatcher<'_> {
                 // old arm for a counted one (probe, 2026-11-17, the whole `it` suite).
                 debug_assert!(entry.sess.srv_uncounted(), "a reused connection that holds its own slot");
                 entry.sess.srv_park_exp = Tick::ETERNITY;
-                entry.sess.srv_kept = false;
+                entry.sess.flags.clear(sess_flags::SRV_KEPT);
                 if !counted {
                     server_actconn_add(entry, proxies, true);
                 }
-                entry.sess.server_connected(now);
-                entry.sess.bc_idle = false;
+                mark_server_connected(entry, proxies, now);
+                entry.sess.flags.clear(sess_flags::BC_IDLE);
                 if let Some(txn) = entry.sess.strm.txn.as_mut() {
                     txn.srv_reused = true;
                 }
@@ -15255,7 +16350,7 @@ impl EngineDispatcher<'_> {
             release_server(entry, proxies, fdtab, poller, idle_pool, true);
         }
         // The connection opened or taken from here is the stream's, in use.
-        entry.sess.srv_kept = false;
+        entry.sess.flags.clear(sess_flags::SRV_KEPT);
 
         let s_idx = picked_idx;
         entry.target_server_idx = s_idx;
@@ -15265,6 +16360,11 @@ impl EngineDispatcher<'_> {
         maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
         set_target(entry, target_addr);
+        // `socks4 <proxy>`: a new connection goes out to the proxy; the tunnel request
+        // carries the server's address and is driven before any traffic. A pooled
+        // connection finished its handshake when it was made.
+        let real = connect_addr(target_addr, entry.sess.server_addr);
+        let socks4 = socks4_proxy_of(proxies, be_idx, s_idx);
 
         let mut reused = None;
         entry.srv_served = 0;
@@ -15281,7 +16381,7 @@ impl EngineDispatcher<'_> {
             // and so is every HTTP/3 request, the relay's included (`qcs_new`, `mux_quic.c`): one
             // server connection per HTTP/3 request overflowed a small server's accept queue
             // under a burst of 200 (T523).
-            let first_req = entry.sess.is_first_req && !entry.sess.is_h2_child() && !entry.sess.h3;
+            let first_req = entry.sess.flags.has(sess_flags::IS_FIRST_REQ) && !entry.sess.is_h2_child() && entry.sess.client_proto != ClientProto::H3;
             if let Some((conn, safe, registered)) = key.and_then(|k| idle_pool.take(&k, first_req, proxies[be_idx].http_reuse, steal)) {
                 entry.srv_served = if safe { 2 } else { 1 };
                 reused = Some((conn, registered));
@@ -15302,11 +16402,12 @@ impl EngineDispatcher<'_> {
         }
 
         count_connect(proxies, be_idx, s_idx, reused.is_some());
+        let be_srv = proxies[be_idx].srv_set();
         if let Some((IdleConn { fd: srv_fd, xprt, src }, registered)) = reused {
             let sfd = srv_fd.as_raw_fd();
             entry.srv_raw_fd = Some(sfd);
             entry.sess.attach_server_from(srv_fd, xprt, src, now);
-            entry.sess.server_connected(now);
+            mark_server_connected(entry, proxies, now);
             if let Some(txn) = entry.sess.strm.txn.as_mut() {
                 txn.srv_reused = true;
             }
@@ -15340,11 +16441,16 @@ impl EngineDispatcher<'_> {
                     new_interest.writable,
                 );
             }
-        } else if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].srv_set().tfo_of(target_addr))
+        } else if let Ok((srv_fd, immediate)) = raw::connect_opts(
+            socks4.unwrap_or(real),
+            be_srv.tfo_of(target_addr),
+            s_idx.and_then(|i| be_srv.md5sig_at(i)).map(str::as_bytes),
+        )
         .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
     {
             let sfd = srv_fd.as_raw_fd();
             attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
+            start_socks4_handshake(&mut entry.sess, socks4);
             entry.srv_raw_fd = Some(sfd);
             if immediate {
                 entry.sess.server_connected(now);
@@ -15405,7 +16511,11 @@ impl EngineDispatcher<'_> {
         }
         let ms = entry.sess.queue_ms();
         let deadline = if ms == 0 { Tick::ETERNITY } else { now.add(ms) };
-        entry.sess.strm.log.be_queue = entry.sess.queue.enter(entry.task, be_idx, srv, proxies[be_idx].stats.clone(), deadline);
+        // `srv->queueslength`: the request counted on the server it waits for, not only on
+        // the backend's queue (`pendconn_add`).
+        let srv_q = srv.and_then(|i| proxies[be_idx].srv_set().queue_ref(i));
+        entry.sess.strm.log.be_queue = entry.sess.queue.enter(entry.task, be_idx, srv, proxies[be_idx].stats.clone(), srv_q, deadline);
+        entry.sess.strm.log.queue_is_srv = srv.is_some();
         None
     }
 
@@ -15416,6 +16526,7 @@ impl EngineDispatcher<'_> {
         poller: &mut Poller,
         now: Tick,
         lb_snap: &mut crate::lb::LbSnapCache,
+        emit: LogEmit<'_>,
     ) {
         let Some(be_idx) = Self::resolve_backend(entry, proxies) else {
             // `force-be-switch` sent the connection to a disabled backend: no server.
@@ -15424,10 +16535,10 @@ impl EngineDispatcher<'_> {
         };
         // Back here after the backend's `tcp-request content` rules waited: the stream is
         // already counted for the backend.
-        let resumed = entry.sess.be_inspect;
+        let resumed = entry.sess.flags.has(sess_flags::BE_INSPECT);
         entry.backend_idx = be_idx;
         enter_backend(entry, proxies, be_idx);
-        entry.sess.retry_conn = proxies[be_idx].ids.retry_on & alcyon_config::RE_CONN_FAILED != 0;
+        entry.sess.flags.set_to(sess_flags::RETRY_CONN, proxies[be_idx].ids.retry_on & alcyon_config::RE_CONN_FAILED != 0);
         entry.sess.set_backend_timeouts(&proxies[be_idx]);
         stream_timeouts_enter(proxies, entry.proxy_idx, be_idx, &entry.sess);
         if !resumed {
@@ -15445,7 +16556,7 @@ impl EngineDispatcher<'_> {
                 // (`stream_set_backend` clears the analyser's expiry).
                 entry.sess.inspect_exp = proxies[be_idx]
                     .tcp_req_inspect_delay
-                    .map(|d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
+                    .map_or(Tick::ETERNITY, |d| now.add(u32::try_from(d.as_millis()).unwrap_or(u32::MAX)));
             }
             crate::resolvers::dr_set_task(entry.task);
             let res = eval_tcp_req_content_rules(
@@ -15456,15 +16567,16 @@ impl EngineDispatcher<'_> {
                 &mut entry.sess,
                 now,
                 0,
+                emit,
             );
             if res == ContentEvalResult::Waiting {
                 // Held until the delay is over, or the request says more: the server is
                 // not connected, and this runs again.
-                entry.sess.be_inspect = true;
+                entry.sess.flags.set(sess_flags::BE_INSPECT);
                 return;
             }
-            entry.sess.be_inspect = false;
-            entry.sess.inspect_exp = None;
+            entry.sess.flags.clear(sess_flags::BE_INSPECT);
+            entry.sess.inspect_exp = Tick::ETERNITY;
             match res {
                 ContentEvalResult::Reject => {
                     entry.sess.abort_client();
@@ -15489,7 +16601,7 @@ impl EngineDispatcher<'_> {
         let chosen = Self::use_server(&entry.sess, be_idx, proxies);
         let assigned = chosen.is_some();
         let direct = chosen.or(Self::sticking_rules(&mut entry.sess, be_idx, proxies, assigned));
-        entry.sess.lb_picked = direct.is_none();
+        entry.sess.flags.set_to(sess_flags::LB_PICKED, direct.is_none());
         // The slot is taken with the pick (T590); a server persistence names is counted
         // whether or not it is full, as before.
         let be = &proxies[be_idx];
@@ -15514,17 +16626,29 @@ impl EngineDispatcher<'_> {
 
         maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
+        // `socks4 <proxy>`: the connection goes to the proxy; the tunnel request carries
+        // the real server address and is driven by the stream before any traffic
+        // (`TcpSession::process_srv_io`), mirroring `tcp_connect_server` +
+        // `conn_send_socks4_proxy_request`.
+        let real = connect_addr(target_addr, entry.sess.server_addr);
+        let socks4 = socks4_proxy_of(proxies, be_idx, s_idx);
         set_target(entry, target_addr);
         // A connect that completed at once (`connect()` returning 0, which a TCP socket on
         // Linux never does: it is EINPROGRESS even on loopback) takes the same path: the
         // socket is reported writable on the next poll and completes there. Only INET
         // servers exist (`unix@` is refused at parse time), so no test could reach a
         // separate branch for it.
-        if let Ok((srv_fd, _immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].srv_set().tfo_of(target_addr))
+        let be_srv = proxies[be_idx].srv_set();
+        if let Ok((srv_fd, _immediate)) = raw::connect_opts(
+            socks4.unwrap_or(real),
+            be_srv.tfo_of(target_addr),
+            s_idx.and_then(|i| be_srv.md5sig_at(i)).map(str::as_bytes),
+        )
         .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
     {
             let sfd = srv_fd.as_raw_fd();
             attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
+            start_socks4_handshake(&mut entry.sess, socks4);
             entry.srv_raw_fd = Some(sfd);
             {
                 entry.srv_interest = Interest::WRITE;
@@ -15593,6 +16717,23 @@ impl EngineDispatcher<'_> {
         }
     }
 
+    fn step_agent_check(&mut self, idx: usize) -> Outcome {
+        let Some(agent) = self.agent_checks.get_mut(idx) else { return Outcome::Done };
+        let next = crate::agent_check::step_agent_check(
+            agent,
+            self.fdtab,
+            self.poller,
+            self.now,
+            self.proxies,
+            self.checks,
+        );
+        if let Some(px) = self.proxies.get(agent.proxy()) {
+            crate::track::publish_agent_view(px, agent);
+        }
+        self.timer_updates.push((agent.task, next));
+        Outcome::Keep
+    }
+
     /// Runs `resolvers` section `idx` (`crate::resolvers`): its log lines go to the servers'
     /// proxies and to stderr, as `HAProxy`'s `send_log` and `ha_warning`. Out of line: kept off
     /// the stream path's code.
@@ -15631,10 +16772,12 @@ impl EngineDispatcher<'_> {
     /// A stream's line: `info`, or `err` when it failed and the frontend has `option
     /// log-separate-errors` (`strm_log`).
     /// The first `sd` bytes of `line` are its STRUCTURED-DATA (`log-format-sd`).
-    fn send_stream_log(&self, proxy_idx: usize, err: bool, line: &[u8], sd: u32) {
-        let separate = self.proxies.get(proxy_idx).is_some_and(|p| p.log_opts & alcyon_config::LOG_OPT_SEPARATE_ERRORS != 0);
+    /// `level` is the line's level with `set-log-level` already applied, fixed when the
+    /// line was built (see [`stream_log_level`]): a `silent` line was suppressed at build
+    /// time and never reaches here.
+    fn send_stream_log(&self, proxy_idx: usize, level: LogLevel, line: &[u8], sd: u32) {
         let (sd, line) = line.split_at(usize::try_from(sd).unwrap_or(0).min(line.len()));
-        self.send_log(proxy_idx, if err && separate { LogLevel::Err } else { LogLevel::Info }, sd, line);
+        self.send_log(proxy_idx, level, sd, line);
     }
 
     /// `sd` is the line's STRUCTURED-DATA, which only an rfc5424 target writes (`-` when
@@ -15643,26 +16786,28 @@ impl EngineDispatcher<'_> {
         let Some(proxy) = self.proxies.get(proxy_idx) else {
             return;
         };
-        for (k, &i) in proxy.log_target_idx.iter().enumerate() {
-            let Some(target) = self.log_targets.get(i) else {
-                continue;
-            };
-            // Level first: a line the logger filters out does not take a sampling slot.
-            if !target.accepts(level) {
-                continue;
-            }
-            if let (Some(sample), Some(cursor)) = (target.sample(), proxy.log_cursors.get(k)) {
-                if !crate::syslog::sample_admits(sample, cursor) {
-                    continue;
-                }
-            }
-            let tag = proxy.log_tag.as_deref().unwrap_or(self.log_tag);
-            // Discarded deliberately: syslog over UDP is fire-and-forget, and a
-            // collector that is down must not slow or fail the data path.
-            // No hostname in the header: `HAProxy` sends one only with
-            // `log-send-hostname`, which Alcyon does not have.
-            let _ = target.send_sd(level, tag, "", sd, msg);
-        }
+        let emit = LogEmit { targets: &self.log_targets, tag: &self.log_tag, pid: self.pid };
+        send_log_targets(proxy, emit, level, sd, msg);
+    }
+
+    /// The profile-aware cousin of [`send_stream_log`], for a proxy one of whose targets
+    /// carries a `log-profile`. Each such target sends its profile's format for the line's
+    /// `origin` -- the step the line is the log of -- or nothing when the step is `drop`; a
+    /// step the profile does not name (and that has no `on any`) sends the proxy's own line,
+    /// as `HAProxy` does (`_process_send_log_override`). A target without a profile is sent
+    /// its line, and a profile's `log-tag` overrides the tag of every line it sends.
+    fn send_stream_log_profiled(
+        &self,
+        proxy_idx: usize,
+        origin: alcyon_config::ast::logging::LogProfileStepKind,
+        line: &[u8],
+        sd: u32,
+        entry: Option<&SessionEntry>,
+        level: LogLevel,
+    ) {
+        if self.proxies.get(proxy_idx).is_none() { return; }
+        let emit = LogEmit { targets: &self.log_targets, tag: &self.log_tag, pid: self.pid };
+        send_entry_log_profiled(self.proxies, emit, proxy_idx, origin, level, line, sd, entry);
     }
 
     fn step_applet(&mut self, applet_idx: usize) -> Outcome {
@@ -15791,6 +16936,10 @@ impl EngineDispatcher<'_> {
             Some(Kind::Check) => {
                 let check_idx = kind.index() as usize;
                 self.step_check(check_idx)
+            }
+            Some(Kind::AgentCheck) => {
+                let idx = kind.index() as usize;
+                self.step_agent_check(idx)
             }
             Some(Kind::Resolver) => self.step_resolver(kind.index() as usize),
             // Its timer fired: the engine runs the concern after the pass (L1).
@@ -16566,7 +17715,7 @@ fn reread_request_length(sess: &mut TcpSession) -> bool {
 }
 
 fn set_req_header(sess: &mut TcpSession, name: &str, val: &str) {
-    if sess.has_htx {
+    if sess.flags.has(sess_flags::HAS_HTX) {
         sess.with_htx_mut(|htx| {
             let _ = htx.set_header(name, val);
         });
@@ -16576,7 +17725,7 @@ fn set_req_header(sess: &mut TcpSession, name: &str, val: &str) {
     hdrs.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
     hdrs.push((name.to_string(), val.to_string()));
     sess.req_headers = Some(hdrs);
-    sess.htx_modified = true;
+    sess.flags.set(sess_flags::HTX_MODIFIED);
 }
 
 /// [`add_req_header`] for a header `HAProxy` adds with `http_add_header` and fails the request
@@ -16599,7 +17748,7 @@ fn add_req_header_fit(sess: &mut TcpSession, name: &str, val: &str) -> bool {
 /// so the line goes in where it belongs, with the HTX block; nothing is written out again. A
 /// request that edits go through [`add_req_header`].
 fn add_req_connection(sess: &mut TcpSession, tok: &str) {
-    let plain_h1 = req_text_is_htx(sess) && sess.h2_active().is_none() && !sess.h3;
+    let plain_h1 = req_text_is_htx(sess) && sess.h2_active().is_none() && sess.client_proto != ClientProto::H3;
     let mut line = [0u8; 40];
     let parts: [&[u8]; 3] = [b"connection: ", tok.as_bytes(), b"\r\n"];
     let mut n = 0;
@@ -16619,7 +17768,7 @@ fn add_req_connection(sess: &mut TcpSession, tok: &str) {
 }
 
 fn add_req_header(sess: &mut TcpSession, name: &str, val: &str) {
-    if sess.has_htx {
+    if sess.flags.has(sess_flags::HAS_HTX) {
         sess.with_htx_mut(|htx| {
             let _ = htx.add_header(name, val);
         });
@@ -16628,14 +17777,14 @@ fn add_req_header(sess: &mut TcpSession, name: &str, val: &str) {
     let mut hdrs = sess.req_headers.take().unwrap_or_default();
     hdrs.push((name.to_string(), val.to_string()));
     sess.req_headers = Some(hdrs);
-    sess.htx_modified = true;
+    sess.flags.set(sess_flags::HTX_MODIFIED);
 }
 
 /// Whether the head in the request buffer is the HTX's (an HTTP/1 head nothing has edited
 /// since it was parsed, or an HTTP/2 one as the bridge wrote it): a text edit may then be
 /// made to both. An edited head is the HTX's alone until the send writes it (X2).
 fn req_text_is_htx(sess: &TcpSession) -> bool {
-    sess.has_htx && !sess.htx_modified
+    sess.flags.has(sess_flags::HAS_HTX) && !sess.flags.has(sess_flags::HTX_MODIFIED)
 }
 
 /// What a pass over a list of `http-request` rules came to.
@@ -16782,7 +17931,7 @@ fn txn_req_body(sess: &TcpSession) -> Option<&[u8]> {
 /// not yet whole.
 fn req_head_len(sess: &TcpSession) -> usize {
     let data = sess.req.readable();
-    if sess.req_head_pending {
+    if sess.flags.has(sess_flags::REQ_HEAD_PENDING) {
         0
     } else {
         crate::proxy::find_eoh(data).map_or(data.len(), |(h, e)| h + e)
@@ -16791,11 +17940,11 @@ fn req_head_len(sess: &TcpSession) -> usize {
 
 fn del_req_header(sess: &mut TcpSession, name: &str) {
     // `-m beg|end|sub|reg` names a set of headers: remove each that matches.
-    if !sess.has_htx {
+    if !sess.flags.has(sess_flags::HAS_HTX) {
         let mut hdrs = sess.req_headers.take().unwrap_or_default();
         hdrs.retain(|(k, _)| !header_name_matches(k, name));
         sess.req_headers = Some(hdrs);
-        sess.htx_modified = true;
+        sess.flags.set(sess_flags::HTX_MODIFIED);
         return;
     }
     if name.starts_with('\0') {
@@ -16833,7 +17982,7 @@ fn req_htx_init(sess: &TcpSession) {
     let data = sess.req.readable();
     // The head as it is in the buffer (an edited one is written at the send, an HTTP/2 one is
     // not there yet): what follows it is the body.
-    let head_len = if sess.req_head_pending { 0 } else { sess.req.eoh().map_or(data.len(), |(h, e)| h + e) };
+    let head_len = if sess.flags.has(sess_flags::REQ_HEAD_PENDING) { 0 } else { sess.req.eoh().map_or(data.len(), |(h, e)| h + e) };
     let body = data.len().saturating_sub(head_len);
     let line = 8 + 20 + line + 8;
     let head = line + hdrs + 9;
@@ -16865,7 +18014,7 @@ fn req_set_uri(sess: &mut TcpSession, uri: String) -> bool {
         let _ = htx.set_uri(&uri);
     });
     sess.req_uri.set(&uri);
-    sess.htx_modified = true;
+    sess.flags.set(sess_flags::HTX_MODIFIED);
     true
 }
 
@@ -16880,7 +18029,7 @@ fn req_set_method(sess: &mut TcpSession, method: String) -> bool {
         let _ = htx.set_method(&method);
     });
     sess.req_method.set(&method);
-    sess.htx_modified = true;
+    sess.flags.set(sess_flags::HTX_MODIFIED);
     true
 }
 
@@ -17128,7 +18277,7 @@ fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
     // are replaced or removed (a removal is a tombstone).
     let mut touched = false;
     let mut changed = false;
-    let was_modified = sess.htx_modified;
+    let was_modified = sess.flags.has(sess_flags::HTX_MODIFIED);
     crate::reuse::with_bytes(|scratch| {
         sess.with_htx_mut(|htx| {
             let n = htx.num_blocks();
@@ -17155,7 +18304,7 @@ fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
     });
     // Nothing in the `Cookie` headers changed: the head is left as it came (X2).
     if !changed {
-        sess.htx_modified = was_modified;
+        sess.flags.set_to(sess_flags::HTX_MODIFIED, was_modified);
     }
     if touched {
         if let Some(txn) = sess.strm.txn.as_mut() {
@@ -17173,12 +18322,12 @@ fn manage_client_cookies(sess: &mut TcpSession, be: &Proxy) -> Option<usize> {
 /// An HTTP/2 or HTTP/3 head is written here whatever edited it (X4: `req` holds none of it
 /// until now), its names as `lower` and `table` say; true when they are.
 fn encode_if_modified(sess: &mut TcpSession, lower: bool, table: Option<&std::collections::HashMap<String, String>>) -> bool {
-    if sess.req_head_pending {
+    if sess.flags.has(sess_flags::REQ_HEAD_PENDING) {
         return write_pending_req_head(sess, lower, table);
     }
-    if sess.htx_modified {
+    if sess.flags.has(sess_flags::HTX_MODIFIED) {
         write_req_head(sess);
-        sess.htx_modified = false;
+        sess.flags.clear(sess_flags::HTX_MODIFIED);
     }
     false
 }
@@ -17209,7 +18358,7 @@ pub(crate) fn write_req_head(sess: &mut TcpSession) {
     };
     let old = hdr_len + eoh_len;
     alcyon_sample::work::note(alcyon_sample::work::Op::ReqRebuild, 1);
-    if sess.has_htx {
+    if sess.flags.has(sess_flags::HAS_HTX) {
         // The HTX is in its own buffer: the request buffer is written while it is read.
         let htx = alcyon_proto::htx::HtxSliceRef::new(sess.htx_buf.raw_slice(), sess.htx_blocks);
         if !sess.req.replace_head_with(old, |out| htx.write_h1_wire(out).ok()) {
@@ -17344,6 +18493,13 @@ enum ResRule<'a> {
     Wait(u32, u32),
     /// `pause <time|expr>`: the time, the expression.
     Pause(u32, Option<&'a Expr>),
+    /// `do-log`: the caller, which has the stream, sends the step's line when this fires.
+    DoLog,
+    /// `set-log-level <level|silent>`: the stream's log level, written as the rule fires
+    /// (`s->logs.level`; later `do-log`s and the end line see it).
+    SetLogLevel(i8),
+    /// `set-nice <n>`: the caller sets the session task's nice when the list is done.
+    SetNice(i16),
 }
 
 /// The `at_least` a [`ResWait`] check is called with for a `pause` rule: its `time_ms` is
@@ -17364,6 +18520,9 @@ impl<'a> ResOp<'a> {
             alcyon_config::HttpResAction::Capture { id, .. } => return ResRule::Capture(rc.expr.as_ref(), *id),
             alcyon_config::HttpResAction::WaitForBody { time_ms, at_least } => return ResRule::Wait(*time_ms, *at_least),
             alcyon_config::HttpResAction::Pause { time_ms, .. } => return ResRule::Pause(*time_ms, rc.expr.as_ref()),
+            alcyon_config::HttpResAction::SetLogLevel(l) => return ResRule::SetLogLevel(*l),
+            alcyon_config::HttpResAction::SetNice(n) => return ResRule::SetNice(*n),
+            alcyon_config::HttpResAction::DoLog => return ResRule::DoLog,
         })
     }
 
@@ -17377,6 +18536,8 @@ impl<'a> ResOp<'a> {
             alcyon_config::HttpAfterResAction::SetMap { .. }
             | alcyon_config::HttpAfterResAction::DelMap { .. }
             | alcyon_config::HttpAfterResAction::DelAcl { .. } => Self::MapAction(rc),
+            alcyon_config::HttpAfterResAction::SetLogLevel(l) => return ResRule::SetLogLevel(*l),
+            alcyon_config::HttpAfterResAction::DoLog => return ResRule::DoLog,
         })
     }
 }
@@ -18027,10 +19188,13 @@ fn run_res_rules<'a, 'c>(
     registry: &Registry,
     vars: &mut VarStore,
     wait: Option<ResWait<'_>>,
+    do_log: &mut Option<i8>,
+    set_log_level: &mut i8,
+    set_nice: &mut Option<i16>,
 ) -> Result<Option<usize>, ResStop> {
     // In place, not a copy of the context per rule (S7).
     let prev = ctx.acls.replace(acls);
-    let flow = run_res_rules_in(rules, acls, head, &ctx.as_ctx(), rh, caps, registry, vars, wait);
+    let flow = run_res_rules_in(rules, acls, head, &ctx.as_ctx(), rh, caps, registry, vars, wait, do_log, set_log_level, set_nice);
     ctx.acls = prev;
     flow
 }
@@ -18046,6 +19210,9 @@ fn run_res_rules_in<'a>(
     registry: &Registry,
     vars: &mut VarStore,
     mut wait: Option<ResWait<'_>>,
+    do_log: &mut Option<i8>,
+    set_log_level: &mut i8,
+    set_nice: &mut Option<i16>,
 ) -> Result<Option<usize>, ResStop> {
     let (status, status_msg) = head;
     STRICT_MODE.set(true);
@@ -18070,6 +19237,24 @@ fn run_res_rules_in<'a>(
         }
         let op = match op {
             ResRule::Op(op) => op,
+            ResRule::DoLog => {
+                // Capture the level active when `do-log` fires (`s->logs.level`) so a
+                // later `set-log-level` rule in the same list does not alter it.
+                *do_log = Some(*set_log_level);
+                continue;
+            }
+            ResRule::SetLogLevel(l) => {
+                // As the rule fires: the lines the rules after it (a `do-log`) and the end
+                // line send are at this level (`s->logs.level`).
+                *set_log_level = l;
+                continue;
+            }
+            ResRule::SetNice(n) => {
+                // The caller sets the task's nice once the list is done; nothing in the
+                // list reads it, so the order does not show.
+                *set_nice = Some(n);
+                continue;
+            }
             ResRule::Capture(expr, id) => {
                 // No sample, no capture (the slot keeps what it had); an `id` past the frontend's
                 // slots captures nothing (`http_action_res_capture_by_id`: `id >= fe->nb_rsp_cap`).
@@ -18142,6 +19327,9 @@ fn eval_after_res_rules<'c>(
     mut res_caps: Option<&mut Vec<Option<Vec<u8>>>>,
     registry: &Registry,
     vars: &mut VarStore,
+    do_log: &mut Option<i8>,
+    set_log_level: &mut i8,
+    set_nice: &mut Option<i16>,
 ) -> Result<(), ResStop> {
     let (status, status_msg) = head;
     alcyon_sample::vars::with_stream(vars, |m| m.clear_scope(alcyon_sample::VarScope::Req));
@@ -18151,7 +19339,7 @@ fn eval_after_res_rules<'c>(
         // `http-after-response capture` writes the frontend's slots, whichever proxy the rule is in.
         let fe_slots = &proxies[fe_idx].res_capture_slots;
         let caps = res_caps.as_deref_mut().filter(|_| !fe_slots.is_empty()).map(|c| (c, &fe_slots[..]));
-        run_res_rules(rules, &proxies[px].acls, (&mut *status, &mut *status_msg), ctx, rh, caps, registry, vars, None)?;
+        run_res_rules(rules, &proxies[px].acls, (&mut *status, &mut *status_msg), ctx, rh, caps, registry, vars, None, do_log, set_log_level, set_nice)?;
     }
     Ok(())
 }
@@ -18547,10 +19735,11 @@ fn after_res_on_reply<'r>(
             server_addr: sess.server_addr,
             fc_src: sess.fc_src(),
             so_name: sess.so_name.as_deref(),
-            so_id: sess.so_id,
+            so_id: sess.so_id_opt(),
             fc_dst: sess.fc_dst(),
-            is_first_req: sess.is_first_req,
+            is_first_req: sess.flags.has(sess_flags::IS_FIRST_REQ),
             proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+            saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
             ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
             quic_acks: sess.quic_facts(),
             fc_http_major: sess.fc_http_major(),
@@ -18579,9 +19768,18 @@ fn after_res_on_reply<'r>(
             term_state: Some(sess_term_state(sess)),
             bc_dst: sess.bc_dst(),
             bc_src: sess.bc_src(),
+            last_rule: last_rule_at(sess.strm.log.last_rule),
+            uniq_id: Some(sess.strm.log.uniq_id),
             ..Default::default()
         };
-        eval_after_res_rules(
+        // A reply Alcyon built has no live stream to `do-log` from; the flag is discarded.
+        let mut do_log = None;
+        // `set-nice` is not an `http-after-response` action, so this is not written.
+        let mut set_nice = None;
+        // The level is out on a local: the context above still borrows the stream, and the
+        // rule's write goes back when it is gone.
+        let mut log_level = sess.strm.log.log_level;
+        let result = eval_after_res_rules(
             proxies,
             fe_idx,
             be_idx,
@@ -18591,7 +19789,12 @@ fn after_res_on_reply<'r>(
             Some(&mut res_caps),
             sample_registry(),
             &mut vars,
-        )
+            &mut do_log,
+            &mut log_level,
+            &mut set_nice,
+        );
+        sess.strm.log.log_level = log_level;
+        result
     };
     sess.strm.vars = vars;
     sess.strm.log.res_captures = res_caps;
@@ -18619,10 +19822,11 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &cra
                     client_addr: sess.client_addr,
                     fc_src: sess.fc_src(),
                     proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
+                    saved_syn: sess.sess_addr.as_deref().and_then(|a| a.saved_syn.as_deref()),
                     so_name: sess.so_name.as_deref(),
-                    so_id: sess.so_id,
+                    so_id: sess.so_id_opt(),
                     fc_dst: sess.fc_dst(),
-                    is_first_req: sess.is_first_req,
+                    is_first_req: sess.flags.has(sess_flags::IS_FIRST_REQ),
                     ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
                     quic_acks: sess.quic_facts(),
                     fc_http_major: sess.fc_http_major(),
@@ -18637,6 +19841,7 @@ fn proxy_error_response(sess: &TcpSession, be: &Proxy, fe: &Proxy, proxies: &cra
                     fe_id: Some(fe.ids.iid),
                     be_name: Some(be.name.as_str()),
                     be_id: Some(be.ids.iid),
+                    uniq_id: stream_has_strm(sess).then_some(sess.strm.log.uniq_id),
                     ..Default::default()
                 }, live: None };
                 return Some(build_templated_error_response(
@@ -18852,6 +20057,83 @@ mod arena_tests {
         let mut a = SessionArena::with_capacity(2);
         assert!(a.get2_mut(0, 0).is_none());
         assert!(a.get2_mut(0, 1).is_none());
+    }
+
+    /// `get_mut_with_owner` works whether the child's slot index is below or above the owner's.
+    #[test]
+    fn get_mut_with_owner_handles_both_index_orders() {
+        use std::os::fd::OwnedFd;
+        let make = |task_idx: u32, role: Option<crate::proxy::H2Role>| {
+            let (x, _y) = std::os::unix::net::UnixStream::pair().expect("pair");
+            let mut sess = crate::proxy::TcpSession::new(OwnedFd::from(x), Default::default(), 0, alcyon_sched::Tick::ETERNITY);
+            sess.h2_role = role.map(Box::new);
+            super::SessionEntry {
+                sess,
+                task: alcyon_sched::TaskRef(task_idx),
+                proxy_idx: 0,
+                backend_idx: 0,
+                srv_backend_idx: 0,
+                target_server_idx: None,
+                cli_raw_fd: -1,
+                srv_raw_fd: None,
+                cli_interest: super::Interest::NONE,
+                srv_interest: super::Interest::NONE,
+                actconn_reclaimed: false,
+                stats_done: false,
+                be_counted: std::cell::Cell::new(u32::MAX),
+                connect_log_due: false,
+                rate_max_due: false,
+                srv_served: 0,
+                log_line: None,
+                log_err: false,
+                log_level: super::LogLevel::Info,
+                log_sd: 0,
+                buf_wait: crate::buf_wait::WaitState::default(),
+                parked: false,
+            }
+        };
+        let mut arena = SessionArena::with_capacity(4);
+        let child_role = |oi: u32, ot: u32| {
+            crate::proxy::H2Role::Child(crate::proxy::H2Child {
+                owner: Some((oi, alcyon_sched::TaskRef(ot))),
+                stream: crate::proxy::H2ActiveStream { id: 1, body: Default::default(), chunk_out: false },
+                late_trailers: None,
+                rsp_head: None,
+                reset: false,
+                finished: false,
+                conn_end: None,
+                owner_tx_pending: false,
+                rst: None,
+                goaway: None,
+                tls: None,
+                quic_ack: None,
+                req_abs: Default::default(),
+                sess_vars_at_start: Default::default(),
+            })
+        };
+        // Slot 0 = child pointing to owner at slot 1 (a < b), slot 1 = owner.
+        let i0 = arena.alloc(make(10, Some(child_role(1, 20)))).unwrap();
+        let i1 = arena.alloc(make(20, Some(crate::proxy::H2Role::Owner(Default::default())))).unwrap();
+        assert_eq!((i0, i1), (0, 1));
+        {
+            let (c, o) = arena.get_mut_with_owner(0).unwrap();
+            assert_eq!(c.task, alcyon_sched::TaskRef(10));
+            assert_eq!(o.unwrap().task, alcyon_sched::TaskRef(20));
+        }
+        // Slot 2 = child pointing to owner at slot 1 (a > b).
+        let i2 = arena.alloc(make(30, Some(child_role(1, 20)))).unwrap();
+        assert_eq!(i2, 2);
+        {
+            let (c, o) = arena.get_mut_with_owner(2).unwrap();
+            assert_eq!(c.task, alcyon_sched::TaskRef(30));
+            assert_eq!(o.unwrap().task, alcyon_sched::TaskRef(20));
+        }
+        // Slot 3 = child with a stale owner task ref -> returns owner as None.
+        let i3 = arena.alloc(make(40, Some(child_role(1, 999)))).unwrap();
+        assert_eq!(i3, 3);
+        let (c, o) = arena.get_mut_with_owner(3).unwrap();
+        assert_eq!(c.task, alcyon_sched::TaskRef(40));
+        assert!(o.is_none());
     }
 }
 
@@ -19579,7 +20861,7 @@ mod pending_req_head_tests {
             add_len: None,
         };
         crate::h2_bridge::start_request(&mut s, d);
-        assert!(s.req_head_pending && s.req.readable().is_empty());
+        assert!(s.flags.has(sess_flags::REQ_HEAD_PENDING) && s.req.readable().is_empty());
         (s, owner, peer)
     }
 
@@ -19597,7 +20879,7 @@ mod pending_req_head_tests {
         let data = s.req.readable();
         assert_eq!(&data[..want.len()], want.as_bytes());
         assert_eq!(data.len(), want.len() + free, "the body is kept behind the head");
-        assert!(!s.req_head_pending);
+        assert!(!s.flags.has(sess_flags::REQ_HEAD_PENDING));
     }
 
     /// The engine never sends a head the encoder refuses (a rule's non-numeric
@@ -19710,6 +20992,7 @@ mod unpublished_tests {
             srv_served: 0,
             log_line: None,
             log_err: false,
+            log_level: LogLevel::Info,
             log_sd: 0,
             buf_wait: Default::default(),
             parked: false,
@@ -19758,5 +21041,100 @@ mod unpublished_tests {
         let slot = engine.idle_backend_pool.slot();
         let mut pool = IdlePools::lock(slot);
         assert!(pool.srv_mut((0, 0)).is_none_or(|si| si.conns.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod nice_updates_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn nice_updates_drained_and_does_not_overwrite_reused_task_ref() {
+        let cfg = alcyon_config::parse_str(
+            "defaults\n  mode http\n  timeout client 5s\n\
+             frontend fe\n  bind 127.0.0.1:0\n\
+             http-request set-nice 5 if { path /nice }\n\
+             http-request return status 200\n",
+        )
+        .expect("parse");
+        let mut engine = Engine::new(&cfg, 16).expect("engine");
+        let addr = engine.listeners[0].addr();
+
+        fn step_until(engine: &mut Engine, tick: &mut u32, mut cond: impl FnMut(&mut Engine) -> bool) {
+            let mut done = false;
+            for _ in 0..200 {
+                *tick += 5;
+                let _ = engine.step(Tick(*tick));
+                done = cond(engine);
+                if done { break; }
+            }
+            assert!(done, "condition was not met");
+        }
+        let mut tick = 100u32;
+
+        // 1. First connection runs `http-request set-nice 5` on keep-alive.
+        let mut c1 = std::net::TcpStream::connect(addr).expect("connect c1");
+        c1.set_nonblocking(true).expect("nonblocking");
+        c1.write_all(b"GET /nice HTTP/1.1\r\nHost: x\r\n\r\n").expect("write c1");
+
+        let mut buf1 = Vec::new();
+        let mut tmp = [0u8; 512];
+        step_until(&mut engine, &mut tick, |_| {
+            if let Ok(n) = c1.read(&mut tmp) {
+                buf1.extend_from_slice(&tmp[..n]);
+            }
+            buf1.windows(12).any(|w| w == b"HTTP/1.1 200")
+        });
+
+        assert!(engine.nice_updates.is_empty(), "nice_updates must be drained after pass");
+        let t1 = engine
+            .sessions
+            .entries
+            .iter()
+            .flatten()
+            .find(|e| !e.parked)
+            .map(|e| e.task)
+            .expect("live session 1");
+        assert_eq!(engine.scheduler.tasks.get(t1).nice, 5, "c1 task nice must be 5");
+
+        // 2. Close c1 and step until its session and TaskRef are freed.
+        drop(c1);
+        step_until(&mut engine, &mut tick, |e| {
+            e.sessions.entries.iter().flatten().all(|s| s.parked) && !e.scheduler.is_live(t1)
+        });
+        assert!(engine.nice_updates.is_empty(), "nice_updates must remain empty");
+
+        // 3. Second connection reuses the freed TaskRef slot without running set-nice.
+        let mut c2 = std::net::TcpStream::connect(addr).expect("connect c2");
+        c2.set_nonblocking(true).expect("nonblocking");
+        c2.write_all(b"GET /plain HTTP/1.1\r\nHost: x\r\n\r\n").expect("write c2");
+
+        let mut buf2 = Vec::new();
+        step_until(&mut engine, &mut tick, |_| {
+            if let Ok(n) = c2.read(&mut tmp) {
+                buf2.extend_from_slice(&tmp[..n]);
+            }
+            buf2.windows(12).any(|w| w == b"HTTP/1.1 200")
+        });
+        // Extra pass to confirm no stale update applies after c2 is live.
+        tick += 5;
+        let _ = engine.step(Tick(tick));
+
+        assert!(engine.nice_updates.is_empty(), "nice_updates must be empty after c2");
+        let t2 = engine
+            .sessions
+            .entries
+            .iter()
+            .flatten()
+            .find(|e| !e.parked)
+            .map(|e| e.task)
+            .expect("live session 2");
+        assert_eq!(t2, t1, "c2 should reuse the freed TaskRef slot");
+        assert_eq!(
+            engine.scheduler.tasks.get(t2).nice,
+            0,
+            "stale nice_updates must not overwrite reused Task.nice"
+        );
     }
 }

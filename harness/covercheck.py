@@ -419,6 +419,17 @@ def report_objects(debug: str, built: set[str]) -> list[str]:
             if key in wanted and key not in seen:
                 seen.add(key)
                 objects.append(path)
+    # Cargo 1.100's build-dir layout puts test binaries in debug/build/<pkg>/<hash>/out/,
+    # which the scan above never sees: read the rest of what cargo reported, where it is.
+    for b in sorted(built):
+        try:
+            st = os.stat(b)
+        except OSError:
+            continue
+        key = (st.st_dev, st.st_ino)
+        if key not in seen and os.path.isfile(b):
+            seen.add(key)
+            objects.append(b)
     return objects
 
 
@@ -606,11 +617,32 @@ def print_env() -> int:
     return 0
 
 
+_BRACE_ONLY = re.compile(r"^\s*[})\]]+[;,]?\s*$")
+
+
+def _repo_lines(f: str) -> list[str]:
+    try:
+        with open(os.path.join(REPO, f), encoding="utf-8", errors="replace") as fh:
+            return fh.read().splitlines()
+    except OSError:
+        return []
+
+
 def misses(changed: dict[str, set[int]], execd: dict[str, set[int]],
-           hitmap: dict[str, set[int]]) -> dict[str, list[int]]:
-    """The changed lines the compiler instrumented that no test executed, by file."""
-    m = {f: sorted((ls & execd.get(f, set())) - hitmap.get(f, set())) for f, ls in changed.items()}
-    return {f: ls for f, ls in m.items() if ls}
+           hitmap: dict[str, set[int]], source=_repo_lines) -> dict[str, list[int]]:
+    """The changed lines the compiler instrumented that no test executed, by file. A line
+    that is only closing punctuation (`}`, `});`) is not judged: rustc 1.100 gives such a
+    brace its own counter, zero when the `if` before it was never false, though the
+    brace holds no statement (the body above it carries the verdict)."""
+    m = {}
+    for f, ls in changed.items():
+        cand = sorted((ls & execd.get(f, set())) - hitmap.get(f, set()))
+        if cand:
+            text = source(f)
+            cand = [n for n in cand if not (0 < n <= len(text) and _BRACE_ONLY.match(text[n - 1]))]
+        if cand:
+            m[f] = cand
+    return m
 
 
 def main() -> int:

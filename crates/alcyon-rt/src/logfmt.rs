@@ -247,6 +247,8 @@ impl Opts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Alias {
     Bytes,
+    /// `%OG`: the log step's origin name (`log_origin` of the line's context).
+    Orig,
     CookieClient,
     CookieServer,
     Hostname,
@@ -315,7 +317,7 @@ enum Alias {
 /// `HAProxy` has that Alcyon refuses). `%o` is not here: it renders nothing and sets the
 /// options for what follows, so `compile` handles it before looking a name up.
 const ALIASES: &[(&str, Option<Alias>)] = &[
-    ("OG", None),
+    ("OG", Some(Alias::Orig)),
     ("B", Some(Alias::Bytes)),
     ("CC", Some(Alias::CookieClient)),
     ("CS", Some(Alias::CookieServer)),
@@ -501,6 +503,20 @@ const NUMERIC: &[Alias] = &[
     Alias::SrvQueue,
 ];
 
+/// The timer fetches that read the stream's logs (`smp_fetch_reX_timers`,
+/// `smp_fetch_txn_timers`, `smp_fetch_conn_timers`): a format carrying one needs the
+/// stream in its context. `fc.timer.handshake` is out: Alcyon does not time the handshake, so the
+/// fetch is refused at load (`alcyon_sample::NOT_IMPLEMENTED`).
+pub const STREAM_TIMER_FETCHES: [&str; 7] = [
+    "req.timer.tq",
+    "req.timer.queue",
+    "res.timer.data",
+    "fc.timer.total",
+    "txn.timer.total",
+    "txn.timer.user",
+    "bc.timer.connect",
+];
+
 impl LogFormat {
     /// Compiles `fmt`, checking every expression's fetch and converters against
     /// `registry`.
@@ -570,16 +586,16 @@ impl LogFormat {
     /// line, the counters. A format that does not is rendered from [`LogData::of_context`] alone.
     #[must_use]
     pub fn needs_stream(&self) -> bool {
-        self.nodes.iter().any(|n| {
-            !matches!(
-                n,
-                Node::Text(_)
-                    | Node::Expr(..)
-                    | Node::Alias(
-                        Alias::ClientIp | Alias::ClientPort | Alias::FrontendIp | Alias::FrontendPort | Alias::ServerIp | Alias::ServerPort | Alias::BackendIp | Alias::BackendPort | Alias::Frontend | Alias::Backend | Alias::Server,
-                        ..
-                    )
-            )
+        self.nodes.iter().any(|n| match n {
+            Node::Text(_) => false,
+            // The timer fetches read the stream's logs (`src/sample.c`'s `smp_fetch_reX_timers`
+            // and friends), not only what a context holds: a format that carries one must be
+            // rendered with a stream in the context (`Rules::res_stream`).
+            Node::Expr(e, ..) => STREAM_TIMER_FETCHES.contains(&e.fetch_name.as_str()),
+            Node::Alias(a, ..) => !matches!(
+                a,
+                Alias::ClientIp | Alias::ClientPort | Alias::FrontendIp | Alias::FrontendPort | Alias::ServerIp | Alias::ServerPort | Alias::BackendIp | Alias::BackendPort | Alias::Frontend | Alias::Backend | Alias::Server
+            ),
         })
     }
 
@@ -863,6 +879,15 @@ impl LogFormat {
         *buf = out.0;
     }
 
+    /// Renders a value after what `buf` holds, like [`render_value`]: an expression that
+    /// yields nothing writes nothing. For the `set-proxy-v2-tlv-fmt` values, written into
+    /// the PROXY v2 header being built, not a separate buffer.
+    pub fn render_value_append(&self, buf: &mut Vec<u8>, d: &LogData, registry: &Registry, ctx: &SampleContext) {
+        let mut out = Out(std::mem::take(buf));
+        self.render_into(&mut out, d, registry, ctx, false);
+        *buf = out.0;
+    }
+
     /// Renders the format outside a log line, where an expression that yields nothing, or
     /// an empty string, writes nothing rather than `-`: what `HAProxy` sends for an
     /// `http-check send hdr x %[str()]` (no header at all, 3.5-dev8-885761-29, 2026-10-03).
@@ -965,7 +990,7 @@ impl LogFormat {
                         // The value as the plain format writes it, then as the encoding carries it:
                         // a number for the aliases that are one, a string for the others.
                         let mut plain = Out(Vec::new());
-                        alias(&mut plain, a, Opts { mandatory: false, ..Opts::default() }, d);
+                        alias(&mut plain, a, Opts { mandatory: false, ..Opts::default() }, d, ctx.phase.log_origin);
                         let value = match std::str::from_utf8(&plain.0).ok().and_then(|s| s.parse::<i64>().ok()) {
                             Some(v) if NUMERIC.contains(&a) => Sample::Sint(v),
                             _ => Sample::Bin(plain.0),
@@ -976,10 +1001,10 @@ impl LogFormat {
                         }
                     } else if o.esc {
                         let mut plain = Out(Vec::new());
-                        alias(&mut plain, a, Opts { esc: false, ..o }, d);
+                        alias(&mut plain, a, Opts { esc: false, ..o }, d, ctx.phase.log_origin);
                         escaped_5424(out, &plain.0);
                     } else {
-                        alias(out, a, o, d);
+                        alias(out, a, o, d, ctx.phase.log_origin);
                     }
                 }
             }
@@ -1382,7 +1407,7 @@ pub fn recycle_line(line: Vec<u8>) {
 }
 
 #[allow(clippy::too_many_lines)]
-fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData) {
+fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData, origin: Option<&'static str>) {
     let int = |out: &mut Out, v: i64| {
         let _ = write!(out, "{v}");
     };
@@ -1392,6 +1417,9 @@ fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData) {
         out.push('+');
     }
     match a {
+        // `%OG`: the name the line's log step is logged from (`log_origin`), empty where
+        // there is none. It is text, so the usual `O`/`Q` options do not apply.
+        Alias::Orig => out.push_str(origin.unwrap_or("")),
         Alias::Bytes => int(out, i64::try_from(d.bytes_out).unwrap_or(i64::MAX)),
         Alias::BytesUp => int(out, i64::try_from(d.bytes_in).unwrap_or(i64::MAX)),
         // Alcyon has no `capture cookie`, so there is never a cookie to show.

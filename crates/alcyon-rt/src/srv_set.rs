@@ -46,9 +46,80 @@ struct Cell {
 
 /// The cells of the servers of the configuration (`base`). Later slices add the servers
 /// created at run time next to it; one object shared by every table of the proxy.
+///
+/// The per-server `maxqueue` and queue length of the proxy, in one object:
+///
+/// - `max`: each server's load-only `maxqueue` (0 is unlimited, the default);
+/// - `queue`: the requests queued on each server now (`HAProxy`'s `srv->queueslength`).
+///
+/// Allocated only for a proxy that has a server with a positive `maxqueue` (at load) or
+/// that actually queues a request on one of its servers (on the first such queueing, at
+/// run time); every other proxy keeps no array, so a configuration of 60,000 backends
+/// costs nothing here. A request queued on a server keeps an [`SrvQueue`] by `Arc`, so it
+/// can count itself in and out, the counter included, when the backend's arrays are gone
+/// (`del backend` while it waits).
+#[derive(Debug, Default)]
+struct ServerQueueState {
+    max: Box<[u32]>,
+    queue: Box<[AtomicU32]>,
+}
+
+/// The cells of the servers of the configuration (`base`). Later slices add the servers
+/// created at run time next to it; one object shared by every table of the proxy.
+///
+/// `queue_max` holds the proxy's [`ServerQueueState`]; see it for why most proxies have
+/// none.
 #[derive(Debug, Default)]
 struct ServerCells {
     base: Box<[Cell]>,
+    /// Each server's `tcp-md5sig` key, in `base` order: the RFC 2385 signature set on the
+    /// outgoing socket before `connect` (`alcyon_mmsg::set_tcp_md5sig`). Built once at load
+    /// and read plain; absent when no server of the backend has a key, so a backend without
+    /// signatures allocates nothing here. Lives in the `Arc`'d cells (not in
+    /// [`ServerArrays`]) because `ServerArrays` sits inline in `Proxy`, whose size is
+    /// bounded in `struct_sizes.rs`.
+    md5sig: Option<Box<[Option<Arc<str>>]>>,
+    queue_max: std::sync::OnceLock<Box<ServerQueueState>>,
+}
+
+/// One server's queue counter, by reference: the request queued on it keeps one so it can
+/// count itself in and out (`HAProxy`'s `srv->queueslength`), the counter included, when
+/// the backend's arrays are gone (`del backend` while it waits).
+#[derive(Clone)]
+pub(crate) struct SrvQueue {
+    cells: Arc<ServerCells>,
+    idx: usize,
+}
+
+impl SrvQueue {
+    /// This server's queue counter, creating the proxy's arrays on the first queueing. The
+    /// arrays cannot be derived at load time: whether any request ever queues on a server
+    /// without a `maxqueue` is decided at run time by the servers reaching their `maxconn`.
+    fn counter(&self) -> &AtomicU32 {
+        let n = self.cells.base.len();
+        let st = self
+            .cells
+            .queue_max
+            .get_or_init(|| {
+                Box::new(ServerQueueState {
+                    max: vec![0u32; n].into_boxed_slice(),
+                    queue: (0..n).map(|_| AtomicU32::new(0)).collect(),
+                })
+            });
+        &st.queue[self.idx]
+    }
+
+    /// One more request on this server's queue.
+    #[inline]
+    pub(crate) fn inc(&self) {
+        self.counter().fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One less.
+    #[inline]
+    pub(crate) fn dec(&self) {
+        self.counter().fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// A slot is named by a sample fetch, a `use-server` target, or another server's `track`.
@@ -108,6 +179,24 @@ pub struct ServerArrays {
     server_check_tls: Vec<Option<Arc<crate::srv_tls::CheckTls>>>,
 }
 
+/// One server's `set-proxy-v2-tlv-fmt(<id>) [<fmt>]` TLVs (`srv->pp_tlvs`), compiled once
+/// and in the order `make_proxy_line_v2` sends them: the `default-server` ones first, then
+/// the server's own. `fmt` is `None` for a TLV without a format, whose value is empty.
+/// Per-server `observe` / `error-limit` / `on-error` runtime state.
+#[derive(Debug, Default)]
+pub struct ObserveSlot {
+    pub observe: alcyon_config::ObserveMode,
+    pub on_error: alcyon_config::OnErrorMode,
+    pub error_limit: u32,
+    pub consecutive_errors: std::sync::atomic::AtomicU32,
+    pub failed_hana: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SrvPpv2Tlvs {
+    pub tlvs: Vec<(u8, Option<Arc<crate::logfmt::LogFormat>>)>,
+}
+
 /// The per-server arrays of a [`ProxyIdInfo`], private to this module for the same reason.
 #[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Default)]
@@ -144,6 +233,18 @@ pub struct ServerIdArrays {
     /// Each server's `port` (`check port`, `default-server port`): `srv_agent_port`, and
     /// `srv_check_port` of a server with no check; empty when no server has one.
     server_check_ports: Vec<u16>,
+    /// Each server's `addr` (`check addr`): empty when no server has one.
+    server_check_addrs: Vec<Option<std::net::IpAddr>>,
+    /// Each server's `socks4 <proxy>`: the connection goes to the proxy, which dials the
+    /// server; empty when no server has a tunnel (kept off `Proxy`'s inline size,
+    /// `struct_sizes.rs`).
+    server_socks4: Vec<Option<SocketAddr>>,
+    /// Each server's `check-via-socks4`: the health checks ride the tunnel; empty when none.
+    server_check_via_socks4: Vec<bool>,
+    /// Per-server `observe` state; `None` when no server enables `observe`.
+    server_observe: Option<Arc<Vec<ObserveSlot>>>,
+    /// Servers with `agent-check` (or `agent-*` options) configured.
+    server_agent_checks: Vec<(u32, alcyon_config::ast::AgentCheckConfig)>,
     /// `pool-max-conn`, `pool-low-conn` and `pool-purge-delay` per server; empty when every
     /// server has the defaults (read it with [`ProxyIdInfo::server_pool`]). Read when a
     /// server connection is released, so it lives here, off `Proxy`'s inline size
@@ -152,6 +253,10 @@ pub struct ServerIdArrays {
     /// What the server-state file gave each server (T490, [`crate::server_state`]): read
     /// by `init_checks` and by the `lastchg` columns; empty when no file was applied.
     server_restored: Vec<Option<crate::server_state::Restored>>,
+    /// Each server's `set-proxy-v2-tlv-fmt(<id>) [<fmt>]` TLVs, compiled; a `None` slot
+    /// has none and the outer `None` means no server of the proxy does, so a proxy without
+    /// the keyword pays nothing to look (read it with [`ServerSet::pp_tlv_fmts_at`]).
+    server_pp_tlv_fmts: Option<Arc<Vec<Option<Arc<SrvPpv2Tlvs>>>>>,
 }
 
 impl Default for ServerArrays {
@@ -182,9 +287,43 @@ impl ServerArrays {
     /// The arrays of a section's `servers`.
     pub(crate) fn build(servers: &[alcyon_config::Server], extras: &alcyon_config::ast::ServerExtras, check_timeout: Option<Duration>) -> Self {
         let status = |i: usize, s: &alcyon_config::Server| AtomicU8::new(initial_status(s, extras.unresolved(i)));
-        let base = servers.iter().enumerate().map(|(i, s)| Cell { status: status(i, s), ..Cell::default() }).collect();
+        let base = servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Cell { status: status(i, s), ..Cell::default() })
+            .collect();
+        // The `maxqueue` values, when any server has one: built once here, at load. A
+        // proxy whose servers have no `maxqueue` and no queueing keeps no arrays at all.
+        let n = servers.len();
+        // Each server's `tcp-md5sig` key, in `base` order; `None` when no server has one.
+        // `extras.md5sig` is sparse (server index, key), as `maxqueue` above is.
+        let md5sig = (!extras.md5sig.is_empty()).then(|| {
+            let mut keys = vec![None; n];
+            for &(i, ref key) in &extras.md5sig {
+                if let Some(slot) = keys.get_mut(i as usize) {
+                    *slot = Some(Arc::from(key.as_ref()));
+                }
+            }
+            keys.into_boxed_slice()
+        });
+        let queue_max = extras.maxqueue.iter().any(|&(_, m)| m > 0).then(|| {
+            let mut max = vec![0u32; n];
+            for &(i, m) in &extras.maxqueue {
+                if let Some(slot) = max.get_mut(i as usize) {
+                    *slot = m;
+                }
+            }
+            Box::new(ServerQueueState {
+                max: max.into_boxed_slice(),
+                queue: (0..n).map(|_| AtomicU32::new(0)).collect(),
+            })
+        });
         Self {
-            cells: Arc::new(ServerCells { base }),
+            cells: Arc::new(ServerCells {
+                base,
+                md5sig,
+                queue_max: queue_max.map(std::sync::OnceLock::from).unwrap_or_default(),
+            }),
             servers: servers.iter().map(|s| s.addr).collect(),
             server_ids: servers.iter().map(|s| s.id.clone()).collect(),
             server_cookies: servers.iter().map(|s| s.cookie.as_deref().map(Box::from)).collect(),
@@ -218,10 +357,44 @@ impl ServerIdArrays {
             server_fqdn_changed: server_fqdn_changed(servers.len(), extras),
             server_srv: crate::resolvers::SrvSlots::new(servers.len(), extras),
             server_check_ports: server_check_ports(servers),
+            server_check_addrs: server_check_addrs(servers),
+            server_socks4: server_socks4(servers.len(), extras),
+            server_check_via_socks4: server_check_via_socks4(servers.len(), extras),
+            server_observe: server_observe(servers),
+            server_agent_checks: extras.agent_checks.clone(),
             server_pool: pool_cfgs(servers, mode_http),
             server_restored: Vec::new(),
+            server_pp_tlv_fmts: pp_tlv_fmts(servers.len(), extras),
         }
     }
+}
+
+/// The `set-proxy-v2-tlv-fmt` formats of [`ServerIdArrays`], compiled once; `None` when no
+/// server of the proxy has one.
+fn pp_tlv_fmts(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Option<Arc<Vec<Option<Arc<SrvPpv2Tlvs>>>>> {
+    if extras.ppv2_tlvs.is_empty() {
+        return None;
+    }
+    let mut slots = vec![None; count];
+    for (idx, tlvs) in &extras.ppv2_tlvs {
+        // A format the configuration passed: `validate_config` refused the proxy otherwise,
+        // as `HAProxy` does at load.
+        let compiled: Vec<(u8, Option<Arc<crate::logfmt::LogFormat>>)> = tlvs
+            .iter()
+            .map(|t| {
+                let fmt = (!t.fmt.is_empty())
+                    .then(|| crate::logfmt::LogFormat::compile_rule(&t.fmt, &crate::engine::sample_registry(), false).ok())
+                    .flatten()
+                    .map(Arc::new);
+                (t.id, fmt)
+            })
+            .collect();
+        let idx = *idx as usize;
+        if idx < count {
+            slots[idx] = Some(Arc::new(SrvPpv2Tlvs { tlvs: compiled }));
+        }
+    }
+    Some(Arc::new(slots))
 }
 
 /// The idle connection settings of each server of a proxy, and its `proto h2` in `mode http`
@@ -306,6 +479,73 @@ fn server_check_ports(servers: &[alcyon_config::ast::Server]) -> Vec<u16> {
     servers.iter().map(|s| s.check_port.unwrap_or(0)).collect()
 }
 
+fn server_check_addrs(servers: &[alcyon_config::ast::Server]) -> Vec<Option<std::net::IpAddr>> {
+    if servers.iter().all(|s| s.check_addr().is_none()) {
+        return Vec::new();
+    }
+    servers.iter().map(alcyon_config::ast::Server::check_addr).collect()
+}
+
+/// Each server's `socks4 <proxy>`, from the sparse `ServerExtras::socks4`: `None` for a
+/// server without a tunnel; empty when no server has one.
+fn server_socks4(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Vec<Option<SocketAddr>> {
+    if extras.socks4.is_empty() {
+        return Vec::new();
+    }
+    let mut slots = vec![None; count];
+    for &(idx, addr) in &extras.socks4 {
+        let idx = idx as usize;
+        if idx < count {
+            slots[idx] = Some(addr);
+        }
+    }
+    slots
+}
+
+/// Each server's `check-via-socks4`, from the sparse `ServerExtras::check_via_socks4`;
+/// empty when no server sets it.
+fn server_check_via_socks4(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Vec<bool> {
+    if extras.check_via_socks4.is_empty() {
+        return Vec::new();
+    }
+    let mut slots = vec![false; count];
+    for &idx in &extras.check_via_socks4 {
+        let idx = idx as usize;
+        if idx < count {
+            slots[idx] = true;
+        }
+    }
+    slots
+}
+
+fn server_observe(servers: &[alcyon_config::ast::Server]) -> Option<Arc<Vec<ObserveSlot>>> {
+    if servers.iter().all(|s| !s.check || s.observe() == alcyon_config::ObserveMode::None) {
+        return None;
+    }
+    Some(Arc::new(
+        servers
+            .iter()
+            .map(|s| ObserveSlot {
+                observe: if s.check { s.observe() } else { alcyon_config::ObserveMode::None },
+                on_error: s.on_error(),
+                error_limit: s.error_limit(),
+                consecutive_errors: std::sync::atomic::AtomicU32::new(0),
+                failed_hana: std::sync::atomic::AtomicU64::new(0),
+            })
+            .collect(),
+    ))
+}
+
+impl ServerIdArrays {
+    /// The `observe` slot for server `idx`, or `None` if `observe` is disabled.
+    #[inline]
+    #[must_use]
+    pub fn observe_slot(&self, idx: usize) -> Option<&ObserveSlot> {
+        let slots = self.server_observe.as_deref()?;
+        slots.get(idx).filter(|s| s.observe != alcyon_config::ObserveMode::None)
+    }
+}
+
 /// The flags for [`Proxy::server_forced_ids`]: empty when none asked for an id.
 fn server_forced_ids(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Vec<bool> {
     let mut forced = Vec::new();
@@ -335,6 +575,7 @@ fn server_check_configs(servers: &[alcyon_config::ast::Server], check_timeout: O
                 cfg.inter = inter;
             }
             cfg.check_port = s.check_port;
+            cfg.check_addr = s.check_addr();
             cfg.h2 = s.check_proto.map_or(s.proto_h2, |p| p == "h2");
             cfg.fastinter_ms = s.fastinter_ms();
             cfg.downinter_ms = s.downinter_ms();
@@ -481,6 +722,21 @@ impl Proxy {
         self.ids.srv.server_check_ports.get(idx).copied().unwrap_or(0)
     }
 
+    pub fn server_check_addr(&self, idx: usize) -> Option<std::net::IpAddr> {
+        self.ids.srv.server_check_addrs.get(idx).copied().flatten()
+    }
+
+    /// Agent check configuration for server `idx`, if any.
+    #[must_use]
+    pub fn server_agent_config(&self, idx: usize) -> Option<&alcyon_config::ast::AgentCheckConfig> {
+        self.ids
+            .srv
+            .server_agent_checks
+            .iter()
+            .find(|(i, _)| *i as usize == idx)
+            .map(|(_, a)| a)
+    }
+
     /// Whether the server at `idx` has an `id` of its own (`SRV_F_FORCED_ID`).
     #[must_use]
     pub fn server_forced_id(&self, idx: usize) -> bool {
@@ -594,6 +850,32 @@ impl<'a> ServerSet<'a> {
         self.0.srv.server_maxconn.get(i)
     }
 
+    /// Slot `i`'s `maxqueue`: 0 when it is unlimited (the default) or the proxy keeps no
+    /// arrays (no server has a `maxqueue` and none of them has queued a request yet).
+    #[inline]
+    #[must_use]
+    pub fn maxqueue_at(&self, i: usize) -> u32 {
+        self.0.srv.cells.queue_max.get().and_then(|st| st.max.get(i)).copied().unwrap_or(0)
+    }
+
+    /// The requests queued on slot `i` now (`HAProxy`'s `srv->queueslength`).
+    #[inline]
+    #[must_use]
+    pub fn queue_len(&self, i: usize) -> u32 {
+        self.0.srv.cells.queue_max.get().and_then(|st| st.queue.get(i)).map_or(0, |q| q.load(Ordering::Relaxed))
+    }
+
+    /// The reference a request queued on slot `i` keeps to count itself in and out;
+    /// `None` for a slot that is not a server.
+    #[must_use]
+    pub fn queue_ref(&self, i: usize) -> Option<SrvQueue> {
+        Some(SrvQueue {
+            cells: Arc::clone(&self.0.srv.cells),
+            idx: i,
+        })
+        .filter(|_| self.cell(i).is_some())
+    }
+
     /// Whether slot `i` is a `backup` server.
     #[inline]
     #[must_use]
@@ -683,10 +965,29 @@ impl<'a> ServerSet<'a> {
         self.0.srv.server_send_proxy_v2.get(i).copied().unwrap_or(false)
     }
 
+    /// Slot `i`'s SOCKS4 proxy (`socks4 <addr>:<port>`), `None` for a server without one.
+    #[must_use]
+    pub fn socks4_at(&self, i: usize) -> Option<SocketAddr> {
+        self.0.ids.srv.server_socks4.get(i).copied().flatten()
+    }
+
+    /// Whether slot `i`'s health checks ride its SOCKS4 tunnel (`check-via-socks4`).
+    #[must_use]
+    pub fn check_via_socks4_at(&self, i: usize) -> bool {
+        self.0.ids.srv.server_check_via_socks4.get(i).copied().unwrap_or(false)
+    }
+
     /// Whether slot `i`'s PROXY v2 header carries the unique id.
     #[must_use]
     pub fn pp_unique_id_at(&self, i: usize) -> bool {
         self.0.srv.server_pp_unique_id.get(i).copied().unwrap_or(false)
+    }
+
+    /// Slot `i`'s `set-proxy-v2-tlv-fmt(<id>) [<fmt>]` TLVs, in send order, `None` when
+    /// the server has none.
+    #[must_use]
+    pub fn pp_tlv_fmts_at(&self, i: usize) -> Option<&'a SrvPpv2Tlvs> {
+        self.0.ids.srv.server_pp_tlv_fmts.as_ref().and_then(|slots| slots.get(i)).and_then(Option::as_ref).map(Arc::as_ref)
     }
 
     /// Slot `i`'s session-rate counter.
@@ -737,6 +1038,22 @@ impl<'a> ServerSet<'a> {
     #[must_use]
     pub fn tfo_of(&self, addr: SocketAddr) -> bool {
         self.slot_of_addr(addr).and_then(|i| self.0.srv.server_tfo.get(i).copied()).unwrap_or(false)
+    }
+
+    /// Slot `i`'s server's `tcp-md5sig` key, set on the outgoing socket before `connect`;
+    /// `None` for a server without one (and for a backend whose servers have none, where
+    /// the lookup touches only the empty `Option`). By slot, not by address: two servers
+    /// may share an address with different keys, the `use-server` case of the reg-test,
+    /// and only the picked server's slot says which key is its own.
+    #[must_use]
+    pub fn md5sig_at(&self, i: usize) -> Option<&str> {
+        self.0
+            .srv
+            .cells
+            .md5sig
+            .as_ref()
+            .and_then(|v| v.get(i))
+            .and_then(Option::as_deref)
     }
 
     /// The server in slot `i`; `None` when there is no such slot or it is empty.

@@ -46,8 +46,8 @@ fn rfc3164_day_is_space_padded_not_zero_padded() {
 #[test]
 fn a_datagram_actually_arrives_and_is_well_formed() {
     let (rx, addr) = receiver();
-    let cfg = LogConfig { target: LogTarget::Udp(addr), max_len: 1024, format: None, sample: None, facility: LogFacility::Local0, level: Some(LogLevel::Notice) };
-    let t = SyslogTarget::new(&cfg);
+    let cfg = LogConfig { line: 0, target: LogTarget::Udp(addr), max_len: 1024, format: None, profile: None, sample: None, facility: LogFacility::Local0, level: Some(LogLevel::Notice) };
+    let t = SyslogTarget::new(&cfg, None);
 
     assert!(t.send(LogLevel::Notice, "alcyon", "testhost", "a message"));
 
@@ -65,8 +65,8 @@ fn level_filtering_drops_less_severe_messages() {
     // level or more severe are emitted. Severity counts downward, so "more severe"
     // means a numerically smaller code -- easy to invert by accident.
     let (rx, addr) = receiver();
-    let cfg = LogConfig { target: LogTarget::Udp(addr), max_len: 1024, format: None, sample: None, facility: LogFacility::Local0, level: Some(LogLevel::Warning) };
-    let t = SyslogTarget::new(&cfg);
+    let cfg = LogConfig { line: 0, target: LogTarget::Udp(addr), max_len: 1024, format: None, profile: None, sample: None, facility: LogFacility::Local0, level: Some(LogLevel::Warning) };
+    let t = SyslogTarget::new(&cfg, None);
 
     assert!(t.accepts(LogLevel::Emerg), "more severe than the filter must pass");
     assert!(t.accepts(LogLevel::Warning), "equal to the filter must pass");
@@ -83,15 +83,17 @@ fn sending_to_an_unreachable_collector_never_fails_the_caller() {
     // Logging is best-effort by design: a collector that is gone must not stall or
     // crash the proxy. This is the property that matters most in production.
     let cfg = LogConfig {
+        line: 0,
         // TEST-NET-1, guaranteed not to route anywhere.
         target: LogTarget::Udp("192.0.2.1:514".parse::<SocketAddr>().expect("addr")),
         max_len: 1024,
         format: None,
+        profile: None,
         sample: None,
         facility: LogFacility::Local0,
         level: Some(LogLevel::Info),
     };
-    let t = SyslogTarget::new(&cfg);
+    let t = SyslogTarget::new(&cfg, None);
     for _ in 0..100 {
         let _ = t.send(LogLevel::Info, "alcyon", "h", "into the void");
     }

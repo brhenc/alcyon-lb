@@ -207,6 +207,14 @@ pub struct SocketTuning {
     pub congestion: Option<String>,
     /// `mss <n>`: `TCP_MAXSEG`.
     pub mss: Option<u32>,
+    /// `tcp-md5sig <key>`: the RFC 2385 signature key of the listening socket
+    /// (`setsockopt(TCP_MD5SIG)` in `alcyon-rt`'s listener).
+    pub md5sig: Option<String>,
+    /// `tcp-ss <0|1|2>`: `TCP_SAVE_SYN` on the listening socket: the kernel records the
+    /// SYN of every accepted connection for a one-time `getsockopt(TCP_SAVED_SYN)` (the
+    /// fetch `fc_saved_syn`), with mode 2 adding its Ethernet header. 0 (the default)
+    /// turns the recording off.
+    pub tcp_save_syn: u8,
     /// `quic-force-retry`: a QUIC listener answers every new connection with a Retry first
     /// (`QuicEndpoint`'s Retry policy). Accepted on a TCP bind, where it does nothing, as
     /// `HAProxy` accepts it.
@@ -230,6 +238,10 @@ pub struct BindConfig {
     pub proto: Option<String>,
     pub accept_proxy: bool,
     pub accept_proxy_v2: bool,
+    /// `accept-netscaler-cip <magic>`: connections the bind accepts start with a NetScaler
+    /// Client IP header whose first 4 bytes are the magic. `None` when the bind sets none
+    /// (0 when the rule that expects one reads it, as in `HAProxy`).
+    pub accept_netscaler_cip: Option<u32>,
     /// `name <n>`: what `so_name` reads on connections this bind accepted.
     pub name: Option<String>,
     /// `id <n>`: the listener's explicit numeric id, what `so_id` reads. `None` takes the
@@ -313,6 +325,11 @@ pub struct ListenSection {
     /// `log-format-sd`: the STRUCTURED-DATA of the lines this proxy sends to an `rfc5424`
     /// target.
     pub log_format_sd: Option<String>,
+    /// `log-steps <steps>`: the log steps this proxy sends. `None` is no directive;
+    /// `Some(0)` is `all`; otherwise the bitmask of the named steps
+    /// (`accept`=0x01, `request`=0x02, `connect`=0x04, `response`=0x08, `error`=0x10,
+    /// `close`=0x20, plus the `do-log` steps).
+    pub log_steps: Option<u8>,
     /// `unique-id-header`: the request header the unique ID is sent to the server in.
     pub unique_id_header: Option<String>,
     /// `capture request header`, in declaration order.
@@ -557,6 +574,7 @@ impl Default for ListenSection {
             unique_id_format: None,
             error_log_format: None,
             log_format_sd: None,
+            log_steps: None,
             unique_id_header: None,
             req_header_captures: Vec::new(),
             res_header_captures: Vec::new(),
@@ -673,6 +691,11 @@ pub struct FrontendSection {
     /// `log-format-sd`: the STRUCTURED-DATA of the lines this proxy sends to an `rfc5424`
     /// target.
     pub log_format_sd: Option<String>,
+    /// `log-steps <steps>`: the log steps this proxy sends. `None` is no directive;
+    /// `Some(0)` is `all`; otherwise the bitmask of the named steps
+    /// (`accept`=0x01, `request`=0x02, `connect`=0x04, `response`=0x08, `error`=0x10,
+    /// `close`=0x20, plus the `do-log` steps).
+    pub log_steps: Option<u8>,
     /// `unique-id-header`: the request header the unique ID is sent to the server in.
     pub unique_id_header: Option<String>,
     /// `capture request header`, in declaration order.
@@ -760,6 +783,7 @@ impl Default for FrontendSection {
             unique_id_format: None,
             error_log_format: None,
             log_format_sd: None,
+            log_steps: None,
             unique_id_header: None,
             req_header_captures: Vec::new(),
             res_header_captures: Vec::new(),
@@ -805,6 +829,11 @@ pub struct BackendSection {
     /// the transitions between UP and DOWN.
     /// `log-format`, or the default chosen by `option httplog` / `option tcplog`.
     pub log_format: Option<LogFormatSpec>,
+    /// `log-steps <steps>`: the log steps this proxy sends. `None` is no directive;
+    /// `Some(0)` is `all`; otherwise the bitmask of the named steps
+    /// (`accept`=0x01, `request`=0x02, `connect`=0x04, `response`=0x08, `error`=0x10,
+    /// `close`=0x20, plus the `do-log` steps).
+    pub log_steps: Option<u8>,
     /// `unique-id-format`: the transaction's unique ID, built when first used.
     pub unique_id_format: Option<String>,
     /// `unique-id-header`: the request header the unique ID is sent to the server in.
@@ -940,6 +969,7 @@ impl Default for BackendSection {
             logs: Vec::new(),
             log_global: false,
             log_format: None,
+            log_steps: None,
             unique_id_format: None,
             unique_id_header: None,
             log_health_checks: false,

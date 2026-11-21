@@ -52,8 +52,17 @@ pub struct Listener {
     pub accept_proxy: bool,
     /// `accept-proxy-v2`: the header must be v2.
     pub accept_proxy_v2: bool,
+    /// `bind ... accept-netscaler-cip <magic>`: connections this bind accepts start with a
+    /// NetScaler Client IP header whose first 4 bytes are the magic (`0` when the bind sets
+    /// none and a rule still expects one). Per bind, as in `HAProxy` (`BC_O_ACC_CIP`).
+    pub accept_netscaler_cip: Option<u32>,
     /// `bind ... proto h2`: connections start as HTTP/2 (the preface is expected).
     pub proto_h2: bool,
+    /// `bind ... tcp-ss <0|1|2>`: the `TCP_SAVE_SYN` mode of this socket — the kernel
+    /// records the SYN of each accepted connection for the one-time
+    /// `getsockopt(TCP_SAVED_SYN)` (`fc_saved_syn`), mode 2 adding its Ethernet header.
+    /// 0 turns the recording off.
+    pub tcp_save_syn: u8,
     /// The `listen()` backlog of the bind ([`listener_backlog`]), for the `listen()` that
     /// resumes a paused listener ([`Listener::resume`]).
     pub backlog: i32,
@@ -78,6 +87,9 @@ fn apply_tuning(fd: &OwnedFd, tuning: &alcyon_config::ast::SocketTuning) {
     if let Some(algo) = &tuning.congestion {
         warn_if_refused("the congestion control", net::sockopt::set_tcp_congestion(fd, algo));
     }
+    // `tcp-ss`: `HAProxy` always sets the option — 0 turns the recording off, which also
+    // clears a recording an inherited socket still carries (`tcp_bind_listener`).
+    warn_if_refused("TCP Save SYN", alcyon_mmsg::set_tcp_save_syn(fd.as_fd(), tuning.tcp_save_syn));
 }
 
 /// The one place a refused socket option is reported (HAProxy: a warning, the listener is kept).
@@ -96,6 +108,18 @@ pub fn listener_backlog(bind_backlog: Option<u32>, proxy_backlog: u32, proxy_max
     let proxy_maxconn = if proxy_maxconn == 0 { crate::globalconn::hard() } else { proxy_maxconn };
     let v = [bind_backlog.unwrap_or(0), proxy_backlog, proxy_maxconn].into_iter().find(|&v| v != 0).unwrap_or(1024);
     i32::try_from(v).unwrap_or(i32::MAX)
+}
+
+/// `tcp-md5sig`: the key is bound to the address the socket actually listens on
+/// (`HAProxy`'s `listener->rx.addr`), so it is set after the `bind` that may have
+/// replaced a 0 port. `HAProxy` aborts the load when the kernel refuses it
+/// (`ERR_ALERT | ERR_ABORT`), so the error propagates.
+fn bind_md5sig(fd: &OwnedFd, bound_addr: SocketAddr, key: &str) -> io::Result<()> {
+    if let Err(e) = alcyon_mmsg::set_tcp_md5sig(fd.as_fd(), bound_addr, key.as_bytes()) {
+        crate::stderr_line!("[ALERT] bind: cannot set TCP MD5 signature: {e}");
+        return Err(e);
+    }
+    Ok(())
 }
 
 impl Listener {
@@ -158,6 +182,10 @@ impl Listener {
             addr
         };
 
+        if let Some(key) = &tuning.md5sig {
+            bind_md5sig(&fd, bound_addr, key)?;
+        }
+
         Ok(Listener {
             fd,
             addr: bound_addr,
@@ -167,7 +195,9 @@ impl Listener {
             name: None,
             accept_proxy: false,
             accept_proxy_v2: false,
+            accept_netscaler_cip: None,
             proto_h2: false,
+            tcp_save_syn: tuning.tcp_save_syn,
             luid: 0,
             backlog,
             rate_paused: false,
@@ -223,7 +253,9 @@ impl Listener {
             name: None,
             accept_proxy: false,
             accept_proxy_v2: false,
+            accept_netscaler_cip: None,
             proto_h2: false,
+            tcp_save_syn: tuning.tcp_save_syn,
             luid: 0,
             backlog: 1024,
             rate_paused: false,
@@ -414,6 +446,18 @@ mod tests {
             .expect("socket");
         let err = Listener::adopt(fd, loopback0(), 0, &alcyon_config::ast::SocketTuning::default()).err().expect("must refuse");
         assert!(err.to_string().contains("not a stream socket"), "{err}");
+    }
+
+    /// The kernel refuses `IPPROTO_TCP` options on a socket that does not speak TCP:
+    /// the bind must fail with the error, as `HAProxy` aborts the load when
+    /// `setsockopt(TCP_MD5SIG)` fails (`ERR_ALERT | ERR_ABORT`).
+    #[test]
+    fn a_key_the_kernel_refuses_fails_the_bind() {
+        let udp = net::socket_with(AddressFamily::INET, SocketType::DGRAM, SocketFlags::CLOEXEC, None)
+            .expect("socket");
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        let err = bind_md5sig(&udp, addr, "secret").err().expect("the kernel must refuse the key");
+        assert_eq!(err.raw_os_error(), Some(nix::libc::ENOPROTOOPT), "{err}");
     }
 
     #[test]

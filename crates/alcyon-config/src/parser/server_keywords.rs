@@ -72,12 +72,10 @@ const CHECK: Unimplemented = Refuse(
     "Alcyon does not implement it; the health check would silently test something else",
 );
 const ROUTE: Unimplemented = Refuse("Alcyon does not implement it; requests would be routed differently");
-const SENT: Unimplemented = Refuse("Alcyon does not implement it; the server would receive something else");
 
 /// Keywords `HAProxy` registers that the loops in `server.rs` do not handle.
 pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     // src/server.c
-    kw!("error-limit", Arg::Word, Ignore("the error count for 'observe' and 'on-error', which Alcyon refuses")),
     not_for_default!("guid", Arg::Word, Ignore("a global identifier for the CLI and stats")),
     kw!("ws", Arg::Word, Ignore("the protocol for WebSocket; Alcyon upgrades over HTTP/1.1")),
     kw!("hash-key", Arg::Word, ROUTE),
@@ -86,39 +84,33 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("init-state", Arg::Word, Refuse("Alcyon does not implement it; the server would take traffic in a state it should not")),
     kw!("log-bufsize", Arg::Word, Ignore("log servers only")),
     kw!("log-proto", Arg::Word, Ignore("log servers only")),
-    // `atol`: 0 (or a word) is no limit, which is what Alcyon does; see `parse_unimplemented`.
-    kw!("maxqueue", Arg::Word, Refuse("Alcyon has no per-server queue (a request waits in its backend's queue); only 'maxqueue 0' is accepted")),
     kw!("max-reuse", Arg::Word, Ignore("handled with the other server keywords in parse_server (h2 only, T540)")),
     kw!("minconn", Arg::Word, Ignore("the dynamic connection limit")),
     kw!("namespace", Arg::Word, ROUTE),
     kw!("non-stick", Arg::None, ROUTE),
-    kw!("observe", Arg::Word, CHECK),
-    kw!("on-error", Arg::Word, CHECK),
     kw!("on-marked-down", Arg::Word, Refuse("Alcyon does not implement it; sessions it should end would continue")),
     kw!("on-marked-up", Arg::Word, Refuse("Alcyon does not implement it; sessions it should end would continue")),
     kw!("pool-conn-name", Arg::Word, Refuse(
         "Alcyon does not implement it; requests it should keep apart would share server connections",
     )),
     kw!("redir", Arg::Word, ROUTE),
-    kw!("set-proxy-v2-tlv-fmt", Arg::Word, SENT),
     kw!("shard", Arg::Word, Ignore("peers only")),
     kw!("slowstart", Arg::Delay, Ignore("the warm-up of a server coming back up")),
     kw!("source", Arg::Word, ROUTE),
     kw!("strict-maxconn", Arg::None, Ignore("whether idle connections count against maxconn")),
-    kw!("socks4", Arg::Word, ROUTE),
     kw!("usesrc", Arg::None, ROUTE),
     // src/check.c
-    kw!("addr", Arg::Word, CHECK),
-    kw!("agent-addr", Arg::Word, Ignore("agent checks, which need 'agent-check'; Alcyon refuses it")),
+    kw!("agent-addr", Arg::Word, CHECK),
     kw!("agent-check", Arg::None, CHECK),
-    kw!("agent-inter", Arg::Delay, Ignore("agent checks, which need 'agent-check'; Alcyon refuses it")),
-    kw!("agent-port", Arg::Word, Ignore("agent checks, which need 'agent-check'; Alcyon refuses it")),
-    kw!("agent-send", Arg::Word, Ignore("agent checks, which need 'agent-check'; Alcyon refuses it")),
+    kw!("agent-inter", Arg::Delay, CHECK),
+    kw!("agent-port", Arg::Word, CHECK),
+    kw!("agent-send", Arg::Word, CHECK),
     kw!("check-pool-conn-name", Arg::Word, Ignore("health checks reusing idle connections")),
     kw!("check-reuse-pool", Arg::None, Ignore("health checks reusing idle connections")),
     kw!("check-send-proxy", Arg::None, CHECK),
-    kw!("check-via-socks4", Arg::None, CHECK),
     // `fastinter` and `downinter` are read in `server.rs` (T207) and paced in `check.rs`.
+    // `socks4` and `check-via-socks4` are read in `server.rs` (T281) and driven in
+    // `socks4.rs`, `engine.rs` and `check.rs`.
     // src/cfgparse-ssl.c: the rest is implemented in `server.rs` (`parse_server_ssl_keyword`).
     kw!("allow-0rtt", Arg::None, TLS),
     kw!("ciphers", Arg::Word, TLS),
@@ -140,16 +132,13 @@ pub(crate) const UNIMPLEMENTED_SERVER_KEYWORDS: &[ServerKeyword] = &[
     kw!("tls-tickets", Arg::None, TLS),
     // src/cfgparse-tcp.c
     kw!("cc", Arg::Word, Ignore("the TCP congestion control algorithm")),
-    kw!("tcp-md5sig", Arg::Word, Refuse("Alcyon does not implement it; connections would carry no TCP MD5 signature")),
     kw!("tcp-ut", Arg::Delay, Ignore("the TCP user timeout")),
     // src/tcpcheck.c
     kw!("healthcheck", Arg::Word, CHECK),
 ];
 
 fn find(word: &str) -> Option<&'static ServerKeyword> {
-    // `set-proxy-v2-tlv-fmt(<id>)` carries its argument in its name.
-    let name = word.split_once('(').map_or(word, |(n, _)| n);
-    UNIMPLEMENTED_SERVER_KEYWORDS.iter().find(|k| k.name == name)
+    UNIMPLEMENTED_SERVER_KEYWORDS.iter().find(|k| k.name == word)
 }
 
 /// `'server s1' : ` or, on a `default-server` line, nothing, as `HAProxy` prefixes it.
@@ -188,9 +177,6 @@ pub(crate) fn unimplemented_server_keyword(tokens: &[Token], i: usize, server: O
             i + 1
         }
     };
-    if k.name == "maxqueue" && atol(&tokens[i + 1].text) <= 0 {
-        return Ok(last);
-    }
     if server.is_none() && !k.default_ok {
         super::warn::push_alert(tok.line, crate::ast::global::WarnStyle::At, &format!("'{}' option is not accepted in default-server sections", k.name));
         return Ok(last);

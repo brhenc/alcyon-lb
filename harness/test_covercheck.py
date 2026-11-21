@@ -543,6 +543,32 @@ class ReportObjects(unittest.TestCase):
         self.assertEqual(covercheck.report_objects(self.debug, {os.path.join(self.debug, "alcyon")}),
                          [built])
 
+    def test_a_built_executable_outside_deps_is_read(self):
+        """2026-11-21, cargo 1.100's build-dir layout: test binaries live in
+        debug/build/<pkg>/<hash>/out/, not deps/. The report read 2 objects instead of ~340
+        and called 142 changed lines unexecuted. A path cargo reported building is read
+        wherever it is."""
+        os.makedirs(os.path.join(self.debug, "build", "alcyon-mmsg", "5850fc01", "out"))
+        test_bin = self.exe("build/alcyon-mmsg/5850fc01/out/it-5850fc01")
+        self.assertEqual(covercheck.report_objects(self.debug, {test_bin}), [test_bin])
+
+
+class BraceOnlyLines(unittest.TestCase):
+    """2026-11-21, rustc 1.100: the compiler started giving a closing brace its own
+    counter, zero when the `if` before it was never false, while the body above it ran.
+    covercheck reported 29 such lines in 11 files. A brace has no statement of its own
+    and was never meant to be judged (`read_lcov`): a line that is only closing
+    punctuation is not a miss."""
+
+    SRC = ["fn f(x: bool) {", "    if x {", "        g();", "    }", "    });", "    h()", "}"]
+
+    def test_a_brace_only_line_is_not_a_miss(self):
+        changed = {"a.rs": {2, 3, 4, 5, 6}}
+        execd = {"a.rs": {2, 3, 4, 5, 6}}
+        hit = {"a.rs": {2, 3}}
+        self.assertEqual(covercheck.misses(changed, execd, hit, source=lambda f: self.SRC),
+                         {"a.rs": [6]})
+
 
 class ScopedMode(unittest.TestCase):
     """T609: `covercheck.py --tests <crate>:<target>[:<filter>]` judges the changed lines by

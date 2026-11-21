@@ -68,8 +68,9 @@ const KEYWORDS: &[(&str, Alcyon)] = &[
     ("log-bufsize 1024", Accepts),
     ("log-proto legacy", Accepts),
     ("maxconn 10", Accepts),
-    // T240: a limit Alcyon cannot apply is refused; 0, no limit, is what Alcyon does.
-    ("maxqueue 10", Refuses),
+    // The server's queue limit: a request the balancing assigned waits for the server
+    // there, and 0, no limit, is the default.
+    ("maxqueue 10", Accepts),
     ("maxqueue 0", Accepts),
     ("max-reuse 10", Accepts),
     ("minconn 5", Accepts),
@@ -79,8 +80,9 @@ const KEYWORDS: &[(&str, Alcyon)] = &[
     ("no-send-proxy-v2", Accepts),
     ("no-tfo", Accepts),
     ("non-stick", Refuses),
-    ("observe layer4", Refuses),
-    ("on-error fastinter", Refuses),
+    ("observe layer4", Accepts),
+    ("observe none", Accepts),
+    ("on-error fastinter", Accepts),
     ("on-marked-down shutdown-sessions", Refuses),
     ("on-marked-up shutdown-backup-sessions", Refuses),
     ("pool-conn-name str(a)", Refuses),
@@ -97,7 +99,7 @@ const KEYWORDS: &[(&str, Alcyon)] = &[
     ("resolvers r1", Accepts),
     ("send-proxy", Accepts),
     ("send-proxy-v2", Accepts),
-    ("set-proxy-v2-tlv-fmt(0xE1) foo", Refuses),
+    ("set-proxy-v2-tlv-fmt(0xE1) foo", Accepts),
     ("shard 1", Accepts),
     ("slowstart 10s", Accepts),
     ("source 127.0.0.1", Refuses),
@@ -106,13 +108,13 @@ const KEYWORDS: &[(&str, Alcyon)] = &[
     ("tfo", Accepts),
     // `track` needs a checked server to point at, which these one-server lines lack: it is
     // implemented (T141) and tested in `crates/alcyon-rt/tests/server_track.rs`.
-    ("socks4 127.0.0.1:1080", Refuses),
+    ("socks4 127.0.0.1:1080", Accepts),
     ("usesrc client", Refuses),
     ("weight 10", Accepts),
     // src/check.c
-    ("addr 127.0.0.2", Refuses),
+    ("addr 127.0.0.2", Accepts),
     ("agent-addr 127.0.0.2", Accepts),
-    ("agent-check", Refuses),
+    ("agent-check", Accepts),
     ("agent-inter 5s", Accepts),
     ("agent-port 9000", Accepts),
     ("agent-send foo", Accepts),
@@ -122,7 +124,7 @@ const KEYWORDS: &[(&str, Alcyon)] = &[
     ("check-proto h2", Accepts),
     ("check-reuse-pool", Accepts),
     ("check-send-proxy", Refuses),
-    ("check-via-socks4", Refuses),
+    ("check-via-socks4", Accepts),
     ("no-agent-check", Accepts),
     ("no-check", Accepts),
     ("no-check-reuse-pool", Accepts),
@@ -186,7 +188,10 @@ const KEYWORDS: &[(&str, Alcyon)] = &[
     ("verifyhost foo", Accepts),
     // src/cfgparse-tcp.c
     ("cc cubic", Accepts),
-    ("tcp-md5sig secret", Refuses),
+    // `tcp-md5sig` is implemented: the RFC 2385 key is bound to the server's address
+    // with `setsockopt(TCP_MD5SIG)` before `connect` (`alcyon-rt`); `HAProxy` stores no
+    // key for a name-based or `default-server` address, and Alcyon matches.
+    ("tcp-md5sig secret", Accepts),
     ("tcp-ut 5s", Accepts),
     // src/tcpcheck.c
     ("healthcheck hc1", Refuses),
@@ -372,4 +377,28 @@ fn max_reuse_reads_its_argument_as_atoi() {
     assert_eq!(reuse("7x"), 7);
     assert_eq!(reuse("abc"), 0);
     assert!(reuse("-1") < 0 && reuse("-5") < 0, "a negative value is no limit");
+}
+
+#[test]
+fn socks4_default_server_and_literal_proxy_validation() {
+    let cfg = parse_str(&format!(
+        "{DEFAULTS}backend b\n  default-server socks4 127.0.0.1:1080 check-via-socks4\n  \
+         server s1 127.0.0.1:8080\n  server s2 127.0.0.1:8081 socks4 127.0.0.1:1081\n"
+    ))
+    .expect("default-server socks4 inherits");
+    let extras = &cfg.backends[0].server_extras;
+    assert_eq!(extras.socks4, vec![
+        (0, "127.0.0.1:1080".parse().unwrap()),
+        (1, "127.0.0.1:1081".parse().unwrap()),
+    ]);
+    assert_eq!(extras.check_via_socks4, vec![0, 1]);
+
+    for bad in [
+        format!("{DEFAULTS}backend b\n  server s1 127.0.0.1:8080 socks4 proxy.example.com:1080\n"),
+        format!("{DEFAULTS}backend b\n  server s1 127.0.0.1:8080 socks4 quic+127.0.0.1:1080\n"),
+        format!("{DEFAULTS}backend b\n  default-server socks4 proxy.example.com:1080\n  server s1 127.0.0.1:8080\n"),
+    ] {
+        let err = parse_str(&bad).expect_err(&bad);
+        assert!(err.message.contains("'socks4'"), "{bad}: {}", err.message);
+    }
 }
