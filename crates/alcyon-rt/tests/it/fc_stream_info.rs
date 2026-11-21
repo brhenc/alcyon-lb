@@ -215,3 +215,44 @@ fn fc_nb_streams_h2_three_streams() {
     assert_eq!(run_h2_three_streams(None, lf), vec!["3|100|0", "2|100|0", "1|100|0"]);
     assert_eq!(run_h2_three_streams(Some(7), lf), vec!["3|7|0", "2|7|0", "1|7|0"]);
 }
+
+/// `alcyon -c` on an h2-only frontend holding `line`: the exit code and what it printed.
+fn check_h2(tag: &str, line: &str) -> (Option<i32>, String) {
+    let dir = std::env::temp_dir().join(format!("fc-stream-info-h2-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("c.cfg");
+    let cfg = format!(
+        "global\n  nbthread 1\ndefaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n\
+         frontend fe\n  bind 127.0.0.1:0 proto h2\n  {line}\n  default_backend be\nbackend be\n  server s1 127.0.0.1:1\n"
+    );
+    std::fs::write(&path, cfg).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-c").arg("-f").arg(&path).output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    (out.status.code(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+}
+
+/// CONNVIEW review: the client connection view reaches only `http-request` and
+/// `http-response` rules. Elsewhere (`tcp-request`, `use_backend`, a log line,
+/// `http-after-response`) the two fetches would load and answer nothing, so `-c` refuses them.
+#[test]
+fn fc_fetches_are_refused_where_no_connection_view_reaches() {
+    for f in ["fc_glitches", "fc_settings_streams_limit"] {
+        for (j, line) in [
+            format!("tcp-request content set-var(txn.v) {f}"),
+            format!("use_backend be if {{ {f} gt 0 }}"),
+            format!("log-format \"%[{f}]\""),
+            format!("http-after-response set-header x-f %[{f}]"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (code, out) = check_h2(&format!("{f}-{j}"), line);
+            assert_ne!(code, Some(0), "{line:?} loaded: {out}");
+            assert!(out.contains(&format!("'{f}' : not implemented in Alcyon")), "{line:?}: {out}");
+        }
+        for (j, line) in [format!("http-request set-header x-f %[{f}]"), format!("http-response set-header x-f %[{f}]")].iter().enumerate() {
+            let (code, out) = check_h2(&format!("{f}-ok{j}"), line);
+            assert_eq!(code, Some(0), "{line:?} refused: {out}");
+        }
+    }
+}

@@ -64,9 +64,18 @@ fn bind_is_h2_only(b: &alcyon_config::ast::BindConfig) -> bool {
         || (b.ssl && !b.alpn.is_empty() && b.alpn.iter().all(|a| a == "h2"))
 }
 
-/// Rule 5: Alcyon counts no HTTP/1 glitches, so `fc_glitches` is refused on a frontend or
-/// listen section whose binds can accept HTTP/1.
-pub fn check_fc_glitches(config: &Config, section: SectionKind, proxy: Option<&str>, fetch: &str) -> Result<(), String> {
+/// Rule 5: the client connection view (`FrontConnState`) reaches only `http-request` and
+/// `http-response` rules, so `fc_glitches` and `fc_settings_streams_limit` are refused under
+/// any other `directive` (`tcp-request`, `use_backend`, a log format, `http-after-response`),
+/// where they would answer nothing. Alcyon also counts no HTTP/1 glitches, so `fc_glitches`
+/// is refused on a frontend or listen section whose binds can accept HTTP/1.
+pub fn check_fc_glitches(config: &Config, section: SectionKind, proxy: Option<&str>, directive: &str, fetch: &str) -> Result<(), String> {
+    if !matches!(fetch, "fc_glitches" | "fc_settings_streams_limit") {
+        return Ok(());
+    }
+    if !matches!(directive, "http-request" | "http-response") {
+        return Err(format!("'{fetch}' : not implemented in Alcyon (Alcyon reads the client connection only in 'http-request' and 'http-response' rules)"));
+    }
     if fetch != "fc_glitches" {
         return Ok(());
     }
@@ -473,7 +482,7 @@ impl Section<'_> {
                 // request headers left, and a `tcp-response` no request at all. `HAProxy`
                 // names the action for `set-var`, the expression for the others.
                 let fetch = leading_fetch(expr);
-                check_fc_glitches(config, self.at.section, self.at.proxy, fetch).map_err(|e| {
+                check_fc_glitches(config, self.at.section, self.at.proxy, kw, fetch).map_err(|e| {
                     let stop = if kw.starts_with("http-") && !e.ends_with('.') { "." } else { "" };
                     format!("error detected in {} while parsing '{kw} {action}' rule : {e}{stop}", self.what)
                 })?;
