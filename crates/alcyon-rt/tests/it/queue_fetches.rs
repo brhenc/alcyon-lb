@@ -21,7 +21,7 @@
 //! `T281_ORACLE=/var/tmp/qwen-next-eval/oracle/haproxy` to run this test against `HAProxy`.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -492,4 +492,86 @@ fn connslots_down_backup_and_avg_queue_match_the_oracle() {
     }
 
     common::stop(&mut child);
+}
+
+/// `option redispatch`, the cookie names a server at its `maxconn` whose queue is full, and
+/// the re-pick finds nothing: the other server is disabled and the named one has weight 0, so
+/// the backend is not "all full". Measured on the oracle: C is refused at once, `503` `SC`
+/// (no server to connect to) with the redispatch flag `+` in `%rc`; A is served, B waits in
+/// s1's queue and is served after the release.
+#[test]
+fn redispatch_from_a_full_cookie_server_when_the_others_are_down() {
+    let bin = std::env::var("T281_ORACLE")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_alcyon").to_string());
+    let fe = common::reserve_addr();
+    let pe = common::reserve_addr();
+    let release = Arc::new(AtomicU64::new(1));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let be = held_backend(release.clone(), accepted.clone());
+    let collector = UdpSocket::bind("127.0.0.1:0").expect("collector");
+    collector.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let logaddr = collector.local_addr().unwrap();
+
+    let mut cfg = NamedTempFile::new().expect("tmp");
+    write!(
+        cfg,
+        "defaults\n  mode http\n  timeout connect 3s\n  timeout client 30s\n  timeout server 30s\n\
+         timeout queue 30s\n\
+         frontend f\n  bind {fe}\n  log {logaddr} local0\n  log-format \"LOG %HU %ST %ts %s %rc\"\n  default_backend b\n\
+         frontend p\n  bind {pe}\n  http-request return status 200 hdr x-sq \"%[srv_queue(b/s1)]\"\n\
+         backend b\n  cookie srv insert\n  balance roundrobin\n  option redispatch\n\
+         server s1 {be} weight 0 maxconn 1 maxqueue 1 cookie c1\n\
+         server s2 {be} maxconn 1 maxqueue 1 cookie c2 disabled\n"
+    )
+    .expect("write");
+    let mut child = Command::new(&bin)
+        .arg("-f")
+        .arg(cfg.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    assert!(common::wait_listening(pe), "proxy never opened the probe port");
+    assert!(common::wait_listening(fe), "proxy never opened the frontend port");
+
+    let req = |u: &str| format!("GET /{u} HTTP/1.1\r\nHost: t\r\nCookie: srv=c1\r\nConnection: close\r\n\r\n");
+    let probe = "GET /p HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    // A holds s1's only slot; B fills its queue.
+    let a = client(fe, &req("a"), &["ok"]);
+    let t = Instant::now();
+    while accepted.load(Ordering::SeqCst) < 1 {
+        assert!(t.elapsed() < Duration::from_secs(10), "A never reached the server");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let b = client(fe, &req("b"), &["ok"]);
+    probe_until(pe, probe, &[("x-sq", "1")], 5000, "B queued on s1");
+    // C: s1 is full, the queue is full, s2 is disabled.
+    let c = request(fe, &req("c")).unwrap();
+    assert_eq!(status(&c), 503, "{c:?}");
+    release.store(0, Ordering::SeqCst);
+    let (ra, rb) = (a.join().unwrap(), b.join().unwrap());
+    // Stopped before any assertion, so that an instrumented process still writes its coverage.
+    let mut logs = Vec::new();
+    let mut buf = [0u8; 2048];
+    while logs.len() < 3 {
+        let Ok(n) = collector.recv(&mut buf) else { break };
+        let l = String::from_utf8_lossy(&buf[..n]).to_string();
+        let l = l[l.find("LOG ").expect("log line")..].trim_end().to_string();
+        if l.starts_with("LOG /") {
+            logs.push(l);
+        }
+    }
+    common::stop(&mut child);
+    logs.sort();
+    assert_eq!(status(&ra), 200, "{ra:?}");
+    assert_eq!(status(&rb), 200, "{rb:?}");
+    assert_eq!(status(&c), 503, "{c:?}");
+    assert!(c.contains("No server is available to handle this request"), "{c:?}");
+    // C: no server, `SC`; the oracle sets the redispatch flag (`+` on the retries) although the
+    // re-pick found nothing.
+    assert_eq!(
+        logs,
+        ["LOG /a 200 -- s1 0", "LOG /b 200 -- s1 0", "LOG /c 503 SC <NOSRV> +0"],
+        "{logs:?}"
+    );
 }
