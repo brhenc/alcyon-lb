@@ -81,6 +81,7 @@ const KEYWORDS: &[(&str, Alcyon)] = &[
     ("no-tfo", Accepts),
     ("non-stick", Refuses),
     ("observe layer4", Accepts),
+    ("observe none", Accepts),
     ("on-error fastinter", Accepts),
     ("on-marked-down shutdown-sessions", Refuses),
     ("on-marked-up shutdown-backup-sessions", Refuses),

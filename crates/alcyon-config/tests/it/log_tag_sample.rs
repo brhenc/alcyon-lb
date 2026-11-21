@@ -131,3 +131,23 @@ fn log_profile_and_log_steps_errors_and_overrides_are_handled() {
         assert!(parse_str(bad).is_err(), "expected error for:\n{bad}");
     }
 }
+
+/// Every `log-steps` name the reference (3.5-dev11-ce79f339c, 2026-11-21) accepts on a
+/// frontend: the five that select a step set their bit, the rule-set names are accepted and
+/// select nothing, `all` is every step. On a backend `HAProxy` accepts the keyword and warns
+/// that it is ignored (no frontend capability).
+#[test]
+fn log_steps_names_and_backend_keyword() {
+    use alcyon_config::ast::{LOG_STEP_ACCEPT, LOG_STEP_ALL, LOG_STEP_CLOSE, LOG_STEP_CONNECT, LOG_STEP_REQUEST, LOG_STEP_RESPONSE};
+    let fe = |steps: &str| {
+        parse_str(&format!("frontend f\n  log-steps {steps}\n")).expect(steps).frontends[0].log_steps
+    };
+    assert_eq!(fe("accept,request,connect,response,close"),
+               Some(LOG_STEP_ACCEPT | LOG_STEP_REQUEST | LOG_STEP_CONNECT | LOG_STEP_RESPONSE | LOG_STEP_CLOSE));
+    assert_eq!(fe("request"), Some(LOG_STEP_REQUEST));
+    assert_eq!(fe("response"), Some(LOG_STEP_RESPONSE));
+    assert_eq!(fe("http-req,http-res,http-after-res,tcp-req-conn,tcp-req-sess,tcp-req-cont,tcp-res-cont"), Some(0));
+    assert_eq!(fe("all"), Some(LOG_STEP_ALL));
+    let be = parse_str("backend b\n  log-steps request,response\n").expect("log-steps on a backend");
+    assert_eq!(be.backends[0].log_steps, Some(LOG_STEP_REQUEST | LOG_STEP_RESPONSE));
+}
