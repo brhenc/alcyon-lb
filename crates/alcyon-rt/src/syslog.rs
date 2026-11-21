@@ -356,9 +356,8 @@ impl SyslogTarget {
         }
     }
 
-    /// Compiles a profile step's `format`/`sd`, once. A step format that does not compile
-    /// keeps its step but sends the proxy's line, the way a proxy whose own `log-format`
-    /// will not compile keeps logging nothing.
+    /// Compiles a profile step's `format`/`sd`, once (already checked by
+    /// [`crate::rule_exprs::validate_config`]).
     fn compile_format(fmt: &str) -> Option<Arc<crate::logfmt::LogFormat>> {
         crate::logfmt::LogFormat::compile(fmt, crate::engine::sample_registry()).ok().map(Arc::new)
     }
