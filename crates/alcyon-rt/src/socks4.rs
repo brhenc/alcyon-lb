@@ -56,6 +56,33 @@ pub const fn family_mismatch(proxy: SocketAddr, target: SocketAddr) -> bool {
     proxy.is_ipv6() != target.is_ipv6()
 }
 
+/// Connects to `target`, or through `proxy` when `Some(proxy)` (`socks4 <proxy>`).
+/// Refuses a proxy/target address-family mismatch with `EINVAL` before opening a socket
+/// (`HAProxy`'s `sock_create_server_socket` + `tcp_connect_server` open the socket in the
+/// server's family and fail `connect(&srv->socks4_addr)` with `EINVAL`, `CO_ER_SOCK_ERR`).
+///
+/// # Errors
+/// Returns `EINVAL` on a proxy/target address-family mismatch, or any error from
+/// [`crate::raw::connect_opts`].
+#[inline]
+pub fn connect_opts(
+    target: SocketAddr,
+    proxy: Option<SocketAddr>,
+    tfo: bool,
+    md5sig: Option<&[u8]>,
+) -> std::io::Result<(std::os::unix::io::OwnedFd, bool)> {
+    let dst = match proxy {
+        Some(p) => {
+            if family_mismatch(p, target) {
+                return Err(std::io::Error::from(rustix::io::Errno::INVAL));
+            }
+            p
+        }
+        None => target,
+    };
+    crate::raw::connect_opts(dst, tfo, md5sig)
+}
+
 /// The two phases of a handshake in flight, one per `CO_FL_SOCKS4_*`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Hs {
@@ -234,6 +261,11 @@ mod tests {
         assert!(family_mismatch(v6, v4));
         assert!(!family_mismatch(v4, v4));
         assert!(!family_mismatch(v6, v6_doc));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_v4 = listener.local_addr().unwrap();
+        let err = connect_opts(v6, Some(proxy_v4), false, None).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(rustix::io::Errno::INVAL.raw_os_error()));
     }
 
     #[test]

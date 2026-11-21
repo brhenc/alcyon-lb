@@ -9585,8 +9585,9 @@ fn init_client_session(
             let s_idx = srv_set.slot_of_addr(target);
             let real = connect_addr(target, sess.server_addr);
             let socks4 = socks4_proxy_of(proxies, proxy_idx, s_idx);
-            let connected = raw::connect_opts(
-                socks4.unwrap_or(real),
+            let connected = crate::socks4::connect_opts(
+                real,
+                socks4,
                 srv_set.tfo_of(target),
                 target_slot.and_then(|i| srv_set.md5sig_at(i)).map(str::as_bytes),
             )
@@ -10672,8 +10673,9 @@ fn retry_server_connect(
     let be_srv = proxies[be_idx].srv_set();
     let real = connect_addr(target_addr, entry.sess.server_addr);
     let socks4 = socks4_proxy_of(proxies, be_idx, s_idx);
-    if let Ok((srv_fd, immediate)) = raw::connect_opts(
-        socks4.unwrap_or(real),
+    if let Ok((srv_fd, immediate)) = crate::socks4::connect_opts(
+        real,
+        socks4,
         be_srv.tfo_of(target_addr),
         s_idx.and_then(|i| be_srv.md5sig_at(i)).map(str::as_bytes),
     )
@@ -16441,8 +16443,9 @@ impl EngineDispatcher<'_> {
                     new_interest.writable,
                 );
             }
-        } else if let Ok((srv_fd, immediate)) = raw::connect_opts(
-            socks4.unwrap_or(real),
+        } else if let Ok((srv_fd, immediate)) = crate::socks4::connect_opts(
+            real,
+            socks4,
             be_srv.tfo_of(target_addr),
             s_idx.and_then(|i| be_srv.md5sig_at(i)).map(str::as_bytes),
         )
@@ -16639,8 +16642,9 @@ impl EngineDispatcher<'_> {
         // servers exist (`unix@` is refused at parse time), so no test could reach a
         // separate branch for it.
         let be_srv = proxies[be_idx].srv_set();
-        if let Ok((srv_fd, _immediate)) = raw::connect_opts(
-            socks4.unwrap_or(real),
+        if let Ok((srv_fd, _immediate)) = crate::socks4::connect_opts(
+            real,
+            socks4,
             be_srv.tfo_of(target_addr),
             s_idx.and_then(|i| be_srv.md5sig_at(i)).map(str::as_bytes),
         )
