@@ -103,7 +103,26 @@ fn start() -> Proxy {
         }
     });
     assert!(common::wait_listening(sentinel), "proxy never listened");
+    assert!(wait_serving(sentinel), "proxy never answered");
     Proxy { child, fe, logs, _cfg: cfg }
+}
+
+/// Waits until the proxy answers a request on `addr`. A connect succeeds as soon as the
+/// listener is bound, ~35 ms (Alcyon) before the worker serves it: a head sent in that
+/// gap is read late, and `%TR`, which starts at the read, loses the difference (T649).
+fn wait_serving(addr: SocketAddr) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(mut c) = TcpStream::connect(addr) {
+            let _ = c.set_read_timeout(Some(Duration::from_millis(200)));
+            let mut b = [0u8; 16];
+            if c.write_all(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n").is_ok() && c.read(&mut b).is_ok_and(|n| n > 0) {
+                return true;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    false
 }
 
 /// The response of the request whose log line is `r={marker}`: its `th=` and `ti=`
