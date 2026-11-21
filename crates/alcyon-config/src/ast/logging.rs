@@ -183,6 +183,10 @@ pub struct LogProfileSection {
     /// re-parses the step, so the later `format`/`sd` replace the earlier and `drop` is
     /// whatever the combined lines leave.
     pub steps: Vec<LogProfileStep>,
+    /// Every `format` and `sd` string parsed in this section (with its 1-based line),
+    /// including lines later replaced by another `on <step>`, so load-time validation
+    /// compiles all of them as `HAProxy`'s `cfg_parse_log_profile` does.
+    pub format_strings: Vec<(usize, String)>,
 }
 
 /// Where a `log` line sends its output.

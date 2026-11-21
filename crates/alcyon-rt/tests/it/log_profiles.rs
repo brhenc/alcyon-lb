@@ -224,6 +224,109 @@ fn a_minimal_log_profile_is_accepted() {
     assert!(out.status.success(), "rc={:?} stderr={}", out.status.code(), String::from_utf8_lossy(&out.stderr));
 }
 
+fn run_cfg_startup(cfg: &str) -> Output {
+    let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+    f.write_all(cfg.as_bytes()).expect("write cfg");
+    let mut child = Command::new(bin())
+        .arg("-f")
+        .arg(f.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn binary");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if child.try_wait().expect("try_wait").is_some() {
+            return child.wait_with_output().expect("wait_with_output");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let out = child.wait_with_output().expect("wait_with_output");
+            panic!(
+                "binary did not exit on invalid config within 2s (stderr={})",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_bad_profile_step_format_or_sd_is_refused_at_load() {
+    let addr = common::reserve_addr();
+    let cases = [
+        (
+            "format bad alias",
+            format!(
+                "defaults\n  mode http\n  timeout client 5s\nlog-profile lp1\n  on close format \"%{{+X}}o %bogus\"\nfrontend fe\n  bind {addr}\n  log 127.0.0.1:514 profile lp1 local0\n"
+            ),
+            "no such format alias 'bogus'",
+            true,
+        ),
+        (
+            "sd bad alias",
+            format!(
+                "defaults\n  mode http\n  timeout client 5s\nlog-profile lp1\n  on close sd \"%{{+X}}o %bogus\"\nfrontend fe\n  bind {addr}\n  log 127.0.0.1:514 profile lp1 local0\n"
+            ),
+            "no such format alias 'bogus'",
+            true,
+        ),
+        (
+            "unused profile format",
+            "defaults\n  mode http\nlog-profile lp1\n  on close format \"%bogus\"\n".to_string(),
+            "no such format alias 'bogus'",
+            false,
+        ),
+        (
+            "unknown fetch in format",
+            "defaults\n  mode http\nlog-profile lp1\n  on http-req format \"%[nosuchfetch]\"\n".to_string(),
+            "unknown fetch method 'nosuchfetch'",
+            false,
+        ),
+        (
+            "unknown converter in sd",
+            "defaults\n  mode http\nlog-profile lp1\n  on any sd \"%[src,nosuchconv]\"\n".to_string(),
+            "unknown converter 'nosuchconv'",
+            false,
+        ),
+        (
+            "overridden bad format",
+            "defaults\n  mode http\nlog-profile lp1\n  on close format \"%bogus\"\n  on close format \"%ci\"\n".to_string(),
+            "no such format alias 'bogus'",
+            false,
+        ),
+    ];
+
+    for (label, cfg, expected_err, check_startup) in &cases {
+        let out = run_cfg(&["-c"], cfg);
+        assert!(
+            !out.status.success(),
+            "{label} (-c): expected failure, got rc={:?} stdout={} stderr={}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("failed to parse logformat") && err.contains(expected_err),
+            "{label} (-c): stderr was: {err}"
+        );
+        if *check_startup {
+            let out = run_cfg_startup(cfg);
+            assert!(
+                !out.status.success(),
+                "{label} (startup): expected failure, got rc={:?}",
+                out.status.code()
+            );
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                err.contains("failed to parse logformat") && err.contains(expected_err),
+                "{label} (startup): stderr was: {err}"
+            );
+        }
+    }
+}
+
 /// A thread draining one collector until `stop`.
 fn drain(sock: UdpSocket, stop: Instant, lines: Arc<Mutex<Vec<String>>>) {
     sock.set_read_timeout(Some(Duration::from_millis(50))).expect("timeout");

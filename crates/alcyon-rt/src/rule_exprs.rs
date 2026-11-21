@@ -698,6 +698,13 @@ pub fn validate_formats(config: &Config, registry: &Registry) -> Result<(), Stri
             check("backend", &b.name, "unique-id", fmt)?;
         }
     }
+    for lp in &config.log_profiles {
+        for (line, fmt) in &lp.format_strings {
+            LogFormat::compile(fmt, registry).map(|_| ()).map_err(|e| {
+                format!("parsing [line {line}]: log-profile '{}': failed to parse logformat: {e}", lp.name)
+            })?;
+        }
+    }
     // `set-proxy-v2-tlv-fmt`: each server's TLV formats are compiled when the server is
     // finalised, inherited `default-server` formats included: a bad one is fatal,
     // `'server <proxy>/<srv>' : <error>`. A section's `default-server` alone is never
