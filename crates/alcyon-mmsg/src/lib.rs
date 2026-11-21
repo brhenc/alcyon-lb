@@ -546,6 +546,60 @@ pub fn set_ipv6_recvpktinfo(fd: BorrowedFd<'_>, value: bool) -> io::Result<()> {
     }
 }
 
+/// Sets the mode of `TCP_SAVE_SYN` on a listening socket: 0 turns the recording
+/// off, 1 makes the kernel record the SYN of every accepted connection, 2 records
+/// it with its Ethernet header.
+///
+/// # Errors
+///
+/// Returns an error if the underlying `setsockopt` syscall fails.
+pub fn set_tcp_save_syn(fd: BorrowedFd<'_>, mode: u8) -> io::Result<()> {
+    const TCP_SAVE_SYN: libc::c_int = 27; // linux/tcp.h
+    let val: libc::c_int = i32::from(mode);
+    // SAFETY: the pointer passed to setsockopt is valid for `size_of_val(&val)` bytes.
+    let ret = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            TCP_SAVE_SYN,
+            std::ptr::addr_of!(val).cast::<libc::c_void>(),
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Reads back the SYN the kernel recorded for this connection (`TCP_SAVED_SYN`).
+/// The kernel answers with the data only once per connection; a second read has
+/// none (`buf` comes back with a length of 0).
+///
+/// # Errors
+///
+/// Returns an error if the underlying `getsockopt` syscall fails.
+pub fn get_saved_syn(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
+    const TCP_SAVED_SYN: libc::c_int = 28; // linux/tcp.h
+    let mut len = buf.len() as libc::socklen_t;
+    // SAFETY: `buf` is valid for `len` bytes and `getsockopt` writes back the length it used.
+    let ret = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            TCP_SAVED_SYN,
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if ret < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(len as usize)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,6 +640,17 @@ mod tests {
             assert_eq!(item.len, 0);
             assert_eq!(item.buf, &[0u8; 10]);
         }
+    }
+
+    /// `TCP_SAVE_SYN` and `TCP_SAVED_SYN` are TCP options: on a non-TCP socket the kernel
+    /// refuses them (`EPROTONOPT`/`EOPNOTSUPP`), and the wrappers must surface that refusal
+    /// instead of pretending to have set or read a SYN.
+    #[test]
+    fn the_saved_syn_options_refuse_a_non_tcp_socket() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert!(set_tcp_save_syn(sock.as_fd(), 1).is_err(), "setsockopt must refuse IPPROTO_TCP on a UDP socket");
+        let mut buf = [0u8; 64];
+        assert!(get_saved_syn(sock.as_fd(), &mut buf).is_err(), "getsockopt must refuse TCP_SAVED_SYN on a UDP socket");
     }
 
     /// The control message `set_src_cmsg` builds, read back by `extract_dst_addr` and by hand,

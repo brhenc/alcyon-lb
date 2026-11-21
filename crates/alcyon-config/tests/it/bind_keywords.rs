@@ -213,7 +213,7 @@ fn frontend_quic_bind_defaults_its_alpn_to_h3() {
 #[test]
 fn bind_keywords_that_would_be_dropped_are_refused() {
     for kw in [
-        "tfo", "defer-accept", "process 1", "thread 1", "nbconn 1", "nice 5", "shards 2", "tcp-ss 1",
+        "tfo", "defer-accept", "process 1", "thread 1", "nbconn 1", "nice 5", "shards 2",
         "idle-ping 1s", "label foo", "guid-prefix g",
     ] {
         let name = kw.split(' ').next().unwrap();
@@ -252,4 +252,21 @@ fn bind_mss_takes_an_absolute_value_between_1_and_65535() {
     }
     let err = in_frontend("bind 127.0.0.1:8080 mss").expect_err("missing").to_string();
     assert!(err.contains("'mss' : missing MSS value"), "{err}");
+}
+
+#[test]
+fn bind_tcp_ss_parses_the_save_mode() {
+    // 0 = off, 1 = save the SYN, 2 = save with the MAC header (`bind_parse_tcp_ss`).
+    for f in [in_listen, in_frontend] {
+        for (kw, mode) in [("tcp-ss 0", 0u8), ("tcp-ss 1", 1u8), ("tcp-ss 2", 2u8)] {
+            let cfg = f(&format!("bind 127.0.0.1:8080 {kw}")).unwrap_or_else(|e| panic!("{kw}: {e}"));
+            let b = cfg.listens.first().map(|l| &l.binds[0]).or_else(|| cfg.frontends.first().map(|fe| &fe.binds[0]))
+                .expect("bind");
+            assert_eq!(b.sock.as_ref().expect("tuning").tcp_save_syn, mode, "{kw}");
+        }
+    }
+    for bad in ["tcp-ss", "tcp-ss 3", "tcp-ss -1", "tcp-ss abc", "tcp-ss 99999999999999999999"] {
+        let err = in_frontend(&format!("bind 127.0.0.1:8080 {bad}")).expect_err(bad).to_string();
+        assert!(err.contains("'tcp-ss'"), "{bad}: {err}");
+    }
 }

@@ -413,6 +413,7 @@ mod retry_on_reused_close;
 mod rfc7239_field;
 mod roundrobin_after_direct;
 mod sc_src_fetches;
+mod saved_syn;
 mod scheduler_task_reuse;
 mod server_and_option_keywords;
 mod server_disabled_use_server;

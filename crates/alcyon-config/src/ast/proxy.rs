@@ -210,6 +210,11 @@ pub struct SocketTuning {
     /// `tcp-md5sig <key>`: the RFC 2385 signature key of the listening socket
     /// (`setsockopt(TCP_MD5SIG)` in `alcyon-rt`'s listener).
     pub md5sig: Option<String>,
+    /// `tcp-ss <0|1|2>`: `TCP_SAVE_SYN` on the listening socket: the kernel records the
+    /// SYN of every accepted connection for a one-time `getsockopt(TCP_SAVED_SYN)` (the
+    /// fetch `fc_saved_syn`), with mode 2 adding its Ethernet header. 0 (the default)
+    /// turns the recording off.
+    pub tcp_save_syn: u8,
     /// `quic-force-retry`: a QUIC listener answers every new connection with a Retry first
     /// (`QuicEndpoint`'s Retry policy). Accepted on a TCP bind, where it does nothing, as
     /// `HAProxy` accepts it.

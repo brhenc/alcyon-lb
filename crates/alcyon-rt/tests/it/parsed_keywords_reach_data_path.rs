@@ -229,7 +229,7 @@ fn standalone_accept_proxy_is_refused_like_haproxy() {
 #[test]
 fn bind_keywords_without_a_safe_implementation_are_refused() {
     for kw in [
-        "tfo", "defer-accept", "process 1", "thread 1", "nbconn 1", "nice 5", "shards 2", "tcp-ss 1",
+        "tfo", "defer-accept", "process 1", "thread 1", "nbconn 1", "nice 5", "shards 2",
         "idle-ping 1s", "label foo", "guid-prefix g",
     ] {
         let (ok, msg) = check(&format!("{DEFAULTS}frontend x\n  bind 127.0.0.1:1 {kw}\n"));

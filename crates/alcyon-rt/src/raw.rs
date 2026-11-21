@@ -298,6 +298,22 @@ pub fn reset_pending(fd: BorrowedFd<'_>) -> bool {
     matches!(poll(&mut fds, 0), Ok(n) if n > 0) && fds[0].revents().contains(PollFlags::ERR)
 }
 
+/// The SYN the kernel recorded for this connection (`bind tcp-ss`): `getsockopt` with
+/// `TCP_SAVED_SYN`. The kernel answers with the data only once — a second read has none —
+/// so the session reads it a single time at accept and keeps the bytes (`HAProxy` instead
+/// re-reads it at every fetch evaluation, `src/tcp_sample.c`).
+///
+/// 512 bytes is above the largest recording the kernel can make: 14 Ethernet (mode 2) +
+/// 20 IP + 60 TCP header-plus-options.
+#[must_use]
+pub fn saved_syn(fd: BorrowedFd<'_>) -> Option<Box<[u8]>> {
+    let mut buf = [0u8; 512];
+    alcyon_mmsg::get_saved_syn(fd, &mut buf)
+        .ok()
+        .filter(|&len| len > 0)
+        .map(|len| buf[..len].to_vec().into_boxed_slice())
+}
+
 /// Whether this process may put a TCP socket in repair mode (`CAP_NET_ADMIN`): probed once on a
 /// scratch socket, since the answer is the process's and does not change.
 #[must_use]

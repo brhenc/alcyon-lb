@@ -58,6 +58,11 @@ pub struct Listener {
     pub accept_netscaler_cip: Option<u32>,
     /// `bind ... proto h2`: connections start as HTTP/2 (the preface is expected).
     pub proto_h2: bool,
+    /// `bind ... tcp-ss <0|1|2>`: the `TCP_SAVE_SYN` mode of this socket — the kernel
+    /// records the SYN of each accepted connection for the one-time
+    /// `getsockopt(TCP_SAVED_SYN)` (`fc_saved_syn`), mode 2 adding its Ethernet header.
+    /// 0 turns the recording off.
+    pub tcp_save_syn: u8,
     /// The `listen()` backlog of the bind ([`listener_backlog`]), for the `listen()` that
     /// resumes a paused listener ([`Listener::resume`]).
     pub backlog: i32,
@@ -82,6 +87,9 @@ fn apply_tuning(fd: &OwnedFd, tuning: &alcyon_config::ast::SocketTuning) {
     if let Some(algo) = &tuning.congestion {
         warn_if_refused("the congestion control", net::sockopt::set_tcp_congestion(fd, algo));
     }
+    // `tcp-ss`: `HAProxy` always sets the option — 0 turns the recording off, which also
+    // clears a recording an inherited socket still carries (`tcp_bind_listener`).
+    warn_if_refused("TCP Save SYN", alcyon_mmsg::set_tcp_save_syn(fd.as_fd(), tuning.tcp_save_syn));
 }
 
 /// The one place a refused socket option is reported (HAProxy: a warning, the listener is kept).
@@ -189,6 +197,7 @@ impl Listener {
             accept_proxy_v2: false,
             accept_netscaler_cip: None,
             proto_h2: false,
+            tcp_save_syn: tuning.tcp_save_syn,
             luid: 0,
             backlog,
             rate_paused: false,
@@ -246,6 +255,7 @@ impl Listener {
             accept_proxy_v2: false,
             accept_netscaler_cip: None,
             proto_h2: false,
+            tcp_save_syn: tuning.tcp_save_syn,
             luid: 0,
             backlog: 1024,
             rate_paused: false,

@@ -974,6 +974,24 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
                 bind.sock.get_or_insert_with(Default::default).tcp_user_timeout = Some(parse_timeout(a, "tcp-ut")?);
                 i += 1;
             }
+            // `bind_parse_tcp_ss`: 0 = off, 1 = save the SYN, 2 = with the MAC header.
+            // `HAProxy` `atoi`s the argument behind an `isdigit` gate, so a leading
+            // integer with trailing text is what it takes (`1.5` is 1); a longer digit
+            // run overflows `atoi` into out-of-range, as the oracle refuses.
+            "tcp-ss" => {
+                let a = arg(i, "a 0 to 2 value (0: off, 1: save the SYN, 2: save with the MAC header)")?;
+                let v = a.text.bytes().position(|b| !b.is_ascii_digit()).unwrap_or(a.text.len());
+                let v = a.text[..v].parse::<i32>().unwrap_or(i32::MAX);
+                if !(0..=2).contains(&v) {
+                    return Err(ConfigError::new(
+                        a.line,
+                        a.col,
+                        format!("{prefix} : 'tcp-ss' : TCP Save SYN option expects an integer argument from 0 to 2"),
+                    ));
+                }
+                bind.sock.get_or_insert_with(Default::default).tcp_save_syn = u8::try_from(v).unwrap();
+                i += 1;
+            }
             "mss" => {
                 let a = arg(i, "missing MSS value")?;
                 let v = a.text.parse::<i64>().unwrap_or(0).unsigned_abs();
