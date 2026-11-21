@@ -306,6 +306,11 @@ pub struct Rules {
     /// Some `http-request` rule's format or expression reads a stream timer fetch: the
     /// http-request context then carries the timers (five clock reads, not free - T455).
     pub req_stream: bool,
+    /// Some `http-response` or `http-after-response` rule sets or reads `StreamLog::log_level`
+    /// (`set-log-level`, `do-log`).
+    pub res_uses_log_level: bool,
+    /// Some `http-response` rule sets task nice (`set-nice`).
+    pub res_has_set_nice: bool,
 }
 
 impl Rules {
@@ -321,6 +326,25 @@ impl Rules {
         };
         self.res_stream = self.http_res.iter().chain(&self.http_after_res).any(reads) || self.reply_pages.values().any(|p| p.needs_stream());
         self.req_stream = self.http_req.iter().any(reads);
+        self
+    }
+
+    /// Records whether any `http-response` or `http-after-response` rule uses `set-log-level`,
+    /// `do-log`, or `set-nice`, so response evaluation skips touching them when unused.
+    #[must_use]
+    pub fn with_res_actions(
+        mut self,
+        http_res: &[alcyon_config::HttpResRule],
+        http_after_res: &[alcyon_config::HttpAfterResRule],
+    ) -> Self {
+        self.res_uses_log_level = http_res.iter().any(|r| {
+            matches!(r.action, HttpResAction::SetLogLevel(_) | HttpResAction::DoLog)
+        }) || http_after_res.iter().any(|r| {
+            matches!(r.action, HttpAfterResAction::SetLogLevel(_) | HttpAfterResAction::DoLog)
+        });
+        self.res_has_set_nice = http_res
+            .iter()
+            .any(|r| matches!(r.action, HttpResAction::SetNice(_)));
         self
     }
 }

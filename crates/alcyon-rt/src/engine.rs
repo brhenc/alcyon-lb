@@ -68,6 +68,22 @@ thread_local! {
     /// The response being rewritten by `http-response`/`http-after-response`, as the HTX
     /// message `HAProxy` holds it in: (bytes in use, size). See [`res_htx_init`].
     static RES_HTX: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    /// Tasks whose nice was updated during the current scheduler pass (`set-nice`).
+    static HAS_NICE_UPDATES: Cell<bool> = const { Cell::new(false) };
+    static NICE_UPDATES: std::cell::RefCell<Vec<(TaskRef, i16)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Nice value set by `http-response set-nice`, read once the list finishes.
+    static PENDING_NICE: Cell<Option<i16>> = const { Cell::new(None) };
+    /// Active stream log level during response-rule evaluation (`set-log-level`), and
+    /// captured levels for `do-log` in `http-response` / `http-after-response`.
+    static RES_LOG_LEVEL: Cell<i8> = const { Cell::new(0) };
+    static DO_LOG_LEVEL: Cell<i8> = const { Cell::new(0) };
+    static DO_LOG_RES_LEVEL: Cell<i8> = const { Cell::new(0) };
+    static DO_LOG_AFTER_LEVEL: Cell<i8> = const { Cell::new(0) };
+}
+
+fn push_nice_update(task: TaskRef, nice: i16) {
+    HAS_NICE_UPDATES.set(true);
+    NICE_UPDATES.with(|v| v.borrow_mut().push((task, nice)));
 }
 
 /// What an idle server connection is pooled under. `HAProxy` keeps idle connections per
@@ -3938,24 +3954,30 @@ impl Proxy {
 /// top (`strm_log`, `do_log_ctx`): `silent` (-1) sends nothing, a named level (its syslog
 /// number plus one) beats the line's own, and 0 (no rule ran) keeps it: `info`, or `err` for
 /// a failed line under `option log-separate-errors`.
+#[inline]
 fn stream_log_level(log_level: i8, fe: &Proxy, err: bool) -> Option<LogLevel> {
-    match log_level {
-        0 => Some(if err && fe.log_opts & alcyon_config::LOG_OPT_SEPARATE_ERRORS != 0 {
+    if log_level == 0 {
+        return Some(if err && fe.log_opts & alcyon_config::LOG_OPT_SEPARATE_ERRORS != 0 {
             LogLevel::Err
         } else {
             LogLevel::Info
-        }),
+        });
+    }
+    stream_log_level_override(log_level)
+}
+
+#[cold]
+fn stream_log_level_override(log_level: i8) -> Option<LogLevel> {
+    match log_level {
         -1 => None,
-        n => Some(match n {
-            1 => LogLevel::Emerg,
-            2 => LogLevel::Alert,
-            3 => LogLevel::Crit,
-            4 => LogLevel::Err,
-            5 => LogLevel::Warning,
-            6 => LogLevel::Notice,
-            7 => LogLevel::Info,
-            _ => LogLevel::Debug,
-        }),
+        1 => Some(LogLevel::Emerg),
+        2 => Some(LogLevel::Alert),
+        3 => Some(LogLevel::Crit),
+        4 => Some(LogLevel::Err),
+        5 => Some(LogLevel::Warning),
+        6 => Some(LogLevel::Notice),
+        7 => Some(LogLevel::Info),
+        _ => Some(LogLevel::Debug),
     }
 }
 
@@ -4054,12 +4076,15 @@ fn set_stream_log(entry: &mut SessionEntry, proxies: &crate::table::Table, pid: 
     let fe = &proxies[entry.proxy_idx];
     // Under `log-steps`, `close` is logged only when the `close` step is enabled (`strm_log`
     // at `LOG_ORIG_TXN_CLOSE`); a session error before any request (`_sess_log`) still logs.
-    let skip_close = fe.log_steps.is_some_and(|m| m & alcyon_config::LOG_STEP_CLOSE == 0)
-        && !(entry.sess.mode == Mode::Http && entry.sess.strm.log.request.is_none());
-    if !skip_close {
-        match stream_log_line(entry, proxies, pid) {
-            Some((line, sd, err, level)) => (entry.log_line, entry.log_sd, entry.log_err, entry.log_level) = (Some(line), sd, err, level),
-            None => entry.log_line = None,
+    if !fe.log_target_idx.is_empty() {
+        let skip_close = fe.log_steps.is_some_and(|m| m & alcyon_config::LOG_STEP_CLOSE == 0)
+            && !(entry.sess.mode == Mode::Http && entry.sess.strm.log.request.is_none());
+        if !skip_close {
+            match stream_log_line(entry, proxies, pid) {
+                Some((line, sd, err, level)) => (entry.log_line, entry.log_sd, entry.log_err, entry.log_level) = (Some(line), sd, err, level),
+                None if entry.log_line.is_some() => entry.log_line = None,
+                None => {}
+            }
         }
     }
     leave_backend(entry, proxies);
@@ -4985,7 +5010,9 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         reply_pages: crate::rule_compiled::reply_pages(&listen.error_replies),
         res_stream: false,
         req_stream: false,
-    }.finish());
+        res_uses_log_level: false,
+        res_has_set_nice: false,
+    }.finish().with_res_actions(&listen.http_res_rules, &listen.http_after_res_rules));
     Ok(Proxy {
         id: usize_to_u32(proxy_idx),
         ids: Box::new(ProxyIdInfo {
@@ -5127,7 +5154,9 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         reply_pages: crate::rule_compiled::reply_pages(&fe.error_replies),
         res_stream: false,
         req_stream: false,
-    }.finish());
+        res_uses_log_level: false,
+        res_has_set_nice: false,
+    }.finish().with_res_actions(&fe.http_res_rules, &fe.http_after_res_rules));
     Ok(Proxy {
         id: usize_to_u32(proxy_idx),
         ids: Box::new(ProxyIdInfo {
@@ -5260,7 +5289,9 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         reply_pages: crate::rule_compiled::reply_pages(&be.error_replies),
         res_stream: false,
         req_stream: false,
-    }.finish());
+        res_uses_log_level: false,
+        res_has_set_nice: false,
+    }.finish().with_res_actions(&be.http_res_rules, &be.http_after_res_rules));
     Ok(Proxy {
         id: usize_to_u32(proxy_idx),
         ids: Box::new(ProxyIdInfo {
@@ -5956,7 +5987,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             worker_id,
             events: Vec::with_capacity(capacity * 2),
             timer_updates: Vec::with_capacity(capacity * 2),
-            nice_updates: Vec::with_capacity(capacity * 2),
+            nice_updates: Vec::new(),
             wake_scratch: Vec::new(),
             wake_now_scratch: Vec::new(),
             links_scratch: Vec::new(),
@@ -7031,8 +7062,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
 
         let mut timer_updates = std::mem::take(&mut self.timer_updates);
         timer_updates.clear();
-        let mut nice_updates = std::mem::take(&mut self.nice_updates);
-        nice_updates.clear();
 
         let mut dispatcher = EngineDispatcher {
             sessions: &mut self.sessions,
@@ -7051,7 +7080,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             run_queue_len,
             now,
             timer_updates,
-            nice_updates,
             wake_queue: std::mem::take(&mut self.wake_scratch),
             heavy: Vec::new(),
             h2_spawn: std::mem::take(&mut self.h2_spawn_scratch),
@@ -7087,11 +7115,15 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 self.scheduler.queue_timer(task_ref, expiry);
             }
         }
-        // The nice a `set-nice` rule set this pass (`task_set_nice`): drain so stale
-        // entries never leak or overwrite a later connection that reuses the `TaskRef`.
-        for (task_ref, nice) in dispatcher.nice_updates.drain(..) {
-            if self.scheduler.is_live(task_ref) {
-                self.scheduler.set_nice(task_ref, nice);
+        // The nice a `set-nice` rule set this pass (`task_set_nice`): drain only when any
+        // rule fired, so stale entries never leak or overwrite a later reused `TaskRef`.
+        if HAS_NICE_UPDATES.get() {
+            HAS_NICE_UPDATES.set(false);
+            NICE_UPDATES.with(|v| std::mem::swap(&mut self.nice_updates, &mut *v.borrow_mut()));
+            for (task_ref, nice) in self.nice_updates.drain(..) {
+                if self.scheduler.is_live(task_ref) {
+                    self.scheduler.set_nice(task_ref, nice);
+                }
             }
         }
         for &task_ref in &dispatcher.heavy {
@@ -7102,7 +7134,6 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         let mut h2_spawn = std::mem::take(&mut dispatcher.h2_spawn);
         let mut wake_queue = std::mem::take(&mut dispatcher.wake_queue);
         self.timer_updates = dispatcher.timer_updates;
-        self.nice_updates = dispatcher.nice_updates;
         for (owner_idx, owner_task) in h2_spawn.drain(..) {
             self.spawn_h2_children(owner_idx, owner_task, &mut wake_queue);
         }
@@ -8196,7 +8227,7 @@ fn eval_tcp_req_conn_rules(
                 let sc = SampleContext { phase: &ctx, live: None };
                 // No set-log-level can have run yet on this path (tcp-request connection
                 // rules do not accept it), so the level is the unset default.
-                emit_step_log_with(proxy, emit, alcyon_config::ast::logging::LogProfileStepKind::TcpReqConn, stream_log_level(0, proxy, false), &data, &sc);
+                emit_step_log_with(proxy, emit, alcyon_config::ast::logging::LogProfileStepKind::TcpReqConn, Some(LogLevel::Info), &data, &sc);
                 ctx.log_origin = None;
             }
             _ => {}
@@ -9816,7 +9847,6 @@ struct EngineDispatcher<'a> {
     run_queue_len: usize,
     now: Tick,
     timer_updates: Vec<(TaskRef, Tick)>,
-    nice_updates: Vec<(TaskRef, i16)>,
     wake_queue: Vec<TaskRef>,
     /// The housekeeping concerns whose timers fired this pass (bit per `hk::*`), run by the
     /// engine after the pass.
@@ -11179,7 +11209,6 @@ impl EngineDispatcher<'_> {
         log_targets: &[crate::syslog::SyslogTarget],
         log_tag: &str,
         fc: Option<crate::proxy::ConnView<'_>>,
-        nice_updates: &mut Vec<(TaskRef, i16)>,
     ) -> Option<crate::stats_html::AdminAction> {
         // An HTTP/2 connection serving a stream is not between requests: the stream is its
         // child's, which ends it (T280).
@@ -11343,14 +11372,7 @@ impl EngineDispatcher<'_> {
                 t.req_rules_done = true;
             }
             let was_connected = entry.sess.strm.log.connect.is_some();
-            // `set-nice` of the `http-request` rules: applied once the pass is over; the
-            // scheduler reads it on the task's next wakeup (`task_set_nice` shows nothing
-            // while the task runs either).
-            let mut set_nice_req = None;
-            admin = Self::connect_http_backend(entry, proxies, checks, pid, fdtab, poller, idle_pool, now, lb_snap, fc, emit, &mut set_nice_req);
-            if let Some(n) = set_nice_req {
-                nice_updates.push((entry.task, n));
-            }
+            admin = Self::connect_http_backend(entry, proxies, checks, pid, fdtab, poller, idle_pool, now, lb_snap, fc, emit);
             log_if_newly_connected(was_connected, entry, proxies, emit);
             let sess = &mut entry.sess;
             if let Some(t) = sess.strm.txn.as_mut() {
@@ -11373,9 +11395,6 @@ impl EngineDispatcher<'_> {
         // (`wants_rerun`): nothing else wakes it, as everything is already read, and the
         // heads behind waited for `timeout server`, or for ever (T248).
         let mut ran_out = true;
-        // `set-nice` of the `http-response`/`http-after-response` rules: applied once the
-        // pass wrote it; the scheduler reads it on the task's next wakeup.
-        let mut set_nice_res = None;
         let snapshot = |entry: &SessionEntry| {
             (entry.sess.req.len(), entry.sess.rep.len(), entry.sess.strm.txn.as_ref().map(|t| (t.req, t.rsp)))
         };
@@ -11387,11 +11406,8 @@ impl EngineDispatcher<'_> {
                 if Self::l7_retry(entry, proxies, fdtab, poller, now, lb_snap) {
                     continue;
                 }
-                if !Self::apply_http_response_rules(entry, proxies, now, pid, log_targets, log_tag, fc, &mut set_nice_res) {
+                if !Self::apply_http_response_rules(entry, proxies, now, pid, log_targets, log_tag, fc) {
                     Self::write_response_head_names(entry, proxies);
-                }
-                if let Some(n) = set_nice_res.take() {
-                    nice_updates.push((entry.task, n));
                 }
             }
             if Self::l7_retry_failure(entry, proxies, fdtab, poller, now, lb_snap) {
@@ -12738,7 +12754,6 @@ impl EngineDispatcher<'_> {
                     &self.log_targets,
                     &self.log_tag,
                     fc,
-                    &mut self.nice_updates,
                 );
             }
 
@@ -13244,23 +13259,22 @@ impl EngineDispatcher<'_> {
         log_targets: &[crate::syslog::SyslogTarget],
         log_tag: &str,
         fc: Option<crate::proxy::ConnView<'_>>,
-        set_nice: &mut Option<i16>,
     ) -> bool {
         if let Some(c) = entry.sess.h2_child_mut() {
             c.rsp_head = None;
         }
         let mut lowered = false;
-        let mut do_log_res = None;
-        let mut do_log_after = None;
+        let mut do_log_res = false;
+        let mut do_log_after = false;
         let was_waiting = entry.sess.strm.txn.as_ref().is_some_and(|t| t.rsp == MsgState::Waiting);
-        Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered, pid, &mut do_log_res, &mut do_log_after, fc, set_nice);
+        Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered, pid, &mut do_log_res, &mut do_log_after, fc);
         // A `do-log` at `http-response`/`http-after-response` (and `log-steps response`) sends
         // the stream's line for its step. The response head is borrowed by the rules' context
         // inside the `_in` function, so the send runs here, once that context is gone.
         let fe_idx = entry.proxy_idx;
         let emit = LogEmit { targets: log_targets, tag: log_tag, pid };
-        if let Some(level) = do_log_res {
-            emit_step_log_entry_level(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::HttpRes, level);
+        if do_log_res {
+            emit_step_log_entry_level(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::HttpRes, DO_LOG_RES_LEVEL.get());
         }
         if was_waiting
             && proxies[fe_idx].log_steps.is_some_and(|m| m & alcyon_config::LOG_STEP_RESPONSE != 0)
@@ -13268,8 +13282,8 @@ impl EngineDispatcher<'_> {
         {
             emit_step_log_entry(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::Response);
         }
-        if let Some(level) = do_log_after {
-            emit_step_log_entry_level(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::HttpAfterRes, level);
+        if do_log_after {
+            emit_step_log_entry_level(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::HttpAfterRes, DO_LOG_AFTER_LEVEL.get());
         }
         lowered
     }
@@ -13281,10 +13295,9 @@ impl EngineDispatcher<'_> {
         now: Tick,
         lowered: &mut bool,
         _pid: u32,
-        do_log_res: &mut Option<i8>,
-        do_log_after: &mut Option<i8>,
+        do_log_res: &mut bool,
+        do_log_after: &mut bool,
         fc: Option<crate::proxy::ConnView<'_>>,
-        set_nice: &mut Option<i16>,
     ) {
         let threshold = entry.sess.bufsize.saturating_sub(entry.sess.maxrewrite);
         // Empty lines ahead of a status line are skipped (`H1_MSG_RPBEFORE`), so that the
@@ -13995,6 +14008,10 @@ impl EngineDispatcher<'_> {
         let mut held: Option<crate::txn::RspWait> = None;
         let mut timed_out = false;
         let mut malformed = false;
+        let res_uses_log_level = proxies[be_idx].rules.res_uses_log_level || proxies[fe_idx].rules.res_uses_log_level;
+        if res_uses_log_level {
+            RES_LOG_LEVEL.set(entry.sess.strm.log.log_level);
+        }
         let failed: Option<ResStop> = 'rules: {
             // 0. Apply be.tcp_res_content_rules. They run before the response is analysed
             // as HTTP (`AN_RES_INSPECT` ahead of `AN_RES_WAIT_HTTP`), so its status and
@@ -14080,7 +14097,7 @@ impl EngineDispatcher<'_> {
             let mut stopped = None;
             LAST_RULE.set(None);
             for (list, &px) in order.iter().enumerate() {
-                if resume.is_some_and(|w| list < w.list) {
+                if resume.is_some_and(|w| list < w.list) || proxies[px].http_res_rules.is_empty() {
                     continue;
                 }
                 let start = resume.filter(|w| w.list == list).map_or(0, |w| w.rule);
@@ -14134,8 +14151,6 @@ impl EngineDispatcher<'_> {
                     &mut entry.sess.strm.vars,
                     Some(ResWait { start, check: &mut check }),
                     do_log_res,
-                    &mut entry.sess.strm.log.log_level,
-                    set_nice,
                 ) {
                     Err(stop) => {
                         stopped = Some(stop);
@@ -14143,6 +14158,14 @@ impl EngineDispatcher<'_> {
                     }
                     Ok(Some(_)) => break,
                     Ok(None) => {}
+                }
+            }
+            if *do_log_res {
+                DO_LOG_RES_LEVEL.set(DO_LOG_LEVEL.get());
+            }
+            if proxies[be_idx].rules.res_has_set_nice || proxies[fe_idx].rules.res_has_set_nice {
+                if let Some(n) = PENDING_NICE.take() {
+                    push_nice_update(entry.task, n);
                 }
             }
             if let Some(line) = LAST_RULE.take().filter(|&l| l != 0) {
@@ -14202,29 +14225,35 @@ impl EngineDispatcher<'_> {
             }
 
             // 2. and 3. `http-after-response`, the backend's then the frontend's.
-            let after = eval_after_res_rules(
-                proxies,
-                fe_idx,
-                be_idx,
-                (&mut status, &mut status_msg),
-                &mut ctx,
-                &rh,
-                Some(&mut res_caps),
-                registry,
-                &mut entry.sess.strm.vars,
-                do_log_after,
-                &mut entry.sess.strm.log.log_level,
-                set_nice,
-            );
-            if !res_caps.is_empty() || !entry.sess.strm.log.res_captures.is_empty() {
-                note_res_caps_clone();
-                entry.sess.strm.log.res_captures.clone_from(&res_caps);
-            }
-            if let Err(stop) = after {
-                break 'rules Some(stop);
+            if !proxies[be_idx].http_after_res_rules.is_empty() || !proxies[fe_idx].http_after_res_rules.is_empty() {
+                let after = eval_after_res_rules(
+                    proxies,
+                    fe_idx,
+                    be_idx,
+                    (&mut status, &mut status_msg),
+                    &mut ctx,
+                    &rh,
+                    Some(&mut res_caps),
+                    registry,
+                    &mut entry.sess.strm.vars,
+                    do_log_after,
+                );
+                if *do_log_after {
+                    DO_LOG_AFTER_LEVEL.set(DO_LOG_LEVEL.get());
+                }
+                if !res_caps.is_empty() || !entry.sess.strm.log.res_captures.is_empty() {
+                    note_res_caps_clone();
+                    entry.sess.strm.log.res_captures.clone_from(&res_caps);
+                }
+                if let Err(stop) = after {
+                    break 'rules Some(stop);
+                }
             }
             None
         };
+        if res_uses_log_level {
+            entry.sess.strm.log.log_level = RES_LOG_LEVEL.get();
+        }
         // A `return` is made while the context is there to render it: its reply reads the
         // response as truncated (`http_reply_message`), its status and headers fetching as
         // nothing.
@@ -14929,7 +14958,6 @@ impl EngineDispatcher<'_> {
         lb_snap: &mut crate::lb::LbSnapCache,
         fc: Option<crate::proxy::ConnView<'_>>,
         emit: LogEmit<'_>,
-        set_nice: &mut Option<i16>,
     ) -> Option<crate::stats_html::AdminAction> {
         let proxy_idx = entry.proxy_idx;
         // A request held for its body (`wait-for-body`) comes back here when the body is
@@ -15808,9 +15836,9 @@ impl EngineDispatcher<'_> {
                         sess.strm.log.log_level = *l;
                     }
                     alcyon_config::HttpReqAction::SetNice(n) => {
-                        // The caller sets the task's nice once the pass is over; the
-                        // scheduler reads it on the next wakeup (`task_set_nice`).
-                        *set_nice = Some(*n);
+                        // Applied once the pass is over; the scheduler reads it on the
+                        // next wakeup (`task_set_nice`).
+                        push_nice_update(my_task, *n);
                     }
                 }
             }
@@ -18511,6 +18539,7 @@ enum ResRule<'a> {
 const PAUSE_RULE: u32 = u32::MAX;
 
 impl<'a> ResOp<'a> {
+    #[inline(always)]
     fn of_res(a: &'a alcyon_config::HttpResAction, rc: &'a crate::rule_compiled::Rule) -> ResRule<'a> {
         ResRule::Op(match a {
             alcyon_config::HttpResAction::SetHeader { name, fmt } => Self::Set(name, fmt, rc),
@@ -18530,6 +18559,7 @@ impl<'a> ResOp<'a> {
         })
     }
 
+    #[inline(always)]
     fn of_after_res(a: &'a alcyon_config::HttpAfterResAction, rc: &'a crate::rule_compiled::Rule) -> ResRule<'a> {
         ResRule::Op(match a {
             alcyon_config::HttpAfterResAction::Capture { id, .. } => return ResRule::Capture(rc.expr.as_ref(), *id),
@@ -19192,13 +19222,11 @@ fn run_res_rules<'a, 'c>(
     registry: &Registry,
     vars: &mut VarStore,
     wait: Option<ResWait<'_>>,
-    do_log: &mut Option<i8>,
-    set_log_level: &mut i8,
-    set_nice: &mut Option<i16>,
+    do_log: &mut bool,
 ) -> Result<Option<usize>, ResStop> {
     // In place, not a copy of the context per rule (S7).
     let prev = ctx.acls.replace(acls);
-    let flow = run_res_rules_in(rules, acls, head, &ctx.as_ctx(), rh, caps, registry, vars, wait, do_log, set_log_level, set_nice);
+    let flow = run_res_rules_in(rules, acls, head, &ctx.as_ctx(), rh, caps, registry, vars, wait, do_log);
     ctx.acls = prev;
     flow
 }
@@ -19214,16 +19242,17 @@ fn run_res_rules_in<'a>(
     registry: &Registry,
     vars: &mut VarStore,
     mut wait: Option<ResWait<'_>>,
-    do_log: &mut Option<i8>,
-    set_log_level: &mut i8,
-    set_nice: &mut Option<i16>,
+    do_log: &mut bool,
 ) -> Result<Option<usize>, ResStop> {
     let (status, status_msg) = head;
     STRICT_MODE.set(true);
     let mut result = Ok(None);
     let start = wait.as_ref().map_or(0, |w| w.start);
     let outer = ctx;
-    for (idx, (op, cond, line)) in rules.enumerate().skip(start) {
+    for (idx, (op, cond, line)) in rules.enumerate() {
+        if idx < start {
+            continue;
+        }
         // The slots as the earlier rules left them, for `capture.res.hdr`: a copy of the
         // context per rule, for the lists that capture.
         let with_caps_phase;
@@ -19244,19 +19273,20 @@ fn run_res_rules_in<'a>(
             ResRule::DoLog => {
                 // Capture the level active when `do-log` fires (`s->logs.level`) so a
                 // later `set-log-level` rule in the same list does not alter it.
-                *do_log = Some(*set_log_level);
+                *do_log = true;
+                DO_LOG_LEVEL.set(RES_LOG_LEVEL.get());
                 continue;
             }
             ResRule::SetLogLevel(l) => {
                 // As the rule fires: the lines the rules after it (a `do-log`) and the end
                 // line send are at this level (`s->logs.level`).
-                *set_log_level = l;
+                RES_LOG_LEVEL.set(l);
                 continue;
             }
             ResRule::SetNice(n) => {
                 // The caller sets the task's nice once the list is done; nothing in the
                 // list reads it, so the order does not show.
-                *set_nice = Some(n);
+                PENDING_NICE.set(Some(n));
                 continue;
             }
             ResRule::Capture(expr, id) => {
@@ -19331,19 +19361,20 @@ fn eval_after_res_rules<'c>(
     mut res_caps: Option<&mut Vec<Option<Vec<u8>>>>,
     registry: &Registry,
     vars: &mut VarStore,
-    do_log: &mut Option<i8>,
-    set_log_level: &mut i8,
-    set_nice: &mut Option<i16>,
+    do_log: &mut bool,
 ) -> Result<(), ResStop> {
     let (status, status_msg) = head;
     alcyon_sample::vars::with_stream(vars, |m| m.clear_scope(alcyon_sample::VarScope::Req));
     let order: &[usize] = if fe_idx == be_idx { &[be_idx] } else { &[be_idx, fe_idx] };
     for &px in order {
+        if proxies[px].http_after_res_rules.is_empty() {
+            continue;
+        }
         let rules = proxies[px].http_after_res_rules.iter().zip(&proxies[px].rules.http_after_res).map(|(r, rc)| (ResOp::of_after_res(&r.action, rc), rc.cond.as_ref(), 0));
         // `http-after-response capture` writes the frontend's slots, whichever proxy the rule is in.
         let fe_slots = &proxies[fe_idx].res_capture_slots;
         let caps = res_caps.as_deref_mut().filter(|_| !fe_slots.is_empty()).map(|c| (c, &fe_slots[..]));
-        run_res_rules(rules, &proxies[px].acls, (&mut *status, &mut *status_msg), ctx, rh, caps, registry, vars, None, do_log, set_log_level, set_nice)?;
+        run_res_rules(rules, &proxies[px].acls, (&mut *status, &mut *status_msg), ctx, rh, caps, registry, vars, None, do_log)?;
     }
     Ok(())
 }
@@ -19777,12 +19808,11 @@ fn after_res_on_reply<'r>(
             ..Default::default()
         };
         // A reply Alcyon built has no live stream to `do-log` from; the flag is discarded.
-        let mut do_log = None;
-        // `set-nice` is not an `http-after-response` action, so this is not written.
-        let mut set_nice = None;
-        // The level is out on a local: the context above still borrows the stream, and the
-        // rule's write goes back when it is gone.
-        let mut log_level = sess.strm.log.log_level;
+        let mut do_log = false;
+        let res_uses_log_level = proxies[be_idx].rules.res_uses_log_level || proxies[fe_idx].rules.res_uses_log_level;
+        if res_uses_log_level {
+            RES_LOG_LEVEL.set(sess.strm.log.log_level);
+        }
         let result = eval_after_res_rules(
             proxies,
             fe_idx,
@@ -19794,10 +19824,10 @@ fn after_res_on_reply<'r>(
             sample_registry(),
             &mut vars,
             &mut do_log,
-            &mut log_level,
-            &mut set_nice,
         );
-        sess.strm.log.log_level = log_level;
+        if res_uses_log_level {
+            sess.strm.log.log_level = RES_LOG_LEVEL.get();
+        }
         result
     };
     sess.strm.vars = vars;
