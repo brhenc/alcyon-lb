@@ -61,3 +61,38 @@ To integrate continuous measurement into supervisor check-in, add these lines to
 echo "=== continuous measurement ==="
 tools/measure/run.sh --fast
 ```
+
+## `insreq-quick`: the gate's short ins/req count
+
+`tools/checkin.sh` stage `insreq-quick` (`tools/measure/insreq_gate.py`) runs in every gate
+except the exclusive measuring one (`tools/gate.sh --exclusive`, whose `measure` stage counts
+in full, N=30000 x 5, ab1 and mb50). It was added on 2026-11-21, after 32 merges went into
+main unmeasured and the next measured gate found keepalive +1.8% and rules +2.5%.
+
+- **Candidate:** `cargo build --profile release-perf --bin alcyon` of the tree, in the gate's
+  plain target and env.
+- **Reference:** `ALCYON_MEASURE_REF`, else the last row of `data/measurements.jsonl` that
+  counted ins/req on a clean ancestor of HEAD *and* passed its own check (within
+  `INS_MAX_RISE_PCT` of its own ref): a failed measurement is never the baseline. Built from
+  `git archive` and cached in `$ALCYON_INSREQ_REF_DIR` (default `$ALCYON_TARGETS/insreq-ref`)
+  by commit **and** `rustc -vV`, so a toolchain bump rebuilds it (1.100 moved c246669a's
+  keepalive from 35,062 to 35,135-35,176).
+- **Count:** `insreq.sh` ab1, keepalive and rules, N=10000 x 3 rounds, minimum of the rounds,
+  user-space instructions; counts slot B (`/tmp/alcyon-load-n1.lock`, CPUs 12-14), waiting
+  up to 30 min for it. FAIL over **+0.5%** (AGENTS.md section 8) on either scenario; exit 2
+  (also a FAIL in the gate) when it could not measure.
+- **Skip:** `ALCYON_GATE_SKIP_INSREQ=1`, recorded as the stage's skip and part of the gate
+  state's key. A running `wwm.exe` is noted in the output and changes nothing.
+- **Cost (measured 2026-11-21):** the release-perf build of the tree ~306 s (fat LTO), the
+  reference's ~300 s once per (commit, rustc), the counting ~11 s.
+
+Spread on 2026-11-21 (a65a069d against c246669a, the same two binaries):
+
+| N x rounds | keepalive | rules | max-min between rounds | wall (counting) |
+|---|---|---|---|---|
+| 2000 x 3 | +1.82% | +2.55% | <= 0.01% | 4 s |
+| 5000 x 3 | +1.81% | +2.55% | <= 0.03% | 6 s |
+| 10000 x 3 (the stage) | +1.82% | +2.55% | <= 0.05% | 11 s |
+| 30000 x 5 (the full figure) | +1.80% | +2.56% | <= 0.18% | 41 s |
+
+c246669a against itself at 10000 x 3: +0.00% and +0.00%.
