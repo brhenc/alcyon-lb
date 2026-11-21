@@ -543,6 +543,15 @@ class ReportObjects(unittest.TestCase):
         self.assertEqual(covercheck.report_objects(self.debug, {os.path.join(self.debug, "alcyon")}),
                          [built])
 
+    def test_a_built_executable_outside_deps_is_read(self):
+        """2026-11-21, cargo 1.100's build-dir layout: test binaries live in
+        debug/build/<pkg>/<hash>/out/, not deps/. The report read 2 objects instead of ~340
+        and called 142 changed lines unexecuted. A path cargo reported building is read
+        wherever it is."""
+        os.makedirs(os.path.join(self.debug, "build", "alcyon-mmsg", "5850fc01", "out"))
+        test_bin = self.exe("build/alcyon-mmsg/5850fc01/out/it-5850fc01")
+        self.assertEqual(covercheck.report_objects(self.debug, {test_bin}), [test_bin])
+
 
 class ScopedMode(unittest.TestCase):
     """T609: `covercheck.py --tests <crate>:<target>[:<filter>]` judges the changed lines by

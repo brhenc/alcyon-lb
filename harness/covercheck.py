@@ -419,6 +419,17 @@ def report_objects(debug: str, built: set[str]) -> list[str]:
             if key in wanted and key not in seen:
                 seen.add(key)
                 objects.append(path)
+    # Cargo 1.100's build-dir layout puts test binaries in debug/build/<pkg>/<hash>/out/,
+    # which the scan above never sees: read the rest of what cargo reported, where it is.
+    for b in sorted(built):
+        try:
+            st = os.stat(b)
+        except OSError:
+            continue
+        key = (st.st_dev, st.st_ino)
+        if key not in seen and os.path.isfile(b):
+            seen.add(key)
+            objects.append(b)
     return objects
 
 
