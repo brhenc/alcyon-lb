@@ -14117,31 +14117,36 @@ impl EngineDispatcher<'_> {
             return;
         };
         let line = &hdr_bytes[..line_end];
-        let first_line: std::borrow::Cow<'_, str> = match std::str::from_utf8(line) {
-            Ok(t) if !alcyon_regex::bytetext::has_escapes(t) => std::borrow::Cow::Borrowed(t),
-            _ => std::borrow::Cow::Owned(alcyon_regex::bytetext::bytes_to_text(line)),
-        };
-
         let mut status: u16 = 200;
         let mut proto_version = crate::reuse::Word::usual("HTTP/1.1");
         let mut status_msg = crate::reuse::Word::usual("OK");
-        let mut parts = first_line.split_whitespace();
-        if let (Some(p0), Some(p1)) = (parts.next(), parts.next()) {
-            if p0 == "HTTP/1.1" {
-                proto_version.set_usual("HTTP/1.1");
-            } else {
-                proto_version.set_words(std::iter::once(p0));
-            }
-            if let Ok(st) = p1.parse::<u16>() {
-                status = st;
-            }
-            // The reason's words, one space between each.
-            if parts.clone().next().is_some() {
-                let usual = status_reason(status);
-                if usual.split(' ').eq(parts.clone()) {
-                    status_msg.set_usual(usual);
+        // The usual status line (`HTTP/1.1 200 OK` and its like) is read as bytes: no text of it, no split.
+        if let Some((st, usual)) = usual_status_line(line) {
+            status = st;
+            status_msg.set_usual(usual);
+        } else {
+            let first_line: std::borrow::Cow<'_, str> = match std::str::from_utf8(line) {
+                Ok(t) if !alcyon_regex::bytetext::has_escapes(t) => std::borrow::Cow::Borrowed(t),
+                _ => std::borrow::Cow::Owned(alcyon_regex::bytetext::bytes_to_text(line)),
+            };
+            let mut parts = first_line.split_whitespace();
+            if let (Some(p0), Some(p1)) = (parts.next(), parts.next()) {
+                if p0 == "HTTP/1.1" {
+                    proto_version.set_usual("HTTP/1.1");
                 } else {
-                    status_msg.set_words(parts);
+                    proto_version.set_words(std::iter::once(p0));
+                }
+                if let Ok(st) = p1.parse::<u16>() {
+                    status = st;
+                }
+                // The reason's words, one space between each.
+                if parts.clone().next().is_some() {
+                    let usual = status_reason(status);
+                    if usual.split(' ').eq(parts.clone()) {
+                        status_msg.set_usual(usual);
+                    } else {
+                        status_msg.set_words(parts);
+                    }
                 }
             }
         }
@@ -18767,6 +18772,22 @@ pub(crate) fn eval_condition(
             crate::proxy::AclEvalResult::NotMatched
         }
     }) == crate::proxy::AclEvalResult::Matched
+}
+
+/// The status line `HTTP/1.1 <3 digits> <the usual reason>` (an optional `\r` ends it) as its
+/// status and the reason's constant, `None` for any other line, which the caller reads as
+/// text. What it matches, the words split of that text gives the same status and words for.
+fn usual_status_line(line: &[u8]) -> Option<(u16, &'static str)> {
+    let rest = line.strip_prefix(b"HTTP/1.1 ")?;
+    let (digits, rest) = rest.split_first_chunk::<3>()?;
+    if !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let rest = rest.strip_prefix(b" ")?;
+    let rest = rest.strip_suffix(b"\r").unwrap_or(rest);
+    let status = u16::from(digits[0] - b'0') * 100 + u16::from(digits[1] - b'0') * 10 + u16::from(digits[2] - b'0');
+    let usual = status_reason(status);
+    (!usual.is_empty() && rest == usual.as_bytes()).then_some((status, usual))
 }
 
 const fn status_reason(status: u16) -> &'static str {
