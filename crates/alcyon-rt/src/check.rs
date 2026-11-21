@@ -2722,6 +2722,9 @@ fn connect_check(proxies: &crate::table::Table, check: &mut ServerCheckState, ad
     let (sock, mut immediate) = match check.run.socks4.as_mut() {
         Some(c) => {
             c.target = addr;
+            if crate::socks4::family_mismatch(c.proxy_addr, c.target) {
+                return Err(io::Error::from(rustix::io::Errno::INVAL));
+            }
             raw::connect(c.proxy_addr)?
         }
         None => raw::connect(addr)?,

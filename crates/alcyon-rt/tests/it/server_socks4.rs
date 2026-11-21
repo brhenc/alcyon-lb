@@ -29,8 +29,13 @@ fn socks4_request(target: SocketAddr) -> [u8; 16] {
     req[0] = 0x04;
     req[1] = 0x01;
     req[2..4].copy_from_slice(&target.port().to_be_bytes());
-    if let SocketAddr::V4(v4) = target {
-        req[4..8].copy_from_slice(&v4.ip().octets());
+    match target {
+        SocketAddr::V4(v4) => req[4..8].copy_from_slice(&v4.ip().octets()),
+        SocketAddr::V6(v6) => {
+            if let Some(word) = v6.ip().octets().chunks_exact(4).find(|w| *w != [0, 0, 0, 0]) {
+                req[4..8].copy_from_slice(word);
+            }
+        }
     }
     req[8..16].copy_from_slice(b"HAProxy\0");
     req
@@ -51,14 +56,15 @@ struct ProxyEvent {
 /// The SOCKS4 proxy: it answers `reply` (or `short_reply`, then gives up) to the 16
 /// request bytes, records what it saw, and, when `reply` grants (`0x5A`), pipes the
 /// traffic to `target`.
-fn socks4_proxy_with_count(
+fn socks4_proxy_with_count_bind(
+    bind_addr: &str,
     target: SocketAddr,
     reply: [u8; 8],
     short_reply: Option<Vec<u8>>,
     events: Arc<Mutex<Vec<ProxyEvent>>>,
     attempts: Arc<AtomicUsize>,
 ) -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind the socks4 proxy");
+    let l = TcpListener::bind(bind_addr).expect("bind the socks4 proxy");
     let addr = l.local_addr().unwrap();
     thread::spawn(move || {
         for s in l.incoming() {
@@ -137,6 +143,16 @@ fn socks4_proxy_with_count(
         }
     });
     addr
+}
+
+fn socks4_proxy_with_count(
+    target: SocketAddr,
+    reply: [u8; 8],
+    short_reply: Option<Vec<u8>>,
+    events: Arc<Mutex<Vec<ProxyEvent>>>,
+    attempts: Arc<AtomicUsize>,
+) -> SocketAddr {
+    socks4_proxy_with_count_bind("127.0.0.1:0", target, reply, short_reply, events, attempts)
 }
 
 fn socks4_proxy(
@@ -644,4 +660,136 @@ fn the_check_bypasses_the_tunnel_without_the_keyword() {
     assert!(seen.lock().unwrap().conns > 0, "the checks reached the server directly");
     assert!(events.lock().unwrap().is_empty(), "the proxy must see nothing of the checks");
     drop(p);
+}
+
+fn backend_on(bind_addr: &str, seen: Arc<Mutex<Seen>>) -> SocketAddr {
+    let l = TcpListener::bind(bind_addr).expect("bind the backend");
+    let addr = l.local_addr().unwrap();
+    thread::spawn(move || {
+        for s in l.incoming() {
+            let Ok(mut s) = s else { continue };
+            let _ = s.set_read_timeout(Some(Duration::from_secs(8)));
+            let seen = Arc::clone(&seen);
+            thread::spawn(move || {
+                seen.lock().unwrap().conns += 1;
+                let mut buf = Vec::new();
+                let mut b = [0u8; 65536];
+                loop {
+                    match s.read(&mut b) {
+                        Ok(0) => return,
+                        Err(_) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&b[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                seen.lock().unwrap().bytes.extend_from_slice(&buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK");
+                let _ = s.flush();
+            });
+        }
+    });
+    addr
+}
+
+/// An IPv6 server over an IPv6 `socks4` proxy connects and sends `is_inet_addr`
+/// (the first non-zero 32-bit word of the IPv6 address), not `0.0.0.0`.
+#[test]
+fn ipv6_server_over_ipv6_socks4_sends_first_nonzero_word() {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let be = backend_on("[::1]:0", seen.clone());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let socks = socks4_proxy_with_count_bind("[::1]:0", be, SOCKS4_OK, None, events.clone(), Arc::new(AtomicUsize::new(0)));
+    let fe = common::reserve_addr();
+    let (log_addr, logs) = start_syslog();
+    let cfg = format!(
+        "global\n  log {log_addr} local0\ndefaults\n  mode http\n  log global\n  \
+         timeout connect 2s\n  timeout client 5s\n  timeout server 5s\n  option httpchk\n\
+         frontend f\n  bind {fe}\n  default_backend b\n\
+         backend b\n  option log-health-checks\n  server s {be} socks4 {socks} check-via-socks4 check inter 200ms rise 1 fall 1\n"
+    );
+    let _p = start_raw(&cfg, &[fe]);
+    wait_log(&logs, "b/s succeeded");
+    let body = get(fe);
+    assert!(body.starts_with("HTTP/1.1 200"), "v6 over v6 socks4 failed: {body:?}");
+    let want = socks4_request(be);
+    assert_ne!(&want[4..8], &[0, 0, 0, 0]);
+    for _ in 0..40 {
+        let reqs = events.lock().unwrap();
+        let has_req = reqs.iter().any(|e| e.request == want && e.to_target.windows(5).any(|w| w == b"GET /"));
+        let has_chk = reqs.iter().any(|e| e.request == want && e.to_target.windows(9).any(|w| w == b"OPTIONS /"));
+        if has_req && has_chk {
+            return;
+        }
+        drop(reqs);
+        thread::sleep(Duration::from_millis(50));
+    }
+    let reqs = events.lock().unwrap();
+    panic!("proxy did not see both traffic and check is_inet_addr requests {want:02x?}: {reqs:?}");
+}
+
+/// Mismatched address families between server and `socks4` proxy (IPv6 server + IPv4
+/// proxy, or IPv4 server + IPv6 proxy) fail the connect with `503 SC` / `6 SOCK_ERR`
+/// (`L4CON` for health checks) and send no SOCKS4 request.
+#[test]
+fn mismatched_address_family_between_server_and_socks4_fails_connect() {
+    let v4_be = backend_on("127.0.0.1:0", Arc::new(Mutex::new(Seen::default())));
+    let v6_be = backend_on("[::1]:0", Arc::new(Mutex::new(Seen::default())));
+
+    let v4_events = Arc::new(Mutex::new(Vec::new()));
+    let v4_socks = socks4_proxy_with_count_bind("127.0.0.1:0", v6_be, SOCKS4_OK, None, v4_events.clone(), Arc::new(AtomicUsize::new(0)));
+    let v6_events = Arc::new(Mutex::new(Vec::new()));
+    let v6_socks = socks4_proxy_with_count_bind("[::1]:0", v4_be, SOCKS4_OK, None, v6_events.clone(), Arc::new(AtomicUsize::new(0)));
+
+    let fe_v6srv = common::reserve_addr();
+    let fe_v4srv = common::reserve_addr();
+    let (log_addr, logs) = start_syslog();
+    let cfg = format!(
+        "global\n  log {log_addr} local0\ndefaults\n  mode http\n  log global\n  \
+         log-format \"%ST %ts %rc %[bc_err] %[bc_err_name] %[bc_err_str]\"\n  \
+         timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n  retries 0\n\
+         frontend f_v6srv\n  bind {fe_v6srv}\n  default_backend b_v6srv\n\
+         backend b_v6srv\n  server s {v6_be} socks4 {v4_socks}\n\
+         frontend f_v4srv\n  bind {fe_v4srv}\n  default_backend b_v4srv\n\
+         backend b_v4srv\n  server s {v4_be} socks4 {v6_socks}\n\
+         backend b_chk_v6srv\n  option log-health-checks\n  server s {v6_be} socks4 {v4_socks} check-via-socks4 check inter 200ms rise 1 fall 1\n\
+         backend b_chk_v4srv\n  option log-health-checks\n  server s {v4_be} socks4 {v6_socks} check-via-socks4 check inter 200ms rise 1 fall 1\n"
+    );
+    let _p = start_raw(&cfg, &[fe_v6srv, fe_v4srv]);
+
+    for (label, fe) in [("v6srv+v4proxy", fe_v6srv), ("v4srv+v6proxy", fe_v4srv)] {
+        let body = get(fe);
+        assert_eq!(body.get(9..12).unwrap_or(""), "503", "{label}: expected 503, got {body:?}");
+    }
+
+    let traffic_logs: Vec<String> = {
+        let mut found = Vec::new();
+        for _ in 0..80 {
+            let guard = logs.lock().unwrap();
+            let matching: Vec<String> = guard.iter().filter(|l| l.contains("503 SC 0 6 SOCK_ERR General socket error")).cloned().collect();
+            if matching.len() >= 2 {
+                found = matching;
+                break;
+            }
+            drop(guard);
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(found.len() >= 2, "expected two 503 SC 0 6 SOCK_ERR logs, got: {:?}", *logs.lock().unwrap());
+        found
+    };
+    assert_eq!(traffic_logs.len(), 2);
+
+    for chk_name in ["b_chk_v6srv/s", "b_chk_v4srv/s"] {
+        let l = wait_log(&logs, &format!("{chk_name} failed"));
+        assert!(
+            l.contains("Layer4 connection problem") && l.contains("General socket error"),
+            "{chk_name}: unexpected check log: {l:?}"
+        );
+    }
+
+    assert!(v4_events.lock().unwrap().is_empty(), "v4 proxy must receive no SOCKS4 request for v6 server");
+    assert!(v6_events.lock().unwrap().is_empty(), "v6 proxy must receive no SOCKS4 request for v4 server");
 }

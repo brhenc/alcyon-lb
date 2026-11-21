@@ -834,6 +834,8 @@ const fn bc_err(code: i64, name: &'static str, text: &'static str) -> alcyon_sam
 
 /// `CO_ER_NONE`: the connection is established.
 pub const BC_CONNECTED: alcyon_sample::ConnErr<'static> = bc_err(0, "", "Success");
+/// `CO_ER_SOCK_ERR`: general socket error.
+pub const BC_SOCK_ERR: alcyon_sample::ConnErr<'static> = bc_err(6, "SOCK_ERR", "General socket error");
 
 /// The error of a server connect the kernel refused once under way, as `sock_conn_check`
 /// records it (`conn_set_errno`).
@@ -4494,6 +4496,16 @@ impl TcpSession {
             let target = self
                 .target_addr
                 .map_or(SocketAddr::from(([0, 0, 0, 0], 0)), |t| crate::engine::connect_addr(t, self.server_addr));
+            if crate::raw::local_addr(sfd).is_some_and(|a| crate::socks4::family_mismatch(a, target)) {
+                // HAProxy's `sock_create_server_socket` opens the socket with `conn->dst`'s
+                // address family, so `tcp_connect_server` fails `connect(&srv->socks4_addr)`
+                // with `EINVAL` (`CO_ER_SOCK_ERR`, 6) before sending any SOCKS4 request.
+                self.clear_socks4();
+                self.flags.set(sess_flags::SOCKS4_FAILED);
+                self.bc_err = Some(&BC_SOCK_ERR);
+                self.srv_state = ScState::Error;
+                return Err(io::Error::from(rustix::io::Errno::INVAL));
+            }
             let mut hs = crate::socks4::Hs {
                 sent: ((self.flags.0 & sess_flags::SOCKS4_SENT_MASK) >> sess_flags::SOCKS4_SENT_SHIFT) as u8,
                 receiving: self.flags.has(sess_flags::SOCKS4_RECV),
