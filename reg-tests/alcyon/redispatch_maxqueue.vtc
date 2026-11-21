@@ -1,0 +1,220 @@
+vtest "Test option redispatch on maxqueue with cookie persistence"
+feature ignore_unknown_macro
+
+# Case 1: s1 (maxconn 1 maxqueue 1 cookie c1) is saturated by A and B;
+# C arrives with cookie c1 and is redispatched to s2 (maxconn 1 cookie c2).
+
+barrier b1_a_held cond 2
+barrier b1_b_sent cond 2
+barrier b1_release cond 2
+barrier b1_a_done cond 2
+
+syslog S1 -level info {
+	recv
+	expect ~ "[^:\\[ ]\\[${h1_pid}\\]: LOG /c 200 -- s2 \\+0$"
+	recv
+	expect ~ "[^:\\[ ]\\[${h1_pid}\\]: LOG /a 200 -- s1 0$"
+	recv
+	expect ~ "[^:\\[ ]\\[${h1_pid}\\]: LOG /b 200 -- s1 0$"
+} -start
+
+server s1 {
+	rxreq
+	expect req.url == "/a"
+	barrier b1_a_held sync
+	barrier b1_release sync
+	txresp -hdr "X-Server: s1"
+	close
+	barrier b1_a_done sync
+	accept
+	rxreq
+	expect req.url == "/b"
+	txresp -hdr "X-Server: s1"
+} -start
+
+server s2 {
+	rxreq
+	expect req.url == "/c"
+	txresp -hdr "X-Server: s2"
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+	log ${S1_addr}:${S1_port} local0 info
+
+    defaults
+	mode http
+	log global
+	timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+	timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+	timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+	timeout queue   "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe1
+	bind "fd@${fe1}"
+	log-format "LOG %HU %ST %ts %s %rc"
+	http-after-response set-header x-redisp "%[txn.redispatched]"
+	default_backend be1
+
+    backend be1
+	id 10
+	cookie srv insert
+	balance roundrobin
+	option redispatch
+	server s1 ${s1_addr}:${s1_port} id 1 maxconn 1 maxqueue 1 cookie c1
+	server s2 ${s2_addr}:${s2_port} id 2 maxconn 1 cookie c2
+} -start
+
+client c1a -connect ${h1_fe1_sock} {
+	txreq -url "/a" -hdr "Cookie: srv=c1" -hdr "Connection: close"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.x-server == "s1"
+	expect resp.http.x-redisp == "0"
+} -start
+
+barrier b1_a_held sync
+
+client c1b -connect ${h1_fe1_sock} {
+	txreq -url "/b" -hdr "Cookie: srv=c1" -hdr "Connection: close"
+	barrier b1_b_sent sync
+	rxresp
+	expect resp.status == 200
+	expect resp.http.x-server == "s1"
+	expect resp.http.x-redisp == "0"
+} -start
+
+barrier b1_b_sent sync
+delay 0.1
+
+client c1c -connect ${h1_fe1_sock} {
+	txreq -url "/c" -hdr "Cookie: srv=c1" -hdr "Connection: close"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.x-server == "s2"
+	expect resp.http.x-redisp == "1"
+	expect resp.http.set-cookie == "srv=c2; path=/"
+} -run
+
+haproxy h1 -cli {
+	send "show stat be1 4 1 typed"
+	expect ~ "S[.]10[.]1[.][0-9]+[.]wredis[.]1:MCPP:u64:1"
+	send "show stat be1 2 -1 typed"
+	expect ~ "B[.]10[.]0[.][0-9]+[.]wredis[.]1:MCPP:u64:1"
+}
+
+barrier b1_release sync
+client c1a -wait
+barrier b1_a_done sync
+client c1b -wait
+
+syslog S1 -wait
+
+# Case 2: failure case when re-pick finds no server (s1 weight 0, s2 disabled).
+# C must still take SF_REDISP (+0 in %rc, wredis incremented) and return 503 SC.
+
+barrier b2_a_held cond 2
+barrier b2_b_sent cond 2
+barrier b2_release cond 2
+barrier b2_a_done cond 2
+
+syslog S2 -level info {
+	recv
+	expect ~ "[^:\\[ ]\\[${h2_pid}\\]: LOG /c 503 SC <NOSRV> \\+0$"
+	recv
+	expect ~ "[^:\\[ ]\\[${h2_pid}\\]: LOG /a 200 -- s3 0$"
+	recv
+	expect ~ "[^:\\[ ]\\[${h2_pid}\\]: LOG /b 200 -- s3 0$"
+} -start
+
+server s3 {
+	rxreq
+	expect req.url == "/a"
+	barrier b2_a_held sync
+	barrier b2_release sync
+	txresp -hdr "X-Server: s3"
+	close
+	barrier b2_a_done sync
+	accept
+	rxreq
+	expect req.url == "/b"
+	txresp -hdr "X-Server: s3"
+} -start
+
+server s4 {
+	rxreq
+	txresp -status 500
+} -start
+
+haproxy h2 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+	log ${S2_addr}:${S2_port} local0 info
+
+    defaults
+	mode http
+	log global
+	timeout connect "${HAPROXY_TEST_TIMEOUT-5s}"
+	timeout client  "${HAPROXY_TEST_TIMEOUT-5s}"
+	timeout server  "${HAPROXY_TEST_TIMEOUT-5s}"
+	timeout queue   "${HAPROXY_TEST_TIMEOUT-5s}"
+
+    frontend fe2
+	bind "fd@${fe2}"
+	log-format "LOG %HU %ST %ts %s %rc"
+	default_backend be2
+
+    backend be2
+	id 20
+	cookie srv insert
+	balance roundrobin
+	option redispatch
+	server s3 ${s3_addr}:${s3_port} id 1 weight 0 maxconn 1 maxqueue 1 cookie c1
+	server s4 ${s4_addr}:${s4_port} id 2 maxconn 1 maxqueue 1 cookie c2 disabled
+} -start
+
+client c2a -connect ${h2_fe2_sock} {
+	txreq -url "/a" -hdr "Cookie: srv=c1" -hdr "Connection: close"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.x-server == "s3"
+} -start
+
+barrier b2_a_held sync
+
+client c2b -connect ${h2_fe2_sock} {
+	txreq -url "/b" -hdr "Cookie: srv=c1" -hdr "Connection: close"
+	barrier b2_b_sent sync
+	rxresp
+	expect resp.status == 200
+	expect resp.http.x-server == "s3"
+} -start
+
+barrier b2_b_sent sync
+delay 0.1
+
+client c2c -connect ${h2_fe2_sock} {
+	txreq -url "/c" -hdr "Cookie: srv=c1" -hdr "Connection: close"
+	rxresp
+	expect resp.status == 503
+	expect resp.http.set-cookie == <undef>
+} -run
+
+haproxy h2 -cli {
+	send "show stat be2 4 1 typed"
+	expect ~ "S[.]20[.]1[.][0-9]+[.]wredis[.]1:MCPP:u64:1"
+	send "show stat be2 2 -1 typed"
+	expect ~ "B[.]20[.]0[.][0-9]+[.]wredis[.]1:MCPP:u64:1"
+}
+
+barrier b2_release sync
+client c2a -wait
+barrier b2_a_done sync
+client c2b -wait
+
+syslog S2 -wait
