@@ -235,7 +235,8 @@ fn parse_netscaler_cip(magic: u32, buf: &[u8]) -> Result<(SocketAddr, SocketAddr
                 return Err(CipError::Truncated);
             }
             let ip_hl = (p[0] & 0x0f) as usize;
-            if p[9] != 6 || ip_hl < 5 || hdr_len < ip_hl * 4 + 20 {
+            // Minimum TCP payload in CIP is `sizeof(struct my_tcphdr)` (4 bytes: src/dst ports).
+            if p[9] != 6 || ip_hl < 5 || hdr_len < ip_hl * 4 + 4 {
                 return Err(CipError::BadProto);
             }
             let tcp = &p[ip_hl * 4..];
@@ -249,7 +250,7 @@ fn parse_netscaler_cip(magic: u32, buf: &[u8]) -> Result<(SocketAddr, SocketAddr
             if buf.len() < 60 || buf.len() < hdr_len {
                 return Err(CipError::Truncated);
             }
-            if p[6] != 6 || hdr_len < 60 {
+            if p[6] != 6 || hdr_len < 44 {
                 return Err(CipError::BadProto);
             }
             let tcp = &p[40..];
@@ -5939,5 +5940,114 @@ mod tests {
         assert!(s2.finish_cip_peek(Ok((src, dst, 52)), Io::Done(52)));
         assert_eq!(s2.client_addr, Some(src));
         assert_eq!(s2.server_addr, Some(dst));
+    }
+
+    #[test]
+    fn parse_netscaler_cip_ports_only_and_bounds() {
+        use super::{parse_netscaler_cip, CipError};
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
+        let magic = 0x1234_5678u32;
+        let ports = [0x04u8, 0xd2, 0x00, 0x51]; // 1234 -> 81
+        let make_ip4 = |ip_hl: u8| -> Vec<u8> {
+            let mut v = vec![
+                0x40 | (ip_hl & 0x0f),
+                0x00,
+                0x00,
+                0x28,
+                0x00,
+                0x01,
+                0x00,
+                0x00,
+                0x40,
+                0x06,
+                0x00,
+                0x00,
+                10,
+                0,
+                0,
+                1,
+                10,
+                0,
+                0,
+                2,
+            ];
+            let target = usize::from(ip_hl) * 4;
+            if target > 20 {
+                v.resize(target, 0x01);
+            }
+            v
+        };
+        let ip6 = [
+            0x60u8, 0x00, 0x00, 0x00, 0x00, 0x14, 0x06, 0x40,
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+        ];
+        let leg = |body: &[u8], trail: &[u8]| -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&magic.to_be_bytes());
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(trail);
+            out
+        };
+        let std = |body: &[u8], trail: &[u8]| -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&magic.to_be_bytes());
+            out.extend_from_slice(&[0u8; 6]);
+            out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(trail);
+            out
+        };
+
+        let exp4 = (
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 1234)),
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 2), 81)),
+        );
+        let exp6 = (
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1), 1234, 0, 0)),
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 2), 81, 0, 0)),
+        );
+
+        let mut b4 = make_ip4(5);
+        b4.extend_from_slice(&ports);
+        // Without trailing data: < 40 bytes total -> Truncated (matches HAProxy trash.data < 40).
+        assert_eq!(parse_netscaler_cip(magic, &leg(&b4, &[])), Err(CipError::Truncated));
+        assert_eq!(parse_netscaler_cip(magic, &std(&b4, &[])), Err(CipError::Truncated));
+        // With trailing HTTP bytes (>= 40 total): accepted with consumed = line + 24.
+        assert_eq!(parse_netscaler_cip(magic, &leg(&b4, b"GET / HTTP/1.1\r\n")), Ok((exp4.0, exp4.1, 32)));
+        assert_eq!(parse_netscaler_cip(magic, &std(&b4, b"GET / HTTP/1.1\r\n")), Ok((exp4.0, exp4.1, 36)));
+
+        // ip_hl = 15 (60-byte IPv4 header) + 4-byte ports = 64.
+        let mut b4_15 = make_ip4(15);
+        b4_15.extend_from_slice(&ports);
+        assert_eq!(parse_netscaler_cip(magic, &leg(&b4_15, &[])), Ok((exp4.0, exp4.1, 72)));
+        assert_eq!(parse_netscaler_cip(magic, &std(&b4_15, &[])), Ok((exp4.0, exp4.1, 76)));
+
+        // IPv6 + 4-byte ports = 44.
+        let mut b6 = ip6.to_vec();
+        b6.extend_from_slice(&ports);
+        assert_eq!(parse_netscaler_cip(magic, &std(&b6, &[])), Err(CipError::Truncated));
+        assert_eq!(parse_netscaler_cip(magic, &leg(&b6, b"GET / HTTP/1.1\r\n")), Ok((exp6.0, exp6.1, 52)));
+        assert_eq!(parse_netscaler_cip(magic, &std(&b6, b"GET / HTTP/1.1\r\n")), Ok((exp6.0, exp6.1, 56)));
+
+        // Too-short announced header lengths (< ip_hl*4 + 4 / < 44) and ip_hl < 5 -> BadProto.
+        let mut b4_23 = make_ip4(5);
+        b4_23.extend_from_slice(&ports[..3]);
+        assert_eq!(parse_netscaler_cip(magic, &leg(&b4_23, b"GET / HTTP/1.1\r\n")), Err(CipError::BadProto));
+        assert_eq!(parse_netscaler_cip(magic, &std(&b4_23, b"GET / HTTP/1.1\r\n")), Err(CipError::BadProto));
+
+        let mut b4_15_63 = make_ip4(15);
+        b4_15_63.extend_from_slice(&ports[..3]);
+        assert_eq!(parse_netscaler_cip(magic, &leg(&b4_15_63, b"GET /")), Err(CipError::BadProto));
+
+        let mut b6_43 = ip6.to_vec();
+        b6_43.extend_from_slice(&ports[..3]);
+        assert_eq!(parse_netscaler_cip(magic, &std(&b6_43, b"GET / HTTP/1.1\r\n")), Err(CipError::BadProto));
+
+        let mut b4_hl4 = make_ip4(4);
+        b4_hl4.extend_from_slice(&ports);
+        assert_eq!(parse_netscaler_cip(magic, &std(&b4_hl4, b"GET / HTTP/1.1\r\n")), Err(CipError::BadProto));
     }
 }
