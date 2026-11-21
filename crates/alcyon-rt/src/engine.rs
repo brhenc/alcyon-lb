@@ -73,9 +73,6 @@ thread_local! {
     /// Active stream log level during response-rule evaluation (`set-log-level`), and
     /// captured levels for `do-log` in `http-response` / `http-after-response`.
     static RES_LOG_LEVEL: Cell<i8> = const { Cell::new(0) };
-    static DO_LOG_LEVEL: Cell<i8> = const { Cell::new(0) };
-    static DO_LOG_RES_LEVEL: Cell<i8> = const { Cell::new(0) };
-    static DO_LOG_AFTER_LEVEL: Cell<i8> = const { Cell::new(0) };
 }
 
 /// What an idle server connection is pooled under. `HAProxy` keeps idle connections per
@@ -4174,10 +4171,32 @@ fn end_stream_build_log(
     Some((l, sd, level))
 }
 
-#[derive(Default)]
-struct ResDoLog {
-    res: bool,
-    after: bool,
+/// A `http-response` / `http-after-response` `do-log` that fired: where it ran, the level
+/// then, and the stream's variables as they were (`do_log_action` sends the line right
+/// there; the response head is borrowed while the rules run, so the line is sent after them).
+struct DoLogPoint {
+    kind: alcyon_config::ast::logging::LogProfileStepKind,
+    level: i8,
+    vars: alcyon_sample::vars::VarStore,
+}
+
+impl DoLogPoint {
+    /// The point as the rule that fires now sees it: the thread's variables (`enter`), copied
+    /// into a store of the `vars` pool.
+    fn here(kind: alcyon_config::ast::logging::LogProfileStepKind, res_uses_log_level: bool, log_level: i8) -> Self {
+        let level = if res_uses_log_level { RES_LOG_LEVEL.get() } else { log_level };
+        let vars = alcyon_sample::vars::with_current(|v| v.snapshot()).unwrap_or_default();
+        Self { kind, level, vars }
+    }
+
+    /// Sends the line with the variables of this point in place.
+    fn emit(mut self, entry: &SessionEntry, proxies: &crate::table::Table, emit: LogEmit<'_>) {
+        let swapped = alcyon_sample::vars::with_current_mut(|m| std::mem::swap(m, &mut self.vars)).is_some();
+        emit_step_log_entry_level(entry, proxies, emit, self.kind, self.level);
+        if swapped {
+            let _ = alcyon_sample::vars::with_current_mut(|m| std::mem::swap(m, &mut self.vars));
+        }
+    }
 }
 
 #[cold]
@@ -13603,24 +13622,21 @@ impl EngineDispatcher<'_> {
         fc: Option<crate::proxy::ConnView<'_>>,
         has_observe: bool,
     ) -> bool {
-        let mut do_log = ResDoLog::default();
         let was_waiting = entry.sess.strm.txn.as_ref().is_some_and(|t| t.rsp == MsgState::Waiting);
-        Self::apply_http_response_rules_in(entry, proxies, now, lowered, Some(&mut do_log), fc, has_observe);
+        let mut points = Vec::new();
+        Self::apply_http_response_rules_in(entry, proxies, now, lowered, Some(&mut points), fc, has_observe);
         // A `do-log` at `http-response`/`http-after-response` (and `log-steps response`) sends
         // the stream's line for its step. The response head is borrowed by the rules' context
         // inside the `_in` function, so the send runs here, once that context is gone.
         let fe_idx = entry.proxy_idx;
-        if do_log.res {
-            emit_step_log_entry_level(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::HttpRes, DO_LOG_RES_LEVEL.get());
+        for p in points {
+            p.emit(entry, proxies, emit);
         }
         if was_waiting
             && proxies[fe_idx].step_log_flags & STEP_LOG_RESPONSE != 0
             && entry.sess.strm.txn.as_ref().is_some_and(|t| t.rsp != MsgState::Waiting)
         {
             emit_step_log_entry(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::Response);
-        }
-        if do_log.after {
-            emit_step_log_entry_level(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::HttpAfterRes, DO_LOG_AFTER_LEVEL.get());
         }
         *lowered
     }
@@ -13631,7 +13647,7 @@ impl EngineDispatcher<'_> {
         proxies: &crate::table::Table,
         now: Tick,
         lowered: &mut bool,
-        mut do_log: Option<&mut ResDoLog>,
+        mut do_log: Option<&mut Vec<DoLogPoint>>,
         fc: Option<crate::proxy::ConnView<'_>>,
         has_observe: bool,
     ) {
@@ -14484,18 +14500,31 @@ impl EngineDispatcher<'_> {
                     }
                     outcome
                 };
-                match run_res_rules(
-                    rules,
-                    &proxies[px].acls,
-                    (&mut status, &mut status_msg),
-                    &mut ctx,
-                    &rh,
-                    caps,
-                    registry,
-                    &mut entry.sess.strm.vars,
-                    Some(ResWait { start, check: &mut check }),
-                    do_log.as_deref_mut().map(|d| &mut d.res),
-                ) {
+                let run = |vars: &mut VarStore, log: Option<&mut dyn FnMut()>| {
+                    run_res_rules(
+                        rules,
+                        &proxies[px].acls,
+                        (&mut status, &mut status_msg),
+                        &mut ctx,
+                        &rh,
+                        caps,
+                        registry,
+                        vars,
+                        Some(ResWait { start, check: &mut check }),
+                        log,
+                    )
+                };
+                let flow = if let Some(points) = do_log.as_deref_mut() {
+                    // A `do-log` marks its place (`do_log_action`): the response head is
+                    // borrowed here, so the line is sent once the rules are done, from what the
+                    // stream held at this rule.
+                    let log_level = entry.sess.strm.log.log_level;
+                    let mut log = || points.push(DoLogPoint::here(alcyon_config::ast::logging::LogProfileStepKind::HttpRes, res_uses_log_level, log_level));
+                    run(&mut entry.sess.strm.vars, Some(&mut log))
+                } else {
+                    run(&mut entry.sess.strm.vars, None)
+                };
+                match flow {
                     Err(stop) => {
                         stopped = Some(stop);
                         break;
@@ -14503,9 +14532,6 @@ impl EngineDispatcher<'_> {
                     Ok(Some(_)) => break,
                     Ok(None) => {}
                 }
-            }
-            if do_log.as_ref().is_some_and(|d| d.res) {
-                DO_LOG_RES_LEVEL.set(DO_LOG_LEVEL.get());
             }
             if let Some(line) = LAST_RULE.take().filter(|&l| l != 0) {
                 entry.sess.strm.log.last_rule = line;
@@ -14565,21 +14591,14 @@ impl EngineDispatcher<'_> {
 
             // 2. and 3. `http-after-response`, the backend's then the frontend's.
             if !proxies[be_idx].http_after_res_rules.is_empty() || !proxies[fe_idx].http_after_res_rules.is_empty() {
-                let after = eval_after_res_rules(
-                    proxies,
-                    fe_idx,
-                    be_idx,
-                    (&mut status, &mut status_msg),
-                    &mut ctx,
-                    &rh,
-                    Some(&mut res_caps),
-                    registry,
-                    &mut entry.sess.strm.vars,
-                    do_log.as_deref_mut().map(|d| &mut d.after),
-                );
-                if do_log.as_ref().is_some_and(|d| d.after) {
-                    DO_LOG_AFTER_LEVEL.set(DO_LOG_LEVEL.get());
-                }
+                let after = if let Some(points) = do_log.as_deref_mut() {
+                    // As for `http-response`.
+                    let log_level = entry.sess.strm.log.log_level;
+                    let mut log = || points.push(DoLogPoint::here(alcyon_config::ast::logging::LogProfileStepKind::HttpAfterRes, res_uses_log_level, log_level));
+                    eval_after_res_rules(proxies, fe_idx, be_idx, (&mut status, &mut status_msg), &mut ctx, &rh, Some(&mut res_caps), registry, &mut entry.sess.strm.vars, Some(&mut log))
+                } else {
+                    eval_after_res_rules(proxies, fe_idx, be_idx, (&mut status, &mut status_msg), &mut ctx, &rh, Some(&mut res_caps), registry, &mut entry.sess.strm.vars, None)
+                };
                 if !res_caps.is_empty() || !entry.sess.strm.log.res_captures.is_empty() {
                     note_res_caps_clone();
                     entry.sess.strm.log.res_captures.clone_from(&res_caps);
@@ -19589,7 +19608,7 @@ fn run_res_rules<'a, 'c>(
     registry: &Registry,
     vars: &mut VarStore,
     wait: Option<ResWait<'_>>,
-    do_log: Option<&mut bool>,
+    do_log: Option<&mut dyn FnMut()>,
 ) -> Result<Option<usize>, ResStop> {
     // In place, not a copy of the context per rule (S7).
     let prev = ctx.acls.replace(acls);
@@ -19609,7 +19628,7 @@ fn run_res_rules_in<'a>(
     registry: &Registry,
     vars: &mut VarStore,
     mut wait: Option<ResWait<'_>>,
-    mut do_log: Option<&mut bool>,
+    mut do_log: Option<&mut dyn FnMut()>,
 ) -> Result<Option<usize>, ResStop> {
     let (status, status_msg) = head;
     STRICT_MODE.set(true);
@@ -19638,11 +19657,9 @@ fn run_res_rules_in<'a>(
         let op = match op {
             ResRule::Op(op) => op,
             ResRule::DoLog => {
-                // Capture the level active when `do-log` fires (`s->logs.level`) so a
-                // later `set-log-level` rule in the same list does not alter it.
-                if let Some(slot) = do_log.as_deref_mut() {
-                    *slot = true;
-                    DO_LOG_LEVEL.set(RES_LOG_LEVEL.get());
+                // The line is sent here, from the state of this moment (`do_log_action`).
+                if let Some(log) = do_log.as_deref_mut() {
+                    log();
                 }
                 continue;
             }
@@ -19730,7 +19747,7 @@ fn eval_after_res_rules<'c>(
     mut res_caps: Option<&mut Vec<Option<Vec<u8>>>>,
     registry: &Registry,
     vars: &mut VarStore,
-    mut do_log: Option<&mut bool>,
+    mut do_log: Option<&mut dyn FnMut()>,
 ) -> Result<(), ResStop> {
     let (status, status_msg) = head;
     alcyon_sample::vars::with_stream(vars, |m| m.clear_scope(alcyon_sample::VarScope::Req));
@@ -19743,7 +19760,7 @@ fn eval_after_res_rules<'c>(
         // `http-after-response capture` writes the frontend's slots, whichever proxy the rule is in.
         let fe_slots = &proxies[fe_idx].res_capture_slots;
         let caps = res_caps.as_deref_mut().filter(|_| !fe_slots.is_empty()).map(|c| (c, &fe_slots[..]));
-        run_res_rules(rules, &proxies[px].acls, (&mut *status, &mut *status_msg), ctx, rh, caps, registry, vars, None, do_log.as_deref_mut())?;
+        run_res_rules(rules, &proxies[px].acls, (&mut *status, &mut *status_msg), ctx, rh, caps, registry, vars, None, do_log.as_mut().map(|f| &mut **f as &mut dyn FnMut()))?;
     }
     Ok(())
 }

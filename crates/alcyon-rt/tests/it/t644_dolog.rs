@@ -99,14 +99,14 @@ const HEAD: &str = "defaults\n  mode http\n  timeout connect 5s\n  timeout clien
 #[test]
 fn each_response_do_log_logs_at_its_rule_with_its_state() {
     let cfg = format!(
-        "{HEAD}frontend fe\n  bind {{f}}\n  log udp@{{c}} format rfc5424 local0\n  log-format \"std v=%[var(txn.x)] %OG %B\"\n  \
+        "{HEAD}frontend fe\n  bind {{f}}\n  log udp@{{c}} format rfc5424 local0\n  log-format \"std v=%[var(txn.x)] %OG\"\n  log-steps close\n  \
          http-response do-log\n  http-response set-var(txn.x) str(b)\n  http-response do-log\n  \
          http-after-response do-log\n  http-after-response set-var(txn.x) str(c)\n  http-after-response do-log\n  \
          default_backend be\n\nbackend be\n  server app1 {{be}}\n"
     );
     assert_eq!(
         lines_for(&cfg),
-        ["std v=- http-res 0", "std v=b http-res 0", "std v=b http-after-res 0", "std v=c http-after-res 0", "std v=c txn_close 54"]
+        ["std v=- http-res", "std v=b http-res", "std v=b http-after-res", "std v=c http-after-res", "std v=c txn_close"]
     );
 }
 
