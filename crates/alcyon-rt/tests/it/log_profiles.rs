@@ -257,6 +257,18 @@ fn t644_17_a_global_log_directive_with_an_unknown_profile_is_refused() {
 }
 
 #[test]
+fn t644_15_a_log_profile_format_that_does_not_compile_is_refused_at_load() {
+    // Oracle, `-c`, rc=1: `Parsing [file:4]: failed to parse logformat: no such format alias 'bogus'. ...`
+    let out = run_cfg(
+        &["-c"],
+        "defaults\n  mode http\nlog-profile p\n  on close format \"%{+X}o %bogus\"\nfrontend fe\n  bind 127.0.0.1:18099\n  log 127.0.0.1:514 profile p local0\n",
+    );
+    assert!(!out.status.success(), "rc={:?}", out.status.code());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("failed to parse logformat: no such format alias 'bogus'"), "stderr was: {err}");
+}
+
+#[test]
 fn a_minimal_log_profile_is_accepted() {
     let out = run_cfg(
         &["-c"],
