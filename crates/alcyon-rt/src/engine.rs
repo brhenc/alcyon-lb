@@ -2028,6 +2028,9 @@ pub struct Proxy {
     /// load; when it is `false` the stream's line is built and sent exactly as before, so a
     /// proxy without profiles pays nothing for the machinery.
     pub any_log_profile: bool,
+    /// True when any server in this proxy enables `observe`. Computed once at load; when
+    /// `false`, traffic hot paths skip `health_adjust` and `observe_slot` lookups.
+    pub has_observe: bool,
     /// `unique-id-format`, compiled.
     pub unique_id_format: Option<Arc<crate::logfmt::LogFormat>>,
     /// `unique-id-header`: the request header the unique ID is sent to the server in (a
@@ -4986,6 +4989,8 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         res_stream: false,
         req_stream: false,
     }.finish());
+    let srv_ids = ServerIdArrays::build(&listen.servers, &listen.server_extras, listen.mode == Mode::Http);
+    let has_observe = srv_ids.has_observe();
     Ok(Proxy {
         id: usize_to_u32(proxy_idx),
         ids: Box::new(ProxyIdInfo {
@@ -4994,7 +4999,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
             decl: ids.decl,
             next_decl: 0,
             forced_id: ids.forced,
-            srv: ServerIdArrays::build(&listen.servers, &listen.server_extras, listen.mode == Mode::Http),
+            srv: srv_ids,
             listener_ids: alcyon_config::ast::listener_ids(&listen.binds),
             http_mode: listen.http_mode,
             persist: listen.persist,
@@ -5069,6 +5074,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
         log_opts: listen.log_opts,
         log_steps: listen.log_steps,
         any_log_profile: false,
+        has_observe,
         unique_id_format: listen.unique_id_format.as_deref().and_then(compile_unique_id_format),
         extra_log: extra_log_formats(listen.error_log_format.as_deref(), listen.log_format_sd.as_deref()),
         unique_id_header: listen.unique_id_header.as_deref().map(Box::from),
@@ -5209,6 +5215,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
         log_opts: fe.log_opts,
         log_steps: fe.log_steps,
         any_log_profile: false,
+        has_observe: false,
         unique_id_format: fe.unique_id_format.as_deref().and_then(compile_unique_id_format),
         extra_log: extra_log_formats(fe.error_log_format.as_deref(), fe.log_format_sd.as_deref()),
         unique_id_header: fe.unique_id_header.as_deref().map(Box::from),
@@ -5261,6 +5268,8 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         res_stream: false,
         req_stream: false,
     }.finish());
+    let srv_ids = ServerIdArrays::build(&be.servers, &be.server_extras, be.mode == Mode::Http);
+    let has_observe = srv_ids.has_observe();
     Ok(Proxy {
         id: usize_to_u32(proxy_idx),
         ids: Box::new(ProxyIdInfo {
@@ -5269,7 +5278,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
             decl: ids.decl,
             next_decl: 0,
             forced_id: ids.forced,
-            srv: ServerIdArrays::build(&be.servers, &be.server_extras, be.mode == Mode::Http),
+            srv: srv_ids,
             listener_ids: Vec::new(),
             http_mode: be.http_mode,
             persist: be.persist,
@@ -5345,6 +5354,7 @@ fn init_proxy_from_backend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, b
         log_opts: 0,
         log_steps: be.log_steps,
         any_log_profile: false,
+        has_observe,
         unique_id_format: be.unique_id_format.as_deref().and_then(compile_unique_id_format),
         unique_id_header: be.unique_id_header.as_deref().map(Box::from),
         req_capture_slots: Arc::from([]),
@@ -9606,7 +9616,9 @@ fn init_client_session(
                 proxy.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
                 if let Some(i) = proxy.srv_set().slot_of_addr(target) {
                     proxy.srv_set().bump_retr(i, (0, 0, 1));
-                    crate::check::health_adjust(proxies, proxy_idx, i, crate::check::HanaStatus::L4Err);
+                    if proxy.has_observe {
+                        crate::check::health_adjust(proxies, proxy_idx, i, crate::check::HanaStatus::L4Err);
+                    }
                 }
                 sess.srv_state = ScState::Error;
             }
@@ -10446,20 +10458,27 @@ fn count_redispatch_pick_on<'a, R: crate::statcnt::Rows<'a>>(rows: R, be: &'a Pr
 /// A connect attempt to the stream's server failed (`back_handle_st_cer`): while retries
 /// remain, connect again -- after the turnaround (`SC_ST_TAR`) when `wait`, an asynchronous
 /// connect error, and the server is the same one; at once after a connect refused at once.
+#[inline]
 fn observe_http(entry: &SessionEntry, proxies: &crate::table::Table, status: crate::check::HanaStatus) {
     observe_http_ids(proxies, entry.srv_backend_idx, entry.target_server_idx, status);
 }
 
+#[inline]
 fn observe_http_ids(proxies: &crate::table::Table, srv_backend_idx: usize, target_server_idx: Option<usize>, status: crate::check::HanaStatus) {
-    if let Some(i) = target_server_idx {
-        crate::check::health_adjust(proxies, srv_backend_idx, i, status);
+    if proxies.has_observe() {
+        if let Some(i) = target_server_idx {
+            crate::check::health_adjust(proxies, srv_backend_idx, i, status);
+        }
     }
 }
 
+#[inline]
 fn mark_server_connected(entry: &mut SessionEntry, proxies: &crate::table::Table, now: Tick) {
     entry.sess.server_connected(now);
-    if let Some(i) = entry.target_server_idx {
-        crate::check::health_adjust(proxies, entry.srv_backend_idx, i, crate::check::HanaStatus::L4Ok);
+    if proxies.has_observe() {
+        if let Some(i) = entry.target_server_idx {
+            crate::check::health_adjust(proxies, entry.srv_backend_idx, i, crate::check::HanaStatus::L4Ok);
+        }
     }
 }
 
@@ -10486,7 +10505,9 @@ fn server_connect_failed(
             be.counters().failed_conn.fetch_add(1, Ordering::Relaxed);
             if let Some(i) = entry.target_server_idx {
                 be.srv_set().bump_retr(i, (0, 0, 1));
-                crate::check::health_adjust(proxies, entry.srv_backend_idx, i, crate::check::HanaStatus::L4Err);
+                if be.has_observe {
+                    crate::check::health_adjust(proxies, entry.srv_backend_idx, i, crate::check::HanaStatus::L4Err);
+                }
             }
             entry.sess.srv_state = ScState::Error;
             if entry.sess.mode == Mode::Http {
@@ -13359,12 +13380,14 @@ impl EngineDispatcher<'_> {
                     return;
                 }
                 alcyon_proto::response_head::ResponseHead::Valid { status, rewrite, close_server: close, index: ix } => {
-                    let hana = if status >= 100 && (status < 500 || status == 501 || status == 505) {
-                        crate::check::HanaStatus::HttpOk
-                    } else {
-                        crate::check::HanaStatus::HttpSts
-                    };
-                    observe_http(entry, proxies, hana);
+                    if proxies.has_observe() {
+                        let hana = if status >= 100 && (status < 500 || status == 501 || status == 505) {
+                            crate::check::HanaStatus::HttpOk
+                        } else {
+                            crate::check::HanaStatus::HttpSts
+                        };
+                        observe_http(entry, proxies, hana);
+                    }
                     close_server = close;
                     index = ix;
                     if let Some(r) = rewrite {

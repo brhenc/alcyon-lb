@@ -82,6 +82,8 @@ pub enum Routed {
 pub struct Table {
     epoch: u64,
     len: usize,
+    /// True when any proxy in the table has a server with `observe` enabled.
+    has_observe: bool,
     /// Fixed-size chunks: an index is `chunks[slot >> 10][slot & 1023]` with the second bounds
     /// check gone at compile time (T637 S2: the request path indexes the table ~100 times).
     /// A slot at or past `len` holds the empty proxy `filler`: a stale number reads nothing.
@@ -94,11 +96,11 @@ pub struct Table {
 }
 
 impl Table {
-    fn build(epoch: u64, len: usize, items: &[Arc<Proxy>], filler: &Arc<Proxy>, by_name: Arc<HashMap<Box<str>, u32>>, live: Arc<[u32]>) -> Self {
+    fn build(epoch: u64, len: usize, has_observe: bool, items: &[Arc<Proxy>], filler: &Arc<Proxy>, by_name: Arc<HashMap<Box<str>, u32>>, live: Arc<[u32]>) -> Self {
         let empty: Arc<Chunk> = Arc::new(std::array::from_fn(|_| Arc::clone(filler)));
         let mut real = items.chunks(CHUNK).map(|c| Arc::new(std::array::from_fn(|i| Arc::clone(c.get(i).unwrap_or(filler)))));
         let chunks = std::array::from_fn(|_| real.next().unwrap_or_else(|| Arc::clone(&empty)));
-        Self { epoch, len, chunks, by_name, live }
+        Self { epoch, len, has_observe, chunks, by_name, live }
     }
 }
 
@@ -111,6 +113,7 @@ impl Table {
     #[must_use]
     pub fn new(mut proxies: Vec<Proxy>) -> Self {
         let len = proxies.len();
+        let has_observe = proxies.iter().any(|p| p.has_observe);
         let mut by_name: HashMap<Box<str>, u32> = HashMap::with_capacity(len);
         for (i, p) in proxies.iter().enumerate() {
             by_name.entry(p.name.as_str().into()).or_insert_with(|| u32::try_from(i).expect("fewer than 2^32 proxies"));
@@ -121,7 +124,7 @@ impl Table {
         assert!(len <= MAX_CHUNKS * CHUNK, "at most {} proxies", MAX_CHUNKS * CHUNK);
         let items: Vec<Arc<Proxy>> = proxies.into_iter().map(Arc::new).collect();
         let live = (0..u32::try_from(len).expect("fewer than 2^32 proxies")).collect();
-        Self::build(1, len, &items, &Arc::new(crate::engine::empty_proxy()), Arc::new(by_name), live)
+        Self::build(1, len, has_observe, &items, &Arc::new(crate::engine::empty_proxy()), Arc::new(by_name), live)
     }
 
     /// The next table, with the proxy at `slot` replaced by `proxy` (same name). Every chunk but
@@ -133,12 +136,14 @@ impl Table {
     pub fn replace(&self, slot: usize, mut proxy: Proxy) -> Self {
         assert_eq!(self[slot].name, proxy.name, "a replaced backend keeps its name");
         resolve_routes(&mut proxy, &self.by_name);
+        let has_observe = proxy.has_observe
+            || (self.has_observe && (0..self.len).any(|s| s != slot && self[s].has_observe));
         let (c, i) = (slot >> CHUNK_SHIFT, slot & (CHUNK - 1));
         let mut chunks = self.chunks.clone();
         let mut one: Chunk = (*self.chunks[c]).clone();
         one[i] = Arc::new(proxy);
         chunks[c] = Arc::new(one);
-        Self { epoch: self.epoch + 1, len: self.len, chunks, by_name: Arc::clone(&self.by_name), live: Arc::clone(&self.live) }
+        Self { epoch: self.epoch + 1, len: self.len, has_observe, chunks, by_name: Arc::clone(&self.by_name), live: Arc::clone(&self.live) }
     }
 
     /// Which table this is: 1 at load, one more for every [`Table::replace`] of a chain.
@@ -158,7 +163,15 @@ impl Table {
         self.len == 0
     }
 
+    /// Whether any proxy in the table has a server with `observe` enabled.
+    #[inline]
+    #[must_use]
+    pub fn has_observe(&self) -> bool {
+        self.has_observe
+    }
+
     /// The proxy at `slot`.
+    #[inline]
     #[must_use]
     pub fn get(&self, slot: usize) -> Option<&Proxy> {
         (slot < self.len).then(|| &self[slot])

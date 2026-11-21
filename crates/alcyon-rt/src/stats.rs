@@ -1520,6 +1520,7 @@ mod tests {
             log_opts: 0,
             log_steps: None,
             any_log_profile: false,
+            has_observe: false,
             unique_id_format: None,
             unique_id_header: None,
             req_capture_slots: std::sync::Arc::new([]),
