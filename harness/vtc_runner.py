@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import dataclasses
 import glob
+import ipaddress
 import json
 import os
 import threading
@@ -23,6 +24,7 @@ import shlex
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 
@@ -122,6 +124,7 @@ class HttpResponse:
     proto: str = "HTTP/1.1"
     headers: List[Tuple[str, str]] = dataclasses.field(default_factory=list)
     body: bytes = b""
+    last_chunklen: int = 0
 
     def get_header(self, name: str) -> Optional[str]:
         target = name.lower()
@@ -169,6 +172,27 @@ async def read_until_bytes(reader: asyncio.StreamReader, delimiter: bytes, max_l
         buf.extend(chunk)
         if len(buf) > max_len:
             raise ValueError(f"Stream exceeded maximum length {max_len} before finding delimiter {delimiter!r}")
+
+
+async def _read_content_length_body(reader: asyncio.StreamReader, body_bytes: bytearray, cl_hdr: str) -> bytes:
+    """Read exactly `cl` bytes of a Content-Length body, pushing any trailing read-ahead back."""
+    try:
+        cl = int(cl_hdr)
+    except ValueError:
+        return bytes(body_bytes)
+    if cl <= 0:
+        if body_bytes:
+            reader._buffer[:0] = body_bytes  # type: ignore[attr-defined]
+        return b""
+    if len(body_bytes) >= cl:
+        trailing = body_bytes[cl:]
+        if trailing:
+            reader._buffer[:0] = trailing  # type: ignore[attr-defined]
+        return bytes(body_bytes[:cl])
+    needed = cl - len(body_bytes)
+    chunk = await reader.readexactly(needed)
+    body_bytes.extend(chunk)
+    return bytes(body_bytes)
 
 
 async def parse_http_request(reader: asyncio.StreamReader, headers_only: bool = False) -> Optional[HttpRequest]:
@@ -239,14 +263,8 @@ async def parse_http_request(reader: asyncio.StreamReader, headers_only: bool = 
             body_bytes.extend(chunk_data)
             await reader.readline()
     elif cl_hdr is not None:
-        try:
-            cl = int(cl_hdr)
-            needed = cl - len(body_bytes)
-            if needed > 0:
-                chunk = await reader.readexactly(needed)
-                body_bytes.extend(chunk)
-        except ValueError:
-            pass
+        req.body = await _read_content_length_body(reader, body_bytes, cl_hdr)
+        return req
 
     req.body = bytes(body_bytes)
     return req
@@ -294,6 +312,9 @@ async def parse_http_response(reader: asyncio.StreamReader, req_method: str = "G
         reader._buffer[:0] = body_bytes  # type: ignore[attr-defined]
         return resp
     if req_method.upper() == "HEAD" or status in (204, 304) or (100 <= status < 200):
+        # Preserve any trailing bytes (e.g. a subsequent 101 or 200 response in the same read).
+        if body_bytes:
+            reader._buffer[:0] = body_bytes  # type: ignore[attr-defined]
         resp.body = b""
         return resp
 
@@ -319,14 +340,8 @@ async def parse_http_response(reader: asyncio.StreamReader, req_method: str = "G
             body_bytes.extend(chunk_data)
             await reader.readline()
     elif cl_hdr is not None:
-        try:
-            cl = int(cl_hdr)
-            needed = cl - len(body_bytes)
-            if needed > 0:
-                chunk = await reader.readexactly(needed)
-                body_bytes.extend(chunk)
-        except ValueError:
-            pass
+        resp.body = await _read_content_length_body(reader, body_bytes, cl_hdr)
+        return resp
     else:
         # Read until EOF
         while True:
@@ -371,6 +386,7 @@ class ClientBlock:
     repeat: int = 1
     start_immediate: bool = False
     run_immediate: bool = False
+    proxy_spec: Optional[Tuple[int, str]] = None
 
 
 @dataclasses.dataclass
@@ -888,6 +904,8 @@ def _expect_field(expr: str, resp: Optional["HttpResponse"], req: Optional["Http
         return True, resp.body.decode("latin1", errors="replace") if resp else None
     if expr == "resp.bodylen":
         return True, str(len(resp.body)) if resp else "0"
+    if expr == "resp.chunklen":
+        return True, str(resp.last_chunklen) if resp else "0"
     if expr == "req.method":
         return True, req.method if req else None
     if expr == "req.url":
@@ -916,7 +934,7 @@ def _evaluate_expectation(
         exp_clean.startswith("'") and exp_clean.endswith("'")
     ):
         exp_clean = exp_clean[1:-1]
-    exp_clean = decode_escapes(exp_clean)
+    exp_clean = decode_hex_escapes(exp_clean)
 
     is_undef_check = exp_clean == "<undef>"
     known, actual_val = _expect_field(expr, resp, req)
@@ -1136,6 +1154,26 @@ def preprocess_haproxy_config(
 # ---------------------------------------------------------------------------
 
 
+_SYSLOG_LEVELS = {
+    "emerg": 0,
+    "panic": 0,
+    "alert": 1,
+    "crit": 2,
+    "err": 3,
+    "error": 3,
+    "warning": 4,
+    "warn": 4,
+    "notice": 5,
+    "info": 6,
+    "debug": 7,
+}
+
+
+def _syslog_severity(msg: str) -> Optional[int]:
+    m = re.match(r"^<(\d+)>", msg)
+    return int(m.group(1)) % 8 if m else None
+
+
 class SyslogRunner:
     """A varnishtest `syslog` block: a UDP collector that records datagrams.
 
@@ -1199,26 +1237,37 @@ class SyslogRunner:
         if not self.block:
             return
         lines = [line.strip() for line in self.block.splitlines() if line.strip() and not line.strip().startswith("#")]
-        for line in lines:
-            if line.startswith("recv"):
-                while self._recv_idx >= len(self.received) and not self._stop.is_set():
-                    await asyncio.sleep(0.02)
-                if self._recv_idx < len(self.received):
-                    self._recv_idx += 1
-            elif line.startswith("expect ~"):
-                pass
-            elif line.startswith("barrier "):
-                parts = line.split()
-                if len(parts) >= 3 and parts[2] == "sync":
-                    b_id = parts[1]
-                    if b_id in self.barriers:
-                        if self.verbose:
-                            print(f"     {Color.DIM}[syslog {self.syslog_id}] barrier {b_id} sync{Color.RESET}")
-                        await self.barriers[b_id].wait()
-            elif line.startswith("delay "):
-                parts = line.split()
-                if len(parts) >= 2:
-                    await asyncio.sleep(float(parts[1]))
+        default_sev = _SYSLOG_LEVELS.get(self.level.lower()) if self.level else None
+        for _ in range(max(1, self.repeat)):
+            for line in lines:
+                if line == "recv" or line.startswith("recv "):
+                    parts = line.split()
+                    target_sev = _SYSLOG_LEVELS.get(parts[1].lower()) if len(parts) >= 2 else default_sev
+                    while not self._stop.is_set():
+                        if self._recv_idx >= len(self.received):
+                            await asyncio.sleep(0.01)
+                            continue
+                        msg = self.received[self._recv_idx]
+                        self._recv_idx += 1
+                        if target_sev is not None:
+                            sev = _syslog_severity(msg)
+                            if sev is not None and sev != target_sev:
+                                continue
+                        break
+                elif line.startswith("expect ~"):
+                    pass
+                elif line.startswith("barrier "):
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[2] == "sync":
+                        b_id = parts[1]
+                        if b_id in self.barriers:
+                            if self.verbose:
+                                print(f"     {Color.DIM}[syslog {self.syslog_id}] barrier {b_id} sync{Color.RESET}")
+                            await self.barriers[b_id].wait()
+                elif line.startswith("delay "):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        await asyncio.sleep(float(parts[1]))
 
     async def wait(self, timeout: float = 5.0) -> None:
         """Waits until every expectation has matched, or the timeout expires.
@@ -1247,9 +1296,17 @@ class SyslogRunner:
             await asyncio.sleep(0.05)
 
     def unmatched(self) -> List[str]:
-        """Expectations with no matching datagram, in order."""
+        """Expectations with no matching datagram, in order (respecting `-repeat N`)."""
         missing = []
+        counts: Dict[str, int] = {}
         for raw_pat in self.expectations:
+            counts[raw_pat] = counts.get(raw_pat, 0) + 1
+        seen_pat: Set[str] = set()
+        for raw_pat in self.expectations:
+            if raw_pat in seen_pat:
+                continue
+            seen_pat.add(raw_pat)
+            required = counts[raw_pat] * max(1, self.repeat)
             # Late expansion: `${h1_pid}` does not exist until the proxy is running.
             pat = _posix_classes_to_python(self.macro_engine.expand(raw_pat))
             try:
@@ -1257,9 +1314,10 @@ class SyslogRunner:
             except re.error:
                 rx = None
             if rx is None:
-                if not any(pat in line for line in self.received):
-                    missing.append(pat)
-            elif not any(rx.search(line) for line in self.received):
+                matched = sum(1 for line in self.received if pat in line)
+            else:
+                matched = sum(1 for line in self.received if rx.search(line))
+            if matched < required:
                 missing.append(pat)
         return missing
 
@@ -1367,7 +1425,7 @@ class MockServerRunner:
                                     status = 200
                             elif opt == "-hdr" and idx + 1 < len(args):
                                 idx += 1
-                                hdr_line = args[idx]
+                                hdr_line = decode_hex_escapes(args[idx])
                                 if ":" in hdr_line:
                                     hk, hv = hdr_line.split(":", 1)
                                     headers.append((hk.strip(), hv.lstrip(" \t")))
@@ -1506,6 +1564,37 @@ class MockServerRunner:
             self.task.cancel()
 
 
+def _parse_addr_port(addr_port: str) -> Tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]:
+    host_str, port_str = addr_port.rsplit(":", 1)
+    if host_str.startswith("[") and host_str.endswith("]"):
+        host_str = host_str[1:-1]
+    return ipaddress.ip_address(host_str), int(port_str)
+
+
+def _build_proxy_header(version: int, spec: str) -> bytes:
+    """Build a PROXY protocol v1 or v2 header from `'src_ip:port dst_ip:port'`."""
+    parts = spec.strip().split()
+    if len(parts) != 2:
+        raise ValueError(f"Invalid -proxy{version} spec: {spec!r}")
+    src_ip, src_port = _parse_addr_port(parts[0])
+    dst_ip, dst_port = _parse_addr_port(parts[1])
+    if version == 1:
+        family = "TCP6" if (src_ip.version == 6 or dst_ip.version == 6) else "TCP4"
+        return f"PROXY {family} {src_ip} {dst_ip} {src_port} {dst_port}\r\n".encode("ascii")
+    if version == 2:
+        sig = b"\x0d\x0a\x0d\x0a\x00\x0d\x0a\x51\x55\x49\x54\x0a"
+        if src_ip.version == 4 and dst_ip.version == 4:
+            fam_proto = 0x11
+            payload = src_ip.packed + dst_ip.packed + struct.pack("!HH", src_port, dst_port)
+        else:
+            src_v6 = ipaddress.IPv6Address(f"::ffff:{src_ip}") if src_ip.version == 4 else src_ip
+            dst_v6 = ipaddress.IPv6Address(f"::ffff:{dst_ip}") if dst_ip.version == 4 else dst_ip
+            fam_proto = 0x21
+            payload = src_v6.packed + dst_v6.packed + struct.pack("!HH", src_port, dst_port)
+        return sig + struct.pack("!BBH", 0x21, fam_proto, len(payload)) + payload
+    raise ValueError(f"Unsupported PROXY protocol version: {version}")
+
+
 class MockClientRunner:
     """Manages an asynchronous mock HTTP/TCP client defined by VTC script."""
 
@@ -1556,6 +1645,11 @@ class MockClientRunner:
                         f"Client {self.client_id} could not connect to {host}:{port} after retries: {connect_err}"
                     )
 
+                if self.client_def.proxy_spec is not None:
+                    p_ver, p_spec = self.client_def.proxy_spec
+                    writer.write(_build_proxy_header(p_ver, self.macro_engine.expand(p_spec)))
+                    await writer.drain()
+
                 cur_resp: Optional[HttpResponse] = None
                 last_req_method = "GET"
 
@@ -1569,7 +1663,7 @@ class MockClientRunner:
                     cmd = action.cmd
                     args = [self.macro_engine.expand(a) for a in action.args]
 
-                    if pending and cmd not in ("send", "sendhex"):
+                    if pending and cmd not in ("send", "send_n", "sendhex"):
                         writer.write(bytes(pending))
                         pending.clear()
                         await writer.drain()
@@ -1639,8 +1733,7 @@ class MockClientRunner:
                             print(f"       {Color.DIM}[{self.client_id}] txreq {method} {url}{Color.RESET}")
 
                         req_str = "\r\n".join(req_lines) + "\r\n\r\n"
-                        writer.write(req_str.encode("latin1") + body_bytes)
-                        await writer.drain()
+                        pending += req_str.encode("latin1") + body_bytes
 
                     elif cmd in ("rxresp", "rxresphdrs"):
                         cur_resp = await parse_http_response(
@@ -1652,6 +1745,24 @@ class MockClientRunner:
                             raise ConnectionResetError(f"Client {self.client_id} expected HTTP response but got EOF")
                         if self.verbose:
                             print(f"       {Color.DIM}[{self.client_id}] rxresp status={cur_resp.status}{Color.RESET}")
+
+                    elif cmd == "rxchunk":
+                        if cur_resp is None:
+                            cur_resp = HttpResponse()
+                        line = await reader.readline()
+                        if not line:
+                            raise ConnectionResetError(f"Client {self.client_id} expected chunk size but got EOF")
+                        chunk_size = int(line.decode("latin1").split(";")[0].strip(), 16)
+                        cur_resp.last_chunklen = chunk_size
+                        if chunk_size == 0:
+                            while True:
+                                tline = await reader.readline()
+                                if not tline or tline in (b"\r\n", b"\n"):
+                                    break
+                        else:
+                            chunk_data = await reader.readexactly(chunk_size)
+                            cur_resp.body += chunk_data
+                            await reader.readline()
 
                     elif cmd == "expect":
                         if len(args) >= 3:
@@ -2094,6 +2205,7 @@ class VtcExecutor:
                     # raise on, it just matches something else. Python says so itself:
                     # "FutureWarning: Possible nested set at position 33".
                     pat = _posix_classes_to_python(self.macro_engine.expand(pat))
+                    _note_assertion()
                     if not re.search(pat, last_resp, re.MULTILINE):
                         raise AssertionError(f"CLI expect pattern {pat!r} failed to match: {last_resp!r}")
                 elif rest.startswith("!~"):
@@ -2250,7 +2362,10 @@ class VtcExecutor:
             elif cmd == "shell":
                 sh_cmd = block if block is not None else (args[0] if args else "")
                 sh_expanded = self.macro_engine.expand(sh_cmd)
-                res = self.run_cmd(sh_expanded, shell=True, text=True, env=self.shell_env())
+                # Run off the event loop so `-start` clients/servers keep progressing concurrently.
+                res = await asyncio.to_thread(
+                    self.run_cmd, sh_expanded, shell=True, text=True, env=self.shell_env()
+                )
                 if res.returncode != 0:
                     raise RuntimeError(f"Shell command failed (exit code {res.returncode}):\n{res.stderr}")
                 # A shell block's exit status is vtest's assertion (default -expectexit 0),
@@ -2376,6 +2491,10 @@ class VtcExecutor:
                         raise KeyError(f"Unknown server {server_id}")
                     if "-start" in opts:
                         runner.start()
+                    if "-break" in opts:
+                        runner.stop()
+                        if runner.srv is not None:
+                            await runner.srv.wait_closed()
                     if "-wait" in opts:
                         await runner.wait()
 
@@ -2391,12 +2510,16 @@ class VtcExecutor:
                     start_imm = False
                     expect_exit = None
                     master_args: List[str] = []
+                    extra_args: List[str] = []
                     idx = 0
                     while idx < len(opts):
                         if opts[idx] in ("-W", "-Ws"):
                             master_args.append(opts[idx])
                         elif opts[idx] == "-S":
                             master_args += ["-S", os.path.join(self.tmpdir, f"{haproxy_id}.master.sock")]
+                        elif opts[idx] == "-arg" and idx + 1 < len(opts):
+                            extra_args.extend(shlex.split(self.macro_engine.expand(opts[idx + 1])))
+                            idx += 1
                         elif opts[idx] in ("-conf", "-conf-OK", "-conf-BAD"):
                             conf_type = opts[idx]
                         elif opts[idx] == "-start":
@@ -2437,18 +2560,19 @@ class VtcExecutor:
                             print(f"       {Color.DIM}{_n:3d}| {_l}{Color.RESET}")
 
                     if conf_type == "-conf-OK":
-                        res = self.run_cmd([binary, "-c", "-f", cfg_path], text=True)
+                        res = self.run_cmd([binary, *extra_args, "-c", "-f", cfg_path], text=True)
                         if res.returncode != 0:
                             raise AssertionError(f"Config check failed (-conf-OK):\n{res.stderr}")
                         _note_assertion()
                     elif conf_type == "-conf-BAD":
-                        res = self.run_cmd([binary, "-c", "-f", cfg_path], text=True)
+                        res = self.run_cmd([binary, *extra_args, "-c", "-f", cfg_path], text=True)
                         if res.returncode == 0:
                             raise AssertionError(f"Config check unexpectedly succeeded (-conf-BAD) for {haproxy_id}")
                         want = (directive.expect_stderr or "").strip()
-                        if want and not re.search(_posix_classes_to_python(self.macro_engine.expand(want)),
-                                                  res.stdout + res.stderr, re.MULTILINE):
-                            raise AssertionError(f"-conf-BAD diagnostic does not match {want!r}:\n{res.stderr}")
+                        if want:
+                            want_expanded = self.macro_engine.expand(want)
+                            if want_expanded not in (res.stdout + res.stderr):
+                                raise AssertionError(f"-conf-BAD diagnostic does not match {want!r}:\n{res.stderr}")
                         _note_assertion()
                     else:
                         if start_imm:
@@ -2458,7 +2582,7 @@ class VtcExecutor:
                             # in the foreground, as vtest runs it.
                             mw = [a for a in master_args if a in ("-W", "-Ws")]
                             proc = popen_tracked(
-                                [binary, *master_args, "-f", cfg_path, "-d"],
+                                [binary, *master_args, *extra_args, "-f", cfg_path, "-d"],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                             )
@@ -2506,6 +2630,7 @@ class VtcExecutor:
                     repeat = 1
                     run_imm = False
                     start_imm = False
+                    proxy_spec: Optional[Tuple[int, str]] = None
 
                     idx = 0
                     while idx < len(opts):
@@ -2514,6 +2639,9 @@ class VtcExecutor:
                             idx += 1
                         elif opts[idx] == "-repeat" and idx + 1 < len(opts):
                             repeat = int(opts[idx + 1])
+                            idx += 1
+                        elif opts[idx] in ("-proxy1", "-proxy2") and idx + 1 < len(opts):
+                            proxy_spec = (1 if opts[idx] == "-proxy1" else 2, opts[idx + 1])
                             idx += 1
                         elif opts[idx] == "-run":
                             run_imm = True
@@ -2531,6 +2659,7 @@ class VtcExecutor:
                         repeat=repeat,
                         start_immediate=start_imm,
                         run_immediate=run_imm,
+                        proxy_spec=proxy_spec,
                     )
                     runner = MockClientRunner(c_block, self.macro_engine, self.barriers, verbose=self.verbose)
                     self.clients[client_id] = runner
@@ -2542,6 +2671,7 @@ class VtcExecutor:
                         await runner.wait()
                     elif start_imm:
                         runner.start()
+                        await asyncio.sleep(0.02)
                 else:
                     runner = self.clients.get(client_id)
                     if not runner:
@@ -2551,6 +2681,7 @@ class VtcExecutor:
                         await runner.wait()
                     elif "-start" in opts:
                         runner.start()
+                        await asyncio.sleep(0.02)
                     elif "-wait" in opts:
                         await runner.wait()
 

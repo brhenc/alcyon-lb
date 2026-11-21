@@ -310,6 +310,19 @@ class ClientSendCoalescing(unittest.TestCase):
         got = b"".join(self._received([A("send", ['"ab"']), A("send_n", ["3", '"cd"'])]))
         self.assertEqual(got, b"abcdcdcd")
 
+    def test_txreq_coalesces_with_send_n(self):
+        # T640 (h1_big_chunk_size_line.vtc): `txreq` followed by `send_n` + `send` must
+        # coalesce into one write just like consecutive `send` lines, so tune.bufsize sees
+        # headers + chunk line together before dispatching to the backend.
+        A = vtc_runner.ActionItem
+        got = self._received([
+            A("txreq", ["-req", "POST", "-url", "/big", "-hdr", "Transfer-Encoding: chunked", "-nolen"]),
+            A("send_n", ["4", '"0"']),
+            A("send", ['"\\r\\n"']),
+        ])
+        self.assertEqual(len(self.writes), 1, f"expected 1 coalesced write, got {len(self.writes)}")
+        self.assertTrue(got[0].endswith(b"\r\n\r\n0000\r\n"))
+
 
 class ExpectClose(unittest.TestCase):
     """`expect_close` reads until EOF, passing over white space (SP, HT, CR, LF) and failing on
@@ -389,6 +402,370 @@ class VtestHex(unittest.TestCase):
     def test_a_non_hex_character_is_an_error(self):
         with self.assertRaises(ValueError):
             vtc_runner.vtest_hex("3x")
+
+
+class CliExpectAssertionCounting(unittest.TestCase):
+    """T640: `haproxy -cli { expect ~ ... }` must count as an evaluated assertion;
+    otherwise CLI-only reg-tests (runtime_settings, show_commands, cli_set_ssl, ...)
+    are scored SKIP ('no assertions were evaluated; nothing was tested')."""
+
+    CLI_PROXY = (
+        "#!/usr/bin/env python3\n"
+        "import os, re, socket, sys, time\n"
+        "cfg_path = sys.argv[sys.argv.index('-f') + 1]\n"
+        "cfg = open(cfg_path).read()\n"
+        "m = re.search(r'stats socket (\\S+)', cfg)\n"
+        "sock_path = m.group(1)\n"
+        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "s.bind(sock_path)\n"
+        "s.listen(8)\n"
+        "while True:\n"
+        "    conn, _ = s.accept()\n"
+        "    cmd = conn.recv(4096).decode()\n"
+        "    conn.sendall(f'CMD:{cmd}'.encode())\n"
+        "    conn.close()\n"
+    )
+
+    def test_cli_expect_regex_counts_as_evaluated_assertion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proxy = os.path.join(tmp, "cliproxy")
+            with open(proxy, "w") as f:
+                f.write(self.CLI_PROXY)
+            os.chmod(proxy, 0o755)
+            vtc = (
+                'varnishtest "cli"\n'
+                'haproxy h1 -conf {\n  defaults\n} -start\n'
+                'haproxy h1 -cli {\n  send "show info"\n  expect ~ "CMD:show info"\n}\n'
+            )
+            ex = executor(vtc, proxy)
+            res = asyncio.run(ex.execute())
+            self.assertEqual(res.status, "PASS", res.error_message)
+
+
+class HaproxyArgFlag(unittest.TestCase):
+    """T640 (automatic_maxconn.vtc, crt_store.vtc): `haproxy ... -arg "..."` must pass
+    its split arguments to the proxy binary on both `-start` and `-conf-OK`/`-conf-BAD`."""
+
+    def test_arg_passes_extra_arguments_to_start(self):
+        fp = FakeProxy()
+        self.addCleanup(fp.tmp.cleanup)
+        ex = executor('varnishtest "x"\nhaproxy h1 -arg "-m 1024" -conf {\n  defaults\n} -start\n', fp.path)
+        asyncio.run(ex.execute())
+        with open(fp.log + ".args") as f:
+            args = f.read().split()
+        self.assertIn("-m", args)
+        self.assertIn("1024", args)
+
+    def test_arg_passes_extra_arguments_to_conf_ok(self):
+        fp = FakeProxy()
+        self.addCleanup(fp.tmp.cleanup)
+        ex = executor('varnishtest "x"\nhaproxy h1 -arg -V -conf-OK {\n  defaults\n}\n', fp.path)
+        res = asyncio.run(ex.execute())
+        self.assertEqual(res.status, "PASS", res.error_message)
+        with open(fp.log + ".args") as f:
+            args = f.read().split()
+        self.assertIn("-V", args)
+
+
+class ConfBadLiteralSubstring(unittest.TestCase):
+    """T640 (filters/config-mode.vtc, http_hardening_profiles.vtc): `-conf-BAD {spec}` in
+    VTest checks a literal substring (`strstr`), not a regex, so metacharacters like
+    `filter-*` and `(not found)` must match literally."""
+
+    def test_literal_regex_metacharacters_in_diagnostic_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proxy = os.path.join(tmp, "badproxy")
+            with open(proxy, "w") as f:
+                f.write("#!/bin/sh\necho \"[ALERT] : 'filter-*' (not found)\" >&2\nexit 1\n")
+            os.chmod(proxy, 0o755)
+            vtc = (
+                "varnishtest \"x\"\n"
+                "haproxy h1 -conf-BAD {'filter-*' (not found)} {\n  bad\n}\n"
+            )
+            ex = executor(vtc, proxy)
+            res = asyncio.run(ex.execute())
+            self.assertEqual(res.status, "PASS", res.error_message)
+
+
+class PipelinedOrInterimResponses(unittest.TestCase):
+    """T640 (h1_ws_1xx_101_same_read.vtc): `parse_http_response` must push unread trailing
+    bytes back into `reader._buffer` when a response has no body (1xx, 204, 304, HEAD)
+    or when Content-Length is shorter than the read-ahead buffer."""
+
+    def test_parse_http_response_preserves_response_after_100(self):
+        wire = (
+            b"HTTP/1.1 100 Continue\r\n\r\n"
+            b"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: abc\r\n\r\n"
+        )
+
+        async def go():
+            r = asyncio.StreamReader()
+            r.feed_data(wire)
+            r.feed_eof()
+            r1 = await vtc_runner.parse_http_response(r)
+            r2 = await vtc_runner.parse_http_response(r)
+            return r1, r2
+
+        r1, r2 = asyncio.run(go())
+        self.assertIsNotNone(r1)
+        self.assertEqual(r1.status, 100)
+        self.assertIsNotNone(r2)
+        self.assertEqual(r2.status, 101)
+        self.assertEqual(r2.get_header("sec-websocket-accept"), "abc")
+
+    def test_parse_http_response_preserves_next_response_after_content_length(self):
+        wire = (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+        )
+
+        async def go():
+            r = asyncio.StreamReader()
+            r.feed_data(wire)
+            r.feed_eof()
+            r1 = await vtc_runner.parse_http_response(r)
+            r2 = await vtc_runner.parse_http_response(r)
+            return r1, r2
+
+        r1, r2 = asyncio.run(go())
+        self.assertEqual(r1.body, b"hello")
+        self.assertEqual(r2.body, b"ok")
+
+
+class ServerTxrespHeaderEscapes(unittest.TestCase):
+    """T640 (http_hardening_h1.vtc): `MockServerRunner` `txresp -hdr` must decode `\\r\\n`,
+    `\\t`, and `\\xHH` escapes just like `MockClientRunner` `txreq -hdr`."""
+
+    def test_txresp_hdr_decodes_crlf_and_hex_escapes(self):
+        async def go():
+            A = vtc_runner.ActionItem
+            blk = vtc_runner.ServerBlock(
+                "s1", [], [A("rxreq", []), A("txresp", ["-hdr", "foo: a\\tb\\xe9c", "-hdr", "bar: x\\r\\n y"])], []
+            )
+            runner = vtc_runner.MockServerRunner(blk, vtc_runner.MacroEngine({}), {})
+            await runner.initialize_socket()
+            runner.start()
+            reader, writer = await asyncio.open_connection("127.0.0.1", runner.port)
+            writer.write(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            await writer.drain()
+            raw = await reader.read(4096)
+            writer.close()
+            await asyncio.wait_for(runner.wait(), 5)
+            runner.stop()
+            return raw
+
+        raw = asyncio.run(go())
+        self.assertIn(b"foo: a\tb\xe9c\r\n", raw)
+        self.assertIn(b"bar: x\r\n y\r\n", raw)
+
+    def test_expect_decodes_hex_escapes(self):
+        resp = vtc_runner.HttpResponse(status=200, headers=[("foo", "a\tb\xe9c")])
+        res = vtc_runner.evaluate_expectation("resp.http.foo", "==", '"a\\tb\\xe9c"', resp=resp)
+        self.assertTrue(res.passed, f"{res.actual!r} != {res.expected!r}")
+
+
+class SyslogRepeatAndLevelFiltering(unittest.TestCase):
+    """T640 (1be_40srv_odd_health_checks.vtc, cli_add_check_server.vtc):
+    1. `syslog -repeat N` must require N matching datagrams, not just 1.
+    2. `syslog -level <lvl>` `recv` must skip datagrams of other severities (e.g. alert/emerg
+       when waiting for notice), so barriers stay synchronized with the test script."""
+
+    def test_syslog_repeat_requires_all_n_datagrams(self):
+        async def go():
+            eng = vtc_runner.MacroEngine({})
+            sr = vtc_runner.SyslogRunner(
+                "S", eng, ["srv[0-9]+ up"],
+                block='recv\nexpect ~ "srv[0-9]+ up"\n',
+                repeat=3, level="notice",
+            )
+            sr.initialize_socket()
+            sr.start()
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                # Only 1 datagram sent, but repeat=3 requires 3.
+                s.sendto(b"<29>srv1 up\n", ("127.0.0.1", sr.port))
+                await sr.wait(timeout=0.3)
+                missing = sr.unmatched()
+            finally:
+                s.close()
+                sr.stop()
+            return missing
+
+        missing = asyncio.run(go())
+        self.assertNotEqual(missing, [])
+
+    def test_syslog_recv_filters_by_severity_level(self):
+        async def go():
+            eng = vtc_runner.MacroEngine({})
+            b = asyncio.Barrier(2)
+            sr = vtc_runner.SyslogRunner(
+                "S1", eng, ["notice-1", "notice-2"],
+                block='recv\nexpect ~ "notice-1"\nbarrier b1 sync\nrecv\nexpect ~ "notice-2"\n',
+                barriers={"b1": b}, repeat=1, level="notice",
+            )
+            sr.initialize_socket()
+            sr.start()
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                # Send 1 notice (<29>), then an alert (<25>) and emerg (<24>) before notice-2.
+                s.sendto(b"<29>notice-1\n", ("127.0.0.1", sr.port))
+                await asyncio.wait_for(b.wait(), timeout=2.0)
+                s.sendto(b"<25>alert-ignored\n", ("127.0.0.1", sr.port))
+                s.sendto(b"<24>emerg-ignored\n", ("127.0.0.1", sr.port))
+                await asyncio.sleep(0.05)
+                # Script must STILL be waiting on notice-2, not finished early on alert!
+                still_waiting = not sr._task.done()
+                s.sendto(b"<29>notice-2\n", ("127.0.0.1", sr.port))
+                await asyncio.wait_for(sr._task, timeout=2.0)
+            finally:
+                s.close()
+                sr.stop()
+            return still_waiting
+
+        self.assertTrue(asyncio.run(go()))
+
+
+class ShellDoesNotBlockClients(unittest.TestCase):
+    """T640 (cli_purge_backend.vtc, cli_purge_server.vtc, cli_purge_all_servers.vtc):
+    A `shell { ... }` directive must not block the asyncio event loop while a
+    `client ... -start` task is running concurrently."""
+
+    def test_client_start_connects_before_and_during_shell(self):
+        async def go():
+            seen = asyncio.Event()
+
+            async def handle(reader, writer):
+                seen.set()
+                await reader.read(1024)
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                await writer.drain()
+                writer.close()
+
+            srv = await asyncio.start_server(handle, "127.0.0.1", 0)
+            port = srv.sockets[0].getsockname()[1]
+            vtc = (
+                'varnishtest "shell-concurrent"\n'
+                f'client c1 -connect 127.0.0.1:{port} {{\n'
+                '  txreq\n  rxresp\n  expect resp.status == 200\n'
+                '} -start\n'
+                'shell {\n  sleep 0.15\n}\n'
+                'client c1 -wait\n'
+            )
+            ex = executor(vtc)
+            # Check inside shell timeframe: run execute and see if `seen` was set
+            # quickly (not after shell finishes).
+            t = asyncio.create_task(ex.execute())
+            try:
+                await asyncio.wait_for(seen.wait(), timeout=0.12)
+                connected_during_shell = True
+            except asyncio.TimeoutError:
+                connected_during_shell = False
+            res = await t
+            srv.close()
+            return connected_during_shell, res
+
+        connected, res = asyncio.run(go())
+        self.assertTrue(connected, "client -start was starved by synchronous shell execution")
+        self.assertEqual(res.status, "PASS", res.error_message)
+
+
+class ClientProxyProtocol(unittest.TestCase):
+    """T640 (converters_ipmask_concat_strcmp_field_word.vtc, http_reuse_conn_hash.vtc):
+    `client ... -proxy1 "..."` and `-proxy2 "..."` send PROXY v1/v2 headers on connect."""
+
+    def _capture_first_bytes(self, opt: str, spec: str) -> bytes:
+        async def go():
+            got = bytearray()
+            done = asyncio.Event()
+
+            async def handle(reader, writer):
+                got.extend(await reader.read(4096))
+                writer.close()
+                done.set()
+
+            srv = await asyncio.start_server(handle, "127.0.0.1", 0)
+            port = srv.sockets[0].getsockname()[1]
+            vtc = (
+                'varnishtest "proxy"\n'
+                f'client c1 -connect 127.0.0.1:{port} {opt} "{spec}" {{\n'
+                '  send "HI"\n'
+                '} -run\n'
+            )
+            ex = executor(vtc)
+            await ex.execute()
+            await asyncio.wait_for(done.wait(), 2)
+            srv.close()
+            return bytes(got)
+
+        return asyncio.run(go())
+
+    def test_proxy1_sends_v1_header(self):
+        wire = self._capture_first_bytes("-proxy1", "127.0.0.1:40000 127.0.0.1:8080")
+        self.assertEqual(wire, b"PROXY TCP4 127.0.0.1 127.0.0.1 40000 8080\r\nHI")
+
+    def test_proxy2_sends_v2_header(self):
+        wire = self._capture_first_bytes("-proxy2", "192.168.1.101:1234 127.0.0.1:2345")
+        self.assertTrue(wire.startswith(b"\r\n\r\n\x00\r\nQUIT\n\x21\x11\x00\x0c"))
+        self.assertEqual(wire[16:28], socket.inet_aton("192.168.1.101") + socket.inet_aton("127.0.0.1") + b"\x04\xd2\x09\x29")
+        self.assertEqual(wire[28:], b"HI")
+
+
+class RxChunkAndChunklen(unittest.TestCase):
+    """T640 (http_no_delay.vtc): `rxchunk` reads one chunk and sets `resp.chunklen`."""
+
+    def test_rxchunk_sets_chunklen_and_accumulates_body(self):
+        async def go():
+            async def handle(reader, writer):
+                await reader.read(4096)
+                writer.write(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
+                await writer.drain()
+                await asyncio.sleep(0.05)
+                writer.write(b"0\r\n\r\n")
+                await writer.drain()
+                writer.close()
+
+            srv = await asyncio.start_server(handle, "127.0.0.1", 0)
+            port = srv.sockets[0].getsockname()[1]
+            vtc = (
+                'varnishtest "rxchunk"\n'
+                f'client c1 -connect 127.0.0.1:{port} {{\n'
+                '  txreq\n'
+                '  rxresphdrs\n'
+                '  rxchunk\n'
+                '  expect resp.chunklen == 5\n'
+                '  rxchunk\n'
+                '  expect resp.chunklen == 0\n'
+                '  expect resp.bodylen == 5\n'
+                '  expect resp.body == "hello"\n'
+                '} -run\n'
+            )
+            ex = executor(vtc)
+            res = await ex.execute()
+            srv.close()
+            return res
+
+        res = asyncio.run(go())
+        self.assertEqual(res.status, "PASS", res.error_message)
+
+
+class ServerBreakDirective(unittest.TestCase):
+    """T640 (http_abortonclose.vtc, spoe/switching_rules.vtc): `server s1 -break` closes
+    the server's listening socket so subsequent connects get ECONNREFUSED and the port is
+    released."""
+
+    def test_server_break_closes_listening_socket(self):
+        async def go():
+            vtc = 'varnishtest "brk"\nserver s1 {} -start\nserver s1 -break\n'
+            ex = executor(vtc)
+            try:
+                await ex._run_directives()
+                port = ex.servers["s1"].port
+                with self.assertRaises(ConnectionRefusedError):
+                    socket.create_connection(("127.0.0.1", port), timeout=1).close()
+            finally:
+                ex.cleanup()
+
+        asyncio.run(go())
 
 
 if __name__ == "__main__":
