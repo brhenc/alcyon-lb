@@ -207,6 +207,9 @@ pub struct SocketTuning {
     pub congestion: Option<String>,
     /// `mss <n>`: `TCP_MAXSEG`.
     pub mss: Option<u32>,
+    /// `tcp-md5sig <key>`: the RFC 2385 signature key of the listening socket
+    /// (`setsockopt(TCP_MD5SIG)` in `alcyon-rt`'s listener).
+    pub md5sig: Option<String>,
     /// `quic-force-retry`: a QUIC listener answers every new connection with a Retry first
     /// (`QuicEndpoint`'s Retry policy). Accepted on a TCP bind, where it does nothing, as
     /// `HAProxy` accepts it.

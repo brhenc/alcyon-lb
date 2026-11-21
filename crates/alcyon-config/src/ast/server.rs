@@ -386,6 +386,11 @@ pub struct ServerExtras {
     /// `default-server`'s), as `HAProxy`'s `srv->maxqueue`: 0 is unlimited, so only
     /// positive limits are kept.
     pub maxqueue: Vec<(u32, u32)>,
+    /// The `tcp-md5sig <key>` of each server that sets one (`srv->tcp_md5sig`): the RFC
+    /// 2385 signature key applied with `setsockopt(TCP_MD5SIG)` on the outgoing socket
+    /// before `connect` (`alcyon-rt`). Sparse, as most servers have none: kept here, not
+    /// in `Server`, whose size is bounded in `struct_sizes.rs`.
+    pub md5sig: Vec<(u32, Box<str>)>,
     /// The line of the `server` line of each server that has a `track`, for the alerts of
     /// the check after the parse (`unable to find required server ... for tracking`).
     pub track_line: Vec<(u32, u32)>,

@@ -79,6 +79,10 @@ pub(crate) fn parse_server(
     let mut ssl = default_server.map(|d| d.ssl.clone()).unwrap_or_default();
     let mut disabled = default_server.is_some_and(|d| d.disabled);
     let mut track = default_server.and_then(|d| d.track.clone());
+    // `default-server` carries no address, so `HAProxy`'s `srv_parse_tcp_md5sig` stores
+    // no key in the default-server (and nothing inherits one); a server's key comes
+    // only from its own `tcp-md5sig`.
+    let mut md5sig = None;
     let mut agent = default_server.map(|d| d.agent.clone()).unwrap_or_default();
     let mut puid = 0u32;
     let index = u32::try_from(servers.len()).unwrap_or(u32::MAX);
@@ -246,6 +250,34 @@ pub(crate) fn parse_server(
                 track = Some(server_kw_arg(tokens, i, who, "expects [<proxy>/]<server> as argument.")?.text.as_str().into());
                 i += 1;
             }
+            // `srv_parse_tcp_md5sig`: the key is kept only when the server line has an
+            // address (a name-based server keeps none); a key over 80 characters is
+            // freed and reported as an alert that does not stop the load.
+            "tcp-md5sig" => {
+                let key = tokens
+                    .get(i + 1)
+                    .filter(|t| !t.text.is_empty())
+                    .ok_or_else(|| {
+                        ConfigError::new(
+                            tokens[i].line,
+                            tokens[i].col,
+                            format!("{}'tcp-md5sig' : missing TCP MD5 signature password.", server_keywords::server_prefix(who)),
+                        )
+                    })?;
+                if fqdn.is_none() {
+                    if key.text.len() > alcyon_mmsg::TCP_MD5SIG_MAXKEYLEN {
+                        super::warn::push_alert(
+                            tokens[i].line,
+                            crate::ast::global::WarnStyle::At,
+                            &format!("{}'tcp-md5sig' : password too long (at most 80 characters expected).", server_keywords::server_prefix(who)),
+                        );
+                        md5sig = None;
+                    } else {
+                        md5sig = Some(key.text.clone());
+                    }
+                }
+                i += 1;
+            }
             "init-addr" => {
                 init_addr = parse_init_addr(tokens, i, who)?;
                 i += 1;
@@ -285,6 +317,9 @@ pub(crate) fn parse_server(
         if mq > 0 {
             extras.maxqueue.push((index, mq));
         }
+    }
+    if let Some(key) = md5sig {
+        extras.md5sig.push((index, key.into_boxed_str()));
     }
     if puid != 0 {
         extras.puid.push((index, puid));
@@ -1048,6 +1083,14 @@ pub(crate) fn parse_default_server(
             "enabled" => cfg.disabled = false,
             "track" => {
                 cfg.track = Some(server_kw_arg(tokens, i, None, "expects [<proxy>/]<server> as argument.")?.text.as_str().into());
+                i += 1;
+            }
+            // `default-server` has no address, so `srv_parse_tcp_md5sig` stores nothing
+            // (and runs no length check); only a missing password is a fatal error.
+            "tcp-md5sig" => {
+                let _key = tokens.get(i + 1).filter(|t| !t.text.is_empty()).ok_or_else(|| {
+                    ConfigError::new(tokens[i].line, tokens[i].col, "'tcp-md5sig' : missing TCP MD5 signature password.")
+                })?;
                 i += 1;
             }
             "init-addr" => {

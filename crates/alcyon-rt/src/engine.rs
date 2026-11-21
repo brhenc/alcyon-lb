@@ -9508,15 +9508,24 @@ fn init_client_session(
     {
         sess.flags.set_to(sess_flags::LB_PICKED, use_server.is_none());
         // A balanced pick takes its server's slot with it (T590), on the index the session
-        // is counted on (`register_new_session`); `use-server` is counted there.
+        // is counted on (`register_new_session`); `use-server` is counted there. The slot
+        // (not just the address) is kept: two servers may share an address with different
+        // `tcp-md5sig` keys, and the key is the picked server's.
+        let mut target_slot = None;
         target_addr = match use_server {
-            Some(i) => Some(proxy.srv_set().addr_at(i)),
+            Some(i) => {
+                target_slot = Some(i);
+                Some(proxy.srv_set().addr_at(i))
+            }
             None => proxy
                 .pick_and_take(true, || {
                     let a = proxy.select_server_with_key(sess.client_addr.map(|a| a.ip()), sess.req_uri.as_deref(), lb_snap)?;
                     Some((proxy.srv_set().slot_of_addr(a), a))
                 })
-                .map(|((_, a), _)| a),
+                .map(|((i, a), _)| {
+                    target_slot = i;
+                    a
+                }),
         };
         if let Some(target) = target_addr {
             let proxies: &crate::table::Table = proxies;
@@ -9526,8 +9535,13 @@ fn init_client_session(
             sess.set_backend_timeouts(proxy);
 
             sess.target_addr = Some(target);
-            let connected = raw::connect_opts(connect_addr(target, sess.server_addr), proxy.srv_set().tfo_of(target))
-                .inspect_err(|e| sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)));
+            let srv_set = proxy.srv_set();
+            let connected = raw::connect_opts(
+                connect_addr(target, sess.server_addr),
+                srv_set.tfo_of(target),
+                target_slot.and_then(|i| srv_set.md5sig_at(i)).map(str::as_bytes),
+            )
+            .inspect_err(|e| sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)));
             if let Ok((srv_fd, immediate)) = connected {
                 let sfd = srv_fd.as_raw_fd();
                 let s_idx = proxy.srv_set().slot_of_addr(target);
@@ -10602,8 +10616,13 @@ fn retry_server_connect(
     maybe_prepend_send_proxy(&proxies[entry.proxy_idx], &proxies[be_idx], proxies, &mut entry.sess, target_addr);
 
     set_target(entry, target_addr);
-    if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].srv_set().tfo_of(target_addr))
-        .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
+    let be_srv = proxies[be_idx].srv_set();
+    if let Ok((srv_fd, immediate)) = raw::connect_opts(
+        connect_addr(target_addr, entry.sess.server_addr),
+        be_srv.tfo_of(target_addr),
+        s_idx.and_then(|i| be_srv.md5sig_at(i)).map(str::as_bytes),
+    )
+    .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
     {
         let sfd = srv_fd.as_raw_fd();
         attach_server_to(&mut entry.sess, proxies, entry.proxy_idx, be_idx, s_idx, srv_fd, now);
@@ -16313,6 +16332,7 @@ impl EngineDispatcher<'_> {
         }
 
         count_connect(proxies, be_idx, s_idx, reused.is_some());
+        let be_srv = proxies[be_idx].srv_set();
         if let Some((IdleConn { fd: srv_fd, xprt, src }, registered)) = reused {
             let sfd = srv_fd.as_raw_fd();
             entry.srv_raw_fd = Some(sfd);
@@ -16351,7 +16371,11 @@ impl EngineDispatcher<'_> {
                     new_interest.writable,
                 );
             }
-        } else if let Ok((srv_fd, immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].srv_set().tfo_of(target_addr))
+        } else if let Ok((srv_fd, immediate)) = raw::connect_opts(
+            connect_addr(target_addr, entry.sess.server_addr),
+            be_srv.tfo_of(target_addr),
+            s_idx.and_then(|i| be_srv.md5sig_at(i)).map(str::as_bytes),
+        )
         .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
     {
             let sfd = srv_fd.as_raw_fd();
@@ -16537,7 +16561,12 @@ impl EngineDispatcher<'_> {
         // socket is reported writable on the next poll and completes there. Only INET
         // servers exist (`unix@` is refused at parse time), so no test could reach a
         // separate branch for it.
-        if let Ok((srv_fd, _immediate)) = raw::connect_opts(connect_addr(target_addr, entry.sess.server_addr), proxies[be_idx].srv_set().tfo_of(target_addr))
+        let be_srv = proxies[be_idx].srv_set();
+        if let Ok((srv_fd, _immediate)) = raw::connect_opts(
+            connect_addr(target_addr, entry.sess.server_addr),
+            be_srv.tfo_of(target_addr),
+            s_idx.and_then(|i| be_srv.md5sig_at(i)).map(str::as_bytes),
+        )
         .inspect_err(|e| entry.sess.bc_err = Some(crate::proxy::bc_connect_now_errno(e)))
     {
             let sfd = srv_fd.as_raw_fd();

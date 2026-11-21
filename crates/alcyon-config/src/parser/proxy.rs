@@ -991,6 +991,23 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
                 bind.sock.get_or_insert_with(Default::default).congestion = Some(arg(i, "expects a congestion control algorithm")?.text.clone());
                 i += 1;
             }
+            // RFC 2385 signatures for the listening socket (`bind_parse_md5sig`): the key
+            // is stored on the socket tuning and `Listener::bind_tuned` sets it. A key
+            // longer than 80 characters is an alert, not an error: `HAProxy` keeps
+            // parsing, the socket listens without a signature.
+            "tcp-md5sig" => {
+                let a = arg(i, "missing TCP MD5 signature password")?;
+                if a.text.len() > alcyon_mmsg::TCP_MD5SIG_MAXKEYLEN {
+                    warn::push_alert(
+                        tokens[i].line,
+                        WarnStyle::Spaced,
+                        &format!("{prefix} : 'tcp-md5sig' : password too long (at most 80 characters expected)"),
+                    );
+                } else {
+                    bind.sock.get_or_insert_with(Default::default).md5sig = Some(a.text.clone());
+                }
+                i += 1;
+            }
             // Threads are not numbered in Alcyon: the kernel spreads connections over the
             // workers (`SO_REUSEPORT`). `thread all` is what that already does.
             "thread" => {

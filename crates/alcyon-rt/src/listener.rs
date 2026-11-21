@@ -102,6 +102,18 @@ pub fn listener_backlog(bind_backlog: Option<u32>, proxy_backlog: u32, proxy_max
     i32::try_from(v).unwrap_or(i32::MAX)
 }
 
+/// `tcp-md5sig`: the key is bound to the address the socket actually listens on
+/// (`HAProxy`'s `listener->rx.addr`), so it is set after the `bind` that may have
+/// replaced a 0 port. `HAProxy` aborts the load when the kernel refuses it
+/// (`ERR_ALERT | ERR_ABORT`), so the error propagates.
+fn bind_md5sig(fd: &OwnedFd, bound_addr: SocketAddr, key: &str) -> io::Result<()> {
+    if let Err(e) = alcyon_mmsg::set_tcp_md5sig(fd.as_fd(), bound_addr, key.as_bytes()) {
+        crate::stderr_line!("[ALERT] bind: cannot set TCP MD5 signature: {e}");
+        return Err(e);
+    }
+    Ok(())
+}
+
 impl Listener {
     /// Binds a listening socket with `SO_REUSEPORT` and `SO_REUSEADDR`.
     ///
@@ -161,6 +173,10 @@ impl Listener {
         } else {
             addr
         };
+
+        if let Some(key) = &tuning.md5sig {
+            bind_md5sig(&fd, bound_addr, key)?;
+        }
 
         Ok(Listener {
             fd,
@@ -420,6 +436,18 @@ mod tests {
             .expect("socket");
         let err = Listener::adopt(fd, loopback0(), 0, &alcyon_config::ast::SocketTuning::default()).err().expect("must refuse");
         assert!(err.to_string().contains("not a stream socket"), "{err}");
+    }
+
+    /// The kernel refuses `IPPROTO_TCP` options on a socket that does not speak TCP:
+    /// the bind must fail with the error, as `HAProxy` aborts the load when
+    /// `setsockopt(TCP_MD5SIG)` fails (`ERR_ALERT | ERR_ABORT`).
+    #[test]
+    fn a_key_the_kernel_refuses_fails_the_bind() {
+        let udp = net::socket_with(AddressFamily::INET, SocketType::DGRAM, SocketFlags::CLOEXEC, None)
+            .expect("socket");
+        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        let err = bind_md5sig(&udp, addr, "secret").err().expect("the kernel must refuse the key");
+        assert_eq!(err.raw_os_error(), Some(nix::libc::ENOPROTOOPT), "{err}");
     }
 
     #[test]
