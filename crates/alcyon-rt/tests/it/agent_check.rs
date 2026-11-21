@@ -381,3 +381,43 @@ backend be1
     assert_eq!(server_state_fields(&sock2, "be1", "srv").get(5).map(String::as_str), Some("2"));
     drop(srv_listener);
 }
+
+/// An agent's "up" does not bring up a server whose regular health check is failing: the
+/// server stays DOWN while `check` fails, and comes up once the check passes too
+/// (`HAProxy`: the agent and the health check must both report up).
+#[test]
+fn agent_up_does_not_override_a_failing_health_check() {
+    let agent = TcpListener::bind("127.0.0.1:0").expect("bind agent");
+    let agent_port = agent.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for mut s in agent.incoming().flatten() {
+            let _ = s.write_all(b"up\n");
+        }
+    });
+    // The server port is closed: the regular `check` fails (L4CON).
+    let srv_port = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let cfg = format!(
+        "global
+    stats socket @SOCK@ level admin
+defaults
+    mode tcp
+    timeout client 5s
+    timeout server 5s
+    timeout connect 1s
+backend be1
+    server srv 127.0.0.1:{srv_port} check inter 50ms fall 1 rise 1 agent-check agent-port {agent_port} agent-inter 50ms
+"
+    );
+    let (_proc, _dir, sock) = spawn_proxy(&cfg);
+    wait_until("server DOWN from the failing check", Duration::from_secs(5), || {
+        stat_col(&sock, "be1", "status").starts_with("DOWN")
+    });
+    // Many agent replies of "up" later, the server is still DOWN.
+    thread::sleep(Duration::from_millis(500));
+    let f = server_state_fields(&sock, "be1", "srv");
+    assert_eq!(f.get(5).map(String::as_str), Some("0"), "op_state after agent up with a failing check: {f:?}");
+    assert!(stat_col(&sock, "be1", "status").starts_with("DOWN"), "{}", stat_col(&sock, "be1", "status"));
+}
