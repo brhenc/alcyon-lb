@@ -38,7 +38,9 @@
 #
 # --exclusive (the supervisor's measuring gate on main) takes every slot, in order, after
 # announcing itself on /tmp/alcyon-gate.exclusive.lock so non-exclusive gates stop taking
-# slots that free up meanwhile. Without --exclusive, ALCYON_GATE_SKIP_MEASURE=1 is forced.
+# slots that free up meanwhile. Without --exclusive, ALCYON_GATE_SKIP_MEASURE=1 is forced,
+# and the short ins/req count (checkin.sh stage insreq-quick, measuring slot B) runs instead
+# of the full measurement; ALCYON_GATE_SKIP_INSREQ=1 skips that too.
 #
 # Refuses (exit 3) when the target filesystem has less than ALCYON_GATE_MIN_FREE_GB
 # (default 40) free; it does not wait for disk.

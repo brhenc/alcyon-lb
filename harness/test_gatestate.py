@@ -105,6 +105,10 @@ class TestTreeKey(unittest.TestCase):
         self.assertNotEqual(self.key(ALCYON_GATE_SKIP_MEASURE="1"), k1)
         self.assertNotEqual(self.key(COVERCHECK="0"), k1)
         self.assertEqual(self.key(COVERCHECK="1"), k1)  # the default, spelled out
+        # insreq-quick: its skip and its reference change its verdict; unset keeps old keys.
+        self.assertNotEqual(self.key(ALCYON_GATE_SKIP_INSREQ="1"), k1)
+        self.assertNotEqual(self.key(ALCYON_MEASURE_REF="HEAD"), k1)
+        self.assertEqual(self.key(ALCYON_GATE_SKIP_INSREQ=""), k1)
         before = git(self.r.path, "rev-parse", "HEAD")
         self.r.write("crates/x/src/lib.rs", "fn a() {}\nfn c() {}\n")
         self.r.commit("third")

@@ -12,7 +12,8 @@ every stage's last attempt on that tree.
 The tree is the key, and nothing from another key is ever reused:
   - the commit, and a clean worktree (`git status --porcelain` empty apart from the files
     the gate itself writes, GATE_WRITES). A dirty tree gets no key: nothing is reusable.
-  - the env that changes a verdict: COVERCHECK, ALCYON_GATE_SKIP_MEASURE, and the base
+  - the env that changes a verdict: COVERCHECK, ALCYON_GATE_SKIP_MEASURE, when set
+    ALCYON_GATE_SKIP_INSREQ and ALCYON_MEASURE_REF (insreq-quick), and the base
     covercheck judges against (ALCYON_COVERCHECK_BASE, or the default that follows the
     branch: the same commit judged against a base that moved is another verdict).
 
@@ -98,9 +99,16 @@ def tree_key(repo: str = REPO, env: dict | None = None,
         "ALCYON_GATE_SKIP_MEASURE": env.get("ALCYON_GATE_SKIP_MEASURE") or "",
         "covercheck_base": base,
     }
+    # insreq-quick's skip and reference: keyed only when set, so the keys of gates that set
+    # neither stay what they were.
+    for var in ("ALCYON_GATE_SKIP_INSREQ", "ALCYON_MEASURE_REF"):
+        if env.get(var):
+            ident[var] = env[var]
     key = hashlib.sha256(json.dumps(ident, sort_keys=True).encode()).hexdigest()[:16]
     desc = (f"commit {head[:12]}, covercheck base {base[:12]}, COVERCHECK={ident['COVERCHECK']}"
-            f", ALCYON_GATE_SKIP_MEASURE={ident['ALCYON_GATE_SKIP_MEASURE'] or 'unset'}")
+            f", ALCYON_GATE_SKIP_MEASURE={ident['ALCYON_GATE_SKIP_MEASURE'] or 'unset'}"
+            + "".join(f", {v}={ident[v]}" for v in ("ALCYON_GATE_SKIP_INSREQ", "ALCYON_MEASURE_REF")
+                      if v in ident))
     return key, desc
 
 

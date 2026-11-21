@@ -14,7 +14,8 @@
 # a flaky test, two uncovered lines, load noise in the measurement. Each stage's result is
 # kept per tree by harness/gatestate.py: the commit, a clean worktree (data/measurements.jsonl
 # apart) and the env that changes a verdict (COVERCHECK, ALCYON_GATE_SKIP_MEASURE, the
-# covercheck base). A result from another tree is never reused, and a dirty tree keeps
+# covercheck base, and when set ALCYON_GATE_SKIP_INSREQ=1, which skips insreq-quick, and
+# ALCYON_MEASURE_REF, its reference). A result from another tree is never reused, and a dirty tree keeps
 # nothing. The verdict is every stage's last attempt on this tree -- PASS only when each one
 # passed -- with every failed attempt before it listed: a stage that passed on a rerun is
 # reported as such, not hidden.
@@ -28,6 +29,8 @@
 #                          not hold one from this tree, a no-op when it does.
 #   measure                builds and times its own plain release alcyon, in the plain target
 #                          and the plain env (tools/measure/run.sh refuses an instrumented one).
+#   insreq-quick           builds its own release-perf alcyon in the plain target and env, and
+#                          the reference's in a cache of its own (tools/measure/insreq_gate.py).
 #   the rest               build what they test (cargo does), or need nothing.
 #
 # Uses its own target directory so it never contends with a build agy is running.
@@ -35,7 +38,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-STAGES=(tripwire harness-tests findings oracles suite covercheck smoke diff-fuzz haproxy lint measure surface stray)
+STAGES=(tripwire harness-tests findings oracles suite covercheck smoke diff-fuzz haproxy lint insreq-quick measure surface stray)
 declare -A TITLE=(
   [tripwire]="tripwire: the spec tests must not change"
   [harness-tests]="the harness's own tests"
@@ -47,6 +50,7 @@ declare -A TITLE=(
   [diff-fuzz]="differential fuzz against HAProxy, end to end, vs the known-differences baseline"
   [haproxy]="does HAProxy still behave as the tests record"
   [lint]="does the rest still build and lint (clippy, and the libFuzzer targets compile: T279)"
+  [insreq-quick]="instructions per request against the last measured main (slot B, +0.5%)"
   [measure]="continuous measurement"
   [surface]="new surface since the nudge, and whether it came with tests"
   [stray]="stray files (the supervisor's own are expected)"
@@ -407,6 +411,78 @@ stage_measure() {
   fi
 }
 
+stage_insreq-quick() {
+  # 11-21: only the exclusive gate measured ins/req, 32 merges went in unmeasured and the next
+  # measured gate found keepalive +1.8%, rules +2.5% (AGENTS.md section 8 allows +0.5%). This
+  # is the short count every other gate runs: release-perf of this tree against the reference
+  # (ALCYON_MEASURE_REF, else the last passing measured main), ab1 keepalive and rules, on
+  # counts slot B (/tmp/alcyon-load-n1.lock, CPUs 12-14). The exclusive gate measures in full
+  # (measure), so it skips this. Most of the time is the fat-LTO build of this tree (~4-5 min):
+  # it is started in the background before the first stage (insreq_build_start) and waited for
+  # here, so it overlaps the suite.
+  if [ "${ALCYON_GATE_SKIP_INSREQ:-}" = 1 ]; then
+    echo "skipped (ALCYON_GATE_SKIP_INSREQ=1): ins/req not counted on this tree"
+    note_skip "ALCYON_GATE_SKIP_INSREQ=1"
+  elif [ "${ALCYON_GATE_SKIP_MEASURE:-}" != 1 ]; then
+    echo "skipped: the measure stage counts ins/req in full in this gate"
+    note_skip "measured in full by the measure stage"
+  elif [ ! -f "$INSREQ_BUILD_PIDFILE" ]; then
+    check 1 "insreq-quick: the background release-perf build was not started"
+  else
+    local pid t0=$SECONDS
+    pid=$(cat "$INSREQ_BUILD_PIDFILE")
+    echo "insreq-quick: waiting for the background release-perf build (pid $pid, log $INSREQ_BUILD_LOG)"
+    while [ ! -f "$INSREQ_BUILD_RC" ] && kill -0 "$pid" 2>/dev/null; do sleep 2; done
+    local rc
+    rc=$(cat "$INSREQ_BUILD_RC" 2>/dev/null || echo died)
+    echo "insreq-quick: background build rc=$rc after $(cat "$INSREQ_BUILD_SECS" 2>/dev/null || echo ?)s, waited $((SECONDS - t0))s here"
+    if [ "$rc" != 0 ]; then
+      tail -n 20 "$INSREQ_BUILD_LOG" 2>/dev/null
+      check 1 "insreq-quick: the release-perf build failed (rc=$rc), see $INSREQ_BUILD_LOG"
+      return
+    fi
+    run_plain python3 tools/measure/insreq_gate.py --cand-bin "$INSREQ_BUILD_TARGET/release-perf/alcyon" --cand-label "this tree"
+    check "$?" "insreq-quick (ins/req over budget, or not measured)"
+  fi
+}
+
+# The insreq-quick candidate build, started before the first stage when that stage will count,
+# so the fat-LTO build overlaps the suite instead of adding ~4-5 min after it. Plain env, its own
+# target ($PLAIN_TARGET_DIR/insreq-quick: never the suite's cargo lock), nice 19 and -j
+# ALCYON_INSREQ_BUILD_JOBS (default 8) so the suite's timing tests keep their CPUs. Its own
+# process group (setsid), killed on any exit of this script (EXIT trap), and by its own watchdog
+# when this script is gone (SIGKILL runs no trap). A TERM to this script alone waits, as for
+# every stage, until the running stage's command returns; Ctrl-C (the whole group) does not.
+INSREQ_BUILD_TARGET=$PLAIN_TARGET_DIR/insreq-quick
+INSREQ_BUILD_LOG=$RUN_DIR/insreq-build.log
+INSREQ_BUILD_RC=$RUN_DIR/insreq-build.rc
+INSREQ_BUILD_SECS=$RUN_DIR/insreq-build.secs
+INSREQ_BUILD_PIDFILE=$RUN_DIR/insreq-build.pid
+insreq_build_start() {
+  case " ${SELECTED[*]} " in *" insreq-quick "*) ;; *) return 0 ;; esac
+  [ "${ALCYON_GATE_SKIP_INSREQ:-}" != 1 ] && [ "${ALCYON_GATE_SKIP_MEASURE:-}" = 1 ] || return 0
+  [ -z "${ALCYON_CHECKIN_FAKE:-}" ] || return 0
+  setsid env -u RUSTFLAGS -u LLVM_PROFILE_FILE -u ALCYON_INSTRUMENTED \
+      CARGO_TARGET_DIR="$INSREQ_BUILD_TARGET" CARGO_INCREMENTAL=0 \
+      bash -c '# A checkin that dies without running its EXIT trap (SIGKILL) takes the build with it.
+               ( while kill -0 "$5" 2>/dev/null; do sleep 5; done; kill -TERM -- "-$$" ) & w=$!
+               t0=$SECONDS; nice -n 19 cargo build --profile release-perf --bin alcyon -j "$1" > "$2" 2>&1
+               rc=$?; kill "$w" 2>/dev/null; echo $((SECONDS - t0)) > "$4"; echo $rc > "$3"' \
+      insreq-build "${ALCYON_INSREQ_BUILD_JOBS:-8}" "$INSREQ_BUILD_LOG" "$INSREQ_BUILD_RC" "$INSREQ_BUILD_SECS" $$ &
+  echo $! > "$INSREQ_BUILD_PIDFILE"
+  echo "checkin: insreq-quick: release-perf build started in the background (pid $!, -j ${ALCYON_INSREQ_BUILD_JOBS:-8}, nice 19, $INSREQ_BUILD_TARGET)"
+}
+insreq_build_stop() {
+  local pid
+  [ -f "$INSREQ_BUILD_PIDFILE" ] && [ ! -f "$INSREQ_BUILD_RC" ] || return 0
+  pid=$(cat "$INSREQ_BUILD_PIDFILE")
+  # setsid made pid its own process group leader: the group is the build and every rustc.
+  kill -TERM -- "-$pid" 2>/dev/null && echo "checkin: insreq-quick: background build (group $pid) stopped"
+}
+trap insreq_build_stop EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 stage_surface() {
   echo "-- uncommitted:"
   git diff --stat | tail -1
@@ -435,6 +511,7 @@ fake_stage() {
 # --- run -------------------------------------------------------------------------------
 GATE_KIND=$(gate_kind); GATE_LOAD0=$(gate_load_pct); GATE_BAND=$(gate_load_band "$GATE_LOAD0")
 [ "$MODE" != all ] || whole_hint "$GATE_KIND" "$GATE_BAND" "$GATE_LOAD0" | sed 's/^/checkin: /'
+insreq_build_start
 RAN=()
 for id in "${SELECTED[@]}"; do
   now=$((SECONDS - GATE_T0))
