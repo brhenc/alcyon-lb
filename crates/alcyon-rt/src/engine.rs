@@ -2690,6 +2690,8 @@ pub struct Engine {
     /// for the `ssl_fc_cipherlist_*` fetches; 0 keeps none.
     ssl_capture_size: usize,
     ssl_ja4_spec: bool,
+    /// True when any proxy in `proxies` has a server with `observe` enabled.
+    has_observe: bool,
     /// `tune.maxaccept`: how many connections one listener wakeup accepts in a row before
     /// the pass goes on to its other work (`listener_accept`: `for (; max_accept;
     /// max_accept--)`); the rest of the backlog is found by the next pass, the listener
@@ -5928,6 +5930,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             .iter()
             .filter(|p| matches!(p.balance, BalanceAlgorithm::Uri | BalanceAlgorithm::Source))
             .count();
+        let has_observe = proxies.iter().any(|p| p.has_observe);
 
         let mut engine = Engine {
             quic_listeners,
@@ -5976,6 +5979,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             global_bufsize: bufsize,
             ssl_capture_size: config.global.as_ref().map_or(0, |g| g.tune_ssl_capture_buffer_size),
             ssl_ja4_spec: config.global.as_ref().is_some_and(|g| g.alcyon_ja4_compat_spec),
+            has_observe,
             global_maxrewrite: config
                 .global
                 .as_ref()
@@ -6153,6 +6157,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 // publisher that no event of this worker reads an older one.
                 crate::mailbox::Msg::Table(t, g) => {
                     g.reply(wid, t.epoch());
+                    self.has_observe = t.iter().any(|p| p.has_observe);
                     self.proxies = Proxies::from_table(t);
                 }
                 crate::mailbox::Msg::Shutdown(f, g) => {
@@ -7071,6 +7076,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             mailboxes: &self.mailboxes,
             worker_id: self.mailbox_wid,
             quic_listeners: &mut self.quic_listeners,
+            has_observe: self.has_observe,
             hk_due: 0,
             wake_now: std::mem::take(&mut self.wake_now_scratch),
             links: std::mem::take(&mut self.links_scratch),
@@ -9854,6 +9860,7 @@ struct EngineDispatcher<'a> {
     worker_id: usize,
     /// The QUIC listeners, which the owners of HTTP/3 connections read and write (T509).
     quic_listeners: &'a mut [crate::quic_listener::QuicListener],
+    has_observe: bool,
 }
 
 /// What a stream's release changes beside the entries of the stream and its connection: the
@@ -10458,27 +10465,36 @@ fn count_redispatch_pick_on<'a, R: crate::statcnt::Rows<'a>>(rows: R, be: &'a Pr
 /// A connect attempt to the stream's server failed (`back_handle_st_cer`): while retries
 /// remain, connect again -- after the turnaround (`SC_ST_TAR`) when `wait`, an asynchronous
 /// connect error, and the server is the same one; at once after a connect refused at once.
-#[inline]
+#[cold]
+#[inline(never)]
 fn observe_http(entry: &SessionEntry, proxies: &crate::table::Table, status: crate::check::HanaStatus) {
     observe_http_ids(proxies, entry.srv_backend_idx, entry.target_server_idx, status);
 }
 
-#[inline]
+#[cold]
+#[inline(never)]
+fn observe_http_valid(entry: &SessionEntry, proxies: &crate::table::Table, status: u16) {
+    let hana = if status >= 100 && (status < 500 || status == 501 || status == 505) {
+        crate::check::HanaStatus::HttpOk
+    } else {
+        crate::check::HanaStatus::HttpSts
+    };
+    observe_http_ids(proxies, entry.srv_backend_idx, entry.target_server_idx, hana);
+}
+
+#[cold]
+#[inline(never)]
 fn observe_http_ids(proxies: &crate::table::Table, srv_backend_idx: usize, target_server_idx: Option<usize>, status: crate::check::HanaStatus) {
-    if proxies.has_observe() {
-        if let Some(i) = target_server_idx {
-            crate::check::health_adjust(proxies, srv_backend_idx, i, status);
-        }
+    if let Some(i) = target_server_idx {
+        crate::check::health_adjust(proxies, srv_backend_idx, i, status);
     }
 }
 
-#[inline]
-fn mark_server_connected(entry: &mut SessionEntry, proxies: &crate::table::Table, now: Tick) {
-    entry.sess.server_connected(now);
-    if proxies.has_observe() {
-        if let Some(i) = entry.target_server_idx {
-            crate::check::health_adjust(proxies, entry.srv_backend_idx, i, crate::check::HanaStatus::L4Ok);
-        }
+#[cold]
+#[inline(never)]
+fn observe_l4_ok(entry: &SessionEntry, proxies: &crate::table::Table) {
+    if let Some(i) = entry.target_server_idx {
+        crate::check::health_adjust(proxies, entry.srv_backend_idx, i, crate::check::HanaStatus::L4Ok);
     }
 }
 
@@ -10750,6 +10766,7 @@ fn retry_server_connect(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_srv_connect(
     entry: &mut SessionEntry,
     proxies: &crate::table::Table,
@@ -10757,6 +10774,7 @@ fn check_srv_connect(
     poller: &mut Poller,
     now: Tick,
     lb_snap: &mut crate::lb::LbSnapCache,
+    has_observe: bool,
 ) {
     if entry.sess.srv_state == ScState::Connecting {
         if let Some(sfd) = entry.srv_raw_fd {
@@ -10767,7 +10785,10 @@ fn check_srv_connect(
                 );
 
                 if let Ok(None) = conn_err {
-                    mark_server_connected(entry, proxies, now);
+                    entry.sess.server_connected(now);
+                    if has_observe {
+                        observe_l4_ok(entry, proxies);
+                    }
                     let (_, srv_want) = entry.sess.interests();
                     let new_interest = Interest {
                         readable: srv_want.read,
@@ -11201,6 +11222,7 @@ impl EngineDispatcher<'_> {
         log_tag: &str,
         fc: Option<crate::proxy::ConnView<'_>>,
         nice_updates: &mut Vec<(TaskRef, i16)>,
+        has_observe: bool,
     ) -> Option<crate::stats_html::AdminAction> {
         // An HTTP/2 connection serving a stream is not between requests: the stream is its
         // child's, which ends it (T280).
@@ -11408,7 +11430,7 @@ impl EngineDispatcher<'_> {
                 if Self::l7_retry(entry, proxies, fdtab, poller, now, lb_snap) {
                     continue;
                 }
-                if !Self::apply_http_response_rules(entry, proxies, now, pid, log_targets, log_tag, fc, &mut set_nice_res) {
+                if !Self::apply_http_response_rules(entry, proxies, now, pid, log_targets, log_tag, fc, &mut set_nice_res, has_observe) {
                     Self::write_response_head_names(entry, proxies);
                 }
                 if let Some(n) = set_nice_res.take() {
@@ -11421,7 +11443,7 @@ impl EngineDispatcher<'_> {
             // An HTTP/2 stream's response goes to the client through its connection's owner
             // (`h2_bridge::forward_response` in `h2_owner_pass`, T280), which drops an
             // interim response and runs the stream again for the head behind it.
-            Self::http_server_side(entry, proxies);
+            Self::http_server_side(entry, proxies, has_observe);
             let next_head = entry.sess.strm.txn.as_ref().is_some_and(|t| t.rsp == MsgState::Waiting)
                 && !entry.sess.rep.is_empty()
                 && snapshot(entry) != top;
@@ -11799,7 +11821,7 @@ impl EngineDispatcher<'_> {
     }
 
     /// How the server side ended, if it has, for a response the server is sending.
-    fn http_server_side(entry: &mut SessionEntry, proxies: &crate::table::Table) {
+    fn http_server_side(entry: &mut SessionEntry, proxies: &crate::table::Table, has_observe: bool) {
         let srv_eof = matches!(entry.sess.srv_state, ScState::ShutR | ScState::Closed);
         let srv_err = entry.sess.srv_state == ScState::Error;
         let h2_child = entry.sess.is_h2_child();
@@ -11862,7 +11884,9 @@ impl EngineDispatcher<'_> {
                 crate::txn::BodyCheck::Fine => false,
             };
             if refused {
-                observe_http_ids(proxies, srv_be_idx, target_srv_idx, crate::check::HanaStatus::HttpRsp);
+                if has_observe {
+                    observe_http_ids(proxies, srv_be_idx, target_srv_idx, crate::check::HanaStatus::HttpRsp);
+                }
                 txn.srv_reusable = false;
                 entry.sess.rep.clear();
                 entry.sess.strm.log.term = Some(*b"PH");
@@ -11876,7 +11900,9 @@ impl EngineDispatcher<'_> {
         if !(srv_eof || srv_err) && !txn.local && !txn.aborted && matches!(txn.rsp, MsgState::Body(_)) && !h2_child {
             let check = txn.rsp.check_body(entry.sess.rep.readable());
             if check.stuck(entry.sess.rep.len(), entry.sess.bufsize) {
-                observe_http_ids(proxies, srv_be_idx, target_srv_idx, crate::check::HanaStatus::HttpRsp);
+                if has_observe {
+                    observe_http_ids(proxies, srv_be_idx, target_srv_idx, crate::check::HanaStatus::HttpRsp);
+                }
                 txn.srv_reusable = false;
                 txn.close_after = true;
                 txn.aborted = true;
@@ -11911,14 +11937,16 @@ impl EngineDispatcher<'_> {
                 // An h2 server's malformed response is the server's fault, not a lost
                 // connection: `PH--` whether or not it was reused (T540).
                 let bad = entry.sess.srv_xprt.bad_response();
-                let hana = if status == 504 {
-                    crate::check::HanaStatus::HttpReadTimeout
-                } else if bad {
-                    crate::check::HanaStatus::HttpHdrRsp
-                } else {
-                    crate::check::HanaStatus::HttpBrokenPipe
-                };
-                observe_http_ids(proxies, srv_be_idx, target_srv_idx, hana);
+                if has_observe {
+                    let hana = if status == 504 {
+                        crate::check::HanaStatus::HttpReadTimeout
+                    } else if bad {
+                        crate::check::HanaStatus::HttpHdrRsp
+                    } else {
+                        crate::check::HanaStatus::HttpBrokenPipe
+                    };
+                    observe_http_ids(proxies, srv_be_idx, target_srv_idx, hana);
+                }
                 if status == 502 && txn.srv_reused && entry.sess.rep.is_empty() && !bad {
                     // `abort_keep_alive`: a keep-alive request lost to a network error,
                     // nothing of a response received. The client retries only if it
@@ -12518,7 +12546,7 @@ impl EngineDispatcher<'_> {
 
             // Step 1: Server connect check if connecting
             let was_connected = entry.sess.strm.log.connect.is_some();
-            check_srv_connect(entry, self.proxies, self.fdtab, self.poller, now, self.lb_snap);
+            check_srv_connect(entry, self.proxies, self.fdtab, self.poller, now, self.lb_snap, self.has_observe);
             let emit = LogEmit { targets: &self.log_targets, tag: &self.log_tag, pid: self.pid };
             log_if_newly_connected(was_connected, entry, self.proxies, emit);
 
@@ -12760,6 +12788,7 @@ impl EngineDispatcher<'_> {
                     &self.log_tag,
                     fc,
                     &mut self.nice_updates,
+                    self.has_observe,
                 );
             }
 
@@ -13257,6 +13286,7 @@ impl EngineDispatcher<'_> {
     /// The response head's rules, framing and `Connection`. True when the head's names are
     /// in lower case already, from its index (E2), and [`Self::write_response_head_names`]
     /// has nothing to do.
+    #[allow(clippy::too_many_arguments)]
     fn apply_http_response_rules(
         entry: &mut SessionEntry,
         proxies: &crate::table::Table,
@@ -13266,6 +13296,7 @@ impl EngineDispatcher<'_> {
         log_tag: &str,
         fc: Option<crate::proxy::ConnView<'_>>,
         set_nice: &mut Option<i16>,
+        has_observe: bool,
     ) -> bool {
         if let Some(c) = entry.sess.h2_child_mut() {
             c.rsp_head = None;
@@ -13274,7 +13305,7 @@ impl EngineDispatcher<'_> {
         let mut do_log_res = None;
         let mut do_log_after = None;
         let was_waiting = entry.sess.strm.txn.as_ref().is_some_and(|t| t.rsp == MsgState::Waiting);
-        Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered, pid, &mut do_log_res, &mut do_log_after, fc, set_nice);
+        Self::apply_http_response_rules_in(entry, proxies, now, &mut lowered, pid, &mut do_log_res, &mut do_log_after, fc, set_nice, has_observe);
         // A `do-log` at `http-response`/`http-after-response` (and `log-steps response`) sends
         // the stream's line for its step. The response head is borrowed by the rules' context
         // inside the `_in` function, so the send runs here, once that context is gone.
@@ -13295,7 +13326,7 @@ impl EngineDispatcher<'_> {
         lowered
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn apply_http_response_rules_in(
         entry: &mut SessionEntry,
         proxies: &crate::table::Table,
@@ -13306,6 +13337,7 @@ impl EngineDispatcher<'_> {
         do_log_after: &mut Option<i8>,
         fc: Option<crate::proxy::ConnView<'_>>,
         set_nice: &mut Option<i16>,
+        has_observe: bool,
     ) {
         let threshold = entry.sess.bufsize.saturating_sub(entry.sess.maxrewrite);
         // Empty lines ahead of a status line are skipped (`H1_MSG_RPBEFORE`), so that the
@@ -13322,7 +13354,9 @@ impl EngineDispatcher<'_> {
             // No end of head and no room for more: as for a request, from `bufsize - 56`
             // (T265).
             if entry.sess.rep.readable().len() > threshold || entry.sess.rep.readable().len() + 56 >= entry.sess.bufsize {
-                observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
+                if has_observe {
+                    observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
+                }
                 entry.sess.rep.clear();
                 reply_error(entry, proxies, 502);
             }
@@ -13372,7 +13406,9 @@ impl EngineDispatcher<'_> {
             }
             match checked {
                 alcyon_proto::response_head::ResponseHead::Invalid => {
-                    observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
+                    if has_observe {
+                        observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
+                    }
                     entry.sess.rep.clear();
                     entry.sess.strm.log.term.get_or_insert(*b"PH");
                     entry.sess.strm.log.bytes_from_server = 0;
@@ -13380,13 +13416,8 @@ impl EngineDispatcher<'_> {
                     return;
                 }
                 alcyon_proto::response_head::ResponseHead::Valid { status, rewrite, close_server: close, index: ix } => {
-                    if proxies.has_observe() {
-                        let hana = if status >= 100 && (status < 500 || status == 501 || status == 505) {
-                            crate::check::HanaStatus::HttpOk
-                        } else {
-                            crate::check::HanaStatus::HttpSts
-                        };
-                        observe_http(entry, proxies, hana);
+                    if has_observe {
+                        observe_http_valid(entry, proxies, status);
                     }
                     close_server = close;
                     index = ix;
@@ -13413,7 +13444,9 @@ impl EngineDispatcher<'_> {
                     match verdict {
                         crate::websocket::Verdict::Keep => {}
                         crate::websocket::Verdict::Refuse => {
-                            observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
+                            if has_observe {
+                                observe_http(entry, proxies, crate::check::HanaStatus::HttpHdrRsp);
+                            }
                             entry.sess.rep.clear();
                             entry.sess.strm.log.term.get_or_insert(*b"PH");
                             entry.sess.strm.log.bytes_from_server = 0;
@@ -16364,7 +16397,10 @@ impl EngineDispatcher<'_> {
                 if !counted {
                     server_actconn_add(entry, proxies, true);
                 }
-                mark_server_connected(entry, proxies, now);
+                entry.sess.server_connected(now);
+                if proxies[be_idx].has_observe {
+                    observe_l4_ok(entry, proxies);
+                }
                 entry.sess.flags.clear(sess_flags::BC_IDLE);
                 if let Some(txn) = entry.sess.strm.txn.as_mut() {
                     txn.srv_reused = true;
@@ -16432,7 +16468,10 @@ impl EngineDispatcher<'_> {
             let sfd = srv_fd.as_raw_fd();
             entry.srv_raw_fd = Some(sfd);
             entry.sess.attach_server_from(srv_fd, xprt, src, now);
-            mark_server_connected(entry, proxies, now);
+            entry.sess.server_connected(now);
+            if proxies[be_idx].has_observe {
+                observe_l4_ok(entry, proxies);
+            }
             if let Some(txn) = entry.sess.strm.txn.as_mut() {
                 txn.srv_reused = true;
             }
