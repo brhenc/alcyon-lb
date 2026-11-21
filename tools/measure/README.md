@@ -83,8 +83,12 @@ main unmeasured and the next measured gate found keepalive +1.8% and rules +2.5%
   (also a FAIL in the gate) when it could not measure.
 - **Skip:** `ALCYON_GATE_SKIP_INSREQ=1`, recorded as the stage's skip and part of the gate
   state's key. A running `wwm.exe` is noted in the output and changes nothing.
-- **Cost (measured 2026-11-21):** the release-perf build of the tree ~306 s (fat LTO), the
-  reference's ~300 s once per (commit, rustc), the counting ~11 s.
+- **Cost (measured 2026-11-21):** the release-perf build of the tree ~306 s (fat LTO) is
+  started by checkin.sh in the background before the first stage (nice 19, `-j
+  ALCYON_INSREQ_BUILD_JOBS`, default 8, target `$CARGO_TARGET_DIR/insreq-quick`, its own process
+  group, killed on exit), so it overlaps the suite: in a full gate it took 236 s and the stage
+  waited 0 s for it. Then the reference's build, ~300-313 s once per (commit, rustc), and the
+  counting ~11 s. A failed background build fails the stage with its log's path.
 
 Spread on 2026-11-21 (a65a069d against c246669a, the same two binaries):
 
