@@ -553,6 +553,23 @@ class ReportObjects(unittest.TestCase):
         self.assertEqual(covercheck.report_objects(self.debug, {test_bin}), [test_bin])
 
 
+class BraceOnlyLines(unittest.TestCase):
+    """2026-11-21, rustc 1.100: the compiler started giving a closing brace its own
+    counter, zero when the `if` before it was never false, while the body above it ran.
+    covercheck reported 29 such lines in 11 files. A brace has no statement of its own
+    and was never meant to be judged (`read_lcov`): a line that is only closing
+    punctuation is not a miss."""
+
+    SRC = ["fn f(x: bool) {", "    if x {", "        g();", "    }", "    });", "    h()", "}"]
+
+    def test_a_brace_only_line_is_not_a_miss(self):
+        changed = {"a.rs": {2, 3, 4, 5, 6}}
+        execd = {"a.rs": {2, 3, 4, 5, 6}}
+        hit = {"a.rs": {2, 3}}
+        self.assertEqual(covercheck.misses(changed, execd, hit, source=lambda f: self.SRC),
+                         {"a.rs": [6]})
+
+
 class ScopedMode(unittest.TestCase):
     """T609: `covercheck.py --tests <crate>:<target>[:<filter>]` judges the changed lines by
     the selected tests only, prints the candidates and always exits 0 (advisory)."""
