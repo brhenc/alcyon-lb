@@ -1048,6 +1048,9 @@ pub fn health_adjust(
     status: HanaStatus,
 ) {
     let Some(px) = proxies.get(p) else { return };
+    if !px.has_observe {
+        return;
+    }
     let Some(slot) = px.ids.srv.observe_slot(s) else { return };
     let kind = status.classify(slot.observe);
     if kind == 0 {

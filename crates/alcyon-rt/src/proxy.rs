@@ -1006,126 +1006,102 @@ impl Drop for ReqText {
     }
 }
 
-/// Bit masks for [`SessFlags`] (`HAProxy`'s `s->flags`).
+/// Bit masks for [`SessFlags`] (`HAProxy`'s `s->flags`), holding the less frequent
+/// session flags while the hottest per-pass/per-request flags sit as plain `bool` fields
+/// on [`TcpSession`] to avoid 64-bit RMWs and enable store-to-load forwarding.
 pub mod sess_flags {
-    /// HTX buffer holds a parsed request head.
-    pub const HAS_HTX: u64 = 1 << 0;
-    /// HTX was edited since the head in `req` was written from it.
-    pub const HTX_MODIFIED: u64 = 1 << 1;
-    /// An HTTP/2 or HTTP/3 request head is in the HTX alone, not yet written to `req`.
-    pub const REQ_HEAD_PENDING: u64 = 1 << 2;
     /// `option httpclose` (or stopping): close client connection after response.
-    pub const CLOSE_CLIENT: u64 = 1 << 3;
+    pub const CLOSE_CLIENT: u32 = 1 << 0;
     /// Process is stopping: each response closes the client connection.
-    pub const STOPPING: u64 = 1 << 4;
-    /// `option http-drop-request-trailers` of the chosen backend.
-    pub const DROP_REQ_TRAILERS: u64 = 1 << 5;
+    pub const STOPPING: u32 = 1 << 1;
     /// `option http-drop-response-trailers` of the frontend.
-    pub const DROP_RSP_TRAILERS: u64 = 1 << 6;
-    /// `req_exp` is the idle wait, not a request head's.
-    pub const REQ_IDLE: u64 = 1 << 7;
+    pub const DROP_RSP_TRAILERS: u32 = 1 << 2;
     /// Server connection stays on the session between transactions.
-    pub const SRV_KEPT: u64 = 1 << 8;
-    /// Backend retries a failed connection (`retry-on conn-failure`).
-    pub const RETRY_CONN: u64 = 1 << 9;
-    /// Stream was redispatched (`SF_REDISP`).
-    pub const REDISPATCHED: u64 = 1 << 10;
-    /// Kept server connection is idle between transactions.
-    pub const BC_IDLE: u64 = 1 << 11;
-    /// Load balancer picked the stream's server (not `use-server`/cookie/stick).
-    pub const LB_PICKED: u64 = 1 << 12;
-    /// `tcp-request session` rules wait for the PROXY header.
-    pub const SESSION_RULES_PENDING: u64 = 1 << 13;
+    pub const SRV_KEPT: u32 = 1 << 3;
     /// One of the rare checks of a stream run may be armed.
-    pub const RARE_ARMED: u64 = 1 << 14;
-    /// PROXY header has already been prepended on the server connection.
-    pub const SEND_PROXY_PREPENDED: u64 = 1 << 15;
-    /// Server socket is drained (`fd_cant_recv`).
-    pub const SRV_CANT_RECV: u64 = 1 << 16;
-    /// Client socket is drained (`fd_cant_recv`).
-    pub const CLI_CANT_RECV: u64 = 1 << 17;
-    /// Last `advance` stopped at its pass bound while still making progress.
-    pub const PASSES_RAN_OUT: u64 = 1 << 18;
-    /// Client connection failed (TLS error, socket error), not a clean close/reset.
-    pub const CLI_FAILED: u64 = 1 << 19;
+    pub const RARE_ARMED: u32 = 1 << 4;
     /// Frontend `tcp-request content` rules are done.
-    pub const TCP_INSPECT_DONE: u64 = 1 << 20;
-    /// Backend `tcp-request content` rules are waiting.
-    pub const BE_INSPECT: u64 = 1 << 21;
-    /// First GOAWAY of an HTTP/2 `timeout client` has been sent.
-    pub const H2_IDLE_GOAWAY: u64 = 1 << 22;
-    /// 400 linger for a stalled upload: hold client for one more `timeout client`.
-    pub const CLI_LINGER: u64 = 1 << 23;
-    /// H2 output was waiting for the client when the timer was last set.
-    pub const H2_OUT_WAITED: u64 = 1 << 24;
-    /// H2 request head was partly received when the timer was last set.
-    pub const H2_HEAD_PARTIAL: u64 = 1 << 25;
-    /// First request on this connection.
-    pub const IS_FIRST_REQ: u64 = 1 << 26;
-    /// Client reset was reported with the first bytes of its request.
-    pub const RESET_WITH_REQUEST: u64 = 1 << 27;
+    pub const TCP_INSPECT_DONE: u32 = 1 << 5;
     /// Keep each request line for the log (`txn->uri`).
-    pub const KEEP_REQUEST_LINE: u64 = 1 << 28;
-    /// `option accept-unsafe-violations-in-http-request` on the frontend.
-    pub const ACCEPT_UNSAFE_REQUEST: u64 = 1 << 29;
+    pub const KEEP_REQUEST_LINE: u32 = 1 << 6;
+    /// PROXY header has already been prepended on the server connection.
+    pub const SEND_PROXY_PREPENDED: u32 = 1 << 7;
+    /// Backend retries a failed connection (`retry-on conn-failure`).
+    pub const RETRY_CONN: u32 = 1 << 8;
+    /// Stream was redispatched (`SF_REDISP`).
+    pub const REDISPATCHED: u32 = 1 << 9;
+    /// Load balancer picked the stream's server (not `use-server`/cookie/stick).
+    pub const LB_PICKED: u32 = 1 << 10;
+    /// `tcp-request session` rules wait for the PROXY header.
+    pub const SESSION_RULES_PENDING: u32 = 1 << 11;
+    /// Client connection failed (TLS error, socket error), not a clean close/reset.
+    pub const CLI_FAILED: u32 = 1 << 12;
+    /// Backend `tcp-request content` rules are waiting.
+    pub const BE_INSPECT: u32 = 1 << 13;
+    /// First GOAWAY of an HTTP/2 `timeout client` has been sent.
+    pub const H2_IDLE_GOAWAY: u32 = 1 << 14;
+    /// 400 linger for a stalled upload: hold client for one more `timeout client`.
+    pub const CLI_LINGER: u32 = 1 << 15;
+    /// H2 output was waiting for the client when the timer was last set.
+    pub const H2_OUT_WAITED: u32 = 1 << 16;
+    /// H2 request head was partly received when the timer was last set.
+    pub const H2_HEAD_PARTIAL: u32 = 1 << 17;
+    /// Client reset was reported with the first bytes of its request.
+    pub const RESET_WITH_REQUEST: u32 = 1 << 18;
     /// The `socks4` tunnel's 16-byte request is not yet fully written (`CO_FL_SOCKS4_SEND`).
-    pub const SOCKS4_SEND: u64 = 1 << 30;
+    pub const SOCKS4_SEND: u32 = 1 << 19;
     /// The `socks4` tunnel's 8-byte reply is not yet read (`CO_FL_SOCKS4_RECV`).
-    pub const SOCKS4_RECV: u64 = 1 << 31;
+    pub const SOCKS4_RECV: u32 = 1 << 20;
     /// The `socks4` handshake failed (`Step::Failed`); retried as a connect failure.
-    pub const SOCKS4_FAILED: u64 = 1 << 32;
+    pub const SOCKS4_FAILED: u32 = 1 << 21;
     /// Bit shift and mask for the `0..=16` bytes already sent in the SOCKS4 request.
-    pub const SOCKS4_SENT_SHIFT: u32 = 33;
-    pub const SOCKS4_SENT_MASK: u64 = 0x1f << SOCKS4_SENT_SHIFT;
+    pub const SOCKS4_SENT_SHIFT: u32 = 22;
+    pub const SOCKS4_SENT_MASK: u32 = 0x1f << SOCKS4_SENT_SHIFT;
     /// Every `SOCKS4_*` flag bit.
-    pub const SOCKS4_ALL: u64 = SOCKS4_SEND | SOCKS4_RECV | SOCKS4_FAILED | SOCKS4_SENT_MASK;
+    pub const SOCKS4_ALL: u32 = SOCKS4_SEND | SOCKS4_RECV | SOCKS4_FAILED | SOCKS4_SENT_MASK;
 }
 
 /// Packed boolean flags on [`TcpSession`].
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct SessFlags(pub u64);
+pub struct SessFlags(pub u32);
 
 impl SessFlags {
     /// Returns `true` if any bit in `f` is set.
     #[must_use]
-    #[inline]
-    pub const fn has(self, f: u64) -> bool {
+    #[inline(always)]
+    pub const fn has(self, f: u32) -> bool {
         self.0 & f != 0
     }
 
     /// Sets every bit in `f`.
-    #[inline]
-    pub const fn set(&mut self, f: u64) {
+    #[inline(always)]
+    pub const fn set(&mut self, f: u32) {
         self.0 |= f;
     }
 
     /// Clears every bit in `f`.
-    #[inline]
-    pub const fn clear(&mut self, f: u64) {
+    #[inline(always)]
+    pub const fn clear(&mut self, f: u32) {
         self.0 &= !f;
     }
 
     /// Sets or clears every bit in `f` according to `val`.
-    #[inline]
-    pub const fn set_to(&mut self, f: u64, val: bool) {
-        if val {
-            self.0 |= f;
-        } else {
-            self.0 &= !f;
-        }
+    #[inline(always)]
+    pub const fn set_to(&mut self, f: u32, val: bool) {
+        self.0 = (self.0 & !f) | (0u32.wrapping_sub(val as u32) & f);
     }
 
     /// Clears `f` and returns whether any bit in `f` was set.
-    #[inline]
-    pub const fn take(&mut self, f: u64) -> bool {
+    #[inline(always)]
+    pub const fn take(&mut self, f: u32) -> bool {
         let was = self.has(f);
         self.clear(f);
         was
     }
 
     /// Sets or clears `f` according to `val` and returns the previous state.
-    #[inline]
-    pub const fn replace(&mut self, f: u64, val: bool) -> bool {
+    #[inline(always)]
+    pub const fn replace(&mut self, f: u32, val: bool) -> bool {
         let was = self.has(f);
         self.set_to(f, val);
         was
@@ -1149,7 +1125,7 @@ pub enum AcceptProxy {
 impl AcceptProxy {
     /// Returns `true` while waiting for the client's PROXY header.
     #[must_use]
-    #[inline]
+    #[inline(always)]
     pub const fn is_pending(self) -> bool {
         matches!(self, Self::Any | Self::V2Only)
     }
@@ -1293,8 +1269,30 @@ pub struct TcpSession {
     pub accept_proxy: AcceptProxy,
     /// Forced client HTTP protocol (`proto h2` or HTTP/3).
     pub client_proto: ClientProto,
-    /// Packed boolean session flags (`HAProxy`'s `s->flags`).
+    /// Packed boolean session flags (`HAProxy`'s `s->flags`, less frequent bits).
     pub flags: SessFlags,
+    /// HTX buffer holds a parsed request head.
+    pub has_htx: bool,
+    /// HTX was edited since the head in `req` was written from it.
+    pub htx_modified: bool,
+    /// An HTTP/2 or HTTP/3 request head is in the HTX alone, not yet written to `req`.
+    pub req_head_pending: bool,
+    /// Client socket is drained (`fd_cant_recv`).
+    pub cli_cant_recv: bool,
+    /// Server socket is drained (`fd_cant_recv`).
+    pub srv_cant_recv: bool,
+    /// Last `advance` stopped at its pass bound while still making progress.
+    pub passes_ran_out: bool,
+    /// First request on this connection.
+    pub is_first_req: bool,
+    /// `req_exp` is the idle wait, not a request head's.
+    pub req_idle: bool,
+    /// `option accept-unsafe-violations-in-http-request` on the frontend.
+    pub accept_unsafe_request: bool,
+    /// `option http-drop-request-trailers` of the chosen backend.
+    pub drop_req_trailers: bool,
+    /// Kept server connection is idle between transactions.
+    pub bc_idle: bool,
     pub proxy_info: Option<Box<alcyon_proto::ProxyInfo>>,
     pub server_addr: Option<SocketAddr>,
     /// The PROXY header the server connection opened with, if any: a later request reuses
@@ -1467,7 +1465,7 @@ impl Drop for TcpSession {
 
 impl TcpSession {
     /// The bind id (`so_id`), or `None` when unset (`0`).
-    #[inline]
+    #[inline(always)]
     #[must_use]
     pub const fn so_id_opt(&self) -> Option<u32> {
         if self.so_id != 0 {
@@ -1558,7 +1556,7 @@ impl TcpSession {
     /// `%bi` and `%bp`: the local address of the server connection.
     #[must_use]
     pub fn bc_src(&self) -> Option<SocketAddr> {
-        self.bc_src.filter(|_| !self.flags.has(sess_flags::BC_IDLE))
+        self.bc_src.filter(|_| !self.bc_idle)
     }
 
     /// `bc_dst`: where the server connection was made, or is being made, to -- the
@@ -1572,7 +1570,7 @@ impl TcpSession {
     /// connection with the new destination.
     #[must_use]
     pub fn bc_dst(&self) -> Option<SocketAddr> {
-        self.target_addr.filter(|_| !self.flags.has(sess_flags::BC_IDLE)).map(|t| crate::engine::connect_addr(t, self.server_addr))
+        self.target_addr.filter(|_| !self.bc_idle).map(|t| crate::engine::connect_addr(t, self.server_addr))
     }
 
     /// Whether the session is a stream of an HTTP/2 connection (T280).
@@ -1750,10 +1748,9 @@ impl TcpSession {
     /// starts (T300). [`Self::h2_child_done`] gives back what the stream changed.
     #[must_use]
     pub fn h2_child_of(owner: &mut TcpSession, owner_ref: (u32, alcyon_sched::TaskRef), stream: H2ActiveStream) -> TcpSession {
-        const INHERIT_CONN_FLAGS: u64 = sess_flags::DROP_RSP_TRAILERS
+        const INHERIT_CONN_FLAGS: u32 = sess_flags::DROP_RSP_TRAILERS
             | sess_flags::RESET_WITH_REQUEST
-            | sess_flags::KEEP_REQUEST_LINE
-            | sess_flags::ACCEPT_UNSAFE_REQUEST;
+            | sess_flags::KEEP_REQUEST_LINE;
         let mut c = TcpSession::new_with_mode(ClientSide::H2Child, owner.mode, Vec::new(), Vec::new(), owner.timeouts, owner.max_retries, Tick::ETERNITY);
         c.cli_exp = Tick::ETERNITY;
         c.parser_kind = owner.parser_kind;
@@ -1770,6 +1767,7 @@ impl TcpSession {
         c.bufsize = owner.bufsize;
         c.maxrewrite = owner.maxrewrite;
         c.h2_flood_config = owner.h2_flood_config;
+        c.accept_unsafe_request = owner.accept_unsafe_request;
         c.flags.set(owner.flags.0 & INHERIT_CONN_FLAGS);
         c.h2_child_init(owner, owner_ref, stream);
         c
@@ -1829,7 +1827,7 @@ impl TcpSession {
         // stream before keeps its request line's memory.
         c.strm.log.clone_from(&owner.strm.log);
         c.tracked_sc.clone_from(&owner.tracked_sc);
-        c.flags.set_to(sess_flags::IS_FIRST_REQ, owner.flags.has(sess_flags::IS_FIRST_REQ));
+        c.is_first_req = owner.is_first_req;
         // A session that served a stream before has its role and its strings still.
         if let Some(H2Role::Child(ch)) = c.h2_role.as_deref_mut() {
             let H2Child { owner: o, stream: st, late_trailers, rsp_head, reset, finished, conn_end, owner_tx_pending, rst, goaway, tls: _, quic_ack, req_abs, sess_vars_at_start } = ch;
@@ -1902,15 +1900,13 @@ impl TcpSession {
     /// `h2s` and `struct stream` instead).
     #[allow(clippy::too_many_lines)] // one line per field, by design
     pub fn park_h2_child(&mut self) {
-        const KEEP_ON_PARK: u64 = sess_flags::CLOSE_CLIENT
+        const KEEP_ON_PARK: u32 = sess_flags::CLOSE_CLIENT
             | sess_flags::STOPPING
             | sess_flags::DROP_RSP_TRAILERS
             | sess_flags::RARE_ARMED
             | sess_flags::TCP_INSPECT_DONE
-            | sess_flags::IS_FIRST_REQ
             | sess_flags::RESET_WITH_REQUEST
-            | sess_flags::KEEP_REQUEST_LINE
-            | sess_flags::ACCEPT_UNSAFE_REQUEST;
+            | sess_flags::KEEP_REQUEST_LINE;
         let TcpSession {
             // The connection's, the same for each of its streams (`h2_child_init` copies
             // the ones a stream may change).
@@ -1968,6 +1964,17 @@ impl TcpSession {
             accept_proxy: _,
             client_proto,
             flags,
+            has_htx,
+            htx_modified,
+            req_head_pending,
+            cli_cant_recv,
+            srv_cant_recv,
+            passes_ran_out,
+            is_first_req: _,
+            req_idle,
+            accept_unsafe_request: _,
+            drop_req_trailers,
+            bc_idle,
             proxy_info: _,
             server_addr: _,
             send_proxy_header,
@@ -2028,6 +2035,15 @@ impl TcpSession {
         *ending = None;
         *client_proto = ClientProto::Auto;
         flags.0 = (flags.0 & KEEP_ON_PARK) | sess_flags::RETRY_CONN;
+        *has_htx = false;
+        *htx_modified = false;
+        *req_head_pending = false;
+        *cli_cant_recv = false;
+        *srv_cant_recv = false;
+        *passes_ran_out = false;
+        *req_idle = false;
+        *drop_req_trailers = false;
+        *bc_idle = false;
         send_proxy_header.clear();
         *pending_resp = None;
         *dr_wait = 0;
@@ -2077,7 +2093,7 @@ impl TcpSession {
             // Nothing reads the stream's role once it is over: its entry is being freed.
             sp.role = child.h2_role.take();
         }
-        self.flags.clear(sess_flags::IS_FIRST_REQ);
+        self.is_first_req = false;
         self.ending = None;
         if let Some(exp) = inspect {
             self.flags.clear(sess_flags::TCP_INSPECT_DONE);
@@ -2230,7 +2246,18 @@ impl TcpSession {
             ending: None,
             accept_proxy: AcceptProxy::Off,
             client_proto: ClientProto::Auto,
-            flags: SessFlags(sess_flags::RETRY_CONN | sess_flags::RARE_ARMED | sess_flags::TCP_INSPECT_DONE | sess_flags::IS_FIRST_REQ),
+            flags: SessFlags(sess_flags::RETRY_CONN | sess_flags::RARE_ARMED | sess_flags::TCP_INSPECT_DONE),
+            has_htx: false,
+            htx_modified: false,
+            req_head_pending: false,
+            cli_cant_recv: false,
+            srv_cant_recv: false,
+            passes_ran_out: false,
+            is_first_req: true,
+            req_idle: false,
+            accept_unsafe_request: false,
+            drop_req_trailers: false,
+            bc_idle: false,
             proxy_info: None,
             server_addr: None,
             send_proxy_header: Vec::new(),
@@ -2264,7 +2291,7 @@ impl TcpSession {
             Some("HTTP/3.0")
         } else if self.is_h2() {
             Some("HTTP/2.0")
-        } else if self.flags.has(sess_flags::HAS_HTX) {
+        } else if self.has_htx {
             None
         } else {
             // The head's HTX is gone once it is forwarded: the version is kept apart.
@@ -2274,7 +2301,7 @@ impl TcpSession {
 
     #[must_use]
     pub fn htx_slice(&self) -> Option<alcyon_proto::htx::HtxSliceRef<'_>> {
-        if self.flags.has(sess_flags::HAS_HTX) {
+        if self.has_htx {
             Some(alcyon_proto::htx::HtxSliceRef::new(
                 self.htx_buf.raw_slice(),
                 self.htx_blocks,
@@ -2288,7 +2315,7 @@ impl TcpSession {
     where
         F: FnOnce(&mut alcyon_proto::htx::HtxSlice<'_>) -> R,
     {
-        if !self.flags.has(sess_flags::HAS_HTX) {
+        if !self.has_htx {
             return None;
         }
         let tail = self.htx_tail;
@@ -2299,7 +2326,7 @@ impl TcpSession {
         self.htx_tail = slice.tail_addr();
         self.htx_blocks = slice.num_blocks();
         self.htx_buf.note_htx(self.htx_tail, self.htx_blocks * alcyon_proto::htx::HTX_DESC_SIZE);
-        self.flags.set(sess_flags::HTX_MODIFIED);
+        self.htx_modified = true;
         Some(res)
     }
 
@@ -2318,9 +2345,9 @@ impl TcpSession {
     where
         F: FnOnce(&mut alcyon_proto::htx::HtxSlice<'_>) -> R,
     {
-        let was = self.flags.has(sess_flags::HTX_MODIFIED);
+        let was = self.htx_modified;
         let r = self.with_htx_mut(f);
-        self.flags.set_to(sess_flags::HTX_MODIFIED, was);
+        self.htx_modified = was;
         r
     }
 
@@ -2355,12 +2382,12 @@ impl TcpSession {
     }
 
     pub fn clear_htx(&mut self) {
-        self.flags.clear(sess_flags::HAS_HTX);
+        self.has_htx = false;
         self.htx_head = 0;
         self.htx_tail = 0;
         self.htx_blocks = 0;
-        self.flags.clear(sess_flags::HTX_MODIFIED);
-        self.flags.clear(sess_flags::REQ_HEAD_PENDING);
+        self.htx_modified = false;
+        self.req_head_pending = false;
     }
 
     /// Whether there is output the client may be sent now: response bytes inside the
@@ -2383,7 +2410,7 @@ impl TcpSession {
     /// `timeout connect`.
     #[must_use]
     pub fn wants_rerun(&self) -> bool {
-        self.flags.has(sess_flags::PASSES_RAN_OUT)
+        self.passes_ran_out
             || self.has_undispatched_h2_streams()
             || (self.srv_state == ScState::Error && (self.srv_xprt.handshake_failed() || self.socks4_failed()))
     }
@@ -2430,7 +2457,7 @@ impl TcpSession {
         // ready until the poller reports it, a loop after the accept. That read is the
         // only one the header gets (a part of it is refused as truncated), so reading at
         // accept, before the client's writes are all in, refused headers `HAProxy` takes.
-        self.flags.set(sess_flags::CLI_CANT_RECV);
+        self.cli_cant_recv = true;
     }
 
     pub(crate) fn arm_client(&mut self, now: Tick) {
@@ -2517,7 +2544,7 @@ impl TcpSession {
     fn head_pending(&self) -> bool {
         self.mode == Mode::Http
             && self.strm.txn.is_none()
-            && (self.flags.has(sess_flags::IS_FIRST_REQ) || !self.req.is_empty())
+            && (self.is_first_req || !self.req.is_empty())
             // An HTTP/2 connection serving a stream has its request head (T280).
             && self.h2_owner().is_none_or(|o| o.children.is_empty())
     }
@@ -2525,7 +2552,7 @@ impl TcpSession {
     /// Whether the connection waits for the first byte of its next request: a response has
     /// gone, nothing has come.
     fn idle_wait(&self) -> bool {
-        self.mode == Mode::Http && !self.is_h2() && self.strm.txn.is_none() && !self.flags.has(sess_flags::IS_FIRST_REQ) && self.req.is_empty()
+        self.mode == Mode::Http && !self.is_h2() && self.strm.txn.is_none() && !self.is_first_req && self.req.is_empty()
     }
 
     /// Starts `timeout http-request` when a request head starts, and ends it when the head
@@ -2537,8 +2564,8 @@ impl TcpSession {
             return;
         }
         if self.head_pending() {
-            if self.flags.has(sess_flags::REQ_IDLE) {
-                self.flags.clear(sess_flags::REQ_IDLE);
+            if self.req_idle {
+                self.req_idle = false;
                 self.req_exp = Tick::ETERNITY;
             }
             if self.http_request_ms != 0 && !self.req_exp.is_set() {
@@ -2548,11 +2575,11 @@ impl TcpSession {
             let ms = if self.keep_alive_ms != 0 { self.keep_alive_ms } else { self.http_request_ms };
             if !self.req_exp.is_set() {
                 self.req_exp = now.add(ms);
-                self.flags.set(sess_flags::REQ_IDLE);
+                self.req_idle = true;
             }
         } else {
             self.req_exp = Tick::ETERNITY;
-            self.flags.clear(sess_flags::REQ_IDLE);
+            self.req_idle = false;
         }
     }
 
@@ -2579,7 +2606,7 @@ impl TcpSession {
         self.bc_src = src;
         self.srv = Some(fd);
         self.srv_xprt = xprt;
-        self.flags.clear(sess_flags::SRV_CANT_RECV);
+        self.srv_cant_recv = false;
         self.srv_state = ScState::Connecting;
         self.bc_err = None;
         self.conn_exp = if self.timeouts.connect == 0 {
@@ -2746,7 +2773,7 @@ impl TcpSession {
             return;
         }
         let Some(t) = &self.strm.txn else { return };
-        let n = self.req_msg(t).canonical_chunk_lines(self.req.readable_mut(), self.flags.has(sess_flags::DROP_REQ_TRAILERS));
+        let n = self.req_msg(t).canonical_chunk_lines(self.req.readable_mut(), self.drop_req_trailers);
         self.req.cut(n, self.req.len());
     }
 
@@ -2805,7 +2832,7 @@ impl TcpSession {
     /// The stream's backend is chosen: `drop` is its `option http-drop-request-trailers`. A
     /// request whose trailer section is already in `req` loses it now.
     pub fn set_drop_req_trailers(&mut self, drop: bool) {
-        self.flags.set_to(sess_flags::DROP_REQ_TRAILERS, drop);
+        self.drop_req_trailers = drop;
         if drop {
             self.rewrite_req_chunk_framing();
         }
@@ -2850,7 +2877,7 @@ impl TcpSession {
     /// The request's message state as `req`'s bytes read: past its head while an HTTP/2 or
     /// HTTP/3 head is in its HTX alone (X4, [`Self::req_head_pending`]).
     fn req_msg(&self, t: &HttpTxn) -> txn::MsgState {
-        if self.flags.has(sess_flags::REQ_HEAD_PENDING) {
+        if self.req_head_pending {
             t.req.past_head()
         } else {
             t.req
@@ -2908,7 +2935,7 @@ impl TcpSession {
     /// an oversized request head does not (measured on 3.5-dev8, `tasks/T87`).
     pub fn write_reply_with(&mut self, raw: &[u8], announce_close: bool) {
         // The request is read past its head below: an HTTP/2 one still in its HTX goes in first.
-        if self.flags.has(sess_flags::REQ_HEAD_PENDING) {
+        if self.req_head_pending {
             crate::h2_bridge::write_pending_head(self, false, None);
         }
         let h2 = self.is_h2();
@@ -3098,12 +3125,12 @@ impl TcpSession {
         // The stream is running, so its variables are in the thread's map
         // (`engine::with_stream_vars`): the transaction's go from there too.
         alcyon_sample::vars::with_current_mut(alcyon_sample::VarStore::clear_txn);
-        self.flags.clear(sess_flags::IS_FIRST_REQ);
+        self.is_first_req = false;
         // How the last transaction ended is not how the next one will: a 503 after refused
         // connects left `ConnectFailed`, and the next request's client leaving was then
         // taken for a stream already over, not aborted (T227, devtest7).
         self.ending = None;
-        self.flags.set(sess_flags::BC_IDLE);
+        self.bc_idle = true;
         self.cli_state = ScState::Ready;
         self.release_idle_buffers();
     }
@@ -3114,7 +3141,7 @@ impl TcpSession {
     pub fn release_idle_buffers(&mut self) {
         self.req.release();
         self.rep.release();
-        if !self.flags.has(sess_flags::HAS_HTX) {
+        if !self.has_htx {
             if self.htx_buf.class() == crate::buf::BufClass::Custom {
                 self.htx_buf = Buf::unallocated(crate::buf::BufClass::Standard);
             } else {
@@ -3132,7 +3159,7 @@ impl TcpSession {
     /// after this point (`req.hdr` is refused in response rules and logs, as in `HAProxy`);
     /// the next request parses a new one.
     fn release_forwarded_head(&mut self) {
-        if self.flags.has(sess_flags::HAS_HTX) {
+        if self.has_htx {
             self.clear_htx();
             self.release_idle_buffers();
         }
@@ -3185,7 +3212,7 @@ impl TcpSession {
     pub(crate) fn fail_request(&mut self, status: u16) {
         self.strm.log.term = Some(*b"PR");
         self.req.clear();
-        self.flags.clear(sess_flags::REQ_HEAD_PENDING);
+        self.req_head_pending = false;
         // A refused request is refused for the log as well: `HAProxy` keeps no line of it
         // (`%r` = `<BADREQ>`) and records no time for it (`%TR` = -1), whatever the head
         // check already wrote of both (T281). The head errors that refuse before either was
@@ -3354,7 +3381,7 @@ impl TcpSession {
             alcyon_proto::parser::HttpStream::set_accept_unsafe_request(&mut p, unsafe_ok);
             p
         };
-        let mut h1_parser = new_parser(self.flags.has(sess_flags::ACCEPT_UNSAFE_REQUEST));
+        let mut h1_parser = new_parser(self.accept_unsafe_request);
         // X2: the head is copied once, whole, to the front of the HTX buffer and indexed there
         // in place (`index_head_in_place`): its blocks are descriptors over those bytes, names
         // as they came in; only what the parser changes, and what the rules add, goes after it.
@@ -3390,7 +3417,7 @@ impl TcpSession {
                 Err(e) if e.kind() == io::ErrorKind::OutOfMemory && !sized => {
                     sized = true;
                     lines = self.req.readable()[..head_len].iter().filter(|&&b| b == b'\n').count() + 3;
-                    h1_parser = new_parser(self.flags.has(sess_flags::ACCEPT_UNSAFE_REQUEST));
+                    h1_parser = new_parser(self.accept_unsafe_request);
                 }
                 Err(e) => return Err(e),
             }
@@ -3423,7 +3450,7 @@ impl TcpSession {
         let (ws, written) = if h1_parser.saw_upgrade() {
             crate::websocket::ReqWs::of(
                 slice.as_ref().header_blocks_where(crate::websocket::ReqWs::reads).map(|(_, n, v)| (n, v)),
-                self.flags.has(sess_flags::ACCEPT_UNSAFE_REQUEST),
+                self.accept_unsafe_request,
             )
         } else {
             (crate::websocket::ReqWs::default(), None)
@@ -3434,10 +3461,10 @@ impl TcpSession {
         self.htx_tail = slice.tail_addr();
         self.htx_blocks = slice.num_blocks();
         self.htx_buf.note_htx(self.htx_tail, self.htx_blocks * alcyon_proto::htx::HTX_DESC_SIZE);
-        self.flags.set(sess_flags::HAS_HTX);
+        self.has_htx = true;
         // Modified, so the head forwarded is regenerated from the HTX, without it. So
         // too when the parser normalised the authority and `Host` (tasks/T93).
-        self.flags.set_to(sess_flags::HTX_MODIFIED, conflict || key_written || head_rewritten);
+        self.htx_modified = conflict || key_written || head_rewritten;
         // What frames the request as parsed (`H1_MF_CLEN`, `H1_MF_CHNK`), for after its rules (T439).
         let len_hdrs = txn::LenHdrs { clen: h1_parser.content_length.is_some() && !h1_parser.is_chunked, chnk: h1_parser.is_chunked };
         Ok((close, len_hdrs, sized_from_write.then_some(key_size)))
@@ -3565,7 +3592,7 @@ impl TcpSession {
         self.sess_addr_mut().cip = Some(CipState { magic, ..Default::default() });
         self.cli_state = ScState::Ready;
         // The header's first read waits for the poller (T157), as the PROXY header's does.
-        self.flags.set(sess_flags::CLI_CANT_RECV);
+        self.cli_cant_recv = true;
     }
 
     /// The expected NetScaler Client IP header, `None` on a connection that carries no
@@ -3630,7 +3657,7 @@ impl TcpSession {
     /// `Ok(true)` once the header is in, `Ok(false)` while it is still arriving.
     fn read_cip_header_before_tls(&mut self) -> io::Result<bool> {
         // Not before the poller reports the socket readable (`enable_accept_netscaler_cip`).
-        if self.flags.has(sess_flags::CLI_CANT_RECV) {
+        if self.cli_cant_recv {
             return Ok(false);
         }
         let Some(fd) = self.cli.fd() else { return Ok(false) };
@@ -3669,7 +3696,7 @@ impl TcpSession {
     /// header is in, `Ok(false)` while it is still arriving.
     fn read_proxy_header_before_tls(&mut self) -> io::Result<bool> {
         // Not before the poller reports the socket readable (`enable_accept_proxy`).
-        if self.flags.has(sess_flags::CLI_CANT_RECV) {
+        if self.cli_cant_recv {
             return Ok(false);
         }
         let Some(fd) = self.cli.fd() else { return Ok(false) };
@@ -3709,6 +3736,7 @@ impl TcpSession {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[inline(always)]
     fn process_cli_io(&mut self) -> io::Result<bool> {
         // A stream of an HTTP/2 connection has no socket: its owner moves its bytes (T280).
         if self.is_h2_child() {
@@ -3752,10 +3780,10 @@ impl TcpSession {
             }
             // Not while the demux is held (`H2MuxContext::wants_input`): what the client
             // sends then waits in the socket, as with `HAProxy` (T235).
-            if self.cli_state.can_read() && !self.flags.has(sess_flags::CLI_CANT_RECV) && self.h2_ctx.as_ref().is_some_and(|h| h.wants_input()) {
+            if self.cli_state.can_read() && !self.cli_cant_recv && self.h2_ctx.as_ref().is_some_and(|h| h.wants_input()) {
                 let mut raw_buf = [0u8; 16384];
                 let r = self.cli.recv(&mut self.cli_xprt, &mut raw_buf)?;
-                self.flags.set_to(sess_flags::CLI_CANT_RECV, self.polls_cli() && self.cli_xprt.drained(r, raw_buf.len()));
+                self.cli_cant_recv = self.polls_cli() && self.cli_xprt.drained(r, raw_buf.len());
                 match r {
                     Io::Eof => {
                         self.cli.shutdown_read();
@@ -3786,11 +3814,11 @@ impl TcpSession {
         } else {
             // Read from the client into the request buffer while reading is permitted
             // and buffer space exists. Backpressure stops reads when full.
-            if self.cli_state.can_read() && !self.req.is_full() && !self.flags.has(sess_flags::CLI_CANT_RECV) && self.alloc_or_wait_req()? {
+            if self.cli_state.can_read() && !self.req.is_full() && !self.cli_cant_recv && self.alloc_or_wait_req()? {
                 let dst = self.req.writable();
                 let asked = dst.len();
                 let r = self.cli.recv(&mut self.cli_xprt, dst)?;
-                self.flags.set_to(sess_flags::CLI_CANT_RECV, self.polls_cli() && self.cli_xprt.drained(r, asked));
+                self.cli_cant_recv = self.polls_cli() && self.cli_xprt.drained(r, asked);
                 match r {
                     // The client left before a byte of the expected header.
                     Io::Eof if self.awaiting_cip_header() => self.refuse_cip_header(CipError::Empty),
@@ -3848,7 +3876,7 @@ impl TcpSession {
             if self.req.readable().starts_with(H2_CONN_PREFACE) {
                 let mut h2 = H2MuxContext::new(alcyon_proto::conn::ConnId(0), true);
                 h2.flood_config = self.h2_flood_config;
-                h2.relaxed_path = self.flags.has(sess_flags::ACCEPT_UNSAFE_REQUEST);
+                h2.relaxed_path = self.accept_unsafe_request;
                 // The request heads go into the buffers their streams adopt (CP2a).
                 h2.take_rx_head = Buf::take_rx_head;
                 // An extended CONNECT to a websocket gets the key an HTTP/2 client does not send.
@@ -4001,7 +4029,7 @@ impl TcpSession {
             // whatever else is wrong, and so is a version that is not `HTTP/<digit>.<digit>`
             // (T286, T291).
             if self.req.readable() != b"\r"
-                && alcyon_proto::h1::scan_request_line(self.req.readable(), self.flags.has(sess_flags::ACCEPT_UNSAFE_REQUEST)) == alcyon_proto::h1::ReqLineScan::Invalid
+                && alcyon_proto::h1::scan_request_line(self.req.readable(), self.accept_unsafe_request) == alcyon_proto::h1::ReqLineScan::Invalid
             {
                 self.fail_request(400);
                 return Ok(true);
@@ -4059,7 +4087,7 @@ impl TcpSession {
                 // Where the head's `Connection` headers are, while the facts still say (T439).
                 let mut conn_scan = None;
                 let mut parsed_size: Option<Option<u64>> = None;
-                if self.flags.has(sess_flags::HAS_HTX) {
+                if self.has_htx {
                     let (conn_close, wire_replacement) = {
                         let htx = alcyon_proto::htx::HtxSliceRef::new(
                             self.htx_buf.raw_slice(),
@@ -4092,7 +4120,7 @@ impl TcpSession {
                         if conn_tokens.map_or_else(|| connection().any(|v| txn::connection_has(v, "close")), |t| t.0) {
                             conn_close = true;
                         }
-                        let wire_replacement = if self.flags.has(sess_flags::HTX_MODIFIED) {
+                        let wire_replacement = if self.htx_modified {
                             // Sized to the head, not a fixed buffer (tasks/T101).
                             Some(htx.write_h1_wire_vec())
                         } else {
@@ -4194,7 +4222,7 @@ impl TcpSession {
                 // The head in the buffer is the HTX's from here (written again from it above when
                 // the parse changed it, and every edit since made to both): the send passes it
                 // as it is unless the rules edit it (X2, `engine::encode_if_modified`).
-                self.flags.clear(sess_flags::HTX_MODIFIED);
+                self.htx_modified = false;
                 self.req_head_deferred = None;
                 let line = self.req.readable().split(|&b| b == b'\n').next().map_or(&[][..], <[u8]>::trim_ascii_end);
                 let ver = &line[line.len().saturating_sub(8)..];
@@ -4210,19 +4238,19 @@ impl TcpSession {
                 // The client's own method: rules that rewrite it have not run yet.
                 txn.client_head = self.req_method.as_deref().is_some_and(|m| m.eq_ignore_ascii_case("HEAD"));
                 self.strm.txn = Some(txn);
-                self.flags.clear(sess_flags::DROP_REQ_TRAILERS);
+                self.drop_req_trailers = false;
                 self.rewrite_req_chunk_framing();
                 self.cli_state = ScState::Established;
                 changed = true;
-            } else if match alcyon_proto::h1::scan_request_line(self.req.readable(), self.flags.has(sess_flags::ACCEPT_UNSAFE_REQUEST)) {
-                alcyon_proto::h1::ReqLineScan::Complete(l) => alcyon_proto::h1::header_lines_invalid(self.req.readable(), l.eol + l.eol_len, self.flags.has(sess_flags::ACCEPT_UNSAFE_REQUEST)),
+            } else if match alcyon_proto::h1::scan_request_line(self.req.readable(), self.accept_unsafe_request) {
+                alcyon_proto::h1::ReqLineScan::Complete(l) => alcyon_proto::h1::header_lines_invalid(self.req.readable(), l.eol + l.eol_len, self.accept_unsafe_request),
                 _ => false,
             } {
                 // A head not yet whole with a byte HAProxy refuses in a header line: 400 at
                 // that byte, not a 408 later (T291).
                 self.fail_request(400);
                 return Ok(true);
-            } else if let alcyon_proto::h1::ClEarly::Bad = match alcyon_proto::h1::scan_request_line(self.req.readable(), self.flags.has(sess_flags::ACCEPT_UNSAFE_REQUEST)) {
+            } else if let alcyon_proto::h1::ClEarly::Bad = match alcyon_proto::h1::scan_request_line(self.req.readable(), self.accept_unsafe_request) {
                 alcyon_proto::h1::ReqLineScan::Complete(l) => alcyon_proto::h1::content_length_early(self.req.readable(), l.eol + l.eol_len),
                 _ => alcyon_proto::h1::ClEarly::Fine,
             } {
@@ -4301,6 +4329,7 @@ impl TcpSession {
         Ok(changed)
     }
 
+    #[inline(always)]
     fn process_cli_transitions(&mut self) -> bool {
         // An HTTP connection's life is decided per transaction, by the engine
         // (`end_txn`): a server closing ends a response, not the client connection.
@@ -4430,7 +4459,7 @@ impl TcpSession {
         if self.srv_xprt.h2().is_none() || !self.strm.txn.as_ref().is_some_and(|t| matches!(t.req, txn::MsgState::Head { .. })) {
             return Ok(None);
         }
-        let Some((h, e)) = self.req.eoh().filter(|&(h, e)| self.mode == Mode::Http && self.flags.has(sess_flags::HAS_HTX) && h + e <= window) else { return Ok(None) };
+        let Some((h, e)) = self.req.eoh().filter(|&(h, e)| self.mode == Mode::Http && self.has_htx && h + e <= window) else { return Ok(None) };
         let chunked = self.h2_active().is_some_and(|a| a.chunk_out);
         let sfd = self.srv.as_ref().map(AsFd::as_fd).ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
         let htx = alcyon_proto::htx::HtxSliceRef::new(self.htx_buf.raw_slice(), self.htx_blocks);
@@ -4438,7 +4467,7 @@ impl TcpSession {
         if matches!(r, Io::Done(_)) {
             // The blocks went: a head the send was to write as text is not (X3b-2).
             if self.req_head_deferred.take().is_some() {
-                self.flags.clear(sess_flags::HTX_MODIFIED);
+                self.htx_modified = false;
             }
             let n = h + e;
             if let Some(t) = self.strm.txn.as_mut() {
@@ -4455,7 +4484,7 @@ impl TcpSession {
     fn write_deferred_head(&mut self) {
         let Some(lower) = self.req_head_deferred.take() else { return };
         crate::engine::write_req_head(self);
-        self.flags.clear(sess_flags::HTX_MODIFIED);
+        self.htx_modified = false;
         // Nothing of the head went (the text is written before it goes): its length is read
         // again from the head written, not the one it replaces.
         // (A deferred head is one of a transaction whose head is still to send.)
@@ -4504,7 +4533,7 @@ impl TcpSession {
                     self.flags.set_to(sess_flags::SOCKS4_SEND, hs.sending());
                     self.flags.set_to(sess_flags::SOCKS4_RECV, hs.receiving);
                     self.flags.0 = (self.flags.0 & !sess_flags::SOCKS4_SENT_MASK)
-                        | ((u64::from(hs.sent) << sess_flags::SOCKS4_SENT_SHIFT) & sess_flags::SOCKS4_SENT_MASK);
+                        | ((u32::from(hs.sent) << sess_flags::SOCKS4_SENT_SHIFT) & sess_flags::SOCKS4_SENT_MASK);
                     return Ok(changed);
                 }
                 crate::socks4::Step::Done => {
@@ -4628,7 +4657,7 @@ impl TcpSession {
             }
         }
 
-        if self.srv_state.can_read() && !self.rep.is_full() && self.reads_server() && !self.flags.has(sess_flags::SRV_CANT_RECV) && self.alloc_or_wait_rep()? {
+        if self.srv_state.can_read() && !self.rep.is_full() && self.reads_server() && !self.srv_cant_recv && self.alloc_or_wait_rep()? {
             let r = {
                 let sfd = self
                     .srv
@@ -4649,7 +4678,7 @@ impl TcpSession {
                 };
                 // Not for h2 either: the codec may hold frames that a full response text
                 // left unread, which no socket event announces.
-                self.flags.set_to(sess_flags::SRV_CANT_RECV, self.mode == Mode::Http && !self.srv_xprt.is_tls() && !self.srv_xprt.is_h2() && drained(r, asked));
+                self.srv_cant_recv = self.mode == Mode::Http && !self.srv_xprt.is_tls() && !self.srv_xprt.is_h2() && drained(r, asked);
                 r
             };
             match r {
@@ -4767,7 +4796,7 @@ impl TcpSession {
     /// drop. The engine dropped every error `process` returned, and an error ended nothing
     /// until a timeout fired (T261).
     pub fn advance(&mut self, now: Tick) {
-        self.flags.clear(sess_flags::PASSES_RAN_OUT);
+        self.passes_ran_out = false;
         for pass in 0..16 {
             let a = self.process_cli();
             let b = self.process_srv().unwrap_or_else(|e| {
@@ -4781,7 +4810,7 @@ impl TcpSession {
             if !a && !b {
                 break;
             }
-            self.flags.set_to(sess_flags::PASSES_RAN_OUT, pass == 15);
+            self.passes_ran_out = pass == 15;
             // A stream of an HTTP/2 connection waits on its client alone: what its owner
             // moves for it re-arms its timer (`h2_bridge_moves`), its server's bytes do not
             // (`HAProxy` times out a stream whose response the client's window holds while
@@ -4896,7 +4925,7 @@ impl TcpSession {
             return false;
         }
         let live = (self.head_pending() || self.idle_wait()) && self.cli_timer_live();
-        self.flags.clear(sess_flags::REQ_IDLE);
+        self.req_idle = false;
         live.then(|| {
             self.cli_state = ScState::Error;
             self.ending.get_or_insert(Ending::Timeout(Which::Client));
@@ -5668,7 +5697,7 @@ mod tests {
         client.write_all(&frame(4, 0, 0, &[])).expect("settings");
         client.write_all(&frame(1, 4, 1, &head)).expect("headers");
         let mut o = super::TcpSession::new_with_mode(super::ClientSide::Fd(cli.into()), super::Mode::Http, Vec::new(), Vec::new(), super::Timeouts::default(), 0, alcyon_sched::Tick(1000));
-        o.flags.clear(sess_flags::CLI_CANT_RECV);
+        o.cli_cant_recv = false;
         o.process(alcyon_sched::Tick(1000)).expect("process");
         let d = crate::h2_bridge::dispatch_next(o.h2_ctx.as_deref_mut().expect("h2"), false).expect("the request is dispatched");
         let mut s = super::TcpSession::h2_child_of(&mut o, (0, alcyon_sched::TaskRef::NONE), d.stream);
@@ -5782,7 +5811,7 @@ mod tests {
         assert_eq!(s.htx_buf.class(), crate::buf::BufClass::Standard);
         // an HTX still holding a message is kept
         s.htx_buf.alloc_if_needed();
-        s.flags.set(sess_flags::HAS_HTX);
+        s.has_htx = true;
         s.release_idle_buffers();
         assert!(!s.htx_buf.raw_slice().is_empty());
     }
@@ -5922,7 +5951,7 @@ mod tests {
         let mut s = super::TcpSession::new(std::os::fd::OwnedFd::from(a), Default::default(), 0, alcyon_sched::Tick::ETERNITY);
         s.enable_accept_netscaler_cip(0x1234_5678);
         assert!(!s.read_cip_header_before_tls().expect("cant_recv"));
-        s.flags.clear(sess_flags::CLI_CANT_RECV);
+        s.cli_cant_recv = false;
         assert!(!s.read_cip_header_before_tls().expect("would_block"));
         assert_eq!(s.cip_state().and_then(|c| c.err), None);
         assert_ne!(s.cli_state, ScState::Error);

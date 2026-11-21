@@ -940,3 +940,199 @@ fn t644_15_a_log_profile_format_that_does_not_compile_is_refused_at_load() {
     assert!(err.contains("failed to parse logformat: no such format alias 'bogus'"), "stderr was: {err}");
 }
 
+/// Keep-alive HTTP server for connection-reuse and queued `log-steps connect` tests;
+/// sleeps briefly when path is `/slow` so a concurrent request enters the server queue.
+fn ka_and_slow_responder() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ka responder");
+    let addr = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        for mut c in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match c.read(&mut chunk) {
+                            Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                            _ => return,
+                        }
+                    }
+                    let pos = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                    let req = String::from_utf8_lossy(&buf[..pos]).into_owned();
+                    buf.drain(..pos);
+                    if req.starts_with("GET /slow ") {
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                    if c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+#[test]
+fn connect_step_variants_and_embryonic_error_profile() {
+    let ka_be = ka_and_slow_responder();
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+    let tcp_be = tcp_listener.local_addr().expect("tcp addr");
+    thread::spawn(move || {
+        for mut c in tcp_listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut b = [0u8; 64];
+                if let Ok(n) = c.read(&mut b) {
+                    if n > 0 {
+                        let _ = c.write_all(b"pong");
+                    }
+                }
+            });
+        }
+    });
+
+    let mut socks = Vec::new();
+    for _ in 0..3 {
+        socks.push(UdpSocket::bind("127.0.0.1:0").expect("collector bind"));
+    }
+    let c: Vec<SocketAddr> = socks.iter().map(|s| s.local_addr().expect("addr")).collect();
+    let f: Vec<SocketAddr> = (0..3).map(|_| common::reserve_addr()).collect();
+
+    let cfg = format!(
+        r#"defaults
+  mode http
+  timeout connect 5s
+  timeout client 5s
+  timeout server 5s
+  log-tag "haproxy"
+
+frontend fe_emb
+  bind {f0} accept-proxy
+  log udp@{c0} format rfc5424 profile p_err local0
+  default_backend be_ka
+
+frontend fe_http_conn
+  bind {f1}
+  log-format "dummy"
+  log-steps connect
+  log udp@{c1} format rfc5424 profile p_http_conn local0
+  default_backend be_ka
+
+frontend fe_tcp_conn
+  bind {f2}
+  mode tcp
+  log-format "dummy"
+  log-steps connect
+  tcp-request inspect-delay 1s
+  tcp-request content accept if {{ req.len gt 0 }}
+  log udp@{c2} format rfc5424 profile p_tcp_conn local0
+  default_backend be_tcp
+
+log-profile p_err
+  on error format "embryonic_err"
+  on any drop
+
+log-profile p_http_conn
+  on connect format "http_connect"
+  on any drop
+
+log-profile p_tcp_conn
+  on connect format "tcp_connect"
+  on any drop
+
+backend be_ka
+  mode http
+  http-reuse always
+  server app1 {ka_be} maxconn 1
+
+backend be_tcp
+  mode tcp
+  server app1 {tcp_be}
+"#,
+        f0 = f[0],
+        f1 = f[1],
+        f2 = f[2],
+        c0 = c[0],
+        c1 = c[1],
+        c2 = c[2],
+    );
+
+    let mut cfg_file = tempfile::NamedTempFile::new().expect("tempfile");
+    cfg_file.write_all(cfg.as_bytes()).expect("write cfg");
+    let mut child = common::alcyon_command(bin())
+        .arg("-f")
+        .arg(cfg_file.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+
+    let stop = Instant::now() + Duration::from_secs(6);
+    let mut holders = Vec::new();
+    for sock in socks {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        holders.push(lines.clone());
+        thread::spawn(move || drain(sock, stop, lines));
+    }
+
+    // 1. Reuse via idle pool on HTTP (`connect_http_backend`) and queued HTTP (`maxconn 1`).
+    get_wait(f[1]);
+    get(f[1]);
+    let slow_addr = f[1];
+    let t_slow = thread::spawn(move || {
+        let mut s = TcpStream::connect(slow_addr).expect("slow connect");
+        s.write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("slow send");
+        let mut b = [0u8; 256];
+        while s.read(&mut b).map(|n| n > 0).unwrap_or(false) {}
+    });
+    thread::sleep(Duration::from_millis(25));
+    get(f[1]);
+    t_slow.join().expect("slow join");
+
+    // 2. Embryonic PROXY protocol failure on `fe_emb` (`is_embryonic == true` -> `on error`).
+    {
+        let mut s = TcpStream::connect(f[0]).expect("emb connect");
+        s.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("emb send");
+        let mut b = [0u8; 64];
+        let _ = s.read(&mut b);
+    }
+
+    // 3. Deferred TCP connect (`tcp-request content` -> `connect_tcp_backend`).
+    {
+        let mut s = TcpStream::connect(f[2]).expect("tcp connect");
+        s.write_all(b"ping").expect("tcp write");
+        let mut b = [0u8; 16];
+        let n = s.read(&mut b).unwrap_or(0);
+        assert_eq!(&b[..n], b"pong");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let n0 = holders[0].lock().unwrap().len();
+        let n1 = holders[1].lock().unwrap().len();
+        let n2 = holders[2].lock().unwrap().len();
+        if n0 >= 1 && n1 >= 4 && n2 >= 1 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(150));
+
+    let lines: Vec<Vec<String>> = holders
+        .iter()
+        .map(|h| h.lock().unwrap().iter().map(|s| normalize(s)).collect())
+        .collect();
+
+    common::stop(&mut child);
+
+    const L: &str = "<134>1 TS - haproxy PID - - ";
+    expect("fe_emb", &lines[0], &[&format!("{L}embryonic_err")]);
+    expect("fe_http_conn", &lines[1], &[
+        &format!("{L}http_connect"),
+        &format!("{L}http_connect"),
+        &format!("{L}http_connect"),
+        &format!("{L}http_connect"),
+    ]);
+    expect("fe_tcp_conn", &lines[2], &[&format!("{L}tcp_connect")]);
+}
+

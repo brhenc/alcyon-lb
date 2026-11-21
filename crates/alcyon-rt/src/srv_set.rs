@@ -537,6 +537,13 @@ fn server_observe(servers: &[alcyon_config::ast::Server]) -> Option<Arc<Vec<Obse
 }
 
 impl ServerIdArrays {
+    /// Whether any server in this proxy enables `observe`.
+    #[inline]
+    #[must_use]
+    pub fn has_observe(&self) -> bool {
+        self.server_observe.is_some()
+    }
+
     /// The `observe` slot for server `idx`, or `None` if `observe` is disabled.
     #[inline]
     #[must_use]
