@@ -216,6 +216,47 @@ fn a_log_directive_with_an_unknown_profile_is_refused() {
 }
 
 #[test]
+fn t644_17_a_global_log_directive_with_an_unknown_profile_is_refused() {
+    // Oracle (startup, not `-c`; rc=1):
+    // `global log directive declared in file <file> at line '2' unknown log-profile 'nosuch'.`
+    let addr = common::reserve_addr();
+    let cfg = format!(
+        "global\n  log 127.0.0.1:514 profile nosuch local0\ndefaults\n  mode http\n  timeout client 5s\n  timeout connect 5s\n  timeout server 5s\nfrontend fe\n  bind {addr}\n"
+    );
+    let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+    f.write_all(cfg.as_bytes()).expect("write cfg");
+    let mut child = Command::new(bin())
+        .arg("-f")
+        .arg(f.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    // The refusal is immediate; a process still running after 5 s accepted the config.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            break Some(st);
+        }
+        if Instant::now() > deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let Some(status) = status else {
+        common::stop(&mut child);
+        panic!("an unknown profile on a global log line was accepted: the process kept running");
+    };
+    let mut err = String::new();
+    child.stderr.take().expect("stderr").read_to_string(&mut err).expect("read stderr");
+    assert!(!status.success(), "rc={:?}", status.code());
+    assert!(
+        err.contains("global log directive declared in file") && err.contains("unknown log-profile 'nosuch'"),
+        "stderr was: {err}"
+    );
+}
+
+#[test]
 fn a_minimal_log_profile_is_accepted() {
     let out = run_cfg(
         &["-c"],
