@@ -417,18 +417,71 @@ stage_insreq-quick() {
   # is the short count every other gate runs: release-perf of this tree against the reference
   # (ALCYON_MEASURE_REF, else the last passing measured main), ab1 keepalive and rules, on
   # counts slot B (/tmp/alcyon-load-n1.lock, CPUs 12-14). The exclusive gate measures in full
-  # (measure), so it skips this. Most of the time is the fat-LTO build of this tree.
+  # (measure), so it skips this. Most of the time is the fat-LTO build of this tree (~4-5 min):
+  # it is started in the background before the first stage (insreq_build_start) and waited for
+  # here, so it overlaps the suite.
   if [ "${ALCYON_GATE_SKIP_INSREQ:-}" = 1 ]; then
     echo "skipped (ALCYON_GATE_SKIP_INSREQ=1): ins/req not counted on this tree"
     note_skip "ALCYON_GATE_SKIP_INSREQ=1"
   elif [ "${ALCYON_GATE_SKIP_MEASURE:-}" != 1 ]; then
     echo "skipped: the measure stage counts ins/req in full in this gate"
     note_skip "measured in full by the measure stage"
+  elif [ ! -f "$INSREQ_BUILD_PIDFILE" ]; then
+    check 1 "insreq-quick: the background release-perf build was not started"
   else
-    run_plain python3 tools/measure/insreq_gate.py
+    local pid t0=$SECONDS
+    pid=$(cat "$INSREQ_BUILD_PIDFILE")
+    echo "insreq-quick: waiting for the background release-perf build (pid $pid, log $INSREQ_BUILD_LOG)"
+    while [ ! -f "$INSREQ_BUILD_RC" ] && kill -0 "$pid" 2>/dev/null; do sleep 2; done
+    local rc
+    rc=$(cat "$INSREQ_BUILD_RC" 2>/dev/null || echo died)
+    echo "insreq-quick: background build rc=$rc after $(cat "$INSREQ_BUILD_SECS" 2>/dev/null || echo ?)s, waited $((SECONDS - t0))s here"
+    if [ "$rc" != 0 ]; then
+      tail -n 20 "$INSREQ_BUILD_LOG" 2>/dev/null
+      check 1 "insreq-quick: the release-perf build failed (rc=$rc), see $INSREQ_BUILD_LOG"
+      return
+    fi
+    run_plain python3 tools/measure/insreq_gate.py --cand-bin "$INSREQ_BUILD_TARGET/release-perf/alcyon" --cand-label "this tree"
     check "$?" "insreq-quick (ins/req over budget, or not measured)"
   fi
 }
+
+# The insreq-quick candidate build, started before the first stage when that stage will count,
+# so the fat-LTO build overlaps the suite instead of adding ~4-5 min after it. Plain env, its own
+# target ($PLAIN_TARGET_DIR/insreq-quick: never the suite's cargo lock), nice 19 and -j
+# ALCYON_INSREQ_BUILD_JOBS (default 8) so the suite's timing tests keep their CPUs. Its own
+# process group (setsid), killed on any exit of this script (EXIT trap), and by its own watchdog
+# when this script is gone (SIGKILL runs no trap). A TERM to this script alone waits, as for
+# every stage, until the running stage's command returns; Ctrl-C (the whole group) does not.
+INSREQ_BUILD_TARGET=$PLAIN_TARGET_DIR/insreq-quick
+INSREQ_BUILD_LOG=$RUN_DIR/insreq-build.log
+INSREQ_BUILD_RC=$RUN_DIR/insreq-build.rc
+INSREQ_BUILD_SECS=$RUN_DIR/insreq-build.secs
+INSREQ_BUILD_PIDFILE=$RUN_DIR/insreq-build.pid
+insreq_build_start() {
+  case " ${SELECTED[*]} " in *" insreq-quick "*) ;; *) return 0 ;; esac
+  [ "${ALCYON_GATE_SKIP_INSREQ:-}" != 1 ] && [ "${ALCYON_GATE_SKIP_MEASURE:-}" = 1 ] || return 0
+  [ -z "${ALCYON_CHECKIN_FAKE:-}" ] || return 0
+  setsid env -u RUSTFLAGS -u LLVM_PROFILE_FILE -u ALCYON_INSTRUMENTED \
+      CARGO_TARGET_DIR="$INSREQ_BUILD_TARGET" CARGO_INCREMENTAL=0 \
+      bash -c '# A checkin that dies without running its EXIT trap (SIGKILL) takes the build with it.
+               ( while kill -0 "$5" 2>/dev/null; do sleep 5; done; kill -TERM -- "-$$" ) & w=$!
+               t0=$SECONDS; nice -n 19 cargo build --profile release-perf --bin alcyon -j "$1" > "$2" 2>&1
+               rc=$?; kill "$w" 2>/dev/null; echo $((SECONDS - t0)) > "$4"; echo $rc > "$3"' \
+      insreq-build "${ALCYON_INSREQ_BUILD_JOBS:-8}" "$INSREQ_BUILD_LOG" "$INSREQ_BUILD_RC" "$INSREQ_BUILD_SECS" $$ &
+  echo $! > "$INSREQ_BUILD_PIDFILE"
+  echo "checkin: insreq-quick: release-perf build started in the background (pid $!, -j ${ALCYON_INSREQ_BUILD_JOBS:-8}, nice 19, $INSREQ_BUILD_TARGET)"
+}
+insreq_build_stop() {
+  local pid
+  [ -f "$INSREQ_BUILD_PIDFILE" ] && [ ! -f "$INSREQ_BUILD_RC" ] || return 0
+  pid=$(cat "$INSREQ_BUILD_PIDFILE")
+  # setsid made pid its own process group leader: the group is the build and every rustc.
+  kill -TERM -- "-$pid" 2>/dev/null && echo "checkin: insreq-quick: background build (group $pid) stopped"
+}
+trap insreq_build_stop EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 stage_surface() {
   echo "-- uncommitted:"
@@ -458,6 +511,7 @@ fake_stage() {
 # --- run -------------------------------------------------------------------------------
 GATE_KIND=$(gate_kind); GATE_LOAD0=$(gate_load_pct); GATE_BAND=$(gate_load_band "$GATE_LOAD0")
 [ "$MODE" != all ] || whole_hint "$GATE_KIND" "$GATE_BAND" "$GATE_LOAD0" | sed 's/^/checkin: /'
+insreq_build_start
 RAN=()
 for id in "${SELECTED[@]}"; do
   now=$((SECONDS - GATE_T0))

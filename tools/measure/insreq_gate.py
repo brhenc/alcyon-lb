@@ -10,7 +10,7 @@ against the reference's, insreq.sh ab1 on keepalive and rules, on counts slot B
 (/tmp/alcyon-load-n1.lock, CPUs 12-14). Counts only, never a timing claim.
 
     tools/measure/insreq_gate.py [--ref SHA] [--cand-sha SHA | --cand-bin PATH]
-                                 [-n N] [--rounds R] [--budget PCT]
+                                 [--cand-label TEXT] [-n N] [--rounds R] [--budget PCT]
 
 The reference: --ref, else ALCYON_MEASURE_REF, else the last row of data/measurements.jsonl
 that measured ins/req on a clean ancestor of HEAD and passed its own ins/req check (a row over
@@ -24,7 +24,8 @@ older rustc built would be reused after a toolchain bump (1.100 moved c246669a's
 
 The candidate is `cargo build --profile release-perf --bin alcyon` of this tree into
 $CARGO_TARGET_DIR (measure.py ensure_alcyon_binary), or --cand-bin, or --cand-sha (built and
-cached like the reference).
+cached like the reference). In the gate, checkin.sh builds it in the background while the suite
+runs and passes --cand-bin.
 
 Judged: the minimum over rounds of instructions:u per request, as the measuring gate judges.
 FAIL (exit 1) when either scenario is over +budget% (default 0.5). Exit 2: could not measure.
@@ -199,6 +200,7 @@ def main() -> int:
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--cand-sha")
     g.add_argument("--cand-bin")
+    ap.add_argument("--cand-label", help="what --cand-bin is, in the output (default: its path)")
     ap.add_argument("-n", type=int, default=int(os.environ.get("ALCYON_INSREQ_N", DEFAULT_N)))
     ap.add_argument("--rounds", type=int,
                     default=int(os.environ.get("ALCYON_INSREQ_ROUNDS", DEFAULT_ROUNDS)))
@@ -216,7 +218,7 @@ def main() -> int:
         print(f"insreq-quick: ref {ref_sha[:12]}, ab1 N={a.n} x {a.rounds} rounds, budget "
               f"+{a.budget}%, slot B CPUs {SLOT_B_CPUS}", flush=True)
         if a.cand_bin:
-            cand_bin, cand_label = Path(a.cand_bin), a.cand_bin
+            cand_bin, cand_label = Path(a.cand_bin), a.cand_label or a.cand_bin
         elif a.cand_sha:
             cand_bin, cand_label = cached_binary(_git("rev-parse", a.cand_sha)), a.cand_sha
         else:
