@@ -4487,7 +4487,7 @@ impl TcpSession {
                 .srv
                 .as_ref()
                 .map(AsFd::as_fd)
-                .ok_or_else(|| io::Error::from(io::ErrorKind::NotConnected))?;
+                .ok_or(io::ErrorKind::NotConnected)?;
             // The address the socket dials is the proxy; the address it must dial, what the
             // 16-byte request carries, is the server's, as the connect computed it
             // (`connect_addr`, the `target_addr` the connect stored).
