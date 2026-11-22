@@ -470,14 +470,28 @@ fn bytes_out_fetches_are_refused_with_a_reason() {
     }
 }
 
-/// TIMERFETCH: Alcyon does not time the client handshake (`logs->t_handshake`), so
-/// `fc.timer.handshake` was registered as a constant 0 (the oracle answers ~300 ms for a TLS
-/// or PROXY handshake). Refused with a reason until the handshake is timed.
+/// TIMERFETCH: `fc.timer.handshake` reads `logs->t_handshake`, stamped once when the
+/// connection's handshakes are done (`HAProxy`'s `conn_complete_session`): ~300 ms for a
+/// client that sends its PROXY header 300 ms after it connects (the oracle's shape,
+/// `handshake_timer.rs`), not the constant 0 it was refused for.
 #[test]
-fn fc_timer_handshake_is_refused_with_a_reason() {
+fn fc_timer_handshake_reads_the_handshakes_time() {
     for rule in ["http-request set-header x \"%[fc.timer.handshake]\"", "log-format \"%[fc.timer.handshake]\""] {
         let (code, out) = load(rule);
-        assert_ne!(code, Some(0), "{rule} loaded: {out}");
-        assert!(out.contains("'fc.timer.handshake' : not implemented in Alcyon"), "{rule}: {out}");
+        assert_eq!(code, Some(0), "{rule} refused: {out}");
     }
+
+    let fe = common::reserve_addr();
+    let _alcyon = start(
+        &format!("{DEFAULTS}frontend fe\n  bind {fe} accept-proxy\n  http-request return status 200 hdr x-hs \"%[fc.timer.handshake]\"\n"),
+        fe,
+    );
+    let mut s = TcpStream::connect(fe).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    thread::sleep(Duration::from_millis(300));
+    s.write_all(b"PROXY TCP4 10.1.1.1 10.2.2.2 1234 5678\r\nGET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").expect("send");
+    let mut out = String::new();
+    let _ = s.read_to_string(&mut out);
+    let v = header(&out, "x-hs").expect("x-hs").parse::<i64>().expect("milliseconds");
+    assert!((250..=900).contains(&v), "fc.timer.handshake = {v}, wanted ~300: {out}");
 }

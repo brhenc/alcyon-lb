@@ -3577,6 +3577,33 @@ impl TcpSession {
         self.accept_proxy.is_pending() || self.cip_state().is_some_and(|c| !c.done)
     }
 
+    /// The end of the connection's handshakes, stamped on the stream's log once, the first
+    /// pass that finds them all over: `HAProxy`'s `conn_complete_session` sets
+    /// `sess->t_handshake = now - accept_ts` the moment the last layer (the PROXY or CIP
+    /// header, the TLS accept) completes -- and runs it on a layer's failure too (the TLS
+    /// callback, `ssl_sock.c`; a refused PROXY or CIP header), so a failed or refused
+    /// handshake ends the timer as well and the error log reports the time the attempt
+    /// took. A client timeout that ends the session before any layer completed or failed
+    /// leaves it at -1, as the oracle does. `%Th` and `fc.timer.handshake` read it,
+    /// `%Ti` runs after it; `0` when there is no layer to wait for, as a plain connection's
+    /// stamp lands on its accept.
+    #[inline]
+    pub fn handshake_done(&mut self) {
+        if self.strm.log.t_handshake >= 0 {
+            return;
+        }
+        let proxy = self.accept_proxy.is_pending() && self.proxy_hdr_err.is_none();
+        let cip = self.cip_state().is_some_and(|c| !c.done && c.err.is_none());
+        // A refusal kills the connection, so the transport's own state is moot from then.
+        let refused = self.proxy_hdr_err.is_some() || self.cip_state().is_some_and(|c| c.err.is_some());
+        let over = !proxy && !cip && (self.cli_xprt.is_ready() || self.cli_xprt.handshake_failed() || refused);
+        if !over {
+            return;
+        }
+        let ms = crate::txnlog::loop_now().saturating_duration_since(self.strm.log.start).as_millis();
+        self.strm.log.t_handshake = i32::try_from(ms).unwrap_or(i32::MAX);
+    }
+
     /// Ends the connection for a PROXY header that was not accepted, and remembers why.
     fn refuse_proxy_header(&mut self, why: ProxyHdrError) {
         self.proxy_hdr_err = Some(why);
@@ -3847,7 +3874,10 @@ impl TcpSession {
                         self.req.commit(n);
                         self.rewrite_req_chunk_framing();
                         self.bytes_in += n as u64;
-                        self.strm.log.first_byte_now();
+                        // The first byte the mux times (`t_idle`, `%Ti`) is the first byte
+                        // of the request itself: the PROXY and CIP headers, when they
+                        // belong to the handshake, are consumed below before it (the
+                        // `HAProxy` h1 mux never sees them, `mux_h1.c`).
                         // The server is gone behind a complete response: the request's
                         // next byte cannot be forwarded.
                         if !self.srv_state.can_write()
@@ -3874,6 +3904,10 @@ impl TcpSession {
 
             // Check for cleartext H2 preface in self.req
             if self.req.readable().starts_with(H2_CONN_PREFACE) {
+                // The preface is the first request byte of the connection (t_idle, %Ti,
+                // runs from it, as the TLS owner read does); stamp it before the streams
+                // are created from it and clone the owner log.
+                self.strm.log.first_byte_now();
                 let mut h2 = H2MuxContext::new(alcyon_proto::conn::ConnId(0), true);
                 h2.flood_config = self.h2_flood_config;
                 h2.relaxed_path = self.accept_unsafe_request;
@@ -3962,6 +3996,12 @@ impl TcpSession {
             if self.accept_proxy.is_pending() {
                 return Ok(changed);
             }
+        }
+
+        // Request bytes in hand, handshake headers consumed: the first byte the mux
+        // times (`t_idle`, `%Ti`) is in, as above.
+        if !self.req.is_empty() {
+            self.strm.log.first_byte_now();
         }
 
         // The streams are dispatched to their own entries, and their bytes moved, by the

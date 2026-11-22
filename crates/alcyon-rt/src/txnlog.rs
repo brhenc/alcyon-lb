@@ -69,6 +69,13 @@ pub struct StreamLog {
     /// stream's lines are not sent), else the level's syslog number plus one (1 `emerg` .. 8
     /// `debug`).
     pub log_level: i8,
+    /// `t_handshake`: milliseconds from the start to the end of the connection's handshakes
+    /// (the PROXY header, the TLS accept), as `HAProxy`'s `sess->t_handshake` stamped once in
+    /// `conn_complete_session`; -1 while the last layer is not done. `%Th` prints it, `%Ti`
+    /// runs after it. `0` for the next request of a kept-alive connection, as `HAProxy`
+    /// resets it there (`mux_h1`/`mux_h2`); the next stream of an HTTP/2 connection inherits
+    /// it from the owner's log, which `h2_child_done` reset.
+    pub t_handshake: i32,
     /// `%rt`.
     pub uniq_id: u64,
     /// The termination state, when the proxy itself ended the stream: `PR` for a denied
@@ -247,6 +254,7 @@ impl StreamLog {
             prio_class: 0,
             prio_offset: 0,
             log_level: 0,
+            t_handshake: -1,
             uniq_id: STREAM_COUNTER.fetch_add(1, Ordering::Relaxed),
             term: None,
             status: None,
@@ -286,6 +294,7 @@ impl StreamLog {
             prio_class,
             prio_offset,
             log_level,
+            t_handshake,
             uniq_id,
             term,
             status,
@@ -316,6 +325,9 @@ impl StreamLog {
         *prio_class = 0;
         *prio_offset = 0;
         *log_level = 0;
+        // The connection's handshakes are over for this request, as for the next ones
+        // (`HAProxy` sets `sess->t_handshake = 0` when the previous transaction ends).
+        *t_handshake = 0;
         *uniq_id = STREAM_COUNTER.fetch_add(1, Ordering::Relaxed);
         *term = None;
         *status = None;
@@ -354,6 +366,7 @@ impl StreamLog {
             prio_class,
             prio_offset,
             log_level,
+            t_handshake,
             uniq_id,
             term,
             status,
@@ -373,7 +386,7 @@ impl StreamLog {
         copy_captures(req_captures, &src.req_captures);
         copy_captures(res_captures, &src.res_captures);
         unique_id.clone_from(&src.unique_id);
-        (*last_rule, *prio_class, *prio_offset, *log_level, *uniq_id) = (src.last_rule, src.prio_class, src.prio_offset, src.log_level, src.uniq_id);
+        (*last_rule, *prio_class, *prio_offset, *log_level, *t_handshake, *uniq_id) = (src.last_rule, src.prio_class, src.prio_offset, src.log_level, src.t_handshake, src.uniq_id);
         (*term, *status) = (src.term, src.status);
         (*redispatched, *applet, *be_queue, *queue_is_srv, *asap_done, *srv_status) = (src.redispatched, src.applet, src.be_queue, src.queue_is_srv, src.asap_done, src.srv_status);
     }
@@ -382,6 +395,19 @@ impl StreamLog {
     #[must_use]
     pub fn ms(&self, t: Option<Instant>) -> i64 {
         t.map_or(-1, |t| i64::try_from(t.saturating_duration_since(self.start).as_millis()).unwrap_or(i64::MAX))
+    }
+
+    /// `%Ti`: the idle time from the end of the connection's handshakes to the first byte
+    /// (`HAProxy` measures `t_idle` from there, so `%TR` is `t_request - t_idle -
+    /// t_handshake`), -1 while no byte has come.
+    #[must_use]
+    pub fn t_idle_ms(&self) -> i64 {
+        let idle = self.ms(self.first_byte);
+        if idle < 0 {
+            idle
+        } else {
+            idle - i64::from(self.t_handshake.max(0))
+        }
     }
 
     /// Records the first request byte, once.
@@ -447,7 +473,10 @@ mod tests {
     }
 
     /// `reset` leaves the log as `start` builds it (O1a): every field a stream wrote is gone,
-    /// the stream's start and its `%rt` are new.
+    /// the stream's start and its `%rt` are new. The one field the two set differently on
+    /// purpose is `t_handshake`: `reset` is the next request of a kept connection, whose
+    /// handshakes are done (`HAProxy` zeroes `sess->t_handshake` at each transaction's end),
+    /// while `start` is a fresh connection that has not started them (-1).
     #[test]
     fn reset_is_a_new_start_in_place() {
         let mut l = StreamLog::start(1, 2);
@@ -470,6 +499,8 @@ mod tests {
         let mut fresh = StreamLog::start(10, 20);
         assert!(l.uniq_id > id);
         (fresh.start, fresh.uniq_id) = (l.start, l.uniq_id);
+        assert_eq!(l.t_handshake, 0);
+        fresh.t_handshake = 0;
         assert_eq!(format!("{l:?}"), format!("{fresh:?}"));
     }
 }

@@ -107,6 +107,9 @@ impl<'a> LogData<'a> {
             server: ctx.srv_name,
             accept_date: ctx.accept_date.unwrap_or((0, 0)),
             t_idle: timers.map_or(0, |t| t[0].max(0)),
+            // `logs->t_handshake` (`%Th`): the handshakes' time, `-1` while the last layer
+            // has not completed.
+            t_handshake: ctx.stream.map_or(0, |s| s.t_handshake),
             t_request: timers.map_or(-1, |t| t[1]),
             t_queue: timers.map_or(-1, |t| t[2]),
             t_connect: timers.map_or(-1, |t| t[3]),
@@ -505,12 +508,12 @@ const NUMERIC: &[Alias] = &[
 
 /// The timer fetches that read the stream's logs (`smp_fetch_reX_timers`,
 /// `smp_fetch_txn_timers`, `smp_fetch_conn_timers`): a format carrying one needs the
-/// stream in its context. `fc.timer.handshake` is out: Alcyon does not time the handshake, so the
-/// fetch is refused at load (`alcyon_sample::NOT_IMPLEMENTED`).
-pub const STREAM_TIMER_FETCHES: [&str; 7] = [
+/// stream in its context.
+pub const STREAM_TIMER_FETCHES: [&str; 8] = [
     "req.timer.tq",
     "req.timer.queue",
     "res.timer.data",
+    "fc.timer.handshake",
     "fc.timer.total",
     "txn.timer.total",
     "txn.timer.user",
