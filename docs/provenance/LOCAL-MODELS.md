@@ -45,7 +45,7 @@ How the code came in:
 | Qwen3.8-27B | 39 | 18767 | 17714 |
 | Gemini 4 Hydrogen, xhigh | 31 | 8489 | 7013 |
 | Gemini 4 | 1 | 636 | 626 |
-| Gemini 4 Hydrogen, high | 15 | 2867 | 2676 |
+| Gemini 4 Hydrogen, high | 16 | 2892 | 2701 |
 
 ## Commits
 
@@ -186,4 +186,5 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-22 | HSTIMER | Qwen3.8-27B | `3f4b299f49` | 534 | 534 | `crates/alcyon-rt/src/engine.rs` +22/22<br>`crates/alcyon-rt/src/logfmt.rs` +6/6<br>`crates/alcyon-rt/src/proxy.rs` +41/41<br>`crates/alcyon-rt/src/txnlog.rs` +33/33<br>`crates/alcyon-rt/tests/it/fetch_edge_cases.rs` +20/20<br>`crates/alcyon-rt/tests/it/handshake_timer.rs` +384/384<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/timer_fetches.rs` +3/3<br>`crates/alcyon-sample/src/registry.rs` +24/24 | unmodified model output |
 | 2026-11-22 | LOGQUOTE | Qwen3.8-27B | `cd8130ccbd` | 356 | 356 | `crates/alcyon-rt/src/logfmt.rs` +48/48<br>`crates/alcyon-rt/tests/it/logfmt_quote_escape.rs` +307/307<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-22 | T640 | Gemini 4 Hydrogen, high | `0fd2ae5a7b` | 19 | 19 | `harness/test_vtc_runner.py` +14/14<br>`harness/vtc_runner.py` +5/5 | unmodified model output |
+| 2026-11-22 | T659 | Gemini 4 Hydrogen, high | `2d309c7a54` | 25 | 25 | `crates/alcyon-rt/src/lifecycle.rs` +25/25 | unmodified model output |
 | 2026-11-22 | T659 | Gemini 4 Hydrogen, high | `0aacdf18d3` | 38 | 38 | `crates/alcyon-rt/src/engine.rs` +15/15<br>`crates/alcyon-rt/tests/it/idle_wakeups.rs` +23/23 | unmodified model output |
