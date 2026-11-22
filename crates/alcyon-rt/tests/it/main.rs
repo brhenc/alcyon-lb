@@ -318,6 +318,7 @@ mod log_stderr_signal;
 mod log_stdout_full_pipe;
 mod log_tag_sample;
 mod logfmt;
+mod logfmt_quote_escape;
 mod logfmt_unknown_fetch;
 mod log_format_arg_refusals;
 mod many_log_lines;
