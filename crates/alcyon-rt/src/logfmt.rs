@@ -999,11 +999,10 @@ impl LogFormat {
                             Sample::Bin(b) if b.is_empty() => {}
                             v => sample_encoded(out, &v, o, named.as_ref().map_or(Cast::Same, |n| n.cast), false),
                         }
-                    } else if o.esc {
-                        let mut plain = Out(Vec::new());
-                        alias(&mut plain, a, Opts { esc: false, ..o }, d, ctx.phase.log_origin);
-                        escaped_5424(out, &plain.0);
                     } else {
+                        // Each renderer applies `+E` to the value and `+Q` around it, in that
+                        // order (`_lf_quotetext_len` quotes the escaped value, never the
+                        // quotes it adds itself).
                         alias(out, a, o, d, ctx.phase.log_origin);
                     }
                 }
@@ -1244,7 +1243,8 @@ fn url_escaped(b: u8) -> bool {
 }
 
 /// `lf_encode_string`: `s`, with every byte `escaped` selects written `#XX`, quoted if
-/// asked.
+/// asked. With `+E`, a byte the map does not select but the RFC 5424 one does (`"`, `\`,
+/// `]`) gets a backslash instead (`_lf_rfc5424_escape_byte`).
 fn encoded(out: &mut Out, s: &[u8], escaped: fn(u8) -> bool, o: Opts) {
     if o.quote {
         out.push('"');
@@ -1252,6 +1252,9 @@ fn encoded(out: &mut Out, s: &[u8], escaped: fn(u8) -> bool, o: Opts) {
     for &c in s {
         if escaped(c) {
             let _ = write!(out, "#{c:02X}");
+        } else if o.esc && matches!(c, b'"' | b'\\' | b']') {
+            out.push('\\');
+            out.push(char::from(c));
         } else {
             out.push(char::from(c));
         }
@@ -1289,10 +1292,14 @@ fn text<S: AsRef<[u8]> + ?Sized>(out: &mut Out, s: Option<&S>, o: Opts) {
     }
 }
 
+/// `lf_ip`: the address as text, so `+Q` quotes it (and a missing one is `""` quoted or `-`);
+/// `+X` is raw hex, never quoted.
 fn ip(out: &mut Out, a: Option<SocketAddr>, o: Opts) {
     match a {
         None => {
-            if o.mandatory {
+            if o.quote {
+                out.push_str("\"\"");
+            } else if o.mandatory {
                 out.push('-');
             }
         }
@@ -1307,7 +1314,13 @@ fn ip(out: &mut Out, a: Option<SocketAddr>, o: Opts) {
             }
         }
         Some(a) => {
+            if o.quote {
+                out.push('"');
+            }
             let _ = write!(out, "{}", a.ip());
+            if o.quote {
+                out.push('"');
+            }
         }
     }
 }
@@ -1418,8 +1431,8 @@ fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData, origin: Option<&'static 
     }
     match a {
         // `%OG`: the name the line's log step is logged from (`log_origin`), empty where
-        // there is none. It is text, so the usual `O`/`Q` options do not apply.
-        Alias::Orig => out.push_str(origin.unwrap_or("")),
+        // there is none. Text: `+Q` quotes it, `+E` escapes it (`lf_text`).
+        Alias::Orig => text(out, Some(origin.unwrap_or("")), o),
         Alias::Bytes => int(out, i64::try_from(d.bytes_out).unwrap_or(i64::MAX)),
         Alias::BytesUp => int(out, i64::try_from(d.bytes_in).unwrap_or(i64::MAX)),
         // Alcyon has no `capture cookie`, so there is never a cookie to show.
@@ -1640,8 +1653,9 @@ fn sample_encoded(out: &mut Out, s: &Sample, o: Opts, cast: Cast, converted: boo
     }
 }
 
-/// A sample's text in a log line (`lf_text`/`lf_int`): strings quoted if asked, an empty
-/// string as `-` (or `""` quoted), binary as its bytes.
+/// A sample's text in a log line: in a raw line every type is converted to text
+/// (`sample_convert(SMP_T_STR)`) and written by `lf_text`, so `+Q` quotes them all;
+/// an empty string is `-` (or `""` quoted), binary as its bytes.
 fn sample(out: &mut Out, s: &Sample, o: Opts, cast: Cast, converted: bool) {
     if o.encoded() {
         return sample_encoded(out, s, o, cast, converted);
@@ -1666,16 +1680,40 @@ fn sample(out: &mut Out, s: &Sample, o: Opts, cast: Cast, converted: bool) {
         // A string holds a byte that is not UTF-8 as the character `bytetext` gave it (T455).
         Sample::Str(v) => text(out, Some(&*alcyon_regex::bytetext::text_to_bytes(v)), o),
         Sample::Sint(v) => {
+            if o.quote {
+                out.push('"');
+            }
             let _ = write!(out, "{v}");
+            if o.quote {
+                out.push('"');
+            }
         }
         Sample::Bool(v) => {
+            if o.quote {
+                out.push('"');
+            }
             let _ = write!(out, "{}", i32::from(*v));
+            if o.quote {
+                out.push('"');
+            }
         }
         Sample::Ipv4(v) => {
+            if o.quote {
+                out.push('"');
+            }
             let _ = write!(out, "{v}");
+            if o.quote {
+                out.push('"');
+            }
         }
         Sample::Ipv6(v) => {
+            if o.quote {
+                out.push('"');
+            }
             let _ = write!(out, "{v}");
+            if o.quote {
+                out.push('"');
+            }
         }
         Sample::Meth(v) => text(out, Some(v.as_str()), o),
     }
