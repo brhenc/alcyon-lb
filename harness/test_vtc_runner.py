@@ -442,29 +442,32 @@ class CliExpectAssertionCounting(unittest.TestCase):
             self.assertEqual(res.status, "PASS", res.error_message)
 
 
-class HaproxyArgFlag(unittest.TestCase):
-    """T640 (automatic_maxconn.vtc, crt_store.vtc): `haproxy ... -arg "..."` must pass
-    its split arguments to the proxy binary on both `-start` and `-conf-OK`/`-conf-BAD`."""
+class HaproxyArgIgnoresFlags(unittest.TestCase):
+    """T640: `haproxy ... -arg "..."` flags such as `-L A` (peer node name) and
+    `-dMno-merge,tag` must not be forwarded to the proxy binary; Alcyon refuses
+    them (`Unknown option: -L`, `-dM ... not supported`), regressing passing
+    balance-* and log_cbor tests while the one reg-test needing `-m` still fails
+    for missing thread-groups on multi-core hosts."""
 
-    def test_arg_passes_extra_arguments_to_start(self):
+    def test_arg_does_not_forward_unsupported_flags_to_start(self):
         fp = FakeProxy()
         self.addCleanup(fp.tmp.cleanup)
-        ex = executor('varnishtest "x"\nhaproxy h1 -arg "-m 1024" -conf {\n  defaults\n} -start\n', fp.path)
+        ex = executor('varnishtest "x"\nhaproxy h1 -arg "-L A" -conf {\n  defaults\n} -start\n', fp.path)
         asyncio.run(ex.execute())
         with open(fp.log + ".args") as f:
             args = f.read().split()
-        self.assertIn("-m", args)
-        self.assertIn("1024", args)
+        self.assertNotIn("-L", args)
+        self.assertNotIn("A", args)
 
-    def test_arg_passes_extra_arguments_to_conf_ok(self):
+    def test_arg_does_not_forward_to_conf_ok(self):
         fp = FakeProxy()
         self.addCleanup(fp.tmp.cleanup)
-        ex = executor('varnishtest "x"\nhaproxy h1 -arg -V -conf-OK {\n  defaults\n}\n', fp.path)
+        ex = executor('varnishtest "x"\nhaproxy h1 -arg "-dMno-merge,tag" -conf-OK {\n  defaults\n}\n', fp.path)
         res = asyncio.run(ex.execute())
         self.assertEqual(res.status, "PASS", res.error_message)
         with open(fp.log + ".args") as f:
             args = f.read().split()
-        self.assertIn("-V", args)
+        self.assertNotIn("-dMno-merge,tag", args)
 
 
 class ConfBadLiteralSubstring(unittest.TestCase):

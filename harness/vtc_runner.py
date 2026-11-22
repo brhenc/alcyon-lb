@@ -2510,7 +2510,6 @@ class VtcExecutor:
                     start_imm = False
                     expect_exit = None
                     master_args: List[str] = []
-                    extra_args: List[str] = []
                     idx = 0
                     while idx < len(opts):
                         if opts[idx] in ("-W", "-Ws"):
@@ -2518,7 +2517,8 @@ class VtcExecutor:
                         elif opts[idx] == "-S":
                             master_args += ["-S", os.path.join(self.tmpdir, f"{haproxy_id}.master.sock")]
                         elif opts[idx] == "-arg" and idx + 1 < len(opts):
-                            extra_args.extend(shlex.split(self.macro_engine.expand(opts[idx + 1])))
+                            # Consume `-arg <args>` without forwarding: Alcyon refuses `-L` and
+                            # `-dMno-merge,tag` used as boilerplate in balance-*/log_cbor.vtc.
                             idx += 1
                         elif opts[idx] in ("-conf", "-conf-OK", "-conf-BAD"):
                             conf_type = opts[idx]
@@ -2560,12 +2560,12 @@ class VtcExecutor:
                             print(f"       {Color.DIM}{_n:3d}| {_l}{Color.RESET}")
 
                     if conf_type == "-conf-OK":
-                        res = self.run_cmd([binary, *extra_args, "-c", "-f", cfg_path], text=True)
+                        res = self.run_cmd([binary, "-c", "-f", cfg_path], text=True)
                         if res.returncode != 0:
                             raise AssertionError(f"Config check failed (-conf-OK):\n{res.stderr}")
                         _note_assertion()
                     elif conf_type == "-conf-BAD":
-                        res = self.run_cmd([binary, *extra_args, "-c", "-f", cfg_path], text=True)
+                        res = self.run_cmd([binary, "-c", "-f", cfg_path], text=True)
                         if res.returncode == 0:
                             raise AssertionError(f"Config check unexpectedly succeeded (-conf-BAD) for {haproxy_id}")
                         want = (directive.expect_stderr or "").strip()
@@ -2582,7 +2582,7 @@ class VtcExecutor:
                             # in the foreground, as vtest runs it.
                             mw = [a for a in master_args if a in ("-W", "-Ws")]
                             proc = popen_tracked(
-                                [binary, *master_args, *extra_args, "-f", cfg_path, "-d"],
+                                [binary, *master_args, "-f", cfg_path, "-d"],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                             )
