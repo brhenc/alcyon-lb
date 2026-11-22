@@ -115,3 +115,26 @@ fn an_idle_process_on_four_threads_does_not_wake() {
 fn an_idle_process_with_a_two_second_check_wakes_only_for_the_check() {
     check("c", 1, "server s1 127.0.0.1:9 check inter 2s");
 }
+
+/// T659: `Engine::run_once` and `Engine::step` are single-step entry points used by callers
+/// that interleave their own work on the same thread; unlike `Engine::run_loop`, an idle
+/// step with no timers or events must return within the poll bound (100 ms) rather than
+/// blocking forever in `epoll_wait(-1)`.
+#[test]
+fn run_once_and_step_return_within_poll_bound_when_idle() {
+    use alcyon_rt::Engine;
+    use alcyon_sched::Tick;
+    let cfg = alcyon_config::parse_str("global\n").expect("parse");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || {
+        let mut engine = Engine::new(&cfg, 64).expect("Engine::new");
+        let _ = engine.run_once();
+        let _ = engine.step(Tick(100));
+        let _ = tx.send(());
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "Engine::run_once / Engine::step blocked past the 100 ms poll bound when idle"
+    );
+    h.join().expect("join");
+}
