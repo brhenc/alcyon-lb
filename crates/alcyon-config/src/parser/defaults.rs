@@ -177,7 +177,8 @@ pub(crate) fn parse_defaults_directive(
         "cliexp" => parse_cliexp(kw),
         "srvexp" => parse_srvexp(kw),
         "http-check" => {
-            parse_http_check_directive(&mut defaults.http_checks, tokens, kw)?;
+            take_own_http_check(&mut defaults.http_check_own, &mut defaults.httpchk, &mut defaults.http_checks);
+            parse_http_check_directive(&mut defaults.http_checks, tokens, kw, defaults.httpchk.is_some(), defaults.httpchk_own)?;
             Ok(())
         }
         "tcp-check" => {
@@ -263,7 +264,11 @@ pub(crate) fn parse_option_defaults(
             defaults.stats.accept_unsafe_response = true;
         }
         "log-health-checks" => defaults.log_health_checks = true,
-        "httpchk" => parse_httpchk_option(&mut defaults.httpchk, tokens, kw)?,
+        "httpchk" => {
+            take_own_http_check(&mut defaults.http_check_own, &mut defaults.httpchk, &mut defaults.http_checks);
+            parse_httpchk_option(&mut defaults.httpchk, tokens, kw)?;
+            defaults.httpchk_own = true;
+        }
         "tcp-check" => defaults.tcp_check = true,
         _ => {
             parse_proto_check_option(&mut defaults.proto_check, tokens, kw)?;

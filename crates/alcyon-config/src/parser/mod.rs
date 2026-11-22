@@ -252,6 +252,12 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                         })?;
                         let mut d = parent_def.clone();
                         d.name = None;
+                        // The implicit `option httpchk` send lives in the parent's own
+                        // ruleset; this section's ruleset only gets one from its own line.
+                        // The parent's own lines are not this section's: its first own
+                        // line drops the inherited rules, as it does in a backend.
+                        d.httpchk_own = false;
+                        d.http_check_own = false;
                         d
                     } else {
                         let name = tokens[1].text.clone();
@@ -262,6 +268,12 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
                             })?;
                             let mut d = parent_def.clone();
                             d.name = Some(name);
+                            // The implicit `option httpchk` send lives in the parent's own
+                            // ruleset; this section's ruleset only gets one from its own line.
+                            // The parent's own lines are not this section's: its first own
+                            // line drops the inherited rules, as it does in a backend.
+                            d.httpchk_own = false;
+                            d.http_check_own = false;
                             d
                         } else if tokens.len() >= 3 && tokens[2].text == "from" {
                             return Err(ConfigError::new(tokens[2].line, tokens[2].col, "'from' expects a defaults section name".to_string()));

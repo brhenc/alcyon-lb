@@ -123,6 +123,14 @@ pub struct DefaultsSection {
     pub hash_preserve_affinity: Option<HashPreserveAffinity>,
     /// Default HTTP check configuration (`option httpchk`).
     pub httpchk: Option<HttpChkConfig>,
+    /// This section has an `option httpchk` line of its own (so far): that is what
+    /// plants the implicit `http-check send` in its ruleset; an inherited
+    /// `option httpchk` does not (`HAProxy` keys the http-check ruleset per section).
+    pub httpchk_own: bool,
+    /// This section has an `http-check` line of its own (so far). The first one drops
+    /// the rules cloned from a `defaults ... from` parent, as the first own line does
+    /// in a backend or listen section.
+    pub http_check_own: bool,
     /// Protocol-specific check configuration (`option redis-check`, `option smtpchk`, etc.).
     pub proto_check: Option<ProtoCheckConfig>,
     /// Optional name for named defaults sections (`defaults <name>`).
@@ -449,6 +457,10 @@ pub struct ListenSection {
     pub error_replies: HashMap<u16, ErrorPageSource>,
     /// Log tag (`log-tag`).
     pub log_tag: Option<std::sync::Arc<str>>,
+    /// This section has an `option httpchk` line of its own (so far): that is what
+    /// plants the implicit `http-check send` in its ruleset; an inherited
+    /// `option httpchk` does not (`HAProxy` keys the http-check ruleset per section).
+    pub httpchk_own: bool,
 }
 
 /// Stats configuration options for a proxy.
@@ -629,6 +641,7 @@ impl Default for ListenSection {
             error_files: HashMap::new(),
             error_replies: HashMap::new(),
             log_tag: None,
+            httpchk_own: false,
         }
     }
 }
@@ -960,6 +973,10 @@ pub struct BackendSection {
     pub error_replies: HashMap<u16, ErrorPageSource>,
     /// Log tag (`log-tag`).
     pub log_tag: Option<std::sync::Arc<str>>,
+    /// This section has an `option httpchk` line of its own (so far): that is what
+    /// plants the implicit `http-check send` in its ruleset; an inherited
+    /// `option httpchk` does not (`HAProxy` keys the http-check ruleset per section).
+    pub httpchk_own: bool,
 }
 
 impl Default for BackendSection {
@@ -1030,6 +1047,7 @@ impl Default for BackendSection {
             error_files: HashMap::new(),
             error_replies: HashMap::new(),
             log_tag: None,
+            httpchk_own: false,
         }
     }
 }

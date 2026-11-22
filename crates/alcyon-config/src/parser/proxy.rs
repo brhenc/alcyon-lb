@@ -62,6 +62,7 @@ pub(crate) fn parse_listen_header(
 
     Ok(ListenSection {
         httpchk: defaults.and_then(|d| d.httpchk.clone()),
+        httpchk_own: false,
         proto_check: defaults.and_then(|d| d.proto_check.clone()),
         http_checks: defaults.map_or_else(Vec::new, |d| d.http_checks.clone()),
         http_check_own: false,
@@ -279,6 +280,7 @@ pub(crate) fn parse_backend_header(
 
     Ok(BackendSection {
         httpchk: defaults.and_then(|d| d.httpchk.clone()),
+        httpchk_own: false,
         proto_check: defaults.and_then(|d| d.proto_check.clone()),
         http_checks: defaults.map_or_else(Vec::new, |d| d.http_checks.clone()),
         http_check_own: false,
@@ -472,7 +474,7 @@ pub(crate) fn parse_listen_directive(
         "stats" => parse_stats_directive(&mut proxy.stats, tokens, kw, false),
         "http-check" => {
             take_own_http_check(&mut proxy.http_check_own, &mut proxy.httpchk, &mut proxy.http_checks);
-            parse_http_check_directive(&mut proxy.http_checks, tokens, kw)?;
+            parse_http_check_directive(&mut proxy.http_checks, tokens, kw, proxy.httpchk.is_some(), proxy.httpchk_own)?;
             Ok(())
         }
         "tcp-response" => {
@@ -775,7 +777,7 @@ pub(crate) fn parse_backend_directive(
         "log-steps" => parse_log_steps(&mut be.log_steps, tokens, kw),
         "http-check" => {
             take_own_http_check(&mut be.http_check_own, &mut be.httpchk, &mut be.http_checks);
-            parse_http_check_directive(&mut be.http_checks, tokens, kw)?;
+            parse_http_check_directive(&mut be.http_checks, tokens, kw, be.httpchk.is_some(), be.httpchk_own)?;
             Ok(())
         }
         "tcp-response" => {
@@ -1162,6 +1164,7 @@ pub(crate) fn parse_option_listen(
         "httpchk" => {
             take_own_http_check(&mut proxy.http_check_own, &mut proxy.httpchk, &mut proxy.http_checks);
             parse_httpchk_option(&mut proxy.httpchk, tokens, kw)?;
+            proxy.httpchk_own = true;
         }
         "tcp-check" => proxy.tcp_check = true,
         _ => {
@@ -1285,6 +1288,7 @@ pub(crate) fn parse_option_backend(
         "httpchk" => {
             take_own_http_check(&mut be.http_check_own, &mut be.httpchk, &mut be.http_checks);
             parse_httpchk_option(&mut be.httpchk, tokens, kw)?;
+            be.httpchk_own = true;
         }
         "tcp-check" => be.tcp_check = true,
         _ => {

@@ -31,8 +31,36 @@ fn http_check_rules_haproxy_accepts() {
         "http-check set-var(check.x) str(a)\n  http-check unset-var(check.x)",
         "http-check expect status 200\n  http-check unset-var(check.x)\n  http-check set-var(check.y) str(b)",
         "http-check connect port 7\n  http-check send meth GET",
+        "http-check connect port 7\n  http-check send meth GET\n  http-check expect status 200",
+        "http-check comment hi\n  http-check connect addr 127.0.0.1:1234",
     ] {
         parse("http", "option httpchk", rule).unwrap_or_else(|e| panic!("HAProxy accepts `{rule}`: {e}"));
+    }
+}
+
+/// A `listen` section's own `option httpchk` plants the implicit send just as a
+/// backend's does, so the same order rules hold there.
+///
+/// `HAProxy`, same version and date: `option httpchk` plus `send` then `expect` (and
+/// `comment` before `connect`) is accepted; `send` then `send` is refused with
+/// `unable to add http-check send rule at step 2 (missing connect rule)`.
+#[test]
+fn a_listen_section_with_option_httpchk_keeps_the_order_rules() {
+    let listen = |rule: &str| {
+        format!("defaults\n  mode http\n  timeout connect 1s\n  timeout client 1s\n  timeout server 1s\n\
+                 listen l\n  bind 127.0.0.1:29011\n  option httpchk\n  {rule}\n  server s 127.0.0.1:1 check\n")
+    };
+    for rule in [
+        "http-check send meth GET\n  http-check expect status 200",
+        "http-check comment hi\n  http-check connect addr 127.0.0.1:1234",
+    ] {
+        parse_str(&listen(rule)).unwrap_or_else(|e| panic!("HAProxy accepts `{rule}`: {e}"));
+    }
+    for rule in [
+        "http-check send meth GET\n  http-check send meth GET",
+        "http-check connect addr 127.0.0.1:1234\n  http-check expect status 200",
+    ] {
+        assert!(parse_str(&listen(rule)).is_err(), "HAProxy refuses `{rule}`");
     }
 }
 
@@ -65,6 +93,9 @@ fn http_check_rules_haproxy_refuses() {
         "http-check expect comment",
         "http-check expect rstatus",
         "http-check expect rstatus (",
+        "http-check send meth GET\n  http-check connect",
+        "http-check connect addr 127.0.0.1:1234\n  http-check send meth GET\n  http-check connect addr 127.0.0.1:1234",
+        "http-check connect addr 127.0.0.1:1234\n  http-check expect status 200",
         "http-check connect addr",
         "http-check connect addr nope",
         "http-check connect port",

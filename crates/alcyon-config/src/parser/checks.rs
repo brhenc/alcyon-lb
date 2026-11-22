@@ -264,16 +264,141 @@ fn parse_status_ranges(text: &str, kw: &Token) -> Result<Vec<(u16, u16)>, Config
     Ok(out)
 }
 
+/// The three kinds of `http-check` rules that order one another; a `comment`, a
+/// variable rule or `send-state` is a step no order check refers to.
+#[derive(Clone, Copy, PartialEq)]
+enum HttpCheckRuleKind {
+    Connect,
+    Send,
+    Expect,
+}
+
+fn http_check_rule_kind(rule: &HttpCheckAction) -> Option<HttpCheckRuleKind> {
+    match rule {
+        HttpCheckAction::Connect { .. } => Some(HttpCheckRuleKind::Connect),
+        HttpCheckAction::Send { .. } => Some(HttpCheckRuleKind::Send),
+        HttpCheckAction::Expect { .. } => Some(HttpCheckRuleKind::Expect),
+        HttpCheckAction::Comment(_)
+        | HttpCheckAction::SendState
+        | HttpCheckAction::SetVar { .. }
+        | HttpCheckAction::UnsetVar { .. } => None,
+    }
+}
+
+/// The index that `HAProxy` (`do_parse_httpcheck`) would give to the
+/// `http-check` rule appended after `rules`: the previous rule's index plus
+/// one, or 0 when the ruleset is empty or still holds only the implicit send
+/// of `option httpchk`. The implicit send is rule 0 and the first explicit
+/// `send` merges into it, keeping index 0; `comment` and variable rules take
+/// an index; `send-state` does not (it is a ruleset flag, not a rule).
+/// `implicit_send` says whether this section's ruleset already holds the
+/// implicit send (its own `option httpchk` line was parsed before `rules`);
+/// an inherited `option httpchk` puts it in another section's ruleset. The
+/// index a refused rule is reported at is the one computed before any merge.
+fn http_check_next_step(rules: &[HttpCheckAction], implicit_send: bool) -> usize {
+    let mut implicit = implicit_send;
+    let mut last: Option<usize> = None;
+    for rule in rules {
+        match http_check_rule_kind(rule) {
+            None if matches!(rule, HttpCheckAction::SendState) => {}
+            Some(HttpCheckRuleKind::Send) if implicit => {
+                implicit = false;
+                last = Some(0);
+            }
+            _ => last = Some(last.map_or(0, |step| step + 1)),
+        }
+    }
+    last.map_or(0, |step| step + 1)
+}
+
+/// The `tcpcheck_add_http_rule` checks, run on the section's rules only when
+/// `option httpchk` is already enabled (inherited or of the section's own):
+/// a `send` must follow a `connect`, an `expect` a `send` or an `expect`, and
+/// a `connect` an `expect`; the implicit send of `option httpchk` is never
+/// refused. `HAProxy` names the keyword and the 1-based step the rule would
+/// have been, and the message ends with two dots because its caller appends
+/// its own to the already-dotted one.
+fn http_check_add_check(
+    rules: &[HttpCheckAction],
+    httpchk: bool,
+    httpchk_own: bool,
+    kind: HttpCheckRuleKind,
+    kw: &Token,
+) -> Result<(), ConfigError> {
+    if !httpchk {
+        // Until `option httpchk` enables the http check, `HAProxy` appends the
+        // rule to an unused ruleset without checking its order
+        // (`do_parse_httpcheck` calls `tcpcheck_add_http_rule` only once the
+        // proxy already has http-check enabled).
+        return Ok(());
+    }
+    let step = http_check_next_step(rules, httpchk_own);
+    let Some(last) = rules.iter().rev().find_map(http_check_rule_kind) else {
+        // Only comments/variable rules, or the implicit send alone: nothing
+        // to refuse against.
+        return Ok(());
+    };
+    match (last, kind) {
+        (HttpCheckRuleKind::Connect, HttpCheckRuleKind::Send)
+        | (HttpCheckRuleKind::Send, HttpCheckRuleKind::Expect)
+        | (HttpCheckRuleKind::Expect, HttpCheckRuleKind::Expect | HttpCheckRuleKind::Connect) => Ok(()),
+        (_, HttpCheckRuleKind::Send) => Err(check_err(
+            kw,
+            format!(
+                "'http-check send' : unable to add http-check send rule at step {} (missing connect rule)..",
+                step + 1
+            ),
+        )),
+        (_, HttpCheckRuleKind::Expect) => Err(check_err(
+            kw,
+            format!(
+                "'http-check expect' : unable to add http-check expect rule at step {} (missing send rule)..",
+                step + 1
+            ),
+        )),
+        (_, HttpCheckRuleKind::Connect) => Err(check_err(
+            kw,
+            format!(
+                "'http-check connect' : unable to add http-check connect rule at step {} (missing expect rule)..",
+                step + 1
+            ),
+        )),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn parse_http_check_directive(
     rules: &mut Vec<HttpCheckAction>,
     tokens: &[Token],
     kw: &Token,
+    httpchk: bool,
+    httpchk_own: bool,
 ) -> Result<(), ConfigError> {
     if tokens.len() < 2 {
         return Err(check_err(kw, "http-check requires a subcommand"));
     }
     let sub = tokens[1].text.as_str();
+
+    // The `http-check connect` parser refuses a `connect` when the first rule
+    // that is not a `comment`, a variable rule or the implicit send of
+    // `option httpchk` is not a `connect`; it runs before the arguments are
+    // parsed.
+    if sub == "connect" {
+        for rule in rules.iter() {
+            match http_check_rule_kind(rule) {
+                Some(HttpCheckRuleKind::Connect) => break,
+                None => continue,
+                Some(_) => {
+                    return Err(check_err(
+                        kw,
+                        "'http-check connect' : first step MUST also be a 'connect', optionally \
+                         preceded by a 'set-var', an 'unset-var' or a 'comment', when there is a \
+                         'connect' step in the tcp-check ruleset.",
+                    ));
+                }
+            }
+        }
+    }
 
     match sub {
         "send" => {
@@ -348,6 +473,7 @@ pub(crate) fn parse_http_check_directive(
                 i += 1;
             }
 
+            http_check_add_check(rules, httpchk, httpchk_own, HttpCheckRuleKind::Send, kw)?;
             rules.push(HttpCheckAction::Send {
                 method,
                 uri,
@@ -468,6 +594,7 @@ pub(crate) fn parse_http_check_directive(
             let Some(pattern) = pattern else {
                 return Err(check_err(kw, "http-check expect requires pattern"));
             };
+            http_check_add_check(rules, httpchk, httpchk_own, HttpCheckRuleKind::Expect, kw)?;
             rules.push(HttpCheckAction::Expect { pattern, negate, min_recv, comment });
             Ok(())
         }
@@ -519,6 +646,7 @@ pub(crate) fn parse_http_check_directive(
                 i += 1;
             }
 
+            http_check_add_check(rules, httpchk, httpchk_own, HttpCheckRuleKind::Connect, kw)?;
             rules.push(HttpCheckAction::Connect {
                 addr,
                 port,
