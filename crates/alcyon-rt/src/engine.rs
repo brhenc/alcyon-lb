@@ -3373,7 +3373,10 @@ fn stream_facts(sess: &TcpSession, status: Option<u16>, timers: bool) -> alcyon_
         retries: u32::from(used),
         redispatched: sess.flags.has(sess_flags::REDISPATCHED),
         // Only for a rule whose format prints them: five clock reads are not free (T455).
-        timers: timers.then(|| [log.ms(log.first_byte), log.ms(log.request), log.ms(log.queue), log.ms(log.connect), log.ms(log.data)]),
+        // The first is `t_idle`, run after the connection's handshakes (`handshake_done`
+        // stamps `t_handshake`, which it subtracts); the fetches build the rest from it.
+        timers: timers.then(|| [log.t_idle_ms(), log.ms(log.request), log.ms(log.queue), log.ms(log.connect), log.ms(log.data)]),
+        t_handshake: i64::from(log.t_handshake),
         be_queue: if log.queue_is_srv { 0 } else { log.be_queue },
         srv_queue: if log.queue_is_srv { log.be_queue } else { 0 },
         req_in,
@@ -3721,8 +3724,10 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
         backend: &be.name,
         backend_http: be.mode == Mode::Http,
         accept_date: l.date(),
-        t_handshake: 0,
-        t_idle: l.ms(l.first_byte),
+        // `logs->t_handshake`, stamped by `handshake_done`; -1 while the connection's last
+        // handshake layer has not completed (a session that dies in it logs `%Th` as -1).
+        t_handshake: i64::from(l.t_handshake),
+        t_idle: l.t_idle_ms(),
         t_request: l.ms(l.request),
         t_queue: l.ms(l.queue),
         t_connect: l.ms(l.connect),
@@ -12491,6 +12496,9 @@ impl EngineDispatcher<'_> {
     fn step_h3_owner_links(&mut self, owner_idx: u32, now: Tick, links: &mut Vec<crate::proxy::H2ChildLink>) -> Outcome {
         let Some(e) = self.sessions.get_mut(owner_idx) else { return Outcome::Done };
         let task = e.task;
+        // `HAProxy`'s `conn_complete_session`, for a QUIC connection: the owner's session is
+        // created once the connection is up, so its first pass stamps `t_handshake`, once.
+        e.sess.handshake_done();
         let Some(h3) = e.sess.h3_owner_mut() else { return Outcome::Done };
         let (q_idx, conn) = (h3.listener as usize, h3.conn);
         let Some(ql) = self.quic_listeners.get_mut(q_idx) else { return Outcome::Done };
@@ -12880,7 +12888,15 @@ impl EngineDispatcher<'_> {
             // Step 3: Stream engine process pass
             if !entry.sess.is_done() {
                 let was_connected = self.any_connect_log && entry.sess.strm.log.connect.is_some();
+                // `HAProxy`'s `conn_complete_session`, for a connection with no layer left
+                // to handshake: its handshakes are done at the accept, so the stamp lands
+                // before the pass receives the first byte (the stream's `t_idle` runs from
+                // after it, and a stream created in the pass clones the stamped value).
+                entry.sess.handshake_done();
                 entry.sess.advance(now);
+                // The same stamp for a layer that completed in the pass: the PROXY or CIP
+                // header read, the TLS accept.
+                entry.sess.handshake_done();
                 log_if_newly_connected(self.any_connect_log, was_connected, entry, self.proxies, self.step_emit);
             }
             #[cfg(debug_assertions)]
@@ -15433,9 +15449,9 @@ impl EngineDispatcher<'_> {
                 be_id: be_name.and_then(|n| proxies.iter().find(|p| p.has_backend && p.name == n)).map(|p| p.ids.iid),
                 accept_date: Some(sess.strm.log.date()),
                 request_date: Some(request_date(&sess.strm.log)),
-                // The request's time to its first byte (`s->logs.t_idle`, `%Ti`), as
-                // `req.timer.idle` reads it in a request rule.
-                req_timer_idle: sess.strm.log.ms(sess.strm.log.first_byte),
+                // The request's time to its first byte after the connection's handshakes
+                // (`s->logs.t_idle`, `%Ti`), as `req.timer.idle` reads it in a request rule.
+                req_timer_idle: sess.strm.log.t_idle_ms(),
                 // The stream exists by the time the request rules run (`smp->strm`): a rule
                 // that reads a timer fetch carries the stream's logs, `-1` where nothing is
                 // stamped yet (`request_phase_facts` keeps `t_request` at `-1` for the whole

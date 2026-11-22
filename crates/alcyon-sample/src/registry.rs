@@ -228,9 +228,13 @@ pub struct StreamFacts {
     /// The stream was redispatched (`txn.redispatched`).
     pub redispatched: bool,
     /// What the stream has measured, in milliseconds from its start, `-1` for what has not
-    /// happened: the first byte, the request, the queue, the connect and the response
-    /// (`%Ti`, `%TR`..., a rule's format reads them, T455). `None` where the caller has none.
+    /// happened: the first byte (after the connection's handshakes), the request, the queue,
+    /// the connect and the response (`%Ti`, `%TR`..., a rule's format reads them, T455).
+    /// `None` where the caller has none.
     pub timers: Option<[i64; 5]>,
+    /// `logs->t_handshake`: the time the connection's handshakes took, `-1` while the last
+    /// layer has not completed; what `%Th` and `fc.timer.handshake` read.
+    pub t_handshake: i64,
     /// Position in the backend's queue when dequeued (`logs->prx_queue_pos`); 0 if not queued there.
     pub be_queue: u32,
     /// Position in the server's queue when dequeued (`logs->srv_queue_pos`); 0 if not queued there.
@@ -1056,8 +1060,6 @@ pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
     // BYTESFETCH: registered, and a copy of `req.bytes_in`/`res.bytes_in`.
     ("req.bytes_out", "Alcyon does not count the bytes it forwards after rewriting the message"),
     ("res.bytes_out", "Alcyon does not count the bytes it forwards after rewriting the message"),
-    // TIMERFETCH: registered, and always 0.
-    ("fc.timer.handshake", "Alcyon does not time the client handshake"),
 ];
 
 /// Why `name` -- a fetch or a converter -- is in [`NOT_IMPLEMENTED`].
@@ -2615,9 +2617,11 @@ impl Registry {
         // (`smp_fetch_reX_timers`, `smp_fetch_txn_timers`, `smp_fetch_conn_timers`,
         // `src/sample.c`): each reads the same millisecond the access log writes for its
         // alias - `StreamFacts::timers` is `[t_idle, t_request, t_queue, t_connect,
-        // t_data]`, `PhaseCtx::t_close` the stream's `t_close`, and Alcyon's handshake is
-        // the `0` the log prints for `%Th` (`session_log_data`). Without a stream
-        // `HAProxy` gives no sample, `fc.timer.handshake` the session's value (0) among them.
+        // t_data]` with `t_idle` run after the connection's handshakes,
+        // `StreamFacts::t_handshake` the `logs->t_handshake` the log's `%Th` prints, and
+        // `PhaseCtx::t_close` the stream's `t_close`. Without a stream `HAProxy` gives no
+        // sample (`fc.timer.handshake` reads the session's value, which a context here
+        // does not hold).
         self.register_fetch(FetchDesc {
             name: "req.timer.tq",
             out_type: SampleType::Sint,
@@ -2654,6 +2658,15 @@ impl Registry {
             },
         });
         self.register_fetch(FetchDesc {
+            name: "fc.timer.handshake",
+            out_type: SampleType::Sint,
+            // `logs->t_handshake` (`%Th`): the time the connection's handshakes took
+            // (the PROXY header, the TLS accept), stamped once by `handshake_done`;
+            // `-1` while the last layer has not completed. Without a stream `HAProxy`
+            // reads `sess->t_handshake`, which a context here does not hold.
+            func: |ctx, _args| ctx.stream.map(|s| Sample::Sint(s.t_handshake)),
+        });
+        self.register_fetch(FetchDesc {
             name: "fc.timer.total",
             out_type: SampleType::Sint,
             // `logs->t_close`: 0 until the stream is logged.
@@ -2662,10 +2675,12 @@ impl Registry {
         self.register_fetch(FetchDesc {
             name: "txn.timer.total",
             out_type: SampleType::Sint,
-            // `t_close - (t_idle >= 0 ? t_idle + t_handshake : 0)`.
+            // `t_close - (t_idle >= 0 ? t_idle + t_handshake : 0)`, `t_idle` run after
+            // the handshakes.
             func: |ctx, _args| {
                 let idle = timer_part(ctx, 0)?;
-                Some(Sample::Sint(ctx.t_close - idle.max(0)))
+                let hs = ctx.stream.map_or(0, |s| s.t_handshake);
+                Some(Sample::Sint(if idle >= 0 { ctx.t_close - (idle + hs) } else { ctx.t_close }))
             },
         });
         self.register_fetch(FetchDesc {

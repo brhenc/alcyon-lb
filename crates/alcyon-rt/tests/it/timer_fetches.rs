@@ -13,7 +13,9 @@
 //! its body after 300 ms):
 //! - in an `http-request` rule, `req.timer.tq` answers `-1` (`s->logs.request_ts` is
 //!   stamped by `http_process_req_common` only after the rules ran);
-//! - `fc.timer.handshake` is refused at load (`fetch_edge_cases::fc_timer_handshake_is_refused_with_a_reason`);
+//! - `fc.timer.handshake` reads `logs->t_handshake`, the time the connection's handshakes
+//!   took: `0` on the plain TCP connections here, ~300 ms for a PROXY or TLS handshake
+//!   (`handshake_timer.rs` measures it, and `fetch_edge_cases` its load);
 //! - in an `http-response` rule, `fc.timer.total` is still `0`: `s->logs.t_close` starts
 //!   at `0` when the stream is created (`src/stream.c`) and is stamped only when it is
 //!   logged, so `txn.timer.total` / `txn.timer.user` read `0 - t_idle` there and
