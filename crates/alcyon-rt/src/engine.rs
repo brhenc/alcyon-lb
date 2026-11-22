@@ -6757,7 +6757,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// Returns an error if polling epoll fails.
     pub fn run_once(&mut self) -> io::Result<usize> {
         let at = crate::txnlog::loop_now();
-        self.step_at(self.tick_at(at), at)
+        self.step_at(self.tick_at(at), at, false)
     }
 
     /// Registers any backend socket a QUIC listener has opened since the last pass.
@@ -7067,15 +7067,19 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// it was always 100 ms, ten wakeups a second per thread for nothing). The bounds that
     /// remain: a pass that worked left pool counts the next pass publishes (the publish
     /// interval); `zero-on-free` frees its quarantine on a pass that found nothing; a stopping
-    /// thread watches its sessions, the other threads and `hard-stop-after`. A signal, a message
-    /// from another thread, an event or a timer ends the wait without one.
-    fn idle_poll_cap(&self) -> Option<u32> {
+    /// thread watches its sessions, the other threads and `hard-stop-after`; single-step
+    /// callers (`run_once`/`step`, `unbounded_idle == false`) stay bounded at 100 ms so they
+    /// return to their caller instead of blocking forever in `epoll_wait`. A signal, a
+    /// message from another thread, an event or a timer ends the wait without one.
+    fn idle_poll_cap(&self, unbounded_idle: bool) -> Option<u32> {
         if self.stopping || alcyon_alloc::zero_on_free::is_active() {
             Some(100)
         } else if self.housekeeping.worked {
             Some(12)
-        } else {
+        } else if unbounded_idle {
             None
+        } else {
+            Some(100)
         }
     }
 
@@ -7161,12 +7165,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     }
 
     pub fn step(&mut self, now: Tick) -> io::Result<usize> {
-        self.step_at(now, Instant::now())
+        self.step_at(now, Instant::now(), false)
     }
 
     /// [`Self::step`] with the clock already read: `now_inst` is the instant `now` was taken
-    /// from, what the deadlines before the poller are measured against.
-    fn step_at(&mut self, now: Tick, now_inst: Instant) -> io::Result<usize> {
+    /// from, what the deadlines before the poller are measured against. `unbounded_idle` is
+    /// true only from [`Self::run_loop`].
+    fn step_at(&mut self, now: Tick, now_inst: Instant, unbounded_idle: bool) -> io::Result<usize> {
         #[cfg(debug_assertions)]
         alcyon_sample::work::note(alcyon_sample::work::Op::Pass, 1);
         self.now = now;
@@ -7191,7 +7196,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let next_timer = self.scheduler.next_expiry();
             // A slot freed by another thread wakes nothing here: while requests queue,
             // look again soon.
-            let cap = if crate::proxy::QueueWait::any() { Some(2) } else { self.idle_poll_cap() };
+            let cap = if crate::proxy::QueueWait::any() { Some(2) } else { self.idle_poll_cap(unbounded_idle) };
             match (next_timer.remaining(now), cap) {
                 (Some(remain_ms), Some(cap)) => Some(Duration::from_millis(u64::from(remain_ms.min(cap)))),
                 (Some(remain_ms), None) => Some(Duration::from_millis(u64::from(remain_ms))),
@@ -8122,7 +8127,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             // One clock read a pass, after the poller (`pass_start`): the deadlines the poller
             // waits for are measured from the previous pass's, as HAProxy's `now_ms` is (T579, C2).
             let at = crate::txnlog::loop_now();
-            let ran = self.step_at(self.tick_at(at), at)?;
+            let ran = self.step_at(self.tick_at(at), at, true)?;
             quiet = ran == 0 && self.scheduler.run_queue_len() == 0;
         }
         Ok(())
