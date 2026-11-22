@@ -73,9 +73,6 @@ thread_local! {
     /// Active stream log level during response-rule evaluation (`set-log-level`), and
     /// captured levels for `do-log` in `http-response` / `http-after-response`.
     static RES_LOG_LEVEL: Cell<i8> = const { Cell::new(0) };
-    static DO_LOG_LEVEL: Cell<i8> = const { Cell::new(0) };
-    static DO_LOG_RES_LEVEL: Cell<i8> = const { Cell::new(0) };
-    static DO_LOG_AFTER_LEVEL: Cell<i8> = const { Cell::new(0) };
 }
 
 /// What an idle server connection is pooled under. `HAProxy` keeps idle connections per
@@ -4174,10 +4171,32 @@ fn end_stream_build_log(
     Some((l, sd, level))
 }
 
-#[derive(Default)]
-struct ResDoLog {
-    res: bool,
-    after: bool,
+/// A `http-response` / `http-after-response` `do-log` that fired: where it ran, the level
+/// then, and the stream's variables as they were (`do_log_action` sends the line right
+/// there; the response head is borrowed while the rules run, so the line is sent after them).
+struct DoLogPoint {
+    kind: alcyon_config::ast::logging::LogProfileStepKind,
+    level: i8,
+    vars: alcyon_sample::vars::VarStore,
+}
+
+impl DoLogPoint {
+    /// The point as the rule that fires now sees it: the thread's variables (`enter`), copied
+    /// into a store of the `vars` pool.
+    fn here(kind: alcyon_config::ast::logging::LogProfileStepKind, res_uses_log_level: bool, log_level: i8) -> Self {
+        let level = if res_uses_log_level { RES_LOG_LEVEL.get() } else { log_level };
+        let vars = alcyon_sample::vars::with_current(|v| v.snapshot()).unwrap_or_default();
+        Self { kind, level, vars }
+    }
+
+    /// Sends the line with the variables of this point in place.
+    fn emit(mut self, entry: &SessionEntry, proxies: &crate::table::Table, emit: LogEmit<'_>) {
+        let swapped = alcyon_sample::vars::with_current_mut(|m| std::mem::swap(m, &mut self.vars)).is_some();
+        emit_step_log_entry_level(entry, proxies, emit, self.kind, self.level);
+        if swapped {
+            let _ = alcyon_sample::vars::with_current_mut(|m| std::mem::swap(m, &mut self.vars));
+        }
+    }
 }
 
 #[cold]
@@ -4204,6 +4223,20 @@ fn emit_http_req_do_log(
         &data,
         &sc,
     );
+}
+
+/// The `http-after-response` `do-log` of a reply the proxy builds: sent where the rule runs
+/// (`do_log_action`), from the session as it is, at `level`.
+#[cold]
+#[inline(never)]
+fn emit_after_res_do_log(sess: &TcpSession, proxies: &crate::table::Table, fe_idx: usize, be_idx: usize, level: i8, emit: LogEmit<'_>) {
+    let kind = alcyon_config::ast::logging::LogProfileStepKind::HttpAfterRes;
+    let (fe, be) = (&proxies[fe_idx], &proxies[be_idx]);
+    let (view, stick) = (ProxiesView(proxies), StickView::new(proxies, &sess.tracked_sc));
+    let phase = alcyon_sample::PhaseCtx { at_log: true, log_origin: Some(kind.og_name()), ..stream_sample_ctx(sess, fe, be, &view, &stick, None) };
+    let sc = SampleContext { phase: &phase, live: None };
+    let data = session_log_data(sess, fe, be, emit.pid);
+    emit_step_log_with(fe, emit, kind, stream_log_level(level, fe, false), &data, &sc);
 }
 
 #[derive(Clone, Copy)]
@@ -10164,7 +10197,7 @@ fn reply_error(entry: &mut SessionEntry, proxies: &crate::table::Table, status: 
     }
     let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
     let page = proxy_error_response(&entry.sess, &proxies[be_idx], &proxies[entry.proxy_idx], proxies, status);
-    send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &page);
+    send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &page, None);
 }
 
 /// An `http_reply` with neither body nor headers: the status line and `content-length: 0`
@@ -10172,7 +10205,7 @@ fn reply_error(entry: &mut SessionEntry, proxies: &crate::table::Table, status: 
 fn reply_empty(entry: &mut SessionEntry, proxies: &crate::table::Table, status: u16) {
     let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
     let reply = format!("HTTP/1.1 {status} {}\r\ncontent-length: 0\r\n\r\n", status_reason(status));
-    send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, reply.as_bytes());
+    send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, reply.as_bytes(), None);
 }
 
 /// The answer to a request that could not be parsed. `HAProxy`'s H1 mux sends it before
@@ -13603,24 +13636,21 @@ impl EngineDispatcher<'_> {
         fc: Option<crate::proxy::ConnView<'_>>,
         has_observe: bool,
     ) -> bool {
-        let mut do_log = ResDoLog::default();
         let was_waiting = entry.sess.strm.txn.as_ref().is_some_and(|t| t.rsp == MsgState::Waiting);
-        Self::apply_http_response_rules_in(entry, proxies, now, lowered, Some(&mut do_log), fc, has_observe);
+        let mut points = Vec::new();
+        Self::apply_http_response_rules_in(entry, proxies, now, lowered, Some(&mut points), fc, has_observe);
         // A `do-log` at `http-response`/`http-after-response` (and `log-steps response`) sends
         // the stream's line for its step. The response head is borrowed by the rules' context
         // inside the `_in` function, so the send runs here, once that context is gone.
         let fe_idx = entry.proxy_idx;
-        if do_log.res {
-            emit_step_log_entry_level(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::HttpRes, DO_LOG_RES_LEVEL.get());
+        for p in points {
+            p.emit(entry, proxies, emit);
         }
         if was_waiting
             && proxies[fe_idx].step_log_flags & STEP_LOG_RESPONSE != 0
             && entry.sess.strm.txn.as_ref().is_some_and(|t| t.rsp != MsgState::Waiting)
         {
             emit_step_log_entry(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::Response);
-        }
-        if do_log.after {
-            emit_step_log_entry_level(entry, proxies, emit, alcyon_config::ast::logging::LogProfileStepKind::HttpAfterRes, DO_LOG_AFTER_LEVEL.get());
         }
         *lowered
     }
@@ -13631,7 +13661,7 @@ impl EngineDispatcher<'_> {
         proxies: &crate::table::Table,
         now: Tick,
         lowered: &mut bool,
-        mut do_log: Option<&mut ResDoLog>,
+        mut do_log: Option<&mut Vec<DoLogPoint>>,
         fc: Option<crate::proxy::ConnView<'_>>,
         has_observe: bool,
     ) {
@@ -14484,18 +14514,31 @@ impl EngineDispatcher<'_> {
                     }
                     outcome
                 };
-                match run_res_rules(
-                    rules,
-                    &proxies[px].acls,
-                    (&mut status, &mut status_msg),
-                    &mut ctx,
-                    &rh,
-                    caps,
-                    registry,
-                    &mut entry.sess.strm.vars,
-                    Some(ResWait { start, check: &mut check }),
-                    do_log.as_deref_mut().map(|d| &mut d.res),
-                ) {
+                let run = |vars: &mut VarStore, log: Option<&mut dyn FnMut()>| {
+                    run_res_rules(
+                        rules,
+                        &proxies[px].acls,
+                        (&mut status, &mut status_msg),
+                        &mut ctx,
+                        &rh,
+                        caps,
+                        registry,
+                        vars,
+                        Some(ResWait { start, check: &mut check }),
+                        log,
+                    )
+                };
+                let flow = if let Some(points) = do_log.as_deref_mut() {
+                    // A `do-log` marks its place (`do_log_action`): the response head is
+                    // borrowed here, so the line is sent once the rules are done, from what the
+                    // stream held at this rule.
+                    let log_level = entry.sess.strm.log.log_level;
+                    let mut log = || points.push(DoLogPoint::here(alcyon_config::ast::logging::LogProfileStepKind::HttpRes, res_uses_log_level, log_level));
+                    run(&mut entry.sess.strm.vars, Some(&mut log))
+                } else {
+                    run(&mut entry.sess.strm.vars, None)
+                };
+                match flow {
                     Err(stop) => {
                         stopped = Some(stop);
                         break;
@@ -14503,9 +14546,6 @@ impl EngineDispatcher<'_> {
                     Ok(Some(_)) => break,
                     Ok(None) => {}
                 }
-            }
-            if do_log.as_ref().is_some_and(|d| d.res) {
-                DO_LOG_RES_LEVEL.set(DO_LOG_LEVEL.get());
             }
             if let Some(line) = LAST_RULE.take().filter(|&l| l != 0) {
                 entry.sess.strm.log.last_rule = line;
@@ -14565,21 +14605,14 @@ impl EngineDispatcher<'_> {
 
             // 2. and 3. `http-after-response`, the backend's then the frontend's.
             if !proxies[be_idx].http_after_res_rules.is_empty() || !proxies[fe_idx].http_after_res_rules.is_empty() {
-                let after = eval_after_res_rules(
-                    proxies,
-                    fe_idx,
-                    be_idx,
-                    (&mut status, &mut status_msg),
-                    &mut ctx,
-                    &rh,
-                    Some(&mut res_caps),
-                    registry,
-                    &mut entry.sess.strm.vars,
-                    do_log.as_deref_mut().map(|d| &mut d.after),
-                );
-                if do_log.as_ref().is_some_and(|d| d.after) {
-                    DO_LOG_AFTER_LEVEL.set(DO_LOG_LEVEL.get());
-                }
+                let after = if let Some(points) = do_log.as_deref_mut() {
+                    // As for `http-response`.
+                    let log_level = entry.sess.strm.log.log_level;
+                    let mut log = || points.push(DoLogPoint::here(alcyon_config::ast::logging::LogProfileStepKind::HttpAfterRes, res_uses_log_level, log_level));
+                    eval_after_res_rules(proxies, fe_idx, be_idx, (&mut status, &mut status_msg), &mut ctx, &rh, Some(&mut res_caps), registry, &mut entry.sess.strm.vars, Some(&mut log))
+                } else {
+                    eval_after_res_rules(proxies, fe_idx, be_idx, (&mut status, &mut status_msg), &mut ctx, &rh, Some(&mut res_caps), registry, &mut entry.sess.strm.vars, None)
+                };
                 if !res_caps.is_empty() || !entry.sess.strm.log.res_captures.is_empty() {
                     note_res_caps_clone();
                     entry.sess.strm.log.res_captures.clone_from(&res_caps);
@@ -14664,7 +14697,7 @@ impl EngineDispatcher<'_> {
                     // A redirect is the proxy's own answer, not a refusal: `LH` (measured).
                     entry.sess.strm.log.term = Some(*b"LH");
                     let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
-                    send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &raw);
+                    send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &raw, None);
                 }
                 ResStop::Return { .. } => {
                     let be_idx = if entry.backend_idx < proxies.len() { entry.backend_idx } else { entry.proxy_idx };
@@ -14674,7 +14707,7 @@ impl EngineDispatcher<'_> {
                     }
                     // The proxy's own answer, not a refusal: `LH`.
                     entry.sess.strm.log.term = Some(*b"LH");
-                    send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &raw);
+                    send_proxy_reply(&mut entry.sess, proxies, entry.proxy_idx, be_idx, &raw, None);
                     if let Some(t) = entry.sess.strm.txn.as_mut() {
                         t.keeps_srv = srv_complete;
                     }
@@ -14880,7 +14913,7 @@ impl EngineDispatcher<'_> {
             if let Some(realm) = realm {
                 resp = with_header_at_end_of_head(&resp, &format!("www-authenticate: Basic realm=\"{realm}\""));
             }
-            send_proxy_reply(sess, &*proxies, serving, serving, &resp);
+            send_proxy_reply(sess, &*proxies, serving, serving, &resp, None);
             return true;
         }
         false
@@ -15358,7 +15391,7 @@ impl EngineDispatcher<'_> {
                 if failed {
                     reply_error(entry, proxies, 503);
                 } else {
-                    send_proxy_reply(&mut entry.sess, proxies, proxy_idx, proxy_idx, MONITOR_URI_RESPONSE);
+                    send_proxy_reply(&mut entry.sess, proxies, proxy_idx, proxy_idx, MONITOR_URI_RESPONSE, step_emit);
                 }
                 return None;
             }
@@ -15498,14 +15531,14 @@ impl EngineDispatcher<'_> {
                         // Built in a per-thread buffer that is reused (T437).
                         crate::reuse::with_bytes(|full_resp| {
                             match body {
-                                ResolvedErrorBody::Raw(bytes) => send_proxy_reply(sess, &*proxies, proxy_idx, pages_idx, bytes),
+                                ResolvedErrorBody::Raw(bytes) => send_proxy_reply(sess, &*proxies, proxy_idx, pages_idx, bytes, step_emit),
                                 ResolvedErrorBody::Custom { content_type, reply } => {
                                     let ctx = make_ctx!(sess);
                                     let line = reply.is_some_and(crate::rule_compiled::Reply::uses_request_line).then(|| request_line_of(&ctx));
                                     let data = reply.filter(|r| r.needs_stream()).and_then(|_| stream_data(sess, proxies, &ctx, line.as_deref()));
                                     build_templated_error_response_into(full_resp, *status, content_type, reply, data.as_ref(), &ctx, registry);
                                     fit_or_500(sess, proxies, proxy_idx, pages_idx, full_resp);
-                                    send_proxy_reply(sess, &*proxies, proxy_idx, pages_idx, full_resp);
+                                    send_proxy_reply(sess, &*proxies, proxy_idx, pages_idx, full_resp, step_emit);
                                 }
                             }
                         });
@@ -15521,7 +15554,7 @@ impl EngineDispatcher<'_> {
                     alcyon_config::HttpReqAction::UseServicePrometheus => {
                         sess.strm.log.applet = true;
                         if sess.req_uri.as_deref().is_some_and(|u| !crate::promex::query_ok(u)) {
-                            send_proxy_reply(sess, &*proxies, proxy_idx, pages_idx, crate::promex::BAD_QUERY);
+                            send_proxy_reply(sess, &*proxies, proxy_idx, pages_idx, crate::promex::BAD_QUERY, step_emit);
                         } else {
                             // The body is produced into the response buffer by
                             // `promex::pump` on every pass over the session.
@@ -15555,7 +15588,7 @@ impl EngineDispatcher<'_> {
                         // `dreq` of the proxy whose rule denied (`http_req_get_intercept_rule`).
                         proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
                         for_tracked(proxies, sess, |data| data.count_err());
-                        send_proxy_reply(sess, &*proxies, proxy_idx, pages_idx, &resp);
+                        send_proxy_reply(sess, &*proxies, proxy_idx, pages_idx, &resp, step_emit);
                         return Ok(RuleFlow::Replied);
                     }
                     alcyon_config::HttpReqAction::Tarpit { deny_status, content_type, lf_string: _, error_page } => {
@@ -15596,7 +15629,7 @@ impl EngineDispatcher<'_> {
                             }
                         };
                         for_tracked(proxies, sess, |data| data.count_err());
-                        send_proxy_reply(sess, &*proxies, proxy_idx, pages_idx, &resp);
+                        send_proxy_reply(sess, &*proxies, proxy_idx, pages_idx, &resp, step_emit);
                         return Ok(RuleFlow::Replied);
                     }
                     alcyon_config::HttpReqAction::Allow => {
@@ -15639,7 +15672,7 @@ impl EngineDispatcher<'_> {
                         };
                         let resp = with_header_at_end_of_head(&page, &format!("www-authenticate: Basic realm=\"{realm}\""));
                         for_tracked(proxies, sess, |data| data.count_err());
-                        send_proxy_reply(sess, &*proxies, proxy_idx, pages_idx, &resp);
+                        send_proxy_reply(sess, &*proxies, proxy_idx, pages_idx, &resp, step_emit);
                         return Ok(RuleFlow::Replied);
                     }
                     alcyon_config::HttpReqAction::Redirect(r) => {
@@ -15695,7 +15728,7 @@ impl EngineDispatcher<'_> {
                             None => {}
                         }
                         reply.push_str("\r\n");
-                        send_proxy_reply(sess, &*proxies, proxy_idx, pages_idx, reply.as_bytes());
+                        send_proxy_reply(sess, &*proxies, proxy_idx, pages_idx, reply.as_bytes(), step_emit);
                         return Ok(RuleFlow::Replied);
                     }
                     alcyon_config::HttpReqAction::SetPath { fmt: _ } => {
@@ -19589,7 +19622,7 @@ fn run_res_rules<'a, 'c>(
     registry: &Registry,
     vars: &mut VarStore,
     wait: Option<ResWait<'_>>,
-    do_log: Option<&mut bool>,
+    do_log: Option<&mut dyn FnMut()>,
 ) -> Result<Option<usize>, ResStop> {
     // In place, not a copy of the context per rule (S7).
     let prev = ctx.acls.replace(acls);
@@ -19609,7 +19642,7 @@ fn run_res_rules_in<'a>(
     registry: &Registry,
     vars: &mut VarStore,
     mut wait: Option<ResWait<'_>>,
-    mut do_log: Option<&mut bool>,
+    mut do_log: Option<&mut dyn FnMut()>,
 ) -> Result<Option<usize>, ResStop> {
     let (status, status_msg) = head;
     STRICT_MODE.set(true);
@@ -19638,11 +19671,9 @@ fn run_res_rules_in<'a>(
         let op = match op {
             ResRule::Op(op) => op,
             ResRule::DoLog => {
-                // Capture the level active when `do-log` fires (`s->logs.level`) so a
-                // later `set-log-level` rule in the same list does not alter it.
-                if let Some(slot) = do_log.as_deref_mut() {
-                    *slot = true;
-                    DO_LOG_LEVEL.set(RES_LOG_LEVEL.get());
+                // The line is sent here, from the state of this moment (`do_log_action`).
+                if let Some(log) = do_log.as_deref_mut() {
+                    log();
                 }
                 continue;
             }
@@ -19730,7 +19761,7 @@ fn eval_after_res_rules<'c>(
     mut res_caps: Option<&mut Vec<Option<Vec<u8>>>>,
     registry: &Registry,
     vars: &mut VarStore,
-    mut do_log: Option<&mut bool>,
+    mut do_log: Option<&mut dyn FnMut()>,
 ) -> Result<(), ResStop> {
     let (status, status_msg) = head;
     alcyon_sample::vars::with_stream(vars, |m| m.clear_scope(alcyon_sample::VarScope::Req));
@@ -19743,7 +19774,7 @@ fn eval_after_res_rules<'c>(
         // `http-after-response capture` writes the frontend's slots, whichever proxy the rule is in.
         let fe_slots = &proxies[fe_idx].res_capture_slots;
         let caps = res_caps.as_deref_mut().filter(|_| !fe_slots.is_empty()).map(|c| (c, &fe_slots[..]));
-        run_res_rules(rules, &proxies[px].acls, (&mut *status, &mut *status_msg), ctx, rh, caps, registry, vars, None, do_log.as_deref_mut())?;
+        run_res_rules(rules, &proxies[px].acls, (&mut *status, &mut *status_msg), ctx, rh, caps, registry, vars, None, do_log.as_mut().map(|f| &mut **f as &mut dyn FnMut()))?;
     }
     Ok(())
 }
@@ -19937,7 +19968,7 @@ fn stats_write_reply(entry: &mut SessionEntry, proxies: &crate::table::Table, ra
     // The page is streamed by the applet, not held in the HTX message the rules edit: they
     // see the head alone.
     let head_len = crate::proxy::find_eoh(raw).map_or(raw.len(), |(h, e)| h + e);
-    match after_res_on_reply(&mut entry.sess, proxies, fe, be, &raw[..head_len]) {
+    match after_res_on_reply(&mut entry.sess, proxies, fe, be, &raw[..head_len], None) {
         Ok(head) => {
             let mut out = head.into_owned();
             out.extend_from_slice(&raw[head_len..]);
@@ -20039,16 +20070,16 @@ fn htx_reply_into(raw: &[u8], out: &mut Vec<u8>) {
     lowercase_header_names(out);
 }
 
-fn send_proxy_reply(sess: &mut TcpSession, proxies: &crate::table::Table, fe_idx: usize, be_idx: usize, raw: &[u8]) {
+fn send_proxy_reply(sess: &mut TcpSession, proxies: &crate::table::Table, fe_idx: usize, be_idx: usize, raw: &[u8], emit: Option<&LogEmit<'_>>) {
     // Written in a per-thread buffer, reused from one reply to the next (T437).
-    crate::reuse::with_bytes2(|buf| send_proxy_reply_in(sess, proxies, fe_idx, be_idx, raw, buf));
+    crate::reuse::with_bytes2(|buf| send_proxy_reply_in(sess, proxies, fe_idx, be_idx, raw, buf, emit));
 }
 
-fn send_proxy_reply_in(sess: &mut TcpSession, proxies: &crate::table::Table, fe_idx: usize, be_idx: usize, raw: &[u8], buf: &mut Vec<u8>) {
+fn send_proxy_reply_in(sess: &mut TcpSession, proxies: &crate::table::Table, fe_idx: usize, be_idx: usize, raw: &[u8], buf: &mut Vec<u8>, emit: Option<&LogEmit<'_>>) {
     htx_reply_into(raw, buf);
     rewrite_header_names(buf, client_case_table(&proxies[fe_idx]));
     let raw = &buf[..];
-    if let Ok(out) = after_res_on_reply(sess, proxies, fe_idx, be_idx, raw) {
+    if let Ok(out) = after_res_on_reply(sess, proxies, fe_idx, be_idx, raw, emit) {
         // The headers the `http-after-response` rules added are HTX names too: lower case
         // (row 6 of T455, measured on 3.5-dev8: `set-header X-B` on a deny sends `x-b`).
         match out {
@@ -20063,7 +20094,7 @@ fn send_proxy_reply_in(sess: &mut TcpSession, proxies: &crate::table::Table, fe_
     let page = proxy_error_response(sess, &proxies[be_idx], &proxies[fe_idx], proxies, 500);
     let head_len = crate::proxy::find_eoh(raw).map_or(raw.len(), |(h, _)| h);
     if crate::txn::status_of(&String::from_utf8_lossy(&raw[..head_len])) != 500 {
-        if let Ok(out) = after_res_on_reply(sess, proxies, fe_idx, be_idx, &page) {
+        if let Ok(out) = after_res_on_reply(sess, proxies, fe_idx, be_idx, &page, emit) {
             sess.write_reply(&out);
             return;
         }
@@ -20080,6 +20111,7 @@ fn after_res_on_reply<'r>(
     fe_idx: usize,
     be_idx: usize,
     raw: &'r [u8],
+    emit: Option<&LogEmit<'_>>,
 ) -> Result<std::borrow::Cow<'r, [u8]>, ()> {
     use std::borrow::Cow;
     if proxies[be_idx].http_after_res_rules.is_empty() && proxies[fe_idx].http_after_res_rules.is_empty() {
@@ -20176,11 +20208,20 @@ fn after_res_on_reply<'r>(
             uniq_id: Some(sess.strm.log.uniq_id),
             ..Default::default()
         };
-        // A reply Alcyon built has no live stream to `do-log` from; the flag is discarded.
         let res_uses_log_level = proxies[be_idx].rules.res_uses_log_level || proxies[fe_idx].rules.res_uses_log_level;
         if res_uses_log_level {
             RES_LOG_LEVEL.set(sess.strm.log.log_level);
         }
+        // A `do-log` sends its line where it runs; the session is only read meanwhile, the
+        // variables being the thread's (`enter`) and `vars` the placeholder.
+        let s: &TcpSession = sess;
+        let log_level = s.strm.log.log_level;
+        let mut log = || {
+            if let Some(emit) = emit {
+                let level = if res_uses_log_level { RES_LOG_LEVEL.get() } else { log_level };
+                emit_after_res_do_log(s, proxies, fe_idx, be_idx, level, *emit);
+            }
+        };
         let result = eval_after_res_rules(
             proxies,
             fe_idx,
@@ -20191,7 +20232,7 @@ fn after_res_on_reply<'r>(
             Some(&mut res_caps),
             sample_registry(),
             &mut vars,
-            None,
+            Some(&mut log),
         );
         if res_uses_log_level {
             sess.strm.log.log_level = RES_LOG_LEVEL.get();

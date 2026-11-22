@@ -441,6 +441,22 @@ impl VarStore {
         Self { slots: VARS.take_raw(<SlotVec as alcyon_alloc::Poolable>::try_new).unwrap_or_default().0 }
     }
 
+    /// A copy of this store, in the slots of a spare one if this thread has one: the variables
+    /// as they are now (a `do-log` line is sent later, with these).
+    #[must_use]
+    pub fn snapshot(&self) -> Self {
+        let mut s = Self::new();
+        s.slots.truncate(self.slots.len());
+        s.slots.resize_with(self.slots.len(), Slot::default);
+        for (d, o) in s.slots.iter_mut().zip(&self.slots) {
+            d.val = o.val;
+            d.scope = o.scope;
+            d.buf.clear();
+            d.buf.extend_from_slice(&o.buf);
+        }
+        s
+    }
+
     fn slot(&self, name: &str) -> Option<&Slot> {
         self.slot_id(lookup(name)?)
     }

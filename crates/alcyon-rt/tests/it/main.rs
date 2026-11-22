@@ -310,6 +310,7 @@ mod log_format_sd;
 mod log_format_trailing_blank;
 mod log_parity;
 mod log_profiles;
+mod t644_dolog;
 mod log_rc_redispatch;
 mod cli_stderr_messages;
 mod log_stderr_signal;
