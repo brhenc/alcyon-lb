@@ -341,9 +341,15 @@ fn produce(cur: &mut Cursor, c: &Ctx<'_>, q: &Query<'_>, info: &crate::stats::In
                         }
                         Kind::Server => {
                             if (cur.s as usize) < px.srv_set().len() {
-                                found = Some((p_idx, cur.s as usize));
+                                let s = cur.s as usize;
                                 cur.s += 1;
-                                break;
+                                // T652: a deleted slot (its name is `""`) is no server: skipped,
+                                // as `StatCursor` does, not listed and not the end of the scrape.
+                                if px.srv_set().at(s).is_some() {
+                                    found = Some((p_idx, s));
+                                    break;
+                                }
+                                continue;
                             }
                             cur.pos += 1;
                             cur.s = 0;
