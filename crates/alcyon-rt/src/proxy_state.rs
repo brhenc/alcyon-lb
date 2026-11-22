@@ -631,12 +631,29 @@ std::thread_local! {
     static SERVER_REFS: std::cell::RefCell<Option<Vec<(String, String)>>> = const { std::cell::RefCell::new(None) };
 }
 
+std::thread_local! {
+    /// The backends [`resolve`] found named by a fetch argument, gathered with the servers:
+    /// `HAProxy` sets `PR_FL_NON_PURGEABLE` on each (`sample.c`, `ARGT_BE`), and `del backend`
+    /// refuses them (T637 S6a).
+    static BACKEND_REFS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// What the load-time validation found named by fetch arguments: the `(proxy, server)` of
+/// every server and the name of every backend.
+pub(crate) struct FetchRefs {
+    pub servers: Vec<(String, String)>,
+    pub backends: Vec<String>,
+}
+
 /// Runs `check` (the load-time validation, which resolves every fetch argument) and returns
-/// what it returned, with the `(proxy, server)` of every server a fetch argument names.
-pub(crate) fn referenced_servers<T>(check: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
+/// what it returned, with what the fetch arguments name.
+pub(crate) fn referenced_servers<T>(check: impl FnOnce() -> T) -> (T, FetchRefs) {
     SERVER_REFS.with_borrow_mut(|refs| *refs = Some(Vec::new()));
+    BACKEND_REFS.with_borrow_mut(|refs| *refs = Some(Vec::new()));
     let out = check();
-    (out, SERVER_REFS.with_borrow_mut(Option::take).unwrap_or_default())
+    let servers = SERVER_REFS.with_borrow_mut(Option::take).unwrap_or_default();
+    let backends = BACKEND_REFS.with_borrow_mut(Option::take).unwrap_or_default();
+    (out, FetchRefs { servers, backends })
 }
 
 /// Resolves one argument as `smp_resolve_args` does, with its messages.
@@ -672,7 +689,11 @@ fn resolve(config: &Config, at: Where<'_>, spec: ArgSpec, arg: Option<&str>, wha
             (None, Some(px)) if !has_backend(config, px) => {
                 Err(format!("proxy '{px}', referenced in arg {n} of {what}, has not backend capability"))
             }
-            _ => Ok(()),
+            (named, cur) => {
+                // The one named, or the proxy itself; only while `referenced_servers` gathers.
+                BACKEND_REFS.with_borrow_mut(|refs| refs.iter_mut().for_each(|r| r.extend(named.or(cur).map(str::to_owned))));
+                Ok(())
+            }
         },
         ArgKind::Server => {
             let Some(arg) = arg else {

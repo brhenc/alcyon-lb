@@ -905,6 +905,12 @@ its own answer. An example is "Server nb/a is going DOWN for maintenance. ..." f
 "Backend deleted." alone. The probes are in `docs/design/runtime-server-set-2026-11-16.md`,
 appendix A.3.
 
+`del backend` (T637 S6a) runs `be_check_for_deletion`'s refusals in HAProxy's order, except
+"Only TCP or HTTP proxies can be removed at runtime.": HAProxy 3.5 has no other backend mode
+that loads (`mode health` is refused at load, `mode log` is refused by Alcyon), so there is no
+backend that would get that answer. A second `del server` or `del backend` issued while one is
+in flight waits for it, as in HAProxy, where a change runs with the other threads isolated.
+
 ## `maxcomprate` and `set rate-limit http-compression`: refused, no HTTP compression
 
 HAProxy limits the process's compression speed with `global maxcomprate <n>` (in kB/s,
