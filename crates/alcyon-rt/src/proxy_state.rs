@@ -625,21 +625,17 @@ fn has_table(config: &Config, name: &str) -> bool {
 }
 
 std::thread_local! {
-    /// The servers [`resolve`] found named by a fetch argument, while [`referenced_servers`]
-    /// gathers them: `HAProxy`'s resolver sets `SRV_F_NAME_REFD` on each (`sample.c`), and a
-    /// server so named cannot be renamed (`set server <b>/<s> name`).
-    static SERVER_REFS: std::cell::RefCell<Option<Vec<(String, String)>>> = const { std::cell::RefCell::new(None) };
-}
-
-std::thread_local! {
-    /// The backends [`resolve`] found named by a fetch argument, gathered with the servers:
-    /// `HAProxy` sets `PR_FL_NON_PURGEABLE` on each (`sample.c`, `ARGT_BE`), and `del backend`
-    /// refuses them (T637 S6a).
-    static BACKEND_REFS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+    /// What [`resolve`] found named by fetch arguments, while [`referenced_servers`] gathers
+    /// it (`None` outside that call). Servers: `HAProxy`'s resolver sets `SRV_F_NAME_REFD` on
+    /// each (`sample.c`), and a server so named cannot be renamed (`set server <b>/<s> name`).
+    /// Backends: `HAProxy` sets `PR_FL_NON_PURGEABLE` on each (`sample.c`, `ARGT_BE`), and
+    /// `del backend` refuses them (T637 S6a).
+    static FETCH_REFS: std::cell::RefCell<Option<FetchRefs>> = const { std::cell::RefCell::new(None) };
 }
 
 /// What the load-time validation found named by fetch arguments: the `(proxy, server)` of
 /// every server and the name of every backend.
+#[derive(Default)]
 pub(crate) struct FetchRefs {
     pub servers: Vec<(String, String)>,
     pub backends: Vec<String>,
@@ -648,12 +644,10 @@ pub(crate) struct FetchRefs {
 /// Runs `check` (the load-time validation, which resolves every fetch argument) and returns
 /// what it returned, with what the fetch arguments name.
 pub(crate) fn referenced_servers<T>(check: impl FnOnce() -> T) -> (T, FetchRefs) {
-    SERVER_REFS.with_borrow_mut(|refs| *refs = Some(Vec::new()));
-    BACKEND_REFS.with_borrow_mut(|refs| *refs = Some(Vec::new()));
+    FETCH_REFS.with_borrow_mut(|refs| *refs = Some(FetchRefs::default()));
     let out = check();
-    let servers = SERVER_REFS.with_borrow_mut(Option::take).unwrap_or_default();
-    let backends = BACKEND_REFS.with_borrow_mut(Option::take).unwrap_or_default();
-    (out, FetchRefs { servers, backends })
+    let refs = FETCH_REFS.with_borrow_mut(Option::take).unwrap_or_default();
+    (out, refs)
 }
 
 /// Resolves one argument as `smp_resolve_args` does, with its messages.
@@ -691,7 +685,7 @@ fn resolve(config: &Config, at: Where<'_>, spec: ArgSpec, arg: Option<&str>, wha
             }
             (named, cur) => {
                 // The one named, or the proxy itself; only while `referenced_servers` gathers.
-                BACKEND_REFS.with_borrow_mut(|refs| refs.iter_mut().for_each(|r| r.extend(named.or(cur).map(str::to_owned))));
+                FETCH_REFS.with_borrow_mut(|refs| refs.iter_mut().for_each(|r| r.backends.extend(named.or(cur).map(str::to_owned))));
                 Ok(())
             }
         },
@@ -712,9 +706,9 @@ fn resolve(config: &Config, at: Where<'_>, spec: ArgSpec, arg: Option<&str>, wha
                 },
             };
             if has_server(config, px, srv) {
-                SERVER_REFS.with_borrow_mut(|refs| {
+                FETCH_REFS.with_borrow_mut(|refs| {
                     if let Some(refs) = refs {
-                        refs.push((px.to_owned(), srv.to_owned()));
+                        refs.servers.push((px.to_owned(), srv.to_owned()));
                     }
                 });
                 Ok(())
