@@ -1204,6 +1204,10 @@ fn main() {
     // One mailbox per worker: the CLI's `show sess` and `shutdown session(s)` ask them all.
     // A failure is reported by each worker as its engine's.
     let mailboxes = alcyon_rt::mailbox::Mailboxes::new(nbthread).map_err(|e| e.to_string());
+    // The supervising thread wakes them when a signal arrives: their pollers have no timeout.
+    if let Ok(boxes) = &mailboxes {
+        lifecycle.attach_workers(boxes);
+    }
     // One configuration for every worker, as the proxies are (T160): a worker reads it
     // while it starts, and a copy each held it for the life of the process.
     let config = std::sync::Arc::new(config);
@@ -1234,6 +1238,8 @@ fn main() {
             None => alcyon_alloc::headroom::thread_fits(worker_stack),
         };
         let spawned = fits.and_then(|()| std::thread::Builder::new().name(format!("alcyon-w{worker_id}")).spawn(move || {
+            // Wakes the supervising thread when this worker ends (T659).
+            let _exit = lifecycle_clone.exit_guard();
             // Before the ready message, so before the chroot: it opens this thread's
             // /proc/thread-self/schedstat.
             alcyon_rt::watchdog::register(worker_id);
@@ -1627,7 +1633,20 @@ fn supervise(
         if threads.iter().all(std::thread::JoinHandle::is_finished) {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Nothing to look at until a signal arrives or a worker ends (T659: this was a 20 ms
+        // nap, 50 wakeups a second for as long as the process lived). A reload in progress is
+        // watched for its child's exit and its client; a master's worker for its master.
+        // A worker that has ended is not yet `is_finished`: look again at once.
+        let timeout = if reload.is_some() {
+            Some(std::time::Duration::from_millis(20))
+        } else if master_ppid.is_some() {
+            Some(std::time::Duration::from_secs(1))
+        } else if lifecycle.worker_exited() {
+            Some(std::time::Duration::from_millis(5))
+        } else {
+            None
+        };
+        lifecycle.wait(timeout);
     }
     for t in threads {
         let _ = t.join();
