@@ -155,3 +155,66 @@ fn promex_lists_no_deleted_server() {
     assert!(!body.contains("server=\"\""), "a series has an empty server name");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn tasks(sock: &str) -> i64 {
+    let out = cli(sock, "show info");
+    let line = out.lines().find(|l| l.starts_with("Tasks:")).unwrap_or_else(|| panic!("no Tasks line in {out:?}"));
+    line["Tasks:".len()..].trim().parse().unwrap()
+}
+
+/// T658: `del server` frees the server's check task and its agent-check task, as HAProxy's
+/// `srv_drop` does; `show info`'s `Tasks` is the count. Before the fix the tasks stayed and
+/// woke every `inter` for the life of the process.
+#[test]
+fn a_deleted_servers_check_tasks_are_freed() {
+    let dir = std::env::temp_dir().join(format!("delgaps-tsk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("cli.sock").to_string_lossy().into_owned();
+    // Accepts and never answers: a check and an agent check on it are in flight (waiting for
+    // the reply) when the server goes, so their sockets must be closed with the task.
+    let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+    let sp = silent.local_addr().unwrap().port();
+    let mut cfg = format!(
+        "global\n  stats socket {sock} mode 600 level admin\n\
+         defaults\n  mode http\n  timeout connect 1s\n  timeout client 5s\n  timeout server 5s\n  timeout check 1s\n\
+         backend be\n  option httpchk\n"
+    );
+    for i in 1..=6 {
+        // A check and an agent-check each: two tasks per server.
+        let (port, aport) = if i == 1 { (sp, sp) } else { (9 + i, 20 + i) };
+        cfg.push_str(&format!("  server s{i} 127.0.0.1:{port} check inter 200ms agent-check agent-port {aport} agent-inter 200ms\n"));
+    }
+    // This one is never deleted: its tasks must stay.
+    cfg.push_str("  server keep 127.0.0.1:40 check inter 200ms\n");
+    let _proc = spawn(&dir, &cfg);
+    assert!(wait_cli(&sock), "no CLI socket");
+
+    // Startup tasks (one-shot) end within the first moments.
+    std::thread::sleep(Duration::from_millis(500));
+    let before = tasks(&sock);
+    silent.set_nonblocking(true).unwrap();
+    let mut held = Vec::new();
+    let t = Instant::now();
+    while held.len() < 2 && t.elapsed() < Duration::from_secs(3) {
+        match silent.accept() {
+            Ok((c, _)) => held.push(c),
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    assert_eq!(held.len(), 2, "the check and the agent check of s1 are connected");
+    for i in 1..=6 {
+        cli(&sock, &format!("disable server be/s{i}"));
+        assert_eq!(cli(&sock, &format!("del server be/s{i}")), "Server deleted.\n\n");
+    }
+    // HAProxy frees them at once; Alcyon's tasks free themselves on their next wake (one
+    // `inter` at most), which ends them: wait for it.
+    let t = Instant::now();
+    let mut after = tasks(&sock);
+    while before - after < 12 && t.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(50));
+        after = tasks(&sock);
+    }
+    assert!(before - after >= 12, "12 tasks (6 checks, 6 agent-checks) go with the servers: Tasks {before} -> {after}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
