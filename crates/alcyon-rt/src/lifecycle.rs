@@ -11,15 +11,15 @@
 //! A handler here is a behaviour change an operator would notice, so there is one only
 //! where `HAProxy` has one.
 //!
-//! The handlers set an [`AtomicBool`] and write a byte to a socketpair the supervising thread
+//! The handlers set an [`AtomicBool`] and write a byte to a pipe the supervising thread
 //! sleeps on ([`Lifecycle::wait`]); that thread wakes every worker ([`Lifecycle::attach_workers`]),
 //! whose poller has no timeout while it has no deadline (T659). Everything else happens on the
 //! engine's own thread when it next wakes. `signal-hook` is what
 //! keeps this free of `unsafe`: the crate forbids it, and a hand-rolled `sigaction` would
 //! need it.
 
-use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io;
+use std::os::fd::{IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -42,9 +42,11 @@ pub struct Lifecycle {
     resumed: Arc<AtomicBool>,
     /// `SIGQUIT`: run `pool_gc` (`HAProxy`'s `dump`, `src/haproxy.c:951`), an edge.
     flush: Arc<AtomicBool>,
-    /// The socketpair every handler writes a byte to: what [`Self::wait`] sleeps on. Made by
-    /// [`Self::install_signal_handlers`].
-    wake: Arc<OnceLock<(UnixStream, UnixStream)>>,
+    /// The self-pipe every handler writes a byte to: what [`Self::wait`] sleeps on, plus one
+    /// shared write-end raw fd passed to `signal_hook::low_level::pipe::register_raw` for all
+    /// signals (a pipe rather than a socketpair and one shared write fd so the process holds
+    /// neither extra `socket:` descriptors nor extra fds past `maxsock`).
+    wake: Arc<OnceLock<(OwnedFd, OwnedFd, RawFd)>>,
     /// The workers' mailboxes, woken by [`Self::wait`] when a signal arrived.
     workers: Arc<OnceLock<Arc<crate::mailbox::Mailboxes>>>,
     /// A worker thread ended ([`Self::exit_guard`]).
@@ -74,7 +76,7 @@ impl Lifecycle {
     /// # Errors
     /// Propagates a failure to register the handler.
     pub fn install_signal_handlers(&self) -> io::Result<()> {
-        let (_, w) = self.wake_pair()?;
+        let (_, _, sig_fd) = self.wake_pair()?;
         for sig in [
             signal_hook::consts::SIGUSR1,
             signal_hook::consts::SIGUSR2,
@@ -82,7 +84,7 @@ impl Lifecycle {
             signal_hook::consts::SIGTTIN,
             signal_hook::consts::SIGQUIT,
         ] {
-            signal_hook::low_level::pipe::register(sig, w.try_clone()?)?;
+            signal_hook::low_level::pipe::register_raw(sig, *sig_fd)?;
         }
         signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&self.soft_stop))?;
         // HAProxy ignores SIGUSR2 in standalone mode (`src/haproxy.c:2606`) and reloads on it
@@ -148,19 +150,23 @@ impl Lifecycle {
     /// Propagates a failure to register the handler.
     pub fn install_term_handler(&self) -> io::Result<()> {
         signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&self.terminate))?;
-        let (_, w) = self.wake_pair()?;
-        signal_hook::low_level::pipe::register(signal_hook::consts::SIGTERM, w.try_clone()?)?;
+        let (_, _, sig_fd) = self.wake_pair()?;
+        signal_hook::low_level::pipe::register_raw(signal_hook::consts::SIGTERM, *sig_fd)?;
         Ok(())
     }
 
-    fn wake_pair(&self) -> io::Result<&(UnixStream, UnixStream)> {
+    fn wake_pair(&self) -> io::Result<&(OwnedFd, OwnedFd, RawFd)> {
         if let Some(p) = self.wake.get() {
             return Ok(p);
         }
-        let (r, w) = UnixStream::pair()?;
-        r.set_nonblocking(true)?;
-        w.set_nonblocking(true)?;
-        Ok(self.wake.get_or_init(|| (r, w)))
+        let (r, w) = io::pipe()?;
+        let (r, w) = (OwnedFd::from(r), OwnedFd::from(w));
+        for fd in [&r, &w] {
+            let fl = rustix::fs::fcntl_getfl(fd)?;
+            rustix::fs::fcntl_setfl(fd, fl | rustix::fs::OFlags::NONBLOCK)?;
+        }
+        let sig_fd = w.try_clone()?.into_raw_fd();
+        Ok(self.wake.get_or_init(|| (r, w, sig_fd)))
     }
 
     /// Gives [`Self::wait`] the workers to wake when a signal arrives.
@@ -182,8 +188,8 @@ impl Lifecycle {
     }
 
     fn poke(&self) {
-        if let Some((_, w)) = self.wake.get() {
-            let _ = (&*w).write(&[1]);
+        if let Some((_, w, _)) = self.wake.get() {
+            let _ = rustix::io::write(w, &[1]);
         }
     }
 
@@ -192,7 +198,7 @@ impl Lifecycle {
     /// workers when a signal arrived, so that their pollers need no timeout to see its flag.
     pub fn wait(&self, timeout: Option<Duration>) {
         use rustix::event::{poll, PollFd, PollFlags};
-        let Some((r, _)) = self.wake.get() else {
+        let Some((r, _, _)) = self.wake.get() else {
             std::thread::sleep(timeout.unwrap_or(Duration::from_millis(20)).min(Duration::from_millis(20)));
             return;
         };
@@ -201,7 +207,7 @@ impl Lifecycle {
         let _ = poll(&mut fds, ms);
         let mut buf = [0u8; 64];
         let mut woke = false;
-        while (&*r).read(&mut buf).is_ok_and(|n| n > 0) {
+        while rustix::io::read(r, &mut buf).is_ok_and(|n| n > 0) {
             woke = true;
         }
         if woke {
