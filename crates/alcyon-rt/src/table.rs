@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::engine::Proxy;
+use crate::engine::{Proxy, SharedFlag};
 use crate::mailbox::{Gather, Mailboxes, Msg};
 use alcyon_sched::task::TaskRef;
 
@@ -71,6 +71,9 @@ pub enum Routed {
     /// The rule names a backend `unpublish backend` took out of the switching rules: the
     /// rule is skipped, as one naming a backend the configuration disabled.
     Unpublished(usize),
+    /// The rule names a backend `del backend` is deleting: no path enters it, `force-be-switch`
+    /// included. The rule is skipped.
+    Retiring,
     /// The rule names a backend the configuration disabled.
     Disabled,
     /// The rule names no backend: the next rule is tried.
@@ -141,6 +144,37 @@ impl Table {
         Self { epoch: self.epoch + 1, len: self.len, chunks, by_name: Arc::clone(&self.by_name), live: Arc::clone(&self.live) }
     }
 
+    /// The next table, with the backend at `slot` deleted (T637 S6a, `del backend`). The slot
+    /// keeps its place and is never given to another backend (the LB snapshot cache of every
+    /// worker is keyed by it): it holds an inert tombstone that has no name, no frontend, no
+    /// backend and no server, and keeps the deleted proxy's declaration links so `show stat`'s
+    /// walk goes on through it. The name map and the listing lose the slot; every other chunk
+    /// is shared with `self`.
+    ///
+    /// # Panics
+    /// If `slot` is out of range.
+    #[must_use]
+    pub fn remove(&self, slot: usize) -> Self {
+        let gone = &self[slot];
+        let slot32 = u32::try_from(slot).expect("fewer than 2^32 proxies");
+        let tomb = crate::engine::tombstone_proxy(slot, gone);
+        let mut by_name = (*self.by_name).clone();
+        if by_name.get(gone.name.as_str()) == Some(&slot32) {
+            by_name.remove(gone.name.as_str());
+            // A frontend and a backend may share a name; the first still live one answers.
+            if let Some(i) = self.live.iter().copied().find(|&i| i != slot32 && self[i as usize].name == gone.name) {
+                by_name.insert(gone.name.as_str().into(), i);
+            }
+        }
+        let live: Arc<[u32]> = self.live.iter().copied().filter(|&i| i != slot32).collect();
+        let (c, i) = (slot >> CHUNK_SHIFT, slot & (CHUNK - 1));
+        let mut chunks = self.chunks.clone();
+        let mut one: Chunk = (*self.chunks[c]).clone();
+        one[i] = Arc::new(tomb);
+        chunks[c] = Arc::new(one);
+        Self { epoch: self.epoch + 1, len: self.len, chunks, by_name: Arc::new(by_name), live }
+    }
+
     /// Which table this is: 1 at load, one more for every [`Table::replace`] of a chain.
     #[must_use]
     pub fn epoch(&self) -> u64 {
@@ -198,10 +232,10 @@ impl Table {
         // The backend of a found slot: published, or unpublished (this function is the flag's
         // only reader on the request path).
         let found = |s: usize| -> Routed {
-            if self[s].unpublished.get() {
-                Routed::Unpublished(s)
-            } else {
-                Routed::Backend(s)
+            match self[s].unpublished.state() {
+                SharedFlag::PUBLISHED => Routed::Backend(s),
+                SharedFlag::UNPUBLISHED => Routed::Unpublished(s),
+                _ => Routed::Retiring,
             }
         };
         match target.copied().unwrap_or(Target::Name) {
@@ -233,10 +267,10 @@ impl Table {
         if !self[s].has_backend {
             return Routed::Miss;
         }
-        if self[s].unpublished.get() {
-            Routed::Unpublished(s)
-        } else {
-            Routed::Backend(s)
+        match self[s].unpublished.state() {
+            SharedFlag::PUBLISHED => Routed::Backend(s),
+            SharedFlag::UNPUBLISHED => Routed::Unpublished(s),
+            _ => Routed::Retiring,
         }
     }
 
@@ -475,5 +509,48 @@ mod tests {
         assert_eq!(names(&proxies), want);
         assert_eq!(names(&**proxies.table()), want);
         assert_eq!(proxies[0].name, "b");
+    }
+
+    #[test]
+    fn a_removed_slot_is_a_tombstone_that_keeps_the_listing_order() {
+        let t1 = Table::new(load(&big()));
+        let t2 = t1.remove(3);
+        assert_eq!((t2.epoch(), t2.len()), (2, 1_102));
+        let gone = &t2[3];
+        assert_eq!((&*gone.name, gone.has_frontend, gone.has_backend, gone.srv_set().len(), gone.id), ("", false, false, 0, 3));
+        assert_eq!((gone.ids.decl, gone.ids.next_decl), (t1[3].ids.decl, t1[3].ids.next_decl), "the declaration walk goes on through the hole");
+        assert_eq!(gone.unpublished.state(), SharedFlag::RETIRING);
+        assert_eq!((t2.slot_by_name(&t1[3].name), t2.slot_by_name(&t1[4].name)), (None, Some(4)));
+        assert_eq!((t2.live().len(), t2.live().contains(&3)), (1_101, false));
+        assert!(Arc::ptr_eq(&t1.chunks[1], &t2.chunks[1]) && !Arc::ptr_eq(&t1.chunks[0], &t2.chunks[0]));
+        assert!(Arc::ptr_eq(&t1.chunks[0][4], &t2.chunks[0][4]), "the other proxies of the chunk are shared");
+        assert!(t1[3].has_backend && t1.slot_by_name(&t1[3].name) == Some(3), "the table it came from is unchanged");
+    }
+
+    /// Two proxies with one name (a frontend and a backend): the name map follows the live one.
+    #[test]
+    fn removing_one_of_two_proxies_with_a_name_keeps_the_other_by_name() {
+        let mut proxies = load(&big());
+        proxies[3].name = proxies[2].name.clone();
+        let t1 = Table::new(proxies);
+        let name = t1[2].name.clone();
+        assert_eq!(t1.slot_by_name(&name), Some(2), "the first wins");
+        assert_eq!(t1.remove(2).slot_by_name(&name), Some(3), "the next one answers");
+        assert_eq!(t1.remove(3).slot_by_name(&name), Some(2), "the first stays");
+    }
+
+    /// A retiring backend is entered by no rule, and a deleted one is a miss.
+    #[test]
+    fn a_retiring_backend_is_routed_to_by_nothing() {
+        let t = Table::new(load(&big()));
+        let f = &t[t.len() - 1];
+        assert!(matches!(t.route(f, Some(1)), Routed::Backend(8)));
+        assert!(t[8].unpublished.transition(SharedFlag::PUBLISHED, SharedFlag::RETIRING));
+        assert!(matches!(t.route(f, Some(1)), Routed::Retiring), "a rule naming it");
+        assert!(matches!(t.route_dyn(f, "x7"), Routed::Retiring), "a rule built from a name");
+        t[8].unpublished.set(false);
+        assert!(matches!(t.route(f, Some(1)), Routed::Retiring), "publish does not revive it");
+        let gone = t.remove(8);
+        assert!(matches!(gone.route_dyn(f, "x7"), Routed::Miss));
     }
 }

@@ -34,8 +34,9 @@ pub enum Msg {
     /// A new table of backends (T637 S2): swap to it between two events and reply with its epoch.
     Table(Arc<crate::table::Table>, Arc<Gather<u64>>),
     /// T637 S4, `del server`: close this worker's idle connections to server `srv` of backend
-    /// `be` and reply how many of its streams and queued requests it still has.
-    Retire { be: usize, srv: usize, gather: Arc<Gather<u64>> },
+    /// `be` and reply how many of its streams and queued requests it still has. T637 S6a,
+    /// `del backend`: `srv` is `None`, and the count is the backend's (`beconn` and its queue).
+    Retire { be: usize, srv: Option<usize>, gather: Arc<Gather<u64>> },
     /// To worker 0: a `do-resolve` question its sections answer (T489).
     DoResolve(alcyon_alloc::PoolBox<Box<crate::resolvers::DrMsg>>),
     /// Back to the worker that asked: the answer, for its cache and the waiting stream.
@@ -441,7 +442,7 @@ mod tests {
         let boxes = Mailboxes::new(2).expect("eventfd");
         boxes.close(1);
         let g = Gather::new(&boxes, 0, TaskRef::NONE);
-        boxes.broadcast(|| Msg::Retire { be: 0, srv: 0, gather: Arc::clone(&g) });
+        boxes.broadcast(|| Msg::Retire { be: 0, srv: Some(0), gather: Arc::clone(&g) });
         for m in boxes.take(0) {
             if let Msg::Retire { gather, .. } = m {
                 gather.reply(0, 0);

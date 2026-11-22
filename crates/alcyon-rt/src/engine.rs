@@ -42,7 +42,7 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use std::time::{Duration, Instant};
 
@@ -1785,6 +1785,10 @@ pub struct ProxyIdInfo {
     pub next_decl: u32,
     /// The section has an `id` of its own (`bk_f_forced_id`).
     pub forced_id: bool,
+    /// Other configuration points at this backend: a `use_backend`, a `default_backend`, a
+    /// fetch argument. `del backend` refuses it (`PR_FL_NON_PURGEABLE`); set at load, never
+    /// cleared (T637 S6a).
+    pub non_purgeable: bool,
     /// Each listener's numeric id (`luid`) by `bind` line, as `so_id` reads it.
     pub listener_ids: Vec<u32>,
     /// `option http-server-close`: the server connection carries one request. Read when a
@@ -1865,35 +1869,57 @@ impl Monitor {
     }
 }
 
-/// A bool shared through every `Arc<Proxy>` of one backend while [`Proxy`] stays `Clone`: the
-/// derived clone copies its value; the `Arc` is what makes it shared. A raw atomic in the
-/// derived `Clone` would not compile, and an `Arc` of one costs a pointer chase and an
-/// allocation per backend for the same one byte.
+/// A backend's switching state, shared through every `Arc<Proxy>` of it while [`Proxy`] stays
+/// `Clone`: the derived clone copies its value; the `Arc` is what makes it shared. A raw
+/// atomic in the derived `Clone` would not compile, and an `Arc` of one costs a pointer chase
+/// and an allocation per backend for the same one byte. Three states in that byte (T637 S6a):
+/// [`SharedFlag::PUBLISHED`], [`SharedFlag::UNPUBLISHED`] (`unpublish backend`: skipped by the
+/// switching rules, entered by `force-be-switch`) and [`SharedFlag::RETIRING`] (`del backend`
+/// is counting its streams: no path enters it, `force-be-switch` included; a deleted backend's
+/// slot keeps it for good).
 #[derive(Debug, Default)]
 pub struct SharedFlag {
-    flag: AtomicBool,
+    flag: std::sync::atomic::AtomicU8,
 }
 
 impl SharedFlag {
-    /// The flag starting at `v`: a `be-unpublished` proxy is born with it set.
+    pub const PUBLISHED: u8 = 0;
+    pub const UNPUBLISHED: u8 = 1;
+    pub const RETIRING: u8 = 2;
+
+    /// The flag starting unpublished when `v`: a `be-unpublished` proxy is born with it set.
     #[must_use]
     pub const fn new(v: bool) -> Self {
-        Self { flag: AtomicBool::new(v) }
+        Self { flag: std::sync::atomic::AtomicU8::new(v as u8) }
     }
 
+    /// The state: the one byte [`crate::table::Table::route`] reads.
     #[must_use]
-    pub fn get(&self) -> bool {
+    pub fn state(&self) -> u8 {
         self.flag.load(Ordering::Acquire)
     }
 
+    /// Whether the backend is out of the switching rules, unpublished or retiring (what
+    /// `show stat` marks `(UNPUB)`).
+    #[must_use]
+    pub fn get(&self) -> bool {
+        self.state() != Self::PUBLISHED
+    }
+
+    /// `publish backend` (`false`) and `unpublish backend` (`true`): a retiring backend stays so.
     pub fn set(&self, v: bool) {
-        self.flag.store(v, Ordering::Release);
+        let _ = self.flag.try_update(Ordering::AcqRel, Ordering::Acquire, |c| (c != Self::RETIRING).then_some(u8::from(v)));
+    }
+
+    /// Moves `from` to `to`; whether it was in `from`.
+    pub fn transition(&self, from: u8, to: u8) -> bool {
+        self.flag.compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire).is_ok()
     }
 }
 
 impl Clone for SharedFlag {
     fn clone(&self) -> Self {
-        Self { flag: AtomicBool::new(self.flag.load(Ordering::Relaxed)) }
+        Self { flag: std::sync::atomic::AtomicU8::new(self.flag.load(Ordering::Relaxed)) }
     }
 }
 
@@ -5317,6 +5343,35 @@ pub(crate) fn empty_proxy() -> Proxy {
         .expect("no use_backend rules")
 }
 
+/// `PR_FL_NON_PURGEABLE` on every backend another section's `use_backend` or `default_backend`
+/// names, and on every one a fetch argument names (`nbsrv(be)`): `del backend` refuses them
+/// (T637 S6a; the line where the load reaches the command's checks).
+fn mark_referenced_backends(proxies: &mut [Proxy], fetched: &[String]) {
+    let mut names: std::collections::HashSet<&str> = fetched.iter().map(String::as_str).collect();
+    for p in proxies.iter() {
+        names.extend(p.default_backend.as_deref());
+        names.extend(p.use_backends.iter().map(|u| u.backend.as_str()));
+    }
+    let names: Vec<String> = names.into_iter().map(str::to_owned).collect();
+    for p in proxies.iter_mut().filter(|p| p.has_backend && names.contains(&p.name)) {
+        p.ids.non_purgeable = true;
+    }
+}
+
+/// What a deleted backend's slot holds (T637 S6a): [`empty_proxy`] numbered `slot`, retiring
+/// for good (no path enters it), carrying the declaration links of `gone` so that `show stat`
+/// and the exporter walk through the hole in the order the sections were written.
+pub(crate) fn tombstone_proxy(slot: usize, gone: &Proxy) -> Proxy {
+    let mut p = empty_proxy();
+    // `empty_proxy` is a frontend that never listens: a tombstone is neither kind.
+    p.has_frontend = false;
+    p.id = usize_to_u32(slot);
+    p.ids.decl = gone.ids.decl;
+    p.ids.next_decl = gone.ids.next_decl;
+    p.unpublished.transition(SharedFlag::PUBLISHED, SharedFlag::RETIRING);
+    p
+}
+
 fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, fe: &alcyon_config::FrontendSection) -> io::Result<Proxy> {
     let mut http_req_rules = fe.http_req_rules.clone();
     with_buffered_request(&mut http_req_rules, fe.buffer_request);
@@ -5838,7 +5893,7 @@ impl Engine {
     // An action naming a fetch or converter the registry lacks would load and then do
     // nothing on every request; `HAProxy` refuses the configuration instead.
     // The resolution of every fetch argument also tells which servers a fetch names.
-    let (valid, server_refs) = crate::proxy_state::referenced_servers(|| crate::rule_exprs::validate_config(config));
+    let (valid, fetch_refs) = crate::proxy_state::referenced_servers(|| crate::rule_exprs::validate_config(config));
     valid.map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     // Exactly the proxies built below: a doubling Vec of 1.6 KB proxies left up to half of
     // it unused, 2.7 KB a backend at 10,000 (T175).
@@ -5904,7 +5959,7 @@ impl Engine {
             p.ids.rows = Some(Arc::clone(&table));
         }
     }
-    for (px, srv) in &server_refs {
+    for (px, srv) in &fetch_refs.servers {
         let Some(p) = proxies.iter_mut().find(|p| p.has_backend && p.name == *px) else { continue };
         let Some(i) = p.srv_set().find(srv).map(|s| s.index()) else { continue };
         p.srv_set_mut().mark_name_refd(i);
@@ -5932,6 +5987,7 @@ impl Engine {
             proxies[p_idx].srv_set_mut().mark_non_purgeable(*i as usize);
         }
     }
+    mark_referenced_backends(&mut proxies, &fetch_refs.backends);
     crate::track::attach(&mut proxies, config);
     link_declaration_order(&mut proxies);
     crate::logfwd::start(config)?;
@@ -6503,34 +6559,42 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// backend `be` and replies how many of its streams and queued requests it still holds
     /// (`srv_in_use`, one worker's part). An idle connection is closed, not counted, as
     /// `HAProxy`'s `disable` does.
-    fn retire_server(&mut self, be: usize, srv: usize, gather: &std::sync::Arc<crate::mailbox::Gather<u64>>) {
+    fn retire_server(&mut self, be: usize, srv: Option<usize>, gather: &std::sync::Arc<crate::mailbox::Gather<u64>>) {
         // This worker's slot of the idle pool: the connections it keeps to `(be, srv)` are
         // closed here (the door is closed, so nothing re-opens one), the pool is told of
         // them as `purge_with` tells it, and they are not counted in the answer (HAProxy's
         // `srv_in_use` sees idle connections only because they were still there; a
         // connection this closed is gone for every worker).
-        let slot = self.idle_backend_pool.slot();
-        let mut pool = IdlePools::lock(slot);
-        let mut closed = 0;
-        if let Some(si) = pool.srv_mut((be, srv)) {
-            si.purge_at = None;
-            for p in si.conns.drain(..) {
-                si.safe -= usize::from(p.safe);
-                p.conn.close();
-                closed += 1;
+        if let Some(srv) = srv {
+            let slot = self.idle_backend_pool.slot();
+            let mut pool = IdlePools::lock(slot);
+            let mut closed = 0;
+            if let Some(si) = pool.srv_mut((be, srv)) {
+                si.purge_at = None;
+                for p in si.conns.drain(..) {
+                    si.safe -= usize::from(p.safe);
+                    p.conn.close();
+                    closed += 1;
+                }
+                pool.conns = pool.conns.saturating_sub(closed);
             }
-            pool.conns = pool.conns.saturating_sub(closed);
+            let conns = pool.conns;
+            let next = pool.next_purge();
+            slot.conns.store(conns, Ordering::Relaxed);
+            drop(pool);
+            self.idle_backend_pool.next_purge = next;
+            if closed != 0 {
+                self.idle_backend_pool.pools.count_idle((be, srv), 0, closed);
+            }
         }
-        let conns = pool.conns;
-        let next = pool.next_purge();
-        slot.conns.store(conns, Ordering::Relaxed);
-        drop(pool);
-        self.idle_backend_pool.next_purge = next;
-        if closed != 0 {
-            self.idle_backend_pool.pools.count_idle((be, srv), 0, closed);
-        }
-        let streams = self.sessions.iter().filter(|(_, e)| e.srv_backend_idx == be && e.target_server_idx == Some(srv)).count();
-        let queued = crate::proxy::queued_on(be, srv);
+        let (streams, queued) = match srv {
+            Some(srv) => (
+                self.sessions.iter().filter(|(_, e)| e.srv_backend_idx == be && e.target_server_idx == Some(srv)).count(),
+                crate::proxy::queued_on(be, srv),
+            ),
+            // `del backend`: `beconn`, the streams attached to the backend, and its queue.
+            None => (self.sessions.iter().filter(|(_, e)| counted_backend(e) == Some(be)).count(), crate::proxy::queued_on_backend(be)),
+        };
         gather.reply(self.mailbox_wid, (streams + queued) as u64);
     }
 
@@ -11418,7 +11482,7 @@ impl EngineDispatcher<'_> {
                 // without it the rule is skipped for the next one.
                 Routed::Disabled if forced() => return None,
                 Routed::Unpublished(idx) if forced() => return Some(idx),
-                Routed::Disabled | Routed::Unpublished(_) => {}
+                Routed::Disabled | Routed::Unpublished(_) | Routed::Retiring => {}
                 // The built name was no backend: the loop ends here and the default takes
                 // over, as the break in `process_switching_rules`; the remaining rules are
                 // not tried.
@@ -11433,7 +11497,7 @@ impl EngineDispatcher<'_> {
                 // An unpublished default keeps the request on the frontend, as a missing one.
                 Routed::Unpublished(idx) if forced() => return Some(idx),
                 Routed::Disabled | Routed::Miss => {}
-                Routed::Unpublished(_) => {}
+                Routed::Unpublished(_) | Routed::Retiring => {}
             }
         }
 
@@ -21495,7 +21559,7 @@ mod unpublished_tests {
             pool.conns = 1;
         }
         let gather = crate::mailbox::Gather::new(&engine.mailboxes, engine.mailbox_wid, TaskRef::NONE);
-        engine.retire_server(0, 0, &gather);
+        engine.retire_server(0, Some(0), &gather);
         assert_eq!(gather.take(), Some(vec![0]));
         let slot = engine.idle_backend_pool.slot();
         let mut pool = IdlePools::lock(slot);

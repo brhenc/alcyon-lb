@@ -682,18 +682,8 @@ fn del_server_concurrent_busy() {
     let r1 = t1.join().expect("t1");
     let r2 = t2.join().expect("t2");
 
-    for r in [&r1, &r2] {
-        assert!(
-            r == "Server deleted.\n\n" || r == "Another server deletion is in progress.\n\n",
-            "unexpected concurrent del server answer: {r:?}"
-        );
-    }
-    if r1 != "Server deleted.\n\n" {
-        assert_eq!(cli(&sock, "del server be/s1"), "Server deleted.\n\n");
-    }
-    if r2 != "Server deleted.\n\n" {
-        assert_eq!(cli(&sock, "del server be/s2"), "Server deleted.\n\n");
-    }
+    // P2: a change that finds another in flight waits for it, as in HAProxy; neither is refused.
+    assert_eq!((r1.as_str(), r2.as_str()), ("Server deleted.\n\n", "Server deleted.\n\n"));
 }
 
 #[test]

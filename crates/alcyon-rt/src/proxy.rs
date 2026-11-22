@@ -437,6 +437,13 @@ pub fn queued_on(be: usize, srv: usize) -> usize {
     QUEUED.with(|q| q.borrow().iter().filter(|(_, b, s)| *b == be && *s == Some(srv)).count())
 }
 
+/// The requests this thread queued on backend `be`, for any server or none (T637 S6a: one
+/// worker's part of `del backend`'s `beconn`).
+#[must_use]
+pub fn queued_on_backend(be: usize) -> usize {
+    QUEUED.with(|q| q.borrow().iter().filter(|(_, b, _)| *b == be).count())
+}
+
 impl QueueWait {
     /// A box in no queue.
     fn blank() -> Box<QueueWait> {

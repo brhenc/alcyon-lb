@@ -58,31 +58,62 @@ pub struct AppletContext<'a> {
     pub task: TaskRef,
 }
 
-/// Non-blocking in-progress flag (T637 S4): held by `del server` across its
-/// check-and-commit so that two `del server` commands from two connections cannot pass the
-/// checks for one server at once (C5) without ever blocking a worker thread.
-static CHANGE_IN_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The change guard (T637 S4, S6a): held by every command that changes the set of servers or
+/// backends (`del server`, `del backend`) from its checks to its commit, so that two
+/// commands from two connections never pass the checks for one object at once (C5). As in
+/// `HAProxy`, where a change runs with the other threads isolated, a second command waits for
+/// the first: it parks (`Pending::Wait`) and its connection's task is woken when the guard is
+/// released, without ever blocking a worker thread.
+struct ChangeState {
+    busy: bool,
+    /// The connections to wake when the guard is released: their worker's mailboxes, the
+    /// worker and the task.
+    waiters: Vec<(Arc<Mailboxes>, usize, TaskRef)>,
+}
 
-/// Guard for an in-flight `del server` (C4, C5): releases `CHANGE_IN_PROGRESS` on drop and,
-/// if armed and not disarmed before drop (e.g. client disconnected mid-delete), restores
-/// `prev` on the server slot if it is still `RETIRING`.
+static CHANGE: std::sync::Mutex<ChangeState> = std::sync::Mutex::new(ChangeState { busy: false, waiters: Vec::new() });
+
+fn change_state() -> std::sync::MutexGuard<'static, ChangeState> {
+    CHANGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Guard for an in-flight `del server` or `del backend` (C4, C5): releases the change guard on
+/// drop and, if armed and not disarmed before drop (e.g. client disconnected mid-delete),
+/// restores `prev` on the server slot (`srv`) or the backend (`None`) if it is still
+/// retiring.
 struct RetireGuard {
     table: Option<Arc<crate::table::Table>>,
     be: usize,
-    srv: usize,
+    srv: Option<usize>,
     prev: u8,
     armed: bool,
 }
 
 impl RetireGuard {
-    fn try_acquire() -> Option<Self> {
-        CHANGE_IN_PROGRESS
-            .compare_exchange(false, true, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
-            .ok()
-            .map(|_| Self { table: None, be: 0, srv: 0, prev: 0, armed: false })
+    const fn held() -> Self {
+        Self { table: None, be: 0, srv: None, prev: 0, armed: false }
     }
 
-    fn arm(&mut self, table: Arc<crate::table::Table>, be: usize, srv: usize, prev: u8) {
+    /// The guard, if no change is in flight.
+    #[cfg(test)]
+    fn try_acquire() -> Option<Self> {
+        let mut st = change_state();
+        (!std::mem::replace(&mut st.busy, true)).then(Self::held)
+    }
+
+    /// The guard, or, when a change is in flight, `None` with the caller's connection noted
+    /// for the wakeup that its release posts.
+    fn acquire_or_wait(ctx: &AppletContext) -> Option<Self> {
+        let mut st = change_state();
+        if st.busy {
+            st.waiters.push((Arc::clone(ctx.mailboxes), ctx.worker_id, ctx.task));
+            return None;
+        }
+        st.busy = true;
+        Some(Self::held())
+    }
+
+    fn arm(&mut self, table: Arc<crate::table::Table>, be: usize, srv: Option<usize>, prev: u8) {
         self.table = Some(table);
         self.be = be;
         self.srv = srv;
@@ -97,21 +128,31 @@ impl RetireGuard {
 
 impl Drop for RetireGuard {
     fn drop(&mut self) {
-        if let Some(cell) = self
-            .armed
-            .then_some(())
-            .and(self.table.as_ref())
-            .and_then(|t| t.get(self.be))
-            .and_then(|px| px.srv_set().status_cell(self.srv))
-        {
-            let _ = cell.compare_exchange(
-                crate::check::RETIRING,
-                self.prev,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+        if let Some(px) = self.armed.then_some(()).and(self.table.as_ref()).and_then(|t| t.get(self.be)) {
+            match self.srv {
+                Some(srv) => {
+                    if let Some(cell) = px.srv_set().status_cell(srv) {
+                        let _ = cell.compare_exchange(
+                            crate::check::RETIRING,
+                            self.prev,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                }
+                None => {
+                    px.unpublished.transition(crate::engine::SharedFlag::RETIRING, self.prev);
+                }
+            }
         }
-        CHANGE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+        let waiters = {
+            let mut st = change_state();
+            st.busy = false;
+            std::mem::take(&mut st.waiters)
+        };
+        for (boxes, wid, task) in waiters {
+            boxes.post(wid, crate::mailbox::Msg::Wake(task));
+        }
     }
 }
 
@@ -125,7 +166,7 @@ enum Pending {
     Shut(Arc<Gather<usize>>, bool),
     /// T637 S4, `del server`: every worker's count of the server's streams and queued
     /// requests, asked after the server went [`crate::check::RETIRING`]; `prev` is the state
-    /// a refusal restores (C4); `guard` holds `CHANGE_IN_PROGRESS` and restores `prev` if
+    /// a refusal restores (C4); `guard` holds the change guard and restores `prev` if
     /// the CLI connection closes mid-delete.
     Retire {
         counts: Arc<Gather<u64>>,
@@ -134,6 +175,20 @@ enum Pending {
         prev: u8,
         guard: RetireGuard,
     },
+    /// T637 S6a, `del backend`: every worker's count of the backend's streams and queued
+    /// requests, asked after the backend went retiring; then, with none held, every worker's
+    /// answer to the table without the backend (`published`), after which the backend is gone
+    /// for all of them and the command answers. `guard` holds the change guard, and puts the
+    /// backend back to unpublished if the CLI connection closes before the table is out.
+    DelBackend {
+        counts: Arc<Gather<u64>>,
+        published: Option<Arc<Gather<u64>>>,
+        be: usize,
+        guard: RetireGuard,
+    },
+    /// A command that found the change guard held (P2: it waits, as in `HAProxy`); the
+    /// guard's release wakes the connection, and the command runs again.
+    Wait(String),
 }
 
 /// What a `show quic` waiting for the workers prints: which connections, and (T569, `alcyon-acks`)
@@ -732,7 +787,8 @@ impl CliApplet {
             }
         } else if cmd == "show backend" {
             self.out_buf.extend_from_slice(b"# name\n");
-            for p in ctx.proxies.iter() {
+            // A deleted backend's slot is a tombstone: neither kind, no row (T637 S6a).
+            for p in ctx.proxies.iter().filter(|p| p.has_frontend || p.has_backend) {
                 self.out_buf.extend_from_slice(format!("{}\n", p.name).as_bytes());
             }
             if self.interactive {
@@ -746,8 +802,8 @@ impl CliApplet {
             } else {
                 self.is_done = true;
             }
-        } else if let Some(target) = cmd.strip_prefix("del backend ") {
-            self.handle_del_backend(target.trim(), ctx);
+        } else if cmd == "del backend" || cmd.starts_with("del backend ") {
+            self.handle_del_backend(cmd["del backend".len()..].trim(), ctx);
         } else if cmd == "del server" || cmd.starts_with("del server ") {
             self.handle_del_server(cmd["del server".len()..].trim(), ctx);
         } else if let Some(target) = cmd.strip_prefix("unpublish backend") {
@@ -1096,42 +1152,51 @@ impl CliApplet {
         self.finish_msg(if publish { "Backend published." } else { "Backend unpublished." });
     }
 
-    fn handle_del_backend(&mut self, target: &str, ctx: &mut AppletContext) {
-        let mut found = None;
-        let mut is_referenced = false;
-
-        for p in ctx.proxies.iter() {
-            if p.name == target {
-                found = Some(p);
-            } else {
-                if p.default_backend.as_deref() == Some(target) {
-                    is_referenced = true;
-                }
-                for u in &p.use_backends {
-                    if u.backend == target {
-                        is_referenced = true;
-                    }
-                }
-            }
+    /// `del backend <name>` (T637 S6a, `cli_parse_delete_backend`): the checks of
+    /// `be_check_for_deletion` in `HAProxy`'s order, then the backend goes retiring (no path
+    /// enters it, `force-be-switch` included), every worker counts the streams and queued
+    /// requests it holds (`Msg::Retire`), and with none the table without the backend is
+    /// published (`Table::remove`) and the command answers once every worker reads it. The
+    /// refusal for a held stream puts the backend back to unpublished.
+    fn handle_del_backend(&mut self, args: &str, ctx: &mut AppletContext) {
+        let mut words = args.split_whitespace();
+        let name = words.next().unwrap_or("");
+        if words.next().is_some() {
+            self.finish_msg("Usage: del backend <name>.");
+            return;
         }
-
-        if let Some(p) = found {
-            if is_referenced {
-                self.out_buf.extend_from_slice(b"This proxy cannot be removed at runtime due to other configuration elements pointing to it.\n");
-            } else if p.name == "li" || p.addr.port() != 0 {
-                self.out_buf.extend_from_slice(b"Cannot delete a listen section.\n");
-            } else {
-                self.out_buf.extend_from_slice(b"Backend must be unpublished prior to its deletion.\n");
-            }
+        let Some(mut guard) = RetireGuard::acquire_or_wait(ctx) else {
+            self.pending = Some(Pending::Wait(format!("del backend {name}")));
+            return;
+        };
+        // `proxy_be_by_name`: a backend, or a `listen` section.
+        let Some((be, px)) = ctx.proxies.iter().enumerate().find(|(_, p)| p.has_backend && p.name == name) else {
+            self.finish_msg("No such backend.");
+            return;
+        };
+        let refusal = if px.has_frontend {
+            Some("Cannot delete a listen section.")
+        } else if px.stick_table.is_some() {
+            Some("Cannot remove a backend with stick-table.")
+        } else if px.ids.non_purgeable {
+            Some("This proxy cannot be removed at runtime due to other configuration elements pointing to it.")
+        } else if px.unpublished.state() != crate::engine::SharedFlag::UNPUBLISHED {
+            Some("Backend must be unpublished prior to its deletion.")
+        } else if px.srv_set().live().next().is_some() {
+            Some("Only a backend without server can be deleted.")
         } else {
-            self.out_buf.extend_from_slice(b"No such backend.\n");
+            None
+        };
+        if let Some(msg) = refusal {
+            self.finish_msg(msg);
+            return;
         }
-
-        if self.interactive {
-            self.out_buf.extend_from_slice(b"\n> ");
-        } else {
-            self.is_done = true;
-        }
+        // Close the door: no switching rule enters the backend from here on.
+        px.unpublished.transition(crate::engine::SharedFlag::UNPUBLISHED, crate::engine::SharedFlag::RETIRING);
+        guard.arm(ctx.proxies.arc(), be, None, crate::engine::SharedFlag::UNPUBLISHED);
+        let counts = crate::mailbox::Gather::new(ctx.mailboxes, ctx.worker_id, ctx.task);
+        ctx.mailboxes.broadcast(|| crate::mailbox::Msg::Retire { be, srv: None, gather: Arc::clone(&counts) });
+        self.pending = Some(Pending::DelBackend { counts, published: None, be, guard });
     }
 
     /// `del server <backend>/<server>` (T637 S4, `cli_parse_delete_server`): the server is
@@ -1147,8 +1212,8 @@ impl CliApplet {
             self.finish_msg("Require 'backend/server'.");
             return;
         };
-        let Some(mut guard) = RetireGuard::try_acquire() else {
-            self.finish_msg("Another server deletion is in progress.");
+        let Some(mut guard) = RetireGuard::acquire_or_wait(ctx) else {
+            self.pending = Some(Pending::Wait(format!("del server {target}")));
             return;
         };
         // `proxy_be_by_name`: a backend (or a `listen` section); a frontend is not one.
@@ -1180,11 +1245,11 @@ impl CliApplet {
         // operator's `enable` and `set server ... state` refuse to leave this state. Its
         // state before the door is what a refusal restores (C4).
         let prev = srv.swap_status(crate::check::RETIRING).unwrap_or(raw);
-        guard.arm(ctx.proxies.arc(), be, srv_idx, prev);
+        guard.arm(ctx.proxies.arc(), be, Some(srv_idx), prev);
         let counts = crate::mailbox::Gather::new(ctx.mailboxes, ctx.worker_id, ctx.task);
         ctx.mailboxes.broadcast(|| crate::mailbox::Msg::Retire {
             be,
-            srv: srv_idx,
+            srv: Some(srv_idx),
             gather: std::sync::Arc::clone(&counts),
         });
         self.pending = Some(Pending::Retire { counts, be, srv: srv_idx, prev, guard });
@@ -1328,7 +1393,10 @@ impl CliApplet {
                 if let Some(p_idx) = ctx.proxies.iter().position(|p| p.name == parts[2]) {
                     iid_filter = Some(i32::try_from(ctx.proxies[p_idx].ids.iid).unwrap_or(-2));
                 } else {
-                    iid_filter = Some(-2); // force not found
+                    // `stats_dump_stat_to_buffer`'s proxy lookup (`stats_find_proxy`): a name
+                    // that is no proxy, a deleted backend's included, is an error, not an empty dump.
+                    self.finish_msg("No such proxy.");
+                    return;
                 }
             }
         }
@@ -1877,9 +1945,39 @@ impl CliApplet {
         format!("{lead}{:>13} {:>13} {:>8} {:>8} {:>11}\n", a.ack_eliciting_sent, a.ack_only_received, ratio, thr, excess)
     }
 
+    /// The two waits of `del backend`: the workers' counts, then their reads of the table without
+    /// the backend. `true` once answered.
+    fn resume_del_backend(&mut self, counts: Arc<Gather<u64>>, published: Option<Arc<Gather<u64>>>, be: usize, mut guard: RetireGuard, ctx: &mut AppletContext) -> bool {
+        if let Some(published) = published {
+            // The table without the backend is out: every worker reads it.
+            if published.take().is_none() {
+                self.pending = Some(Pending::DelBackend { counts, published: Some(published), be, guard });
+                return false;
+            }
+            guard.disarm();
+            self.finish_msg("Backend deleted.");
+            return true;
+        }
+        let Some(held) = counts.take() else {
+            self.pending = Some(Pending::DelBackend { counts, published: None, be, guard });
+            return false;
+        };
+        if held.iter().sum::<u64>() != 0 {
+            // The backend is back exactly as it was before the door: `guard` restores it.
+            self.finish_msg("Backend still has attached streams on it.");
+            return true;
+        }
+        // The line where the delete reaches the data path: from the epoch this table
+        // carries, `Table::route` and `slot_by_name` of every worker miss the backend.
+        let next = Arc::new(ctx.proxies.table().remove(be));
+        let published = crate::table::publish(ctx.mailboxes, &next, ctx.worker_id, ctx.task);
+        self.pending = Some(Pending::DelBackend { counts, published: Some(published), be, guard });
+        false
+    }
+
     /// Answers the command waiting for the workers once all have replied; `false` while it
     /// still waits.
-    fn resume_pending(&mut self, p: Pending, ctx: &AppletContext) -> bool {
+    fn resume_pending(&mut self, p: Pending, ctx: &mut AppletContext) -> bool {
         match p {
             Pending::Shut(g, by_id) => {
                 let Some(counts) = g.take() else {
@@ -1981,8 +2079,15 @@ impl CliApplet {
                     self.finish_msg("Server still has connections attached to it, cannot remove it.");
                 }
                 guard.disarm();
-                // `guard` is dropped here, releasing `CHANGE_IN_PROGRESS`.
+                // `guard` is dropped here, releasing the change guard.
                 true
+            }
+            Pending::DelBackend { counts, published, be, guard } => self.resume_del_backend(counts, published, be, guard, ctx),
+            Pending::Wait(cmd) => {
+                // The change guard was released: the command runs again, and parks again if
+                // another one took the guard first.
+                self.execute_command(&cmd, ctx);
+                self.pending.is_none()
             }
         }
     }
@@ -2633,7 +2738,8 @@ impl CliApplet {
     /// side and nothing it sent is left to answer.
     #[must_use]
     pub fn is_finished(&self) -> bool {
-        self.out_buf.is_empty() && !self.table_pending() && (self.is_done || (self.read_shut && self.pending.is_none()))
+        // A command of the line that still waits for the workers keeps the connection open for its answer.
+        self.out_buf.is_empty() && !self.table_pending() && self.pending.is_none() && (self.is_done || self.read_shut)
     }
 }
 
@@ -2848,16 +2954,40 @@ mod rv_d_tests {
         assert!(CliApplet::is_patref_command("show map"));
     }
 
+    /// The change guard is process-wide: the tests that take it run one at a time.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn test_ctx<'a>(proxies: &'a mut crate::engine::Proxies, mailboxes: &'a Arc<Mailboxes>) -> AppletContext<'a> {
+        AppletContext {
+            proxies,
+            checks: &mut [],
+            sessions: None,
+            wake_queue: None,
+            start_time: Instant::now(),
+            pid: 0,
+            total_tasks: 0,
+            run_queue_len: 0,
+            now: Tick::ETERNITY,
+            mailboxes,
+            worker_id: 0,
+            task: TaskRef::NONE,
+        }
+    }
+
     #[test]
     fn retire_guard_restores_prev_on_drop_when_armed() {
+        let _s = serial();
         let cfg = alcyon_config::parse_str("defaults\n  mode http\nbackend be\n  server s1 127.0.0.1:80\n").expect("parse");
         let table = crate::engine::Engine::build_shared_state(&cfg).expect("proxies").arc();
         table[0].srv_set().at(0).expect("s1").store_status(crate::check::RETIRING);
         let mut guard = RetireGuard::try_acquire().expect("acquire");
-        guard.arm(Arc::clone(&table), 0, 0, crate::check::ServerStatus::Maint as u8);
+        guard.arm(Arc::clone(&table), 0, Some(0), crate::check::ServerStatus::Maint as u8);
         drop(guard);
         assert_eq!(table[0].srv_set().status_at(0), Some(crate::check::ServerStatus::Maint as u8));
-        assert!(!CHANGE_IN_PROGRESS.load(std::sync::atomic::Ordering::Acquire));
+        assert!(!change_state().busy);
     }
 
     #[test]
@@ -2897,6 +3027,7 @@ mod rv_d_tests {
 
     #[test]
     fn resume_pending_retire_waits_and_restores_on_held() {
+        let _s = serial();
         let cfg = alcyon_config::parse_str("defaults\n  mode http\nbackend be\n  server s1 127.0.0.1:80\n").expect("parse");
         let mut proxies = crate::engine::Engine::build_shared_state(&cfg).expect("proxies");
         proxies[0].srv_set().at(0).expect("s1").store_status(crate::check::RETIRING);
@@ -2905,7 +3036,7 @@ mod rv_d_tests {
         let mut applet = CliApplet::new(a, Tick::ETERNITY);
         let counts = crate::mailbox::Gather::new(&mailboxes, 0, TaskRef::NONE);
         let mut guard = RetireGuard::try_acquire().expect("acquire");
-        guard.arm(proxies.arc(), 0, 0, crate::check::ServerStatus::Maint as u8);
+        guard.arm(proxies.arc(), 0, Some(0), crate::check::ServerStatus::Maint as u8);
         let pending = Pending::Retire {
             counts: Arc::clone(&counts),
             be: 0,
@@ -2913,7 +3044,7 @@ mod rv_d_tests {
             prev: crate::check::ServerStatus::Maint as u8,
             guard,
         };
-        let ctx = AppletContext {
+        let mut ctx = AppletContext {
             proxies: &mut proxies,
             checks: &mut [],
             sessions: None,
@@ -2927,13 +3058,111 @@ mod rv_d_tests {
             worker_id: 0,
             task: TaskRef::NONE,
         };
-        assert!(!applet.resume_pending(pending, &ctx));
+        assert!(!applet.resume_pending(pending, &mut ctx));
         counts.reply(0, 1);
         counts.reply(1, 0);
         let pending = applet.pending.take().expect("pending");
-        assert!(applet.resume_pending(pending, &ctx));
+        assert!(applet.resume_pending(pending, &mut ctx));
         let out = std::str::from_utf8(&applet.out_buf).expect("utf8");
         assert_eq!(out, "Server still has connections attached to it, cannot remove it.\n\n");
         assert_eq!(ctx.proxies[0].srv_set().status_at(0), Some(crate::check::ServerStatus::Maint as u8));
+    }
+
+    /// P2: a change that finds the guard held waits, as in `HAProxy`, and runs when it is released.
+    #[test]
+    fn a_second_del_server_waits_for_the_change_guard_and_then_runs() {
+        let _s = serial();
+        let cfg = alcyon_config::parse_str("defaults\n  mode http\nbackend be\n  server s1 127.0.0.1:80 disabled\n").expect("parse");
+        let mut proxies = crate::engine::Engine::build_shared_state(&cfg).expect("proxies");
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mailboxes = crate::mailbox::Mailboxes::new(1).expect("eventfd");
+        let mut applet = CliApplet::new(a, Tick::ETERNITY);
+        let mut ctx = test_ctx(&mut proxies, &mailboxes);
+        let held = RetireGuard::try_acquire().expect("acquire");
+        applet.handle_del_server("be/s1", &mut ctx);
+        assert!(matches!(&applet.pending, Some(Pending::Wait(c)) if c == "del server be/s1"), "parked, not refused");
+        assert_eq!(applet.out_buf.len(), 0);
+        drop(held);
+        assert!(matches!(mailboxes.take(0).as_slice(), [crate::mailbox::Msg::Wake(_)]), "the release woke the connection");
+        // Another change took the guard first: the command parks again.
+        let other = RetireGuard::try_acquire().expect("acquire");
+        let p = applet.pending.take().expect("parked");
+        assert!(!applet.resume_pending(p, &mut ctx));
+        assert!(matches!(&applet.pending, Some(Pending::Wait(_))));
+        drop(other);
+        let _ = mailboxes.take(0);
+        let p = applet.pending.take().expect("parked");
+        assert!(!applet.resume_pending(p, &mut ctx), "it runs now: the count round is out");
+        let Some(crate::mailbox::Msg::Retire { gather, .. }) = mailboxes.take(0).into_iter().next() else { panic!("no Retire") };
+        gather.reply(0, 0);
+        let p = applet.pending.take().expect("counting");
+        assert!(applet.resume_pending(p, &mut ctx));
+        assert_eq!(std::str::from_utf8(&applet.out_buf).expect("utf8"), "Server deleted.\n\n");
+        assert!(!change_state().busy && change_state().waiters.is_empty());
+    }
+
+    #[test]
+    fn a_second_del_backend_waits_for_the_change_guard() {
+        let _s = serial();
+        let cfg = alcyon_config::parse_str("defaults\n  mode http\nbackend be\n").expect("parse");
+        let mut proxies = crate::engine::Engine::build_shared_state(&cfg).expect("proxies");
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mailboxes = crate::mailbox::Mailboxes::new(1).expect("eventfd");
+        let mut applet = CliApplet::new(a, Tick::ETERNITY);
+        let mut ctx = test_ctx(&mut proxies, &mailboxes);
+        let held = RetireGuard::try_acquire().expect("acquire");
+        applet.handle_del_backend("be", &mut ctx);
+        assert!(matches!(&applet.pending, Some(Pending::Wait(c)) if c == "del backend be"));
+        drop(held);
+        applet.handle_del_backend("be x", &mut ctx);
+        assert!(std::str::from_utf8(&applet.out_buf).expect("utf8").ends_with("Usage: del backend <name>.\n\n"));
+    }
+
+    /// The whole of `del backend` with one worker: door, count, table, answer.
+    #[test]
+    fn del_backend_counts_then_publishes_the_table_without_it() {
+        let _s = serial();
+        let cfg = alcyon_config::parse_str("defaults\n  mode http\nbackend be\nbackend other\n").expect("parse");
+        let mut proxies = crate::engine::Engine::build_shared_state(&cfg).expect("proxies");
+        proxies[0].unpublished.set(true);
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mailboxes = crate::mailbox::Mailboxes::new(1).expect("eventfd");
+        let mut applet = CliApplet::new(a, Tick::ETERNITY);
+        let mut ctx = test_ctx(&mut proxies, &mailboxes);
+
+        // A stream is attached: the refusal puts the backend back as it was.
+        applet.handle_del_backend("be", &mut ctx);
+        assert_eq!(ctx.proxies[0].unpublished.state(), crate::engine::SharedFlag::RETIRING, "the door is closed");
+        let Some(crate::mailbox::Msg::Retire { be: 0, srv: None, gather }) = mailboxes.take(0).into_iter().next() else { panic!("no Retire") };
+        let p = applet.pending.take().expect("counting");
+        assert!(!applet.resume_pending(p, &mut ctx), "not every worker has answered");
+        gather.reply(0, 2);
+        let p = applet.pending.take().expect("counting");
+        assert!(applet.resume_pending(p, &mut ctx));
+        assert_eq!(std::str::from_utf8(&applet.out_buf).expect("utf8"), "Backend still has attached streams on it.\n\n");
+        assert_eq!(ctx.proxies[0].unpublished.state(), crate::engine::SharedFlag::UNPUBLISHED);
+
+        // A client that closes while the workers count leaves it as it was.
+        applet.out_buf.clear();
+        applet.handle_del_backend("be", &mut ctx);
+        drop(applet.pending.take());
+        assert_eq!(ctx.proxies[0].unpublished.state(), crate::engine::SharedFlag::UNPUBLISHED);
+        let _ = mailboxes.take(0);
+
+        // Nothing held: the table without it goes to every worker, and the answer waits for them.
+        applet.handle_del_backend("be", &mut ctx);
+        let Some(crate::mailbox::Msg::Retire { gather, .. }) = mailboxes.take(0).into_iter().next() else { panic!("no Retire") };
+        gather.reply(0, 0);
+        let p = applet.pending.take().expect("counting");
+        assert!(!applet.resume_pending(p, &mut ctx), "the table is out");
+        let Some(crate::mailbox::Msg::Table(t, g)) = mailboxes.take(0).into_iter().find(|m| matches!(m, crate::mailbox::Msg::Table(..))) else { panic!("no table") };
+        assert_eq!((t.epoch(), &*t[0].name, t.slot_by_name("be"), t.slot_by_name("other")), (2, "", None, Some(1)));
+        let p = applet.pending.take().expect("publishing");
+        assert!(!applet.resume_pending(p, &mut ctx), "a worker still reads the old table");
+        g.reply(0, t.epoch());
+        let p = applet.pending.take().expect("publishing");
+        assert!(applet.resume_pending(p, &mut ctx));
+        assert_eq!(std::str::from_utf8(&applet.out_buf).expect("utf8"), "Backend deleted.\n\n");
+        assert!(!change_state().busy);
     }
 }
