@@ -422,14 +422,6 @@ pub struct GlobalSection {
     pub alcyon_ja4_compat_spec: bool,
     /// `alcyon.ja4-compat` was given: a second one is refused.
     pub alcyon_ja4_compat_configured: bool,
-    /// Default SSL bind ciphers.
-    pub ssl_default_bind_ciphers: Option<String>,
-    /// Default SSL bind options.
-    pub ssl_default_bind_options: Option<String>,
-    /// Default SSL server ciphers.
-    pub ssl_default_server_ciphers: Option<String>,
-    /// Default SSL server options.
-    pub ssl_default_server_options: Option<String>,
     /// The version bounds `ssl-default-bind-options` sets: what a `bind` that names none gets.
     pub ssl_default_bind_versions: TlsRange,
     /// The version bounds `ssl-default-server-options` sets, for `server` lines.

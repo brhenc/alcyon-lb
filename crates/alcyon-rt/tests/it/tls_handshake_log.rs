@@ -454,6 +454,38 @@ fn strict_sni_is_applied_or_refused() {
     assert_eq!(s.probes[1].reply.first(), Some(&0x16));
 }
 
+/// T655 T0: `ssl-default-bind-options strict-sni` was accepted and dropped, so a ClientHello with an
+/// unknown SNI was served a handshake (rule 5). It must be refused at load, naming the word; if a
+/// later slice implements it, the unknown SNI must get alert `unrecognized_name` (112).
+#[test]
+fn global_default_strict_sni_is_applied_or_refused() {
+    let fe = common::reserve_addr();
+    let cert = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/certs/localhost.pem");
+    let mut f = NamedTempFile::new().expect("tmp");
+    write!(
+        f,
+        "global\n  ssl-default-bind-options strict-sni\n\
+         defaults\n  mode http\n  timeout connect 2s\n  timeout client 30s\n  timeout server 30s\n\
+         frontend t\n  bind {fe} ssl crt {cert}\n  http-request return status 200\n"
+    )
+    .expect("write");
+    let mut child = common::Alcyon(Command::new(env!("CARGO_BIN_EXE_alcyon")).arg("-f").arg(f.path()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().expect("spawn"));
+    if !common::wait_listening(fe) {
+        common::stop(&mut child);
+        let mut stderr = String::new();
+        let _ = child.stderr.take().map(|mut e| e.read_to_string(&mut stderr));
+        assert!(stderr.contains("strict-sni"), "{stderr}");
+        return;
+    }
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.write_all(&hello_sni("other.example")).expect("send");
+    c.set_read_timeout(Some(Duration::from_secs(2))).expect("timeout");
+    let mut reply = [0u8; 64];
+    let n = c.read(&mut reply).unwrap_or(0);
+    common::stop(&mut child);
+    assert_eq!(&reply[..n], b"\x15\x03\x03\x00\x02\x02\x70", "an unknown SNI must get unrecognized_name");
+}
+
 fn hello_sni(name: &str) -> Vec<u8> {
     let full = client_hello(b"\x13\x01", 0x0301);
     let n = name.as_bytes();
