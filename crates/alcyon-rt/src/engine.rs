@@ -604,6 +604,9 @@ struct Housekeeping {
     /// Concern runs so far: the scheduler counts them among its tasks run, which are not the
     /// thread's work.
     own_runs: u64,
+    /// The last pass did work: the pools' counts it left may not be published yet, and the
+    /// poller must not sleep past the publish interval (T659).
+    worked: bool,
 }
 
 impl Housekeeping {
@@ -622,7 +625,7 @@ impl Housekeeping {
         }
         // Without a table the expiry counts as armed: nothing ever arms it.
         let armed = if stick { armed } else { armed | (1 << hk::STICK) };
-        Housekeeping { tasks, armed, seen_runs: [0; hk::N], idle_runs: [0; hk::N], purge_at: None, own_runs: 0 }
+        Housekeeping { tasks, armed, seen_runs: [0; hk::N], idle_runs: [0; hk::N], purge_at: None, own_runs: 0, worked: false }
     }
 }
 
@@ -6996,12 +6999,33 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
     }
 
+    /// How long the poller may wait with no timer due, `None` for as long as it takes (T659:
+    /// it was always 100 ms, ten wakeups a second per thread for nothing). The bounds that
+    /// remain: a pass that worked left pool counts the next pass publishes (the publish
+    /// interval); `zero-on-free` frees its quarantine on a pass that found nothing; a stopping
+    /// thread watches its sessions, the other threads and `hard-stop-after`. A signal, a message
+    /// from another thread, an event or a timer ends the wait without one.
+    fn idle_poll_cap(&self) -> Option<u32> {
+        if self.stopping || alcyon_alloc::zero_on_free::is_active() {
+            Some(100)
+        } else if self.housekeeping.worked {
+            Some(12)
+        } else {
+            None
+        }
+    }
+
     /// Whether a housekeeping timer is to be queued after a pass that ran tasks: a periodic
     /// concern asleep, or the idle pool's purge instant moved.
     #[inline]
     fn housekeeping_rearm_wanted(&self) -> bool {
-        const PERIODIC: u8 = (1 << hk::BUF_TRIM) | (1 << hk::STICK);
-        self.housekeeping.armed & PERIODIC != PERIODIC || self.idle_backend_pool.next_purge() != self.housekeeping.purge_at
+        let h = &self.housekeeping;
+        // The stick tables' expiry asleep, or the trim asleep while fresh buffers came (the trim
+        // sleeps through work that allocates none: T659); a trim asleep and nothing fresh is no
+        // reason to look at every pass.
+        h.armed & (1 << hk::STICK) == 0
+            || (h.armed & (1 << hk::BUF_TRIM) == 0 && crate::buf::fresh_count() != h.seen_runs[hk::BUF_TRIM])
+            || self.idle_backend_pool.next_purge() != h.purge_at
     }
 
     /// Runs the housekeeping concerns whose timers fired this pass (`due`), and queues the
@@ -7011,7 +7035,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     #[inline(never)]
     fn run_housekeeping(&mut self, due: u8, inst: Instant) {
         let now = self.now;
-        let activity = self.scheduler.stats().tasks_run.wrapping_sub(self.housekeeping.own_runs);
+        let tasks = self.scheduler.stats().tasks_run.wrapping_sub(self.housekeeping.own_runs);
+        let fresh = crate::buf::fresh_count();
+        // The heap trim watches fresh buffers, not tasks: a health check every 2 s is work for
+        // the scheduler but allocates nothing the trim cares about, and counted as activity it
+        // kept the trim's 100 ms timer armed for as long as the process lived (T659).
+        let activity_of = |i: usize| if i == hk::BUF_TRIM { fresh } else { tasks };
         for i in 0..hk::N {
             if due & (1 << i) == 0 {
                 continue;
@@ -7036,10 +7065,10 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 }
             }
             let h = &mut self.housekeeping;
-            if activity == h.seen_runs[i] {
+            if activity_of(i) == h.seen_runs[i] {
                 h.idle_runs[i] = h.idle_runs[i].saturating_add(1);
             } else {
-                h.seen_runs[i] = activity;
+                h.seen_runs[i] = activity_of(i);
                 h.idle_runs[i] = 0;
             }
             if h.idle_runs[i] < hk::TAIL[i] {
@@ -7050,7 +7079,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // A periodic concern asleep wakes with the thread's work.
         for i in 0..hk::N {
             let h = &mut self.housekeeping;
-            if hk::PERIOD_MS[i] != 0 && h.armed & (1 << i) == 0 && activity != h.seen_runs[i] && self.scheduler.is_live(h.tasks[i]) {
+            if hk::PERIOD_MS[i] != 0 && h.armed & (1 << i) == 0 && activity_of(i) != h.seen_runs[i] && self.scheduler.is_live(h.tasks[i]) {
                 h.idle_runs[i] = 0;
                 self.scheduler.queue_timer(h.tasks[i], now.add(hk::PERIOD_MS[i]));
                 h.armed |= 1 << i;
@@ -7092,24 +7121,25 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         // session woken without a socket event -- the next pipelined request already in
         // its buffer -- otherwise waited for the poll timeout, 100 ms per request.
         // `runnable()` is the timer run queue only.
-        let poll_timeout = if self.scheduler.run_queue_len() > 0 {
-            Duration::from_millis(0)
+        let poll_timeout: Option<Duration> = if self.scheduler.run_queue_len() > 0 {
+            Some(Duration::from_millis(0))
         } else {
             let next_timer = self.scheduler.next_expiry();
             // A slot freed by another thread wakes nothing here: while requests queue,
             // look again soon.
-            let cap = if crate::proxy::QueueWait::any() { 2 } else { 100 };
-            if let Some(remain_ms) = next_timer.remaining(now) {
-                Duration::from_millis(u64::from(remain_ms.min(cap)))
-            } else {
-                Duration::from_millis(cap.into())
+            let cap = if crate::proxy::QueueWait::any() { Some(2) } else { self.idle_poll_cap() };
+            match (next_timer.remaining(now), cap) {
+                (Some(remain_ms), Some(cap)) => Some(Duration::from_millis(u64::from(remain_ms.min(cap)))),
+                (Some(remain_ms), None) => Some(Duration::from_millis(u64::from(remain_ms))),
+                (None, Some(cap)) => Some(Duration::from_millis(cap.into())),
+                (None, None) => None,
             }
         };
 
         // While the listeners are stopped for `global maxconn` or a per-second rate limit,
         // a connection closed by another worker -- or the trailing second rolling -- is
         // only noticed by looking: do not sleep through it.
-        let poll_timeout = if self.global_paused || self.fe_paused || self.rate_paused { poll_timeout.min(Duration::from_millis(5)) } else { poll_timeout };
+        let poll_timeout = if self.global_paused || self.fe_paused || self.rate_paused { Some(poll_timeout.map_or(Duration::from_millis(5), |t| t.min(Duration::from_millis(5)))) } else { poll_timeout };
 
         // A QUIC transport's next deadline can be sooner than the scheduler's. Waiting past
         // it would delay loss recovery; the shortest of the two wins.
@@ -7120,11 +7150,14 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 .quic_listeners
                 .iter_mut()
                 .filter_map(crate::quic_listener::QuicListener::poll_timeout)
-                .fold(poll_timeout, |acc, deadline| acc.min(deadline.saturating_duration_since(now_inst)));
+                .fold(poll_timeout, |acc, deadline| {
+                    let d = deadline.saturating_duration_since(now_inst);
+                    Some(acc.map_or(d, |a| a.min(d)))
+                });
             // Datagrams read and not served yet (a pass serves `RX_PER_PASS`, T560): the socket
             // may be empty and wake nothing, so look again at once. The listener is marked ready.
             if self.quic_listeners.iter().any(crate::quic_listener::QuicListener::has_backlog) {
-                Duration::ZERO
+                Some(Duration::ZERO)
             } else {
                 poll_timeout
             }
@@ -7159,16 +7192,17 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         self.lb_snap.publish();
         // The accept limits: one test when none is in force.
         let poll_timeout = if self.accept_limited.is_some() || self.global_paused || self.fe_paused || self.rate_paused || self.cli_accept_retry.is_some() {
-            self.limits_pass(now_inst, poll_timeout)
+            Some(self.limits_pass(now_inst, poll_timeout.unwrap_or(Duration::from_millis(100))))
         } else {
             poll_timeout
         };
+        self.housekeeping.worked = false;
 
         // 3. Poll readiness events
         let mut events = std::mem::take(&mut self.events);
         events.clear();
         crate::watchdog::sleeping(true);
-        let polled = self.poller.poll(Some(poll_timeout), |ev| events.push(ev));
+        let polled = self.poller.poll(poll_timeout, |ev| events.push(ev));
         crate::watchdog::sleeping(false);
         crate::watchdog::progress();
         polled?;
@@ -7255,6 +7289,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 FdState::Closed => {}
             }
         }
+        self.housekeeping.worked = !events.is_empty();
         self.events = events;
         if mail {
             self.serve_mailbox();
@@ -7395,6 +7430,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
         self.h2_spawn_scratch = h2_spawn;
         self.wake_scratch = wake_queue;
+        self.housekeeping.worked |= tasks_run > hk_due.count_ones() as _;
         if hk_due != 0 || (tasks_run > 0 && self.housekeeping_rearm_wanted()) {
             self.run_housekeeping(hk_due, inst);
         }
@@ -21085,8 +21121,8 @@ mod idle_poll_tests {
     }
 
     /// Nothing looks at the idle connections between their events: a worker holding one,
-    /// and nothing else to do, sleeps until its next timer (at most 100 ms, the poll's
-    /// bound), not every 50 ms to peek at it (the sweep before T434: a `recvfrom(MSG_PEEK)`
+    /// and nothing else to do, sleeps until its next timer (the heap trim's, every 100 ms for
+    /// 600 ms after a burst, then none), not every 50 ms to peek at it (the sweep before T434: a `recvfrom(MSG_PEEK)`
     /// per idle connection per wakeup, on top of one per take).
     #[test]
     fn an_idle_connection_does_not_wake_its_worker() {
@@ -21102,7 +21138,9 @@ mod idle_poll_tests {
         }
         let waits = e.poller.wait_calls() - before;
         assert_eq!(e.idle_backend_pool.total(), 1);
-        assert!(waits <= 5, "{waits} waits in 400 ms");
+        // The trim's timer (4 in 400 ms) and the one pass after the burst that publishes the pool
+        // counts (T659); the 50 ms sweep it replaced made 8.
+        assert!(waits <= 6, "{waits} waits in 400 ms");
     }
 
     /// A connection another worker takes leaves its owner's epoll set under the owner's

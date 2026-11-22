@@ -928,3 +928,22 @@ in the kernel backlog, nothing is refused); `0` lifts a limit. Measured in
 `crates/alcyon-rt/tests/it/rate_limit.rs`. As with HAProxy, the check lives only in the TCP
 accept path: a `quic4@`/`quic6@` bind is neither stopped by the limits nor counted against
 them (the oracle checks and counts `cps_lim`/`sps_lim`/`ssl_lim` only in src/listener.c).
+
+## An idle process: what still wakes it (T659)
+
+HAProxy 3.5-dev11 makes no context switch while idle (nbthread 1, 4 and 16, with a stats socket,
+with a `check inter 2s` server: 0 in 10 s). Alcyon used to make about 23 a second per thread: a
+poller timeout capped at 100 ms, a watchdog tick every 100 ms and a 20 ms nap in the thread that
+supervises the workers. A worker now sleeps in `epoll_wait` until its next timer (no timeout when it
+has none), the watchdog monitor parks while every worker sleeps in its poller, and the supervising
+thread sleeps until a signal arrives or a worker ends. What is left, each with its rate:
+
+* a pass that worked (an event, a task) is followed by one wakeup within 12 ms, which publishes the
+  thread's pool counts for `show pools` (`engine.rs` `idle_poll_cap`); once per burst, not per second;
+* the heap trim's timer, every 100 ms for 600 ms after a burst of fresh buffers (`hk::BUF_TRIM`);
+* `tune.alcyon.zero-on-free`, once set: every worker wakes every 100 ms to free its quarantine;
+* a stopping process: every worker wakes every 100 ms (sessions, `hard-stop-after`);
+* under `-W`/`-Ws` the worker polls for its master every second (HAProxy: an event on a pipe), and the
+  master process still naps 20 ms in its loop (`bin/alcyon/master.rs`);
+* while a reload is in progress, the old process looks at its child every 20 ms;
+* a server queue with waiters: every 2 ms (`QueueWait`), as before.

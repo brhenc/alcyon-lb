@@ -227,6 +227,12 @@ pub fn heap_trims() -> usize {
     HEAP_TRIMS.load(Ordering::Relaxed)
 }
 
+/// Standard buffers taken from the heap so far, as [`trim_idle`] counts them: what a periodic
+/// trim has to watch.
+pub fn fresh_count() -> u64 {
+    BUF_STD_FRESH.load(Ordering::Relaxed) as u64
+}
+
 /// Gives the allocator's free pages back once a burst is over (T318). A burst of
 /// connections in flight needs a buffer each, hundreds at once; they are freed afterwards
 /// (the pool caches only `MAX_CACHED_PER_THREAD`), but glibc keeps the pages in its free

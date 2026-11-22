@@ -11,14 +11,18 @@
 //! A handler here is a behaviour change an operator would notice, so there is one only
 //! where `HAProxy` has one.
 //!
-//! The handlers only set an [`AtomicBool`]; everything else happens on the engine's own
-//! thread when it next wakes, at most one poll timeout (100 ms) later. `signal-hook` is what
+//! The handlers set an [`AtomicBool`] and write a byte to a socketpair the supervising thread
+//! sleeps on ([`Lifecycle::wait`]); that thread wakes every worker ([`Lifecycle::attach_workers`]),
+//! whose poller has no timeout while it has no deadline (T659). Everything else happens on the
+//! engine's own thread when it next wakes. `signal-hook` is what
 //! keeps this free of `unsafe`: the crate forbids it, and a hand-rolled `sigaction` would
 //! need it.
 
-use std::io;
+use std::io::{self, Read, Write};
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 /// Shared stop and reload requests, cloned into every worker.
 #[derive(Clone, Debug, Default)]
@@ -38,6 +42,24 @@ pub struct Lifecycle {
     resumed: Arc<AtomicBool>,
     /// `SIGQUIT`: run `pool_gc` (`HAProxy`'s `dump`, `src/haproxy.c:951`), an edge.
     flush: Arc<AtomicBool>,
+    /// The socketpair every handler writes a byte to: what [`Self::wait`] sleeps on. Made by
+    /// [`Self::install_signal_handlers`].
+    wake: Arc<OnceLock<(UnixStream, UnixStream)>>,
+    /// The workers' mailboxes, woken by [`Self::wait`] when a signal arrived.
+    workers: Arc<OnceLock<Arc<crate::mailbox::Mailboxes>>>,
+    /// A worker thread ended ([`Self::exit_guard`]).
+    worker_exited: Arc<AtomicBool>,
+}
+
+/// Wakes the supervising thread when dropped: a worker thread that ended, by return or panic.
+#[derive(Debug)]
+pub struct ExitGuard(Lifecycle);
+
+impl Drop for ExitGuard {
+    fn drop(&mut self) {
+        self.0.worker_exited.store(true, Ordering::Relaxed);
+        self.0.poke();
+    }
 }
 
 impl Lifecycle {
@@ -52,6 +74,16 @@ impl Lifecycle {
     /// # Errors
     /// Propagates a failure to register the handler.
     pub fn install_signal_handlers(&self) -> io::Result<()> {
+        let (_, w) = self.wake_pair()?;
+        for sig in [
+            signal_hook::consts::SIGUSR1,
+            signal_hook::consts::SIGUSR2,
+            signal_hook::consts::SIGTTOU,
+            signal_hook::consts::SIGTTIN,
+            signal_hook::consts::SIGQUIT,
+        ] {
+            signal_hook::low_level::pipe::register(sig, w.try_clone()?)?;
+        }
         signal_hook::flag::register(signal_hook::consts::SIGUSR1, Arc::clone(&self.soft_stop))?;
         // HAProxy ignores SIGUSR2 in standalone mode (`src/haproxy.c:2606`) and reloads on it
         // in master-worker mode; with a handler registered it is never fatal, and the binary
@@ -116,7 +148,67 @@ impl Lifecycle {
     /// Propagates a failure to register the handler.
     pub fn install_term_handler(&self) -> io::Result<()> {
         signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&self.terminate))?;
+        let (_, w) = self.wake_pair()?;
+        signal_hook::low_level::pipe::register(signal_hook::consts::SIGTERM, w.try_clone()?)?;
         Ok(())
+    }
+
+    fn wake_pair(&self) -> io::Result<&(UnixStream, UnixStream)> {
+        if let Some(p) = self.wake.get() {
+            return Ok(p);
+        }
+        let (r, w) = UnixStream::pair()?;
+        r.set_nonblocking(true)?;
+        w.set_nonblocking(true)?;
+        Ok(self.wake.get_or_init(|| (r, w)))
+    }
+
+    /// Gives [`Self::wait`] the workers to wake when a signal arrives.
+    pub fn attach_workers(&self, boxes: &Arc<crate::mailbox::Mailboxes>) {
+        let _ = self.workers.set(Arc::clone(boxes));
+    }
+
+    /// A guard for a worker thread: when it is dropped, [`Self::wait`] returns and
+    /// [`Self::worker_exited`] is true.
+    #[must_use]
+    pub fn exit_guard(&self) -> ExitGuard {
+        ExitGuard(self.clone())
+    }
+
+    /// Whether a worker thread has ended.
+    #[must_use]
+    pub fn worker_exited(&self) -> bool {
+        self.worker_exited.load(Ordering::Relaxed)
+    }
+
+    fn poke(&self) {
+        if let Some((_, w)) = self.wake.get() {
+            let _ = (&*w).write(&[1]);
+        }
+    }
+
+    /// Sleeps until a signal arrives, or a worker ends, or `timeout` passes
+    /// (`None`: never): the supervising thread's wait, which used to be a 20 ms nap. Wakes the
+    /// workers when a signal arrived, so that their pollers need no timeout to see its flag.
+    pub fn wait(&self, timeout: Option<Duration>) {
+        use rustix::event::{poll, PollFd, PollFlags};
+        let Some((r, _)) = self.wake.get() else {
+            std::thread::sleep(timeout.unwrap_or(Duration::from_millis(20)).min(Duration::from_millis(20)));
+            return;
+        };
+        let mut fds = [PollFd::new(r, PollFlags::IN)];
+        let ms = timeout.map_or(-1, |t| i32::try_from(t.as_millis().max(1)).unwrap_or(i32::MAX));
+        let _ = poll(&mut fds, ms);
+        let mut buf = [0u8; 64];
+        let mut woke = false;
+        while (&*r).read(&mut buf).is_ok_and(|n| n > 0) {
+            woke = true;
+        }
+        if woke {
+            if let Some(boxes) = self.workers.get() {
+                boxes.kick_all();
+            }
+        }
     }
 
     /// Whether `SIGTERM` arrived with the handler of [`Self::install_term_handler`] installed.
@@ -142,5 +234,41 @@ impl Lifecycle {
     #[must_use]
     pub fn soft_stop_requested(&self) -> bool {
         self.soft_stop.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn wait_without_handlers_naps_at_most_the_timeout() {
+        let l = Lifecycle::new();
+        let t = Instant::now();
+        l.wait(Some(Duration::from_millis(5)));
+        assert!(t.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn wait_times_out_and_wakes_on_a_worker_exit_and_kicks_the_workers() {
+        let l = Lifecycle::new();
+        l.install_signal_handlers().expect("handlers");
+        let boxes = crate::mailbox::Mailboxes::new(1).expect("mailboxes");
+        l.attach_workers(&boxes);
+        assert!(format!("{l:?}").contains("Mailboxes(1)"));
+        let t = Instant::now();
+        l.wait(Some(Duration::from_millis(30)));
+        assert!(t.elapsed() >= Duration::from_millis(25), "returned before its timeout");
+        assert!(!l.worker_exited());
+        // A worker ending ends an unbounded wait, and wakes the workers' pollers.
+        let g = l.exit_guard();
+        let h = std::thread::spawn(move || drop(g));
+        l.wait(None);
+        h.join().expect("join");
+        assert!(l.worker_exited());
+        let fd = boxes.fd(0);
+        let mut fds = [rustix::event::PollFd::new(&fd, rustix::event::PollFlags::IN)];
+        assert_eq!(rustix::event::poll(&mut fds, 0).expect("poll"), 1, "the worker was not woken");
     }
 }

@@ -25,6 +25,7 @@ mod h1_lowercase_headers;
 mod smax_beconn;
 mod client_timeout_connect;
 mod idle_h2c_preface;
+mod idle_wakeups;
 mod post_during_connect;
 mod stalled_upload_linger;
 mod absolute_uri;

@@ -162,6 +162,12 @@ pub struct Mailboxes {
     boxes: Vec<Mailbox>,
 }
 
+impl std::fmt::Debug for Mailboxes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Mailboxes({})", self.boxes.len())
+    }
+}
+
 impl Mailboxes {
     /// Mailboxes for `workers` workers.
     ///
@@ -231,6 +237,14 @@ impl Mailboxes {
     pub fn broadcast(&self, make: impl Fn() -> Msg) {
         for wid in 0..self.boxes.len() {
             self.post(wid, make());
+        }
+    }
+
+    /// Wakes every worker without a message: a signal arrived, and each worker's poller waits
+    /// without a timeout while it has no deadline.
+    pub fn kick_all(&self) {
+        for b in &self.boxes {
+            let _ = rustix::io::write(&b.efd, &1u64.to_ne_bytes());
         }
     }
 

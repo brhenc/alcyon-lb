@@ -35,7 +35,7 @@
 use std::cell::Cell;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::{Relaxed, SeqCst}};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -138,7 +138,19 @@ pub fn progress() {
 pub fn sleeping(yes: bool) {
     MINE.with(|m| {
         if let Some(s) = m.get() {
-            s.sleeping.store(yes, Relaxed);
+            if yes {
+                s.sleeping.store(true, Relaxed);
+            } else {
+                // Leaving the poller wakes a monitor that parked because every worker slept
+                // (T659). The swap and the load are sequentially consistent against the
+                // monitor's store and re-check: one of the two sees the other.
+                s.sleeping.swap(false, SeqCst);
+                if PARKED.load(SeqCst) {
+                    if let Some(t) = MONITOR.get() {
+                        t.unpark();
+                    }
+                }
+            }
         }
     });
 }
@@ -165,6 +177,12 @@ pub fn under_control() {
     });
 }
 
+/// The monitor sleeps without a tick while every worker sleeps in its poller: it has nothing
+/// to watch (T659; `HAProxy`'s per-thread timer is armed by a busy thread). A worker leaving the
+/// poller wakes it ([`sleeping`]).
+static PARKED: AtomicBool = AtomicBool::new(false);
+static MONITOR: OnceLock<std::thread::Thread> = OnceLock::new();
+
 /// Starts the monitor thread, ticking every `warn_after`. Once, after [`init`]. With
 /// `warn_only` (`alcyon.watchdog-warn-only`) a thread stuck for good is warned about, never
 /// aborted on.
@@ -175,7 +193,9 @@ pub fn start(warn_after: Duration, warn_only: bool) -> std::io::Result<()> {
     let Some(wd) = WATCHDOG.get() else { return Ok(()) };
     // The stack and std's alternative signal stack together (`headroom::thread_fits`).
     alcyon_alloc::headroom::thread_fits(WATCHDOG_STACK)?;
-    std::thread::Builder::new().name("alcyon-wdt".into()).stack_size(WATCHDOG_STACK).spawn(move || monitor(wd, warn_after, warn_only)).map(|_| ())
+    let t = std::thread::Builder::new().name("alcyon-wdt".into()).stack_size(WATCHDOG_STACK).spawn(move || monitor(wd, warn_after, warn_only))?;
+    let _ = MONITOR.set(t.thread().clone());
+    Ok(())
 }
 
 fn monitor(wd: &'static Watchdog, tick: Duration, warn_only: bool) -> ! {
@@ -191,6 +211,16 @@ fn monitor(wd: &'static Watchdog, tick: Duration, warn_only: bool) -> ! {
     let mut accused: Vec<Option<u64>> = vec![None; n];
     loop {
         std::thread::sleep(tick);
+        // Everyone sleeps in the poller: nothing to watch until one leaves it. Declared parked
+        // first, then looked at again, so that a worker leaving in between wakes us.
+        while wd.slots.iter().all(|s| s.sleeping.load(SeqCst)) {
+            PARKED.store(true, SeqCst);
+            if wd.slots.iter().all(|s| s.sleeping.load(SeqCst)) {
+                std::thread::park();
+            }
+            PARKED.store(false, SeqCst);
+            accused.iter_mut().for_each(|a| *a = None);
+        }
         for (i, s) in wd.slots.iter().enumerate() {
             let beat = s.beat.load(Relaxed);
             if beat != seen[i] || s.sleeping.load(Relaxed) {

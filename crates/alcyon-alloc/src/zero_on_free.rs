@@ -366,6 +366,13 @@ pub(crate) fn drain_for_refusal() -> bool {
     Q.try_with(|q| free_all(q) != 0).unwrap_or(false)
 }
 
+/// Whether `tune.alcyon.zero-on-free` was ever switched on: the engine threads then pass idle
+/// at least every poll bound, to free their quarantine.
+#[must_use]
+pub fn is_active() -> bool {
+    ACTIVE.load(Ordering::Relaxed)
+}
+
 /// Once per loop pass of an engine thread, `idle` when the poller returned no events: marks
 /// the thread as one with a quarantine, frees what is older than the age bound, then
 /// everything (`idle`) or up to the pass budget. One load while the setting was never on.
