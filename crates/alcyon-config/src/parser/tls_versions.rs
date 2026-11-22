@@ -78,19 +78,25 @@ pub(crate) fn version_keyword(range: &mut TlsRange, tokens: &[Token], i: usize, 
     Ok(Some(last))
 }
 
-/// The version range of an `ssl-default-*-options` line; the other options are not
-/// versions and are left to whoever reads the raw text.
+/// The version range of an `ssl-default-*-options` line. Any other word is refused: nothing reads
+/// it (`strict-sni`, `no-tls-tickets`, ...), and accepting it would drop it silently.
 ///
 /// # Errors
-/// As [`version_keyword`], named after `keyword`.
+/// As [`version_keyword`], named after `keyword`; and any word that is not a version keyword.
 pub(crate) fn default_options_range(tokens: &[Token], keyword: &str) -> Result<TlsRange, ConfigError> {
     let prefix = format!("'{keyword}'");
     let mut range = TlsRange::default();
     let mut i = 1;
     while i < tokens.len() {
-        // `ssl-min-ver` and `ssl-max-ver` take a value; the other options take none, so an
-        // unrecognised word is simply the next option.
-        i = version_keyword(&mut range, tokens, i, &prefix)?.unwrap_or(i) + 1;
+        let Some(last) = version_keyword(&mut range, tokens, i, &prefix)? else {
+            let t = &tokens[i];
+            return Err(ConfigError::new(
+                t.line,
+                t.col,
+                format!("{prefix} : '{}' is not supported: Alcyon does not implement it, and would run without it.", t.text),
+            ));
+        };
+        i = last + 1;
     }
     Ok(range)
 }

@@ -928,3 +928,14 @@ in the kernel backlog, nothing is refused); `0` lifts a limit. Measured in
 `crates/alcyon-rt/tests/it/rate_limit.rs`. As with HAProxy, the check lives only in the TCP
 accept path: a `quic4@`/`quic6@` bind is neither stopped by the limits nor counted against
 them (the oracle checks and counts `cps_lim`/`sps_lim`/`ssl_lim` only in src/listener.c).
+
+## `ssl-default-{bind,server}-{options,ciphers,ciphersuites,curves}`: refused at load (T655 T0, tradeoff 6.38)
+
+HAProxy hands these to OpenSSL. Alcyon refuses `ssl-default-{bind,server}-ciphers`,
+`-ciphersuites` and `-curves` with the keyword's name, and accepts in `ssl-default-{bind,server}-options`
+only the version words (`ssl-min-ver`, `ssl-max-ver`, `force-tlsvN`, `no-tlsvN`); any other word
+(`strict-sni`, `no-tls-tickets`, `prefer-client-ciphers`, ...) is refused naming the word. Before this
+they were accepted and dropped: a `strict-sni` default served an unknown SNI. `strict-sni` returns as an
+implementation in a later T655 slice (S1). The oracle accepts all of them. Reg-tests that now fail at
+load: `ssl/ssl_ciphersuites.vtc`, `ssl/ssl_curves_selection.vtc`, `quic/ssl_ciphersuites.vtc`,
+`quic/ssl_curves_selection.vtc`, `checks/tcp-check-client-hello.vtc`, `ssl/del_ssl_crt-list.vtc`.

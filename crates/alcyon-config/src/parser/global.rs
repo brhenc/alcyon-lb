@@ -1188,30 +1188,27 @@ pub(crate) fn parse_global_directive(
             global.alcyon_ja4_compat_configured = true;
             Ok(())
         }
-        "ssl-default-bind-ciphers" => {
-            if tokens.len() >= 2 {
-                global.ssl_default_bind_ciphers = Some(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "));
-            }
-            Ok(())
-        }
+        // Refused at load, naming the keyword: Alcyon offers a fixed suite set (tradeoff 6.38).
+        "ssl-default-bind-ciphers"
+        | "ssl-default-server-ciphers"
+        | "ssl-default-bind-ciphersuites"
+        | "ssl-default-server-ciphersuites"
+        | "ssl-default-bind-curves"
+        | "ssl-default-server-curves" => Err(ConfigError::new(
+            kw.line,
+            kw.col,
+            format!(
+                "'{}' is not supported: Alcyon offers a fixed set of TLS cipher suites and groups, and would ignore the setting.",
+                kw.text
+            ),
+        )),
+        // The version words reach `apply_ssl_default_versions` (`mod.rs`) and from there every bind / server.
         "ssl-default-bind-options" => {
             global.ssl_default_bind_versions = super::tls_versions::default_options_range(tokens, "ssl-default-bind-options")?;
-            if tokens.len() >= 2 {
-                global.ssl_default_bind_options = Some(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "));
-            }
-            Ok(())
-        }
-        "ssl-default-server-ciphers" => {
-            if tokens.len() >= 2 {
-                global.ssl_default_server_ciphers = Some(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "));
-            }
             Ok(())
         }
         "ssl-default-server-options" => {
             global.ssl_default_server_versions = super::tls_versions::default_options_range(tokens, "ssl-default-server-options")?;
-            if tokens.len() >= 2 {
-                global.ssl_default_server_options = Some(tokens[1..].iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" "));
-            }
             Ok(())
         }
         // Options that switch a poller or a kernel feature off. Alcyon always polls with epoll and

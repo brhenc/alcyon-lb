@@ -87,8 +87,9 @@ fn global_bind_options_fill_in_what_the_bind_leaves_open() {
     // A default that contradicts the bind's bound leaves nothing: HAProxy's alert.
     let err = frontend(g, "ssl-max-ver TLSv1.2").unwrap_err().to_string();
     assert!(err.contains("all SSL/TLS versions are disabled for bind"), "{err}");
-    // Options that are not versions are kept as before.
-    assert_eq!(range("global\n  ssl-default-bind-options prefer-client-ciphers no-tls-tickets\n", ""), (None, None));
+    // Options that are not versions are refused, not dropped (T655 T0, `global_ssl_defaults.rs`).
+    let err = frontend("global\n  ssl-default-bind-options prefer-client-ciphers no-tls-tickets\n", "").unwrap_err().to_string();
+    assert!(err.contains("'prefer-client-ciphers' is not supported"), "{err}");
 }
 
 #[test]
