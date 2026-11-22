@@ -689,12 +689,11 @@ fn resolve(config: &Config, at: Where<'_>, spec: ArgSpec, arg: Option<&str>, wha
             (None, Some(px)) if !has_backend(config, px) => {
                 Err(format!("proxy '{px}', referenced in arg {n} of {what}, has not backend capability"))
             }
-            (Some(be), _) | (None, Some(be)) => {
-                // Only while `referenced_servers` gathers (`refs` is `Some`).
-                BACKEND_REFS.with_borrow_mut(|refs| refs.iter_mut().for_each(|r| r.push(be.to_owned())));
+            (named, cur) => {
+                // The one named, or the proxy itself; only while `referenced_servers` gathers.
+                BACKEND_REFS.with_borrow_mut(|refs| refs.iter_mut().for_each(|r| r.extend(named.or(cur).map(str::to_owned))));
                 Ok(())
             }
-            (None, None) => Ok(()),
         },
         ArgKind::Server => {
             let Some(arg) = arg else {

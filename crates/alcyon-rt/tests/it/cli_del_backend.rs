@@ -196,6 +196,8 @@ fn del_backend_deletes_and_every_listing_agrees() {
     let s = &r.sock;
     let before = stat_backends(s);
     assert_eq!(before.first().map(String::as_str), Some("be_first"));
+    // Before the delete the rule built from the name reaches it (no server: the backend's 503).
+    assert!(get(r.f1, "/", "x-be: be_mid\r\n").starts_with("HTTP/1.1 503"));
     for be in ["be_mid", "be_first", "be_tcp"] {
         check!("unpublish", cli(s, &format!("unpublish backend {be}")), "Backend unpublished.\n\n");
     }
