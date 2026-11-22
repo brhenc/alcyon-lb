@@ -1623,6 +1623,14 @@ fn format_l4_connect_error(err: &io::Error) -> String {
     }
 }
 
+/// T658: the server's slot was emptied by `del server`: the check is over for good. It never runs
+/// again (a later reuse of the slot is a new check), and a connection in flight is closed here;
+/// the caller then frees the task (`Outcome::Done`), so nothing wakes for it any more.
+pub fn retire_check(check: &mut ServerCheckState, fdtab: &mut FdTab, poller: &mut Poller) {
+    check.enabled = false;
+    cleanup_check_socket(check, fdtab, poller);
+}
+
 /// Executes or progresses a health check.
 ///
 /// # Errors
@@ -1636,17 +1644,6 @@ pub fn step_check(
     now: Tick,
     proxies: &crate::table::Table,
 ) -> io::Result<CheckStep> {
-    // T637 S4: `del server` empties the server's slot (its name is `""`): the check must
-    // never run again. Disable it rather than skip it, because a later slice reuses the
-    // slot for a different server, which must start unchecked until enabled. `get` (not the
-    // index) so a check driven without the table it belongs to (unit tests) is a no-op here.
-    // The disabled path below does the socket cleanup and rescheduling.
-    if let Some(px) = proxies.get(check.proxy()) {
-        if px.srv_set().at(check.server()).is_none() {
-            check.enabled = false;
-        }
-    }
-
     if !check.enabled {
         if check.in_progress {
             cleanup_check_socket(check, fdtab, poller);

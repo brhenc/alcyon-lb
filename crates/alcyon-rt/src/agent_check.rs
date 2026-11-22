@@ -199,6 +199,19 @@ fn start_agent_check(
 }
 
 /// Advances one agent check state machine and returns the next wake tick.
+/// T658: the server's slot was emptied by `del server`: the agent check is over for good. A
+/// connection in flight is closed, and the caller frees the task (`Outcome::Done`).
+pub fn retire_agent_check(agent: &mut AgentCheckState, fdtab: &mut FdTab, poller: &mut Poller) {
+    match std::mem::replace(&mut agent.sub_state, AgentSubState::Idle) {
+        AgentSubState::Idle => {}
+        AgentSubState::Connecting { sock, .. } | AgentSubState::Sending { sock, .. } | AgentSubState::Reading { sock, .. } => {
+            let _ = poller.delete(sock.as_fd());
+            fdtab.remove(sock.as_raw_fd());
+        }
+    }
+    agent.in_progress = false;
+}
+
 pub fn step_agent_check(
     agent: &mut AgentCheckState,
     fdtab: &mut FdTab,

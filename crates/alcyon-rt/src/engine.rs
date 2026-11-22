@@ -17097,6 +17097,11 @@ impl EngineDispatcher<'_> {
         if check_idx < self.checks.len() {
             let check = &mut self.checks[check_idx];
             let now = self.now;
+            // T658: `del server` emptied the slot; free the task (`srv_drop` does in HAProxy).
+            if self.proxies.get(check.proxy()).is_some_and(|px| px.srv_set().at(check.server()).is_none()) {
+                check::retire_check(check, self.fdtab, self.poller);
+                return Outcome::Done;
+            }
             crate::track::adopt_for(self.proxies, check);
             let step = check::step_check(check, self.fdtab, self.poller, now, self.proxies);
 
@@ -17143,6 +17148,11 @@ impl EngineDispatcher<'_> {
 
     fn step_agent_check(&mut self, idx: usize) -> Outcome {
         let Some(agent) = self.agent_checks.get_mut(idx) else { return Outcome::Done };
+        // T658: `del server` emptied the slot; free the task.
+        if self.proxies.get(agent.proxy()).is_some_and(|px| px.srv_set().at(agent.server()).is_none()) {
+            crate::agent_check::retire_agent_check(agent, self.fdtab, self.poller);
+            return Outcome::Done;
+        }
         let next = crate::agent_check::step_agent_check(
             agent,
             self.fdtab,
