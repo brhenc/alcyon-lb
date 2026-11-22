@@ -610,25 +610,31 @@ impl Scheduler {
                 break;
             };
 
-            let tr = TaskRef(self.timers.data_of(node));
             let tree_key = self.timers.key_of(node);
+            // An entry is looked at once its key is due, as `HAProxy` does (T659b): a key only
+            // ever lags the real deadline, so a key still in the future means the task is too.
+            // Looking earlier repaired the stale key of a session timer on every pass whenever
+            // nothing earlier was queued: an unlink and an insert per request.
+            if !Tick(tree_key).is_expired(self.now) {
+                break;
+            }
+            let tr = TaskRef(self.timers.data_of(node));
             let expire = self.tasks.get(tr).expire;
 
             if expire.is_expired(self.now) {
                 self.unlink_wq(tr);
                 self.wakeup(tr, state::WOKEN_TIMER, CallSite::UNKNOWN);
                 woken += 1;
-            } else if expire.0 != tree_key {
-                // A lazy extension left a stale key here. Repair it now and carry on;
-                // this is the deferred cost of never having touched the tree earlier.
+            } else {
+                // The key is due, the task is not: a lazy extension left a stale key here.
+                // Repair it now and carry on; this is the deferred cost of never having
+                // touched the tree earlier.
+                debug_assert!(expire.0 != tree_key, "a due key with an equal, unexpired deadline");
                 self.unlink_wq(tr);
                 if expire.is_set() {
                     self.insert_wq(tr);
                 }
                 self.stats.timer_lazy_repairs += 1;
-            } else {
-                // Correctly placed and not due. Everything after it is later still.
-                break;
             }
         }
 

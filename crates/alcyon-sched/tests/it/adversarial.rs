@@ -325,6 +325,25 @@ fn lazily_extended_timers_still_fire_at_the_right_time() {
     assert_eq!(s.wake_expired_tasks(), 1, "must fire at the real deadline");
 }
 
+#[test]
+fn a_stale_key_that_is_not_due_is_left_alone() {
+    // T659b: with no earlier timer, a session's lazily extended timer is the tree's head on
+    // every pass. Repairing it at each look (unlink + insert, once per request) cost ~500
+    // instructions a request; HAProxy looks at an entry only once its key is due.
+    let mut s = Scheduler::with_capacity(16);
+    s.set_now(Tick(1000));
+    let t = s.create(synth(1)).expect("alloc");
+    s.queue_timer(t, Tick(1100));
+    s.queue_timer(t, Tick(5000)); // lazy: tree still says 1100
+    let before = s.stats().timer_inserts;
+
+    s.set_now(Tick(1050));
+    assert_eq!(s.wake_expired_tasks(), 0);
+    assert_eq!(s.stats().timer_lazy_repairs, 0, "the key is not due: nothing to repair yet");
+    assert_eq!(s.stats().timer_inserts, before, "no reinsertion before the key is due");
+    assert_eq!(s.next_expiry(), Tick(1100), "the poll still wakes at the key, which is then repaired");
+}
+
 // ---- ordering and fairness --------------------------------------------------------
 
 #[test]
