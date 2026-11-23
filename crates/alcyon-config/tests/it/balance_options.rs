@@ -4,7 +4,7 @@
 //! `hash-type`, `hash-preserve-affinity` and `balance random(N)`: where they are read and
 //! what is refused (`cfgparse-listen.c`, `backend_parse_balance`).
 
-use alcyon_config::{parse_str, BalanceAlgorithm, HashPreserveAffinity, HashType, UriHash};
+use alcyon_config::{parse_str, BalanceAlgorithm, HashFunction, HashMethod, HashPreserveAffinity, HashType, UriHash};
 
 #[test]
 fn hash_options_are_read_in_listen_and_inherited_from_defaults() {
@@ -14,9 +14,23 @@ fn hash_options_are_read_in_listen_and_inherited_from_defaults() {
          listen l\n  bind 127.0.0.1:8080\n  hash-type map-based\n  hash-preserve-affinity always\n",
     )
     .expect("parse");
-    assert_eq!(cfg.backends[0].hash_type, Some(HashType::Consistent));
+    assert_eq!(
+        cfg.backends[0].hash_type,
+        Some(HashType {
+            method: HashMethod::Consistent,
+            function: HashFunction::Sdbm,
+            avalanche: true,
+        })
+    );
     assert_eq!(cfg.backends[0].hash_preserve_affinity, Some(HashPreserveAffinity::MaxConn));
-    assert_eq!(cfg.listens[0].hash_type, Some(HashType::MapBased));
+    assert_eq!(
+        cfg.listens[0].hash_type,
+        Some(HashType {
+            method: HashMethod::MapBased,
+            function: HashFunction::Sdbm,
+            avalanche: false,
+        })
+    );
     assert_eq!(cfg.listens[0].hash_preserve_affinity, Some(HashPreserveAffinity::Always));
 }
 
@@ -26,9 +40,12 @@ fn malformed_or_unimplemented_forms_are_refused() {
         ("balance unknown", "an unknown balance algorithm"),
         ("balance random(x)", "a non-numeric draw count"),
         ("hash-type", "no hashing method"),
-        // A hash function or `avalanche` modifier: HAProxy takes them, Alcyon does not hash
-        // with anything but sdbm-avalanche yet, so it must not accept and ignore them.
-        ("hash-type consistent djb2", "a hash function Alcyon does not implement"),
+        // HAProxy's words for the function and modifier (`src/cfgparse-listen.c`); the
+        // names are case-sensitive.
+        ("hash-type map-based md5", "an unsupported hash function"),
+        ("hash-type consistent SDBM", "a case-sensitive hash function name"),
+        ("hash-type consistent sdbm foo", "an unknown modifier"),
+        ("hash-type avalanche", "the pre-3.0 modifier form"),
         ("hash-preserve-affinity", "no mode"),
         ("hash-preserve-affinity sometimes", "an unknown mode"),
     ] {

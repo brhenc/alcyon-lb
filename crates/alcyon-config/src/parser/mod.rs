@@ -15,7 +15,7 @@ use crate::ast::{LogForwardSection, LogProfileSection, RingSection, ProxyKind, S
     register_http_errors_section, register_resolved_check, register_resolved_check_for_addr,
     AclCondition, AclRule, AclTerm, BackendSection, BalanceAlgorithm, BindConfig, Config, CookieConfig,
     DefaultServerConfig, DefaultsSection, ErrorPageSource, FrontendSection, GlobalSection, ProxyV2Tlv,
-    GlobalSetVar, HashPreserveAffinity, HashType, UriHash, HttpAfterResAction, HttpAfterResRule, HttpCheckAction, HttpCheckExpectPattern,
+    GlobalSetVar, HashFunction, HashMethod, HashPreserveAffinity, HashType, UriHash, HttpAfterResAction, HttpAfterResRule, HttpCheckAction, HttpCheckExpectPattern,
     HttpChkConfig, HttpReqAction, HttpReqRule, HttpResAction, HttpResRule, HttpReuse, RedirectCookie, RedirectKind, RedirectRule, RetriesValue,
     HeaderCapture, ListenSection, LogConfig, LogFacility, LogFormatSpec, LogLevel, LogTarget, MatchType, Mode,
     MysqlCheckVersion, ProtoCheckConfig, ResolvedCheckConfig, ResolvedHttpCheck,
@@ -2055,13 +2055,91 @@ backend b2
     server s1 127.0.0.1:8001
 ";
         let config = parse_str(sample).unwrap();
-        assert_eq!(config.backends[0].hash_type, Some(HashType::Consistent));
+        // `hash-type consistent` alone means `sdbm avalanche` in `cfgparse-listen.c`.
+        assert_eq!(
+            config.backends[0].hash_type,
+            Some(HashType {
+                method: HashMethod::Consistent,
+                function: HashFunction::Sdbm,
+                avalanche: true,
+            })
+        );
         assert_eq!(
             config.backends[0].hash_preserve_affinity,
             Some(HashPreserveAffinity::MaxConn)
         );
-        assert_eq!(config.backends[1].hash_type, Some(HashType::MapBased));
+        assert_eq!(
+            config.backends[1].hash_type,
+            Some(HashType {
+                method: HashMethod::MapBased,
+                function: HashFunction::Sdbm,
+                avalanche: false,
+            })
+        );
         assert_eq!(config.backends[1].hash_preserve_affinity, None);
+
+        // Naming a function turns the consistent default off; `avalanche` after the
+        // function turns it back on, for every function.
+        let fn_default = parse_str("backend b\n hash-type consistent sdbm\n server s1 127.0.0.1:8001\n").unwrap();
+        assert_eq!(
+            fn_default.backends[0].hash_type,
+            Some(HashType {
+                method: HashMethod::Consistent,
+                function: HashFunction::Sdbm,
+                avalanche: false,
+            })
+        );
+        let aval = parse_str("backend b\n hash-type consistent djb2 avalanche\n server s1 127.0.0.1:8001\n").unwrap();
+        assert_eq!(
+            aval.backends[0].hash_type,
+            Some(HashType {
+                method: HashMethod::Consistent,
+                function: HashFunction::Djb2,
+                avalanche: true,
+            })
+        );
+        for (name, function) in [
+            ("sdbm", HashFunction::Sdbm),
+            ("djb2", HashFunction::Djb2),
+            ("wt6", HashFunction::Wt6),
+            ("crc32", HashFunction::Crc32),
+            ("none", HashFunction::None),
+        ] {
+            let cfg = parse_str(&format!(
+                "backend b\n hash-type map-based {name}\n server s1 127.0.0.1:8001\n"
+            ))
+            .expect("the hash function names parse");
+            assert_eq!(
+                cfg.backends[0].hash_type,
+                Some(HashType {
+                    method: HashMethod::MapBased,
+                    function,
+                    avalanche: false,
+                })
+            );
+        }
+
+        // HAProxy's refusals, same words (`src/cfgparse-listen.c`).
+        let md5 = parse_str("backend b\n hash-type map-based md5\n server s1 127.0.0.1:8001\n").unwrap_err();
+        assert_eq!(
+            md5.message,
+            "'hash-type' only supports 'sdbm', 'djb2', 'crc32', or 'wt6' hash functions."
+        );
+        let upper = parse_str("backend b\n hash-type consistent SDBM\n server s1 127.0.0.1:8001\n").unwrap_err();
+        assert_eq!(
+            upper.message,
+            "'hash-type' only supports 'sdbm', 'djb2', 'crc32', or 'wt6' hash functions."
+        );
+        let bad_mod = parse_str("backend b\n hash-type consistent sdbm foo\n server s1 127.0.0.1:8001\n").unwrap_err();
+        assert_eq!(
+            bad_mod.message,
+            "'hash-type' only supports 'avalanche' as a modifier for hash functions."
+        );
+        let legacy = parse_str("backend b\n hash-type avalanche\n server s1 127.0.0.1:8001\n").unwrap_err();
+        assert_eq!(
+            legacy.message,
+            "experimental feature 'hash-type avalanche' is not supported anymore, please use 'hash-type map-based sdbm avalanche' instead."
+        );
 
         let always = parse_str("backend b\n hash-preserve-affinity always\n server s1 127.0.0.1:8001\n").unwrap();
         assert_eq!(always.backends[0].hash_preserve_affinity, Some(HashPreserveAffinity::Always));

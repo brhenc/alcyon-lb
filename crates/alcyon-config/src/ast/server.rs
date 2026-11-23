@@ -327,9 +327,25 @@ pub enum BalanceAlgorithm {
     Random(u32),
 }
 
-/// Hashing method for hash-based balancing algorithms (`hash-type`).
+/// Hashing method for hash-based balancing algorithms (`hash-type`), with the hash
+/// function and modifier the line names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HashType {
+pub struct HashType {
+    /// `hash-type` method: the weighted modulo over the hash value (default) or the
+    /// consistent-hash ring.
+    pub method: HashMethod,
+    /// The hash function `gen_hash` (`src/backend.c`) applies to the key. No function on
+    /// the line means `sdbm` for both methods.
+    pub function: HashFunction,
+    /// The `avalanche` modifier: `gen_hash` spreads the hash with `full_hash`. `hash-type
+    /// consistent` alone means `sdbm avalanche` (`cfgparse-listen.c`); naming a function
+    /// turns the default off unless `avalanche` follows it.
+    pub avalanche: bool,
+}
+
+/// The `hash-type` method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashMethod {
     /// Weighted modulo over the hash value (default).
     #[default]
     MapBased,
@@ -337,6 +353,22 @@ pub enum HashType {
     /// eligibility changes, and the point where `hash-preserve-affinity`
     /// takes effect.
     Consistent,
+}
+
+/// The `hash-type` hash function, as `gen_hash` (`src/backend.c`) selects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HashFunction {
+    /// SDBM database hash, the default for both methods.
+    #[default]
+    Sdbm,
+    /// Bernstein djb2.
+    Djb2,
+    /// WT6, Willy Tarreau's.
+    Wt6,
+    /// CRC-32 (IEEE).
+    Crc32,
+    /// `none`: no hash, the key as a signed decimal integer (`read_int64`).
+    None,
 }
 
 /// When a hash-based algorithm keeps sending a key to the same server after

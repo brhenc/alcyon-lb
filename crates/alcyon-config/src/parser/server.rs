@@ -1378,6 +1378,9 @@ fn c_atoi(text: &str) -> i32 {
     n
 }
 
+/// The `hash-type` line, `src/cfgparse-listen.c`: a method, an optional hash function and an
+/// optional `avalanche` modifier. No function on the line means `sdbm`, and `consistent`
+/// with no function also avalanches; naming a function turns the default off.
 pub(crate) fn parse_hash_type(
     hash_type: &mut HashType,
     tokens: &[Token],
@@ -1390,9 +1393,18 @@ pub(crate) fn parse_hash_type(
             "'hash-type' only supports 'consistent' and 'map-based'.",
         ));
     }
-    *hash_type = match tokens[1].text.as_str() {
-        "consistent" => HashType::Consistent,
-        "map-based" => HashType::MapBased,
+    let method = match tokens[1].text.as_str() {
+        "consistent" => HashMethod::Consistent,
+        "map-based" => HashMethod::MapBased,
+        // `hash-type avalanche` was the pre-3.0 modifier; the keyword moved after the
+        // function.
+        "avalanche" => {
+            return Err(ConfigError::new(
+                tokens[1].line,
+                tokens[1].col,
+                "experimental feature 'hash-type avalanche' is not supported anymore, please use 'hash-type map-based sdbm avalanche' instead.",
+            ));
+        }
         _ => {
             return Err(ConfigError::new(
                 tokens[1].line,
@@ -1401,13 +1413,43 @@ pub(crate) fn parse_hash_type(
             ));
         }
     };
-    if tokens.len() > 2 {
-        return Err(ConfigError::new(
-            tokens[2].line,
-            tokens[2].col,
-            "'hash-type': hash function and 'avalanche' modifiers are not implemented.",
-        ));
+    let mut function = HashFunction::Sdbm;
+    let mut avalanche = method == HashMethod::Consistent;
+    if tokens.len() > 2 && !tokens[2].text.is_empty() {
+        function = match tokens[2].text.as_str() {
+            "sdbm" => HashFunction::Sdbm,
+            "djb2" => HashFunction::Djb2,
+            "wt6" => HashFunction::Wt6,
+            "crc32" => HashFunction::Crc32,
+            // `none` is valid and not listed in the error: the key is used as a number.
+            "none" => HashFunction::None,
+            _ => {
+                return Err(ConfigError::new(
+                    tokens[2].line,
+                    tokens[2].col,
+                    "'hash-type' only supports 'sdbm', 'djb2', 'crc32', or 'wt6' hash functions.",
+                ));
+            }
+        };
+        avalanche = false;
+        if tokens.len() > 3 && !tokens[3].text.is_empty() {
+            match tokens[3].text.as_str() {
+                "avalanche" => avalanche = true,
+                _ => {
+                    return Err(ConfigError::new(
+                        tokens[3].line,
+                        tokens[3].col,
+                        "'hash-type' only supports 'avalanche' as a modifier for hash functions.",
+                    ));
+                }
+            }
+        }
     }
+    *hash_type = HashType {
+        method,
+        function,
+        avalanche,
+    };
     Ok(())
 }
 
