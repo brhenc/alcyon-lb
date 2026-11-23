@@ -981,15 +981,22 @@ fn hash_crc32_step(init: u32, bytes: &[u8]) -> u32 {
 /// at 64 bits -- clamped to the signed range, the low 32 bits of the result the hash. No
 /// digits is 0.
 fn hash_none(head: &[u8], tail: &[u8]) -> u32 {
-    let (neg, rest) = match head.first().copied().or_else(|| tail.first().copied()) {
-        Some(b'-') => (true, &head[1..]),
-        Some(b'+') => (false, &head[1..]),
-        _ => (false, head),
+    let mut bytes = head.iter().chain(tail.iter()).copied().peekable();
+    let neg = match bytes.peek().copied() {
+        Some(b'-') => {
+            bytes.next();
+            true
+        }
+        Some(b'+') => {
+            bytes.next();
+            false
+        }
+        _ => false,
     };
     let mut i: u64 = 0;
     let mut overflowed = false;
-    for &c in rest.iter().chain(tail.iter()) {
-        if c < b'0' || c > b'9' {
+    for c in bytes {
+        if !c.is_ascii_digit() {
             break;
         }
         if overflowed {
@@ -1482,6 +1489,8 @@ mod uri_tests {
         assert_eq!(hash_none(b"/p0", &[]), 0, "no leading digit is 0");
         assert_eq!(hash_none(b"123", &[]), 123);
         assert_eq!(hash_none(b"", b"42"), 42, "an empty head, digits in the tail");
+        assert_eq!(hash_none(b"", b"-5"), 0xffff_fffb, "empty head, negative tail");
+        assert_eq!(hash_none(b"", b"+7"), 7, "empty head, plus tail");
         assert_eq!(hash_none(b"-", b"5"), 0xffff_fffb, "-5 as u32");
         assert_eq!(hash_none(b"+7", &[]), 7);
         assert_eq!(hash_none(b"12x", b"34"), 12, "stops at the first non-digit");
