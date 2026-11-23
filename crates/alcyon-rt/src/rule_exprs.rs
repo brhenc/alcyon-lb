@@ -219,20 +219,12 @@ pub fn server_part(fetch: &str) -> Option<&'static str> {
 /// `%[req.hdr(host)]`, `%[srv_name]` and `%[res.timer.data]` load.
 #[must_use]
 pub fn srv_connect_part(fetch: &str) -> Option<&'static str> {
-    match fetch {
-        // `SMP_USE_L4SRV` (the same fetches as `server_part`'s "server address").
-        "bc_err" | "bc_err_name" | "bc_err_str" | "bc_glitches" | "bc_http_major" | "bc_be_queue" | "bc_srv_queue"
-        | "bc.timer.connect" | "req.timer.queue" | "txn.conn_retries" | "txn.redispatched" | "bc_dst" | "bc_dst_port"
-        | "bc_reused" | "bc_src" | "bc_src_port" => Some("server address"),
-        // `SMP_USE_L5SRV` (the same fetches as `server_part`'s "server-side connection").
-        "bc_nb_streams" | "bc_settings_streams_limit" | "bs.aborted" | "bs.debug_str" | "bs.id" | "bs.rst_code"
-        | "ssl_bc" | "ssl_bc_alg_keysize" | "ssl_bc_alpn" | "ssl_bc_cipher" | "ssl_bc_client_random" | "ssl_bc_curve"
-        | "ssl_bc_err" | "ssl_bc_err_str" | "ssl_bc_is_resumed" | "ssl_bc_npn" | "ssl_bc_protocol"
-        | "ssl_bc_server_random" | "ssl_bc_session_id" | "ssl_bc_session_key" | "ssl_bc_sni" | "ssl_bc_unique_id"
-        | "ssl_bc_use_keysize" => Some("server-side connection"),
+    // `SMP_USE_L4SRV` and `SMP_USE_L5SRV` are `server_part`'s "server address" and
+    // "server-side connection"; its "server" (`SMP_USE_SERVR`) is in.
+    server_part(fetch)
+        .filter(|part| *part != "server")
         // The response's sources, minus `SMP_USE_RSFIN` (`res.timer.data`), which is in.
-        _ => response_part(fetch).filter(|part| *part != "response buffer statistics"),
-    }
+        .or_else(|| response_part(fetch).filter(|part| *part != "response buffer statistics"))
 }
 
 const REQUEST_HEADER_FETCHES: &[&str] = &[
