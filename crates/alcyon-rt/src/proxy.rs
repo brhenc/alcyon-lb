@@ -1537,8 +1537,8 @@ impl TcpSession {
     #[inline]
     pub fn fc_tcp_fd(&self) -> Option<i32> {
         match self.h2_role.as_deref() {
-            Some(H2Role::Child(H2Child { owner: Some(_), owner_fd, .. })) => *owner_fd,
-            Some(H2Role::Child(_)) => None,
+            // `None` once the owner is gone: its socket may be closed and its number reused.
+            Some(H2Role::Child(ch)) => ch.owner.and(ch.owner_fd),
             _ => self.cli_fd().map(|f| std::os::fd::AsRawFd::as_raw_fd(&f)),
         }
     }
