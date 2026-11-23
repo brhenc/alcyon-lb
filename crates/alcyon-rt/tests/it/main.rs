@@ -84,6 +84,7 @@ mod canonical_haproxy_35_e2e;
 mod capture_converters;
 mod capture_shared_slots;
 mod haproxy_env_vars;
+mod hash_type_function;
 mod capture_slots;
 mod capture_ver;
 mod check_condition;

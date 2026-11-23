@@ -5,7 +5,7 @@
 
 use crate::engine::Proxy;
 use crate::check::ServerStatus;
-use alcyon_config::{HashPreserveAffinity, HashType, UriHash};
+use alcyon_config::{HashFunction, HashMethod, HashPreserveAffinity, UriHash};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -616,12 +616,13 @@ pub fn static_rr(proxy: &Proxy) -> Option<usize> {
 
 /// Deterministic URI Hash (`balance uri`), `map-based` as HAProxy defaults it.
 ///
-/// HAProxy's `get_server_uh` (`src/backend.c`) hashes the URI with `sdbm` -- the default
-/// hash function, and no avalanche unless `hash-type` asks for one -- over the slice
-/// its options select, by default the part before the `?` ([`uri_hash_parts`]), and `map_get_server_hash` takes that modulo the
-/// backend's `tot_weight` into the interleaved weighted map ([`WeightMap`]). Both the hash
-/// and the map matter: hashing the query string, or laying the weights out in contiguous
-/// blocks, sends the same URI to another server than HAProxy does.
+/// HAProxy's `get_server_uh` (`src/backend.c`) hashes the URI with `gen_hash` -- the
+/// `hash-type` function over the slice its options select (default `sdbm`, default no
+/// avalanche unless `hash-type` names one or the method is bare `consistent`) -- and
+/// `map_get_server_hash` takes that modulo the backend's `tot_weight` into the interleaved
+/// weighted map ([`WeightMap`]). Both the hash and the map matter: hashing the query
+/// string, or laying the weights out in contiguous blocks, sends the same URI to another
+/// server than HAProxy does.
 ///
 /// For HTTP/2 and HTTP/3 requests whose `:authority` was present, `req_uri` keeps `:path`
 /// while `H2Child::req_abs` holds `scheme://authority`; [`balance_uri_with_abs`] hashes the
@@ -638,10 +639,10 @@ pub fn balance_uri_with_abs(proxy: &Proxy, uri: &str, abs: Option<&str>, cache: 
     // `hash-preserve-affinity` only has an effect
     // on a consistent-hash ring (HAProxy gates
     // it the same way: the option is read only from `chash_get_server_hash`).
-    if proxy.hash_type == HashType::Consistent {
+    if proxy.hash_type.method == HashMethod::Consistent {
         return balance_uri_consistent(proxy, uri, abs, cache);
     }
-    let hash = hash_uri(uri, abs, proxy.chash.2);
+    let hash = hash_uri(proxy, uri, abs);
     if let Some(idx) = proxy.chash.map_pick(proxy, hash, cache) {
         return Some(idx);
     }
@@ -650,9 +651,37 @@ pub fn balance_uri_with_abs(proxy: &Proxy, uri: &str, abs: Option<&str>, cache: 
     first_backup(proxy)
 }
 
-fn hash_uri(uri: &str, abs: Option<&str>, opts: UriHash) -> u32 {
-    let (head, tail) = uri_hash_parts(uri, abs, opts);
-    hash_sdbm_step(hash_sdbm_step(0, head), tail)
+/// The key `balance uri` selections are made with, as `gen_hash` (`src/backend.c`) computes
+/// it for the slice [`uri_hash_parts`] selects: the `hash-type` function over the bytes,
+/// then the `avalanche` modifier as `full_hash`. The two slices are folded from the
+/// function's start state, the same bytes `get_server_uh` hashes in one run.
+fn hash_uri(proxy: &Proxy, uri: &str, abs: Option<&str>) -> u32 {
+    let (head, tail) = uri_hash_parts(uri, abs, proxy.chash.2);
+    let hash = hash_key(proxy.hash_type.function, head, tail);
+    if proxy.hash_type.avalanche {
+        full_hash(hash)
+    } else {
+        hash
+    }
+}
+
+/// The `hash-type` function (`gen_hash`'s switch, `src/backend.c`) over the key bytes,
+/// folded from the function's start state so the two slices hash as their concatenation.
+/// `none` hashes nothing: the key is read as a decimal integer.
+fn hash_key(function: HashFunction, head: &[u8], tail: &[u8]) -> u32 {
+    match function {
+        HashFunction::Sdbm => hash_sdbm_step(hash_sdbm_step(0, head), tail),
+        HashFunction::Djb2 => hash_djb2_step(hash_djb2_step(5381, head), tail),
+        HashFunction::Wt6 => {
+            let mut state = Wt6 { h0: 0xa53c_965a, h1: 0x5ca6_953a, step0: 6, step1: 18 };
+            state.feed(head);
+            state.feed(tail);
+            state.h0 ^ state.h1
+        }
+        HashFunction::Crc32 => !hash_crc32_step(hash_crc32_step(0xffff_ffff, head), tail),
+        // `read_int64` of the key, as `gen_hash` does for `BE_LB_HFCN_NONE`.
+        HashFunction::None => hash_none(head, tail),
+    }
 }
 
 /// The slices of `uri` (and `abs`, when `Some`) that `balance uri` hashes, as `get_server_uh`
@@ -800,37 +829,51 @@ fn gcd2(mut a: u32, mut b: u32) -> u32 {
 /// `balance uri` with `hash-type consistent` (`get_server_uh` + `chash_get_server_hash`,
 /// `src/backend.c` and `src/lb_chash.c`).
 ///
-/// The key is `sdbm` of the same slice of the URI ([`uri_hash_key`]), avalanched by `full_hash` -- `hash-type
-/// consistent` alone means `sdbm avalanche` (`cfgparse-listen.c`) -- and the server is the one owning the
-/// ring point nearest to it. A server at `maxconn` is passed over for the next point
-/// round the ring: that is `hash-preserve-affinity maxconn`. `HAProxy`'s default, `always`,
-/// queues the request on the full server only when persistence assigned it
-/// (`SF_DIRECT`); a hash is not such an assignment, and the hash itself never picks a
-/// full server, so `always` walks the same way once the server is full. `None` when no
-/// server is up, or every candidate is full.
+/// The key is the `hash-type` function of the same slice of the URI ([`hash_uri`]),
+/// avalanched by `full_hash` when the modifier is on -- `hash-type consistent` alone means
+/// `sdbm avalanche` (`cfgparse-listen.c`) -- and the server is the one owning the ring point
+/// nearest to it. A server at `maxconn` is passed over for the next point round the ring:
+/// that is `hash-preserve-affinity maxconn`. `HAProxy`'s default, `always`, queues the
+/// request on the full server only when persistence assigned it (`SF_DIRECT`); a hash is
+/// not such an assignment, and the hash itself never picks a full server, so `always` walks
+/// the same way once the server is full. `None` when no server is up, or every candidate is
+/// full.
 fn balance_uri_consistent(proxy: &Proxy, uri: &str, abs: Option<&str>, cache: &mut LbSnapCache) -> Option<usize> {
-    consistent_pick(proxy, |_| full_hash(hash_uri(uri, abs, proxy.chash.2)), cache)
+    let hash = hash_uri(proxy, uri, abs);
+    consistent_pick(proxy, |_| hash, cache)
 }
 
 /// Source IP hash (`balance source`), `map-based` as `HAProxy` defaults it (`get_server_sh`
 /// and `map_get_server_hash`, `src/backend.c` and `src/lb_map.c`), or `hash-type consistent`
 /// ([`balance_source_consistent`]).
 ///
-/// The key is the XOR of the address' 32-bit big-endian words (`ntohl`, no avalanche in
-/// `map-based` mode), and `map_get_server_hash` indexes the interleaved [`WeightMap`]
-/// modulo `tot_weight`.
+/// The key is the XOR of the address' 32-bit big-endian words (`ntohl`), and
+/// `map_get_server_hash` indexes the interleaved [`WeightMap`] modulo `tot_weight`.
 #[must_use]
 pub fn balance_source(proxy: &Proxy, ip: std::net::IpAddr, cache: &mut LbSnapCache) -> Option<usize> {
-    if proxy.hash_type == HashType::Consistent {
+    if proxy.hash_type.method == HashMethod::Consistent {
         return balance_source_consistent(proxy, ip, cache);
     }
-    let hash = source_hash_key(ip);
+    let hash = source_hash(proxy, ip);
     if let Some(idx) = proxy.chash.map_pick(proxy, hash, cache) {
         return Some(idx);
     }
 
     // Backup failover: the first usable backup alone.
     first_backup(proxy)
+}
+
+/// The key `balance source` selections are made with, as `get_server_sh` (`src/backend.c`)
+/// computes it: the XOR of the address' 32-bit big-endian words, then the `hash-type`
+/// modifier as `full_hash` when it is on. The `hash-type` function is not applied --
+/// `get_server_sh`'s own FIXME.
+fn source_hash(proxy: &Proxy, ip: std::net::IpAddr) -> u32 {
+    let key = source_hash_key(ip);
+    if proxy.hash_type.avalanche {
+        full_hash(key)
+    } else {
+        key
+    }
 }
 
 fn source_hash_key(ip: std::net::IpAddr) -> u32 {
@@ -843,12 +886,13 @@ fn source_hash_key(ip: std::net::IpAddr) -> u32 {
 }
 
 /// `balance source` with `hash-type consistent` (`get_server_sh`, `src/backend.c`): the
-/// key is the XOR of the address' 32-bit words (host order), avalanched by `full_hash`,
-/// and 0 when only one server is left to choose from, then the ring as for `balance uri`.
+/// key is the XOR of the address' 32-bit words (host order), avalanched by `full_hash`
+/// when the modifier is on, and 0 when only one server is left to choose from, then the
+/// ring as for `balance uri`.
 #[must_use]
 pub fn balance_source_consistent(proxy: &Proxy, ip: std::net::IpAddr, cache: &mut LbSnapCache) -> Option<usize> {
-    let key = source_hash_key(ip);
-    consistent_pick(proxy, |servers_in_ring| if servers_in_ring <= 1 { 0 } else { full_hash(key) }, cache)
+    let hash = source_hash(proxy, ip);
+    consistent_pick(proxy, |servers_in_ring| if servers_in_ring <= 1 { 0 } else { hash }, cache)
 }
 
 /// The server owning the ring point nearest to the key `hash(n)`, `n` being how many
@@ -879,13 +923,110 @@ fn consistent_pick(proxy: &Proxy, hash: impl FnOnce(usize) -> u32, cache: &mut L
     }
 }
 
-/// `hash_sdbm` (`src/hash.c`), `HAProxy`'s default hash function for `balance uri`.
 /// `hash_sdbm` (`src/hash.c`), `HAProxy`'s default hash function for `balance uri`, folded
 /// from `init` so two slices hash identically to their concatenation.
 fn hash_sdbm_step(init: u32, bytes: &[u8]) -> u32 {
     bytes.iter().fold(init, |h, &c| {
         u32::from(c).wrapping_add(h << 6).wrapping_add(h << 16).wrapping_sub(h)
     })
+}
+
+/// `hash_djb2` (`src/hash.c`), folded from `init` (`5381` for a whole key).
+fn hash_djb2_step(init: u32, bytes: &[u8]) -> u32 {
+    bytes.iter().fold(init, |h, &c| h.wrapping_mul(33).wrapping_add(u32::from(c)))
+}
+
+/// `hash_wt6` (`src/hash.c`) state, as the loop carries it between bytes: the two hashes
+/// and the rotation steps derived from them.
+struct Wt6 {
+    h0: u32,
+    h1: u32,
+    step0: u32,
+    step1: u32,
+}
+
+impl Wt6 {
+    /// One byte of `hash_wt6`'s loop; feeding two slices in order runs the same loop as
+    /// their concatenation.
+    fn feed(&mut self, bytes: &[u8]) {
+        for &c in bytes {
+            let t = u32::from(c);
+            self.h0 = !(self.h0 ^ t);
+            self.h1 = !(self.h1.wrapping_add(t));
+            let r0 = self.h1.rotate_left(self.step0);
+            self.h1 = self.h0.rotate_left(self.step1);
+            self.h0 = r0;
+            let m = ((self.h0 >> 16) ^ self.h1) & 0xffff;
+            self.step0 = m & 0x1f;
+            self.step1 = m >> 11;
+        }
+    }
+}
+
+/// `hash_crc32` (`src/hash.c`), the running CRC folded from `init` (`~0` for a whole key);
+/// the caller applies the final `~`.
+fn hash_crc32_step(init: u32, bytes: &[u8]) -> u32 {
+    let mut crc = init;
+    for &c in bytes {
+        crc ^= u32::from(c);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+        }
+    }
+    crc
+}
+
+/// The `none` function of `gen_hash` (`src/backend.c`): the key read as a decimal integer,
+/// as `read_int64` (`src/tools.c`) runs it -- an optional sign, decimal digits, saturation
+/// at 64 bits -- clamped to the signed range, the low 32 bits of the result the hash. No
+/// digits is 0.
+fn hash_none(head: &[u8], tail: &[u8]) -> u32 {
+    let mut bytes = head.iter().chain(tail.iter()).copied().peekable();
+    let neg = match bytes.peek().copied() {
+        Some(b'-') => {
+            bytes.next();
+            true
+        }
+        Some(b'+') => {
+            bytes.next();
+            false
+        }
+        _ => false,
+    };
+    let mut i: u64 = 0;
+    let mut overflowed = false;
+    for c in bytes {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        if overflowed {
+            continue;
+        }
+        // `read_uint64`'s `tmp / 10 != i` overflow check, saturated.
+        let digit = u64::from(c - b'0');
+        if i > u64::MAX / 10 {
+            overflowed = true;
+        } else {
+            i *= 10;
+            if i > u64::MAX - digit {
+                overflowed = true;
+            } else {
+                i += digit;
+            }
+        }
+    }
+    let v: i64 = if neg {
+        if i > 0x8000_0000_0000_0000 {
+            i64::MIN
+        } else {
+            -(i as i128) as i64
+        }
+    } else if i > i64::MAX as u64 {
+        i64::MAX
+    } else {
+        i as i64
+    };
+    v as u32
 }
 
 /// `full_hash` (`include/haproxy/intops.h`): Bob Jenkins' integer avalanche, spread by a
@@ -1276,9 +1417,11 @@ mod fwrr_tests {
 
 #[cfg(test)]
 mod uri_tests {
-    use super::hash_uri;
-    use alcyon_config::UriHash;
+    use super::{full_hash, hash_key, hash_none, uri_hash_parts};
+    use alcyon_config::{HashFunction, UriHash};
 
+    /// The fold over the two slices must hash as the joined single run, for every
+    /// `hash-type` function and the `avalanche` modifier (the H2 `req_abs` + `:path` case).
     #[test]
     fn split_abs_and_path_hashes_match_joined_uri() {
         let cases = [
@@ -1287,6 +1430,13 @@ mod uri_tests {
             ("https://example.test:8443", "//a//b?q=1&r=2"),
             ("http://h", "*"),
         ];
+        let functions = [
+            HashFunction::Sdbm,
+            HashFunction::Djb2,
+            HashFunction::Wt6,
+            HashFunction::Crc32,
+            HashFunction::None,
+        ];
         for (abs, path) in cases {
             let joined = if path == "*" { abs.to_string() } else { format!("{abs}{path}") };
             for whole in [false, true] {
@@ -1294,15 +1444,63 @@ mod uri_tests {
                     for len in [0, 1, 4, 8, 10, 15, 64] {
                         for depth_end in [0, 2, 3, 4, 5, i32::MAX] {
                             let opts = UriHash { len, depth_end, whole, path_only };
-                            assert_eq!(
-                                hash_uri(path, Some(abs), opts),
-                                hash_uri(&joined, None, opts),
-                                "abs={abs:?} path={path:?} opts={opts:?}",
-                            );
+                            let (h1, t1) = uri_hash_parts(path, Some(abs), opts);
+                            let (h2, t2) = uri_hash_parts(&joined, None, opts);
+                            for function in functions {
+                                for avalanche in [false, true] {
+                                    let a = if avalanche { full_hash(hash_key(function, h1, t1)) } else { hash_key(function, h1, t1) };
+                                    let b = if avalanche { full_hash(hash_key(function, h2, t2)) } else { hash_key(function, h2, t2) };
+                                    assert_eq!(
+                                        a,
+                                        b,
+                                        "function={function:?} avalanche={avalanche} abs={abs:?} path={path:?} opts={opts:?}",
+                                    );
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    /// The `hash-type` functions against `HAProxy`'s `src/hash.c` on fixed keys (measured
+    /// with `hash_sdbm`/`hash_djb2`/`hash_wt6`/`hash_crc32` run as C).
+    #[test]
+    fn each_function_matches_haproxy_on_fixed_keys() {
+        for (key, sdbm, djb2, wt6, crc32) in [
+            (&b"/p0"[..], 395_637_871u32, 193_431_924, 2_327_879_945, 3_317_076_373),
+            (&b"abc"[..], 807_794_786, 193_485_963, 2_483_038_440, 891_568_578),
+            (&b"123"[..], 408_093_746, 193_432_059, 997_306_101, 2_286_445_522),
+            (&b"/q?n=0"[..], 3_071_336_868, 2_107_814_687, 1_110_594_593, 632_990_192),
+        ] {
+            assert_eq!(hash_key(HashFunction::Sdbm, key, &[]), sdbm);
+            assert_eq!(hash_key(HashFunction::Djb2, key, &[]), djb2);
+            assert_eq!(hash_key(HashFunction::Wt6, key, &[]), wt6);
+            assert_eq!(hash_key(HashFunction::Crc32, key, &[]), crc32);
+        }
+    }
+
+    /// The `none` function is `read_int64` (`src/tools.c`): an optional sign, decimal
+    /// digits stopping at the first other byte, saturation at 64 bits, the signed result
+    /// clamped to its range, the low 32 bits the hash.
+    #[test]
+    fn none_reads_the_key_as_a_signed_decimal_integer() {
+        assert_eq!(hash_none(b"/p0", &[]), 0, "no leading digit is 0");
+        assert_eq!(hash_none(b"123", &[]), 123);
+        assert_eq!(hash_none(b"", b"42"), 42, "an empty head, digits in the tail");
+        assert_eq!(hash_none(b"", b"-5"), 0xffff_fffb, "empty head, negative tail");
+        assert_eq!(hash_none(b"", b"+7"), 7, "empty head, plus tail");
+        assert_eq!(hash_none(b"-", b"5"), 0xffff_fffb, "-5 as u32");
+        assert_eq!(hash_none(b"+7", &[]), 7);
+        assert_eq!(hash_none(b"12x", b"34"), 12, "stops at the first non-digit");
+        assert_eq!(hash_none(b"99999999999999999999", &[]), i64::MAX as u32, "overflows to LLONG_MAX");
+        assert_eq!(hash_none(b"-99999999999999999999", &[]), i64::MIN as u32, "underflows to LLONG_MIN");
+        assert_eq!(hash_none(b"9223372036854775808", &[]), i64::MAX as u32, "2^63 is LLONG_MAX");
+        assert_eq!(hash_none(b"-9223372036854775808", &[]), i64::MIN as u32, "-2^63 is exact");
+        assert_eq!(hash_none(b"18446744073709551615", &[]), i64::MAX as u32, "2^64-1 is LLONG_MAX");
+        assert_eq!(hash_none(b"18446744073709551619", &[]), i64::MAX as u32, "overflow at the add, not the multiply");
+        assert_eq!(hash_none(b"999999999999999999999", &[]), i64::MAX as u32, "digits after the overflow are eaten");
+        assert_eq!(hash_none(b"", b""), 0, "an empty key");
     }
 }

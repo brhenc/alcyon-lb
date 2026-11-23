@@ -11086,7 +11086,7 @@ fn retry_server_connect(
     } else if redispatch {
         // A consistent ring walks past the server to avoid; a map-based hash cannot.
         let hash = matches!(proxies[be_idx].balance, BalanceAlgorithm::Source | BalanceAlgorithm::Uri)
-            && proxies[be_idx].hash_type != alcyon_config::HashType::Consistent;
+            && proxies[be_idx].hash_type.method != alcyon_config::HashMethod::Consistent;
         // The balancing algorithm is asked to avoid the server that just failed, unless it
         // is the only one left (`fwrr_get_next_server(.., prev_srv)` and the like).
         // Only another active server counts: a backup is not a way out of the one active
