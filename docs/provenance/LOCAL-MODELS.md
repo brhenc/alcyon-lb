@@ -42,7 +42,7 @@ How the code came in:
 | qwen3.8-flash-next | 1 | 569 | 230 |
 | Qwen3.8-Flash-Next | 1 | 201 | 194 |
 | Gemini 4 Hydrogen (medium), via Antigravity | 3 | 219 | 133 |
-| Qwen3.8-27B | 39 | 18767 | 17714 |
+| Qwen3.8-27B | 40 | 19107 | 18054 |
 | Gemini 4 Hydrogen, xhigh | 31 | 8489 | 7013 |
 | Gemini 4 | 1 | 636 | 626 |
 | Gemini 4 Hydrogen, high | 16 | 2892 | 2701 |
@@ -183,6 +183,7 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-21 | T644 | Gemini 4 Hydrogen, high | `704b124b73` | 244 | 244 | `crates/alcyon-rt/src/proxy.rs` +112/112<br>`crates/alcyon-rt/tests/it/netscaler_cip.rs` +132/132 | unmodified model output |
 | 2026-11-21 | T644 | Gemini 4 Hydrogen, high | `5103e1b96d` | 80 | 80 | `crates/alcyon-rt/src/bin/alcyon.rs` +26/26<br>`crates/alcyon-rt/tests/it/log_profiles.rs` +54/54 | unmodified model output |
 | 2026-11-21 | redisp | Gemini 4 Hydrogen, high | `8668099c25` | 220 | 220 | `reg-tests/alcyon/redispatch_maxqueue.vtc` +220/220 | unmodified model output |
+| 2026-11-22 | HCHKREFUSE | Qwen3.8-27B | `534dc9018a` | 340 | 340 | `crates/alcyon-config/src/ast/proxy.rs` +18/18<br>`crates/alcyon-config/src/parser/checks.rs` +128/128<br>`crates/alcyon-config/src/parser/defaults.rs` +7/7<br>`crates/alcyon-config/src/parser/mod.rs` +12/12<br>`crates/alcyon-config/src/parser/proxy.rs` +6/6<br>`crates/alcyon-config/tests/it/check_rules_parse.rs` +31/31<br>`crates/alcyon-rt/tests/it/check_rules.rs` +1/1<br>`crates/alcyon-rt/tests/it/http_check_order.rs` +136/136<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-22 | HSTIMER | Qwen3.8-27B | `3f4b299f49` | 534 | 534 | `crates/alcyon-rt/src/engine.rs` +22/22<br>`crates/alcyon-rt/src/logfmt.rs` +6/6<br>`crates/alcyon-rt/src/proxy.rs` +41/41<br>`crates/alcyon-rt/src/txnlog.rs` +33/33<br>`crates/alcyon-rt/tests/it/fetch_edge_cases.rs` +20/20<br>`crates/alcyon-rt/tests/it/handshake_timer.rs` +384/384<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/timer_fetches.rs` +3/3<br>`crates/alcyon-sample/src/registry.rs` +24/24 | unmodified model output |
 | 2026-11-22 | LOGQUOTE | Qwen3.8-27B | `cd8130ccbd` | 356 | 356 | `crates/alcyon-rt/src/logfmt.rs` +48/48<br>`crates/alcyon-rt/tests/it/logfmt_quote_escape.rs` +307/307<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-22 | T640 | Gemini 4 Hydrogen, high | `0fd2ae5a7b` | 19 | 19 | `harness/test_vtc_runner.py` +14/14<br>`harness/vtc_runner.py` +5/5 | unmodified model output |

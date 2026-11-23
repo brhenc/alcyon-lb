@@ -454,6 +454,7 @@ fn unimplemented_check_rules_are_refused_at_load() {
         "tcp-check send-lf foo",
         "tcp-check expect string a on-success b",
         "http-check expect rstring \"(\"",
+        "http-check send meth GET\n  http-check send meth GET",
     ];
     for rule in refused {
         let dir = tempfile::TempDir::new().expect("tmp");

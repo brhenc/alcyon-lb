@@ -22,6 +22,7 @@ mod chunked_body_abort;
 mod common_helpers;
 mod abortonclose;
 mod h1_lowercase_headers;
+mod http_check_order;
 mod smax_beconn;
 mod client_timeout_connect;
 mod idle_h2c_preface;
