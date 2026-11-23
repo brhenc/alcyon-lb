@@ -3,9 +3,10 @@
 
 //! `tcp-response content`: which actions load. Measured against `HAProxy`
 //! 3.5-dev8-885761-29 with `haproxy -c`, 2026-10-03 (`tcp_parse_tcp_rep`, `src/tcp_rules.c`).
-//! Alcyon implements accept, reject, silent-drop, set-var, set-var-fmt and unset-var on the
-//! response; every other action `HAProxy` takes there is refused until it is implemented,
-//! and the ones `HAProxy` refuses are refused too.
+//! Alcyon implements accept, reject, silent-drop, set-var, set-var-fmt, unset-var and the
+//! stick-counter actions (`sc-inc-gpc0`, `sc-inc-gpc1`, `sc-set-gpt0`, `sc-inc-gpc`,
+//! `sc-add-gpc`, `sc-set-gpt`) on the response; every other action `HAProxy` takes there is
+//! refused until it is implemented, and the ones `HAProxy` refuses are refused too.
 
 use alcyon_config::parse_str;
 
@@ -26,6 +27,17 @@ fn the_implemented_response_actions_load() {
         "set-var-fmt(res.p) \"%[res.len]\"",
         "unset-var(res.p)",
         "reject unless { res.payload(0,0),fix_is_valid }",
+        // The stick-counter actions, as on the request side (the id-less `sc-inc-gpc0`
+        // takes sc0, the value may be an expression of the response).
+        "sc-inc-gpc0(0)",
+        "sc-inc-gpc1(1)",
+        "sc-inc-gpc0",
+        "sc-set-gpt0(0) 7",
+        "sc-inc-gpc(2,1)",
+        "sc-add-gpc(1,1) 5",
+        "sc-set-gpt(2,1) 9",
+        "sc-inc-gpc0(0) if { res.len gt 3 }",
+        "sc-set-gpt0(0) res.len if { res.len gt 0 }",
     ] {
         let cfg = backend_rule(action).unwrap_or_else(|e| panic!("{action}: {e}"));
         assert_eq!(cfg.backends[0].tcp_res_content_rules.len(), 1, "{action}");
@@ -39,7 +51,7 @@ fn response_actions_haproxy_refuses_or_alcyon_does_not_run_are_refused() {
         assert!(backend_rule(action).is_err(), "HAProxy refuses tcp-response content {action}");
     }
     // HAProxy accepts these; Alcyon does not run them on the response yet.
-    for action in ["close", "sc-inc-gpc0(0)", "do-log"] {
+    for action in ["close", "do-log"] {
         let err = backend_rule(action).expect_err(action);
         assert!(err.message.contains("not implemented"), "{action}: {}", err.message);
     }

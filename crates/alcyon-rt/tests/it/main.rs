@@ -512,6 +512,7 @@ mod tcp_request_rules;
 mod tcp_request_tracking;
 mod tcp_converters;
 mod tcp_response_rules;
+mod tcp_response_sc_actions;
 mod timeout_tunnel_queue;
 mod timer_waits;
 mod tls12;

@@ -124,6 +124,13 @@ pub enum TcpResAction {
     SetVar { var_name: String, expr: String },
     SetVarFmt { var_name: String, fmt: String },
     UnsetVar { var_name: String },
+    ScIncGpc0 { sc: u8 },
+    ScIncGpc1 { sc: u8 },
+    ScSetGpt0 { sc: u8, expr: String },
+    /// The array forms, read and run like their `tcp-request content` twins.
+    ScIncGpc { idx: usize, sc: u8 },
+    ScAddGpc { idx: usize, sc: u8, expr: String },
+    ScSetGpt { idx: usize, sc: u8, expr: String },
 }
 
 /// Rule pairing a `tcp-response content` action with an optional condition.

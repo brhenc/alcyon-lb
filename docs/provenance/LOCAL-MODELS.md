@@ -42,7 +42,7 @@ How the code came in:
 | qwen3.8-flash-next | 1 | 569 | 230 |
 | Qwen3.8-Flash-Next | 1 | 201 | 194 |
 | Gemini 4 Hydrogen (medium), via Antigravity | 3 | 219 | 133 |
-| Qwen3.8-27B | 43 | 20688 | 19594 |
+| Qwen3.8-27B | 44 | 21091 | 19997 |
 | Gemini 4 Hydrogen, xhigh | 31 | 8489 | 7013 |
 | Gemini 4 | 1 | 636 | 626 |
 | Gemini 4 Hydrogen, high | 16 | 2892 | 2700 |
@@ -191,4 +191,5 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-22 | T659 | Gemini 4 Hydrogen, high | `0aacdf18d3` | 38 | 38 | `crates/alcyon-rt/src/engine.rs` +15/15<br>`crates/alcyon-rt/tests/it/idle_wakeups.rs` +23/23 | unmodified model output |
 | 2026-11-23 | HASHFUNC | Qwen3.8-27B | `ae443a4fe5` | 677 | 671 | `crates/alcyon-config/src/ast/server.rs` +34/34<br>`crates/alcyon-config/src/lib.rs` +1/1<br>`crates/alcyon-config/src/parser/mod.rs` +81/81<br>`crates/alcyon-config/src/parser/server.rs` +51/51<br>`crates/alcyon-config/tests/it/balance_options.rs` +23/23<br>`crates/alcyon-rt/src/engine.rs` +1/1<br>`crates/alcyon-rt/src/lb.rs` +227/221<br>`crates/alcyon-rt/tests/it/hash_type_function.rs` +258/258<br>`crates/alcyon-rt/tests/it/main.rs` +1/1 | unmodified model output |
 | 2026-11-23 | TCPINFO | Qwen3.8-27B | `23857987d4` | 719 | 705 | `crates/alcyon-mmsg/src/lib.rs` +30/25<br>`crates/alcyon-rt/src/engine.rs` +51/43<br>`crates/alcyon-rt/src/proxy_state.rs` +2/2<br>`crates/alcyon-rt/src/raw.rs` +23/23<br>`crates/alcyon-rt/src/rule_exprs.rs` +36/36<br>`crates/alcyon-rt/tests/it/fetch_edge_cases.rs` +4/4<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/tcp_info_fetches.rs` +465/464<br>`crates/alcyon-rt/tests/it/typed_sample_args.rs` +8/8<br>`crates/alcyon-sample/src/registry.rs` +99/99 | unmodified model output |
+| 2026-11-23 | TCPRESSC | Qwen3.8-27B | `6919bca4e1` | 403 | 403 | `crates/alcyon-config/src/ast/rules_tcp.rs` +7/7<br>`crates/alcyon-config/src/parser/rules_tcp.rs` +12/12<br>`crates/alcyon-config/tests/it/tcp_response_content.rs` +16/16<br>`crates/alcyon-rt/src/engine.rs` +33/33<br>`crates/alcyon-rt/src/rule_compiled.rs` +4/4<br>`crates/alcyon-rt/src/rule_exprs.rs` +8/8<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/tcp_response_sc_actions.rs` +322/322 | unmodified model output |
 | 2026-11-23 | TLVFETCHLOC | Qwen3.8-27B | `b95323f092` | 185 | 172 | `crates/alcyon-rt/src/logfmt.rs` +26/26<br>`crates/alcyon-rt/src/rule_exprs.rs` +32/19<br>`crates/alcyon-rt/src/srv_set.rs` +1/1<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/proxy_v2_tlv_fetch_location.rs` +125/125 | unmodified model output |
