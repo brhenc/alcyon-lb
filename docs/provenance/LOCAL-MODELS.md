@@ -42,7 +42,7 @@ How the code came in:
 | qwen3.8-flash-next | 1 | 569 | 230 |
 | Qwen3.8-Flash-Next | 1 | 201 | 194 |
 | Gemini 4 Hydrogen (medium), via Antigravity | 3 | 219 | 133 |
-| Qwen3.8-27B | 40 | 19107 | 18054 |
+| Qwen3.8-27B | 41 | 19292 | 18224 |
 | Gemini 4 Hydrogen, xhigh | 31 | 8489 | 7013 |
 | Gemini 4 | 1 | 636 | 626 |
 | Gemini 4 Hydrogen, high | 16 | 2892 | 2701 |
@@ -151,7 +151,7 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-19 | PPSENDTLV | Gemini 4 Hydrogen, xhigh | `0d621cd91c` | 6 | 6 | `crates/alcyon-rt/tests/it/pp_send_tlv.rs` +6/6 | unmodified model output |
 | 2026-11-19 | PPSENDTLV | Gemini 4 Hydrogen, xhigh | `ada4d5f4d5` | 6 | 6 | `crates/alcyon-rt/tests/it/pp_send_tlv.rs` +6/6 | unmodified model output |
 | 2026-11-19 | PPSENDTLV | Gemini 4 Hydrogen, xhigh | `10ec151ee4` | 20 | 19 | `crates/alcyon-rt/src/engine.rs` +20/19 | unmodified model output |
-| 2026-11-19 | PPSENDTLV | Qwen3.8-27B | `865a87caf3` | 641 | 628 | `crates/alcyon-config/src/ast/server.rs` +15/15<br>`crates/alcyon-config/src/parser/mod.rs` +1/1<br>`crates/alcyon-config/src/parser/server.rs` +112/112<br>`crates/alcyon-config/src/parser/server_keywords.rs` +1/1<br>`crates/alcyon-config/tests/it/server_keywords.rs` +1/1<br>`crates/alcyon-rt/src/engine.rs` +20/7<br>`crates/alcyon-rt/src/logfmt.rs` +9/9<br>`crates/alcyon-rt/src/rule_exprs.rs` +22/22<br>`crates/alcyon-rt/src/srv_set.rs` +48/48<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/pp_send_tlv.rs` +411/411 | unmodified model output |
+| 2026-11-19 | PPSENDTLV | Qwen3.8-27B | `865a87caf3` | 641 | 626 | `crates/alcyon-config/src/ast/server.rs` +15/15<br>`crates/alcyon-config/src/parser/mod.rs` +1/1<br>`crates/alcyon-config/src/parser/server.rs` +112/112<br>`crates/alcyon-config/src/parser/server_keywords.rs` +1/1<br>`crates/alcyon-config/tests/it/server_keywords.rs` +1/1<br>`crates/alcyon-rt/src/engine.rs` +20/7<br>`crates/alcyon-rt/src/logfmt.rs` +9/9<br>`crates/alcyon-rt/src/rule_exprs.rs` +22/21<br>`crates/alcyon-rt/src/srv_set.rs` +48/47<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/pp_send_tlv.rs` +411/411 | unmodified model output |
 | 2026-11-19 | S4DELSRV | Gemini 4 Hydrogen, xhigh | `68171ffcfe` | 22 | 21 | `crates/alcyon-rt/src/engine.rs` +22/21 | unmodified model output |
 | 2026-11-19 | S4DELSRV | Gemini 4 Hydrogen, xhigh | `7e730d0143` | 13 | 13 | `crates/alcyon-rt/tests/it/cli_del_server.rs` +13/13 | unmodified model output |
 | 2026-11-19 | S4DELSRV | Gemini 4 Hydrogen, xhigh | `ef9250a8d1` | 112 | 92 | `crates/alcyon-rt/src/applet.rs` +95/77<br>`crates/alcyon-rt/src/mailbox.rs` +14/13<br>`crates/alcyon-rt/src/track.rs` +2/2<br>`crates/alcyon-rt/tests/it/cli_del_server.rs` +1/0 | unmodified model output |
@@ -189,3 +189,4 @@ Each file is shown as `path +added/still-on-HEAD`.
 | 2026-11-22 | T640 | Gemini 4 Hydrogen, high | `0fd2ae5a7b` | 19 | 19 | `harness/test_vtc_runner.py` +14/14<br>`harness/vtc_runner.py` +5/5 | unmodified model output |
 | 2026-11-22 | T659 | Gemini 4 Hydrogen, high | `2d309c7a54` | 25 | 25 | `crates/alcyon-rt/src/lifecycle.rs` +25/25 | unmodified model output |
 | 2026-11-22 | T659 | Gemini 4 Hydrogen, high | `0aacdf18d3` | 38 | 38 | `crates/alcyon-rt/src/engine.rs` +15/15<br>`crates/alcyon-rt/tests/it/idle_wakeups.rs` +23/23 | unmodified model output |
+| 2026-11-23 | TLVFETCHLOC | Qwen3.8-27B | `b95323f092` | 185 | 172 | `crates/alcyon-rt/src/logfmt.rs` +26/26<br>`crates/alcyon-rt/src/rule_exprs.rs` +32/19<br>`crates/alcyon-rt/src/srv_set.rs` +1/1<br>`crates/alcyon-rt/tests/it/main.rs` +1/1<br>`crates/alcyon-rt/tests/it/proxy_v2_tlv_fetch_location.rs` +125/125 | unmodified model output |

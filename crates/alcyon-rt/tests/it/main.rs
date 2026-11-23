@@ -365,6 +365,7 @@ mod proxy_header_log;
 mod proxy_ids;
 mod proxy_line_reuse;
 mod proxy_protocol;
+mod proxy_v2_tlv_fetch_location;
 mod proxy_v2_unique_id;
 mod reads_per_request;
 mod stream_object;

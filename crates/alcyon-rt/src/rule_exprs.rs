@@ -204,6 +204,29 @@ pub fn server_part(fetch: &str) -> Option<&'static str> {
     }
 }
 
+/// What a `set-proxy-v2-tlv-fmt(<id>) <fmt>` format cannot read, in `HAProxy`'s words: it is
+/// rendered when the server connection opens, before any response, and `HAProxy` compiles it
+/// against that location (`parse_logformat_string(..., SMP_VAL_BE_SRV_CON, ...)` in
+/// `src/server.c`), which refuses a fetch whose sources are not in the location's
+/// capabilities (`fetch_cap`, `src/sample.c`): the response's sources (`SMP_USE_HRSHV` =
+/// "HTTP response headers", `SMP_USE_HRSHP` = "HTTP response", `SMP_USE_L6RES` = "response
+/// buffer", `SMP_USE_HRSBO` = "HTTP response body") and the server's own address and
+/// connection (`SMP_USE_L4SRV`, `SMP_USE_L5SRV`) are not in. The request's sources, the
+/// server itself (`SMP_USE_SERVR` = "server") and the final statistics (`SMP_USE_RSFIN`,
+/// `SMP_USE_RQFIN`, ...) are. Measured on 3.5-dev11: `%[status]` refuses "HTTP response",
+/// `%[res.hdr(y)]` "HTTP response headers", `%[res.len]` "response buffer",
+/// `%[bc.timer.connect]` "server address", `%[ssl_bc_sni]` "server-side connection", while
+/// `%[req.hdr(host)]`, `%[srv_name]` and `%[res.timer.data]` load.
+#[must_use]
+pub fn srv_connect_part(fetch: &str) -> Option<&'static str> {
+    // `SMP_USE_L4SRV` and `SMP_USE_L5SRV` are `server_part`'s "server address" and
+    // "server-side connection"; its "server" (`SMP_USE_SERVR`) is in.
+    server_part(fetch)
+        .filter(|part| *part != "server")
+        // The response's sources, minus `SMP_USE_RSFIN` (`res.timer.data`), which is in.
+        .or_else(|| response_part(fetch).filter(|part| *part != "response buffer statistics"))
+}
+
 const REQUEST_HEADER_FETCHES: &[&str] = &[
     "base",
     "base32",
@@ -721,7 +744,7 @@ pub fn validate_formats(config: &Config, registry: &Registry) -> Result<(), Stri
                 if tlv.fmt.is_empty() {
                     continue;
                 }
-                LogFormat::compile_rule(&tlv.fmt, registry, false)
+                LogFormat::compile_tlv(&tlv.fmt, registry)
                     .map(|_| ())
                     .map_err(|e| format!("'server {name}/{srv}' : {e}"))?;
             }
