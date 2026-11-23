@@ -245,6 +245,30 @@ fn bind_verify_and_ca_file_are_kept_and_rebased_under_ca_base() {
 }
 
 #[test]
+fn bind_quic_verify_required_or_optional_is_refused() {
+    let ca_abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../alcyon-rt/tests/data/client_auth/v3-ca.crt");
+    for mode in ["optional", "required"] {
+        for f in [in_listen, in_frontend] {
+            let err = f(&format!(
+                "bind quic4@127.0.0.1:8443 ssl crt /tmp/c.pem ca-file {} verify {mode}",
+                ca_abs.display()
+            ))
+            .expect_err(mode)
+            .to_string();
+            assert!(
+                err.contains("not supported on QUIC binds yet"),
+                "quic verify {mode} must be refused cleanly: {err}"
+            );
+        }
+    }
+    // Control: `verify none` on a QUIC bind stays accepted.
+    for f in [in_listen, in_frontend] {
+        f("bind quic4@127.0.0.1:8443 ssl crt /tmp/c.pem verify none")
+            .unwrap_or_else(|e| panic!("quic verify none must be accepted: {e}"));
+    }
+}
+
+#[test]
 fn accept_netscaler_cip_is_read_with_its_magic() {
     for f in [in_listen, in_frontend] {
         let cfg = f("bind 127.0.0.1:8080 accept-netscaler-cip 305419896").unwrap();

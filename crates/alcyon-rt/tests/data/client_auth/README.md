@@ -52,4 +52,5 @@ openssl x509 -req -in /tmp/v3-client-expired.csr \
   -extfile /tmp/client.cnf -not_before 20200101000000Z -not_after 20210101000000Z \
   -out /tmp/v3-client-expired.crt
 cat /tmp/v3-client-expired.crt /tmp/v3-client-expired.key > v3-client-expired.pem
+rm -f v3-ca.srl
 ```

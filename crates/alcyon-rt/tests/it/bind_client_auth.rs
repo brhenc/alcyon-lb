@@ -109,8 +109,14 @@ fn s_client(addr: SocketAddr, tls_flag: &str, cert: Option<&Path>) -> String {
     s_client_chain(addr, tls_flag, cert, None)
 }
 
-/// Runs `openssl s_client` with an optional intermediate chain file (`-cert_chain`).
-fn s_client_chain(addr: SocketAddr, tls_flag: &str, cert: Option<&Path>, chain: Option<&Path>) -> String {
+/// Runs `openssl s_client` with optional `-cert_chain` and `-sess_out`/`-sess_in` flags.
+fn s_client_extra(
+    addr: SocketAddr,
+    tls_flag: &str,
+    cert: Option<&Path>,
+    chain: Option<&Path>,
+    extra: &[&str],
+) -> String {
     let mut cmd = Command::new("openssl");
     cmd.arg("s_client")
         .arg("-connect")
@@ -123,6 +129,7 @@ fn s_client_chain(addr: SocketAddr, tls_flag: &str, cert: Option<&Path>, chain: 
     if let Some(ch) = chain {
         cmd.arg("-cert_chain").arg(ch);
     }
+    cmd.args(extra);
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -136,6 +143,11 @@ fn s_client_chain(addr: SocketAddr, tls_flag: &str, cert: Option<&Path>, chain: 
     let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&out.stderr));
     combined
+}
+
+/// Runs `openssl s_client` with an optional intermediate chain file (`-cert_chain`).
+fn s_client_chain(addr: SocketAddr, tls_flag: &str, cert: Option<&Path>, chain: Option<&Path>) -> String {
+    s_client_extra(addr, tls_flag, cert, chain, &[])
 }
 
 /// Extracts a response header value (case-insensitive header name) from `s_client` output.
@@ -248,6 +260,21 @@ fn check_optional_none_and_v1(
     }
 }
 
+fn check_resumption(fe_req: SocketAddr, v3_valid: &Path, dir: &Path) {
+    for ver in ["-tls1_3", "-tls1_2"] {
+        let sess = dir.join(format!("sess-{ver}.pem"));
+        let sess_str = sess.to_str().expect("utf8 sess path");
+        let first = s_client_extra(fe_req, ver, Some(v3_valid), None, &["-sess_out", sess_str]);
+        assert_ok_headers(&format!("fe_req full ({ver})"), &first, "1", "0", "0", "0");
+        assert_eq!(header_value(&first, "x-resumed").as_deref(), Some("0"), "first ({ver}) should not be resumed:\n{first}");
+
+        let resumed = s_client_extra(fe_req, ver, Some(v3_valid), None, &["-sess_in", sess_str]);
+        assert!(resumed.contains("Reused,"), "second ({ver}) should resume TLS session:\n{resumed}");
+        assert_ok_headers(&format!("fe_req resumed ({ver})"), &resumed, "1", "0", "0", "0");
+        assert_eq!(header_value(&resumed, "x-resumed").as_deref(), Some("1"), "second ({ver}) x-resumed mismatch:\n{resumed}");
+    }
+}
+
 #[test]
 fn bind_client_auth_required_optional_and_none() {
     let fx = fixtures_dir();
@@ -294,6 +321,7 @@ fn bind_client_auth_required_optional_and_none() {
          \x20 default_backend be\n\
          \n\
          backend be\n\
+         \x20 http-response set-header X-Resumed %[ssl_fc_is_resumed]\n\
          \x20 http-response set-header X-Used %[ssl_c_used]\n\
          \x20 http-response set-header X-Verify %[ssl_c_verify]\n\
          \x20 http-response set-header X-Err %[ssl_c_err]\n\
@@ -316,7 +344,7 @@ fn bind_client_auth_required_optional_and_none() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn proxy");
-    let _daemon = Daemon { child, dir, stop, origin: Some(origin_handle) };
+    let daemon = Daemon { child, dir: dir.clone(), stop, origin: Some(origin_handle) };
 
     assert!(common::wait_listening(fe_req), "proxy never listened on fe_req ({fe_req})");
     assert!(common::wait_listening(fe_opt), "proxy never listened on fe_opt ({fe_opt})");
@@ -324,7 +352,9 @@ fn bind_client_auth_required_optional_and_none() {
     assert!(common::wait_listening(fe_v1), "proxy never listened on fe_v1 ({fe_v1})");
 
     check_required_frontend(fe_req, &v3_valid, &v3_expired, &srv_crt);
+    check_resumption(fe_req, &v3_valid, &dir);
     check_optional_none_and_v1(fe_opt, fe_none, fe_v1, &v3_valid, &v3_expired, &srv_crt, &v1_client1);
+    drop(daemon);
 }
 
 fn recv_log_line(udp: &UdpSocket) -> String {

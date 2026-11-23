@@ -957,6 +957,15 @@ fn check_bind_client_auth(
                 ));
             }
         }
+        if bind.quic
+            && matches!(ca.verify, crate::ast::BindVerify::Optional | crate::ast::BindVerify::Required)
+        {
+            return Err(ConfigError::new(
+                bind.line,
+                1,
+                format!("'bind {bind_arg}' in section '{section}' : 'verify' is not supported on QUIC binds yet"),
+            ));
+        }
         if bind.ssl
             && matches!(ca.verify, crate::ast::BindVerify::Optional | crate::ast::BindVerify::Required)
             && ca.ca_file.is_none()

@@ -971,8 +971,10 @@ thread sleeps until a signal arrives or a worker ends. What is left, each with i
 exclusively with `rustls-webpki` (`crates/alcyon-tls/src/client_verify.rs`), keeping the result
 as OpenSSL `X509_V_ERR_*` codes for `ssl_c_verify`, `ssl_c_err` and `ssl_c_ca_err`. Because
 webpki enforces a stricter X.509 v3 profile and defines fewer, coarser error variants than
-OpenSSL, three operator-visible differences apply:
+OpenSSL, four operator-visible differences apply:
 
+* **QUIC binds:** `verify optional` and `verify required` are refused at load on `quic4@`/`quic6@`
+  binds (`'verify' is not supported on QUIC binds yet`); `verify none` stays accepted.
 * **X.509 v1 client certificates:** HAProxy (OpenSSL) accepts X.509 v1 client certificates
   (such as `reg-tests/ssl/certs/client1.pem`); Alcyon refuses them because `rustls-webpki`
   validates X.509 v3 certificates only (`UnsupportedCertVersion`), recording
