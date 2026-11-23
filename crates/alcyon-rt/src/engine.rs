@@ -3448,7 +3448,7 @@ fn stream_has_strm(s: &TcpSession) -> bool {
 /// fetch gives no sample there, as in `HAProxy` where the socket is not the client's TCP
 /// connection. Reading two `Option`s; no syscall, nothing stored on the connection.
 fn tcp_info_from_sess(sess: &TcpSession) -> (Option<i32>, Option<i32>, Option<fn(i32, u8) -> Option<u32>>) {
-    let fc_fd = sess.cli_fd().map(|f| f.as_raw_fd());
+    let fc_fd = sess.fc_tcp_fd();
     let bc_fd = sess.srv.as_ref().map(|f| f.as_raw_fd());
     (fc_fd, bc_fd, (fc_fd.is_some() || bc_fd.is_some()).then_some(crate::raw::tcp_info_val))
 }
@@ -3457,7 +3457,7 @@ fn tcp_info_from_sess(sess: &TcpSession) -> (Option<i32>, Option<i32>, Option<fn
 /// `PhaseCtx` literal field by field without a let: present exactly when a side's socket
 /// is a TCP fd, read only when one of the TCP_INFO fetches is evaluated.
 fn tcp_info_reader(sess: &TcpSession) -> Option<fn(i32, u8) -> Option<u32>> {
-    (sess.cli_fd().is_some() || sess.srv.is_some()).then_some(crate::raw::tcp_info_val)
+    (sess.fc_tcp_fd().is_some() || sess.srv.is_some()).then_some(crate::raw::tcp_info_val)
 }
 
 /// The sample context a log line's `%[...]` reads.
@@ -8687,7 +8687,7 @@ fn eval_tcp_req_session_rules(
         so_id: sess.so_id_opt(),
         fe_id: Some(proxy.ids.iid),
         fc_dst: sess.fc_dst(),
-        fc_tcp_fd: sess.cli_fd().map(|f| f.as_raw_fd()),
+        fc_tcp_fd: sess.fc_tcp_fd(),
         bc_tcp_fd: sess.srv.as_ref().map(|f| f.as_raw_fd()),
         tcp_info: tcp_info_reader(sess),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
@@ -8939,7 +8939,7 @@ fn eval_tcp_req_content_rules(
         ssl_bc: sess.srv_xprt.ssl_facts(),
         req_body: if has_content { Some(req_bytes) } else { None },
         raw_req: (sess.mode == Mode::Tcp).then_some(req_bytes),
-        fc_tcp_fd: sess.cli_fd().map(|f| f.as_raw_fd()),
+        fc_tcp_fd: sess.fc_tcp_fd(),
         bc_tcp_fd: sess.srv.as_ref().map(|f| f.as_raw_fd()),
         tcp_info: tcp_info_reader(sess),
         // In HTTP mode the request is parsed by the time these rules run, and `path`,
@@ -9246,7 +9246,7 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &crate::table::Table, regi
         ssl_bc: sess.srv_xprt.ssl_facts(),
         res_body: Some(rep_bytes),
         raw_res: Some(rep_bytes),
-        fc_tcp_fd: sess.cli_fd().map(|f| f.as_raw_fd()),
+        fc_tcp_fd: sess.fc_tcp_fd(),
         bc_tcp_fd: sess.srv.as_ref().map(|f| f.as_raw_fd()),
         tcp_info: tcp_info_reader(sess),
         act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
@@ -11469,7 +11469,7 @@ impl EngineDispatcher<'_> {
         alcyon_sample::PhaseCtx {
             proxies: Some(view),
             stick: Some(stick),
-            fc_tcp_fd: sess.cli_fd().map(|f| f.as_raw_fd()),
+            fc_tcp_fd: sess.fc_tcp_fd(),
             bc_tcp_fd: sess.srv.as_ref().map(|f| f.as_raw_fd()),
             tcp_info: tcp_info_reader(sess),
             client_addr: sess.client_addr,
@@ -12917,6 +12917,7 @@ impl EngineDispatcher<'_> {
             let Some(c) = self.sessions.get_mut(link.idx).filter(|c| c.task == link.task) else { continue };
             if let Some(ch) = c.sess.h2_child_mut() {
                 ch.owner = None;
+                ch.owner_fd = None;
             }
             // (Its owner's pass has usually told it the connection is closed already.)
             if c.sess.cli_state != ScState::Error {
@@ -14459,7 +14460,7 @@ impl EngineDispatcher<'_> {
             client_addr: entry.sess.client_addr,
             server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src(),
-            fc_tcp_fd: entry.sess.cli_fd().map(|f| f.as_raw_fd()),
+            fc_tcp_fd: entry.sess.fc_tcp_fd(),
             bc_tcp_fd: entry.sess.srv.as_ref().map(|f| f.as_raw_fd()),
             tcp_info: tcp_info_reader(&entry.sess),
             so_name: entry.sess.so_name.as_deref(),
@@ -20345,7 +20346,7 @@ fn after_res_on_reply<'r>(
             proxies: Some(&view),
             stick: Some(&stick),
             prio: (sess.strm.log.prio_class, sess.strm.log.prio_offset),
-            fc_tcp_fd: sess.cli_fd().map(|f| f.as_raw_fd()),
+            fc_tcp_fd: sess.fc_tcp_fd(),
             bc_tcp_fd: sess.srv.as_ref().map(|f| f.as_raw_fd()),
             tcp_info: tcp_info_reader(sess),
             client_addr: sess.client_addr,
@@ -20733,6 +20734,7 @@ mod arena_tests {
                 quic_ack: None,
                 req_abs: Default::default(),
                 sess_vars_at_start: Default::default(),
+                owner_fd: None,
             })
         };
         // Slot 0 = child pointing to owner at slot 1 (a < b), slot 1 = owner.

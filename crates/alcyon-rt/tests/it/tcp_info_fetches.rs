@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2000-2026 Willy Tarreau and HAProxy contributors. See LICENSE.
+
 //! The `fc_*`/`bc_*` TCP_INFO fetches (`smp_fetch_fc_*`/`smp_fetch_bc_*`, `HAProxy`'s
 //! `src/tcp_sample.c`): `fc_rtt`, `fc_rttvar`, `bc_rtt`, `bc_rttvar` and the `fc_unacked`,
 //! `fc_sacked`, `fc_lost`, `fc_retrans`, `fc_fackets`, `fc_reordering` counters. The value
@@ -6,7 +9,7 @@
 //! milliseconds by default and microseconds with the `us` argument.
 //!
 //! The values vary from run to run, so the tests check shapes, on both binaries
-//! (`T281_ORACLE` for `HAProxy`, 3.5-dev11, measured 2026-12-11 on loopback):
+//! (`T281_ORACLE` for `HAProxy`, 3.5-dev11, measured 2026-11-23 on loopback):
 //!
 //! - a configuration with every fetch in `http-request` rules loads;
 //! - over loopback `fc_rtt(us)` and `bc_rtt(us)` are greater than 0, `fc_rtt` (ms) and the
@@ -462,4 +465,77 @@ fn quic_frontend_refuses_rtt_fetches() {
     );
     let (code, out) = check_alcyon(&cfg);
     assert_eq!(code, 0, "an fc_rtt condition must load on a plain frontend:\n{out}");
+}
+
+fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+    let n = payload.len();
+    let mut f = vec![(n >> 16) as u8, (n >> 8) as u8, n as u8, kind, flags];
+    f.extend_from_slice(&stream.to_be_bytes());
+    f.extend_from_slice(payload);
+    f
+}
+
+/// A stream of an HTTP/2 connection reads the connection's TCP socket: `fc_rtt` and the
+/// `fc_*` counters answer in its `http-request` rules (`smp->sess->origin` is the client
+/// connection in `HAProxy`, whatever the mux). The status of each stream's response says
+/// whether the rule saw a sample: 200 (`:status`, HPACK static index 8, first byte `0x88`)
+/// when `fc_rtt(us)` and `fc_unacked` both sample, 403 otherwise.
+#[test]
+fn h2_streams_read_the_connection_socket() {
+    let fe = common::reserve_addr();
+    let cfg = format!(
+        "defaults\n  mode http\n  timeout client 5s\n  timeout server 5s\n  timeout connect 5s\n\
+         frontend fe\n  bind {fe} proto h2\n\
+         \x20 http-request return status 200 if {{ fc_rtt(us) gt 0 }} {{ fc_unacked ge 0 }}\n\
+         \x20 http-request return status 403\n"
+    );
+    let mut f = NamedTempFile::new().expect("tmp");
+    f.write_all(cfg.as_bytes()).expect("cfg");
+    let mut child = Command::new(bin())
+        .arg("-f")
+        .arg(f.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    assert!(common::wait_listening(fe), "never listened");
+
+    let mut c = TcpStream::connect(fe).expect("connect");
+    c.set_read_timeout(Some(Duration::from_millis(50))).ok();
+    // GET / on streams 1 and 3: :method GET, :scheme http, :path /, :authority "x".
+    let req = [0x82, 0x86, 0x84, 0x01, 0x01, b'x'];
+    let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    hello.extend_from_slice(&h2_frame(4, 0, 0, &[]));
+    hello.extend_from_slice(&h2_frame(1, 5, 1, &req));
+    hello.extend_from_slice(&h2_frame(1, 5, 3, &req));
+    c.write_all(&hello).expect("send");
+
+    let mut first: Vec<(u32, u8)> = Vec::new();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let t0 = std::time::Instant::now();
+    while first.len() < 2 && t0.elapsed() < Duration::from_secs(5) {
+        match c.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(_) => break,
+        }
+        while buf.len() >= 9 {
+            let len = (usize::from(buf[0]) << 16) | (usize::from(buf[1]) << 8) | usize::from(buf[2]);
+            if buf.len() < 9 + len {
+                break;
+            }
+            let stream = u32::from_be_bytes([buf[5] & 0x7f, buf[6], buf[7], buf[8]]);
+            if buf[3] == 1 && len > 0 {
+                assert_eq!(buf[4] & 0x28, 0, "HEADERS with padding/priority: {:02x?}", &buf[..9 + len]);
+                first.push((stream, buf[9]));
+            }
+            buf.drain(..9 + len);
+        }
+    }
+    common::stop(&mut child);
+
+    first.sort_unstable();
+    assert_eq!(first, vec![(1, 0x88), (3, 0x88)], "(stream, first header-block byte): 0x88 = :status 200, fc_* sampled");
 }
