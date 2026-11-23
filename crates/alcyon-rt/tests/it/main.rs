@@ -63,6 +63,7 @@ mod balance_roundrobin_weights;
 mod balance_source_consistent;
 mod balance_source_map;
 mod balance_uri_map;
+mod bind_client_auth;
 mod bind_name;
 mod bind_options_per_bind;
 mod listen_backlog;

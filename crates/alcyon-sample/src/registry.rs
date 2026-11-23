@@ -838,6 +838,12 @@ pub struct SslFacts<'a> {
     pub alpn: Option<&'a [u8]>,
     /// The peer sent a certificate (`ssl_c_used`).
     pub has_crt: bool,
+    /// Client certificate verification result (`ssl_c_verify`, OpenSSL `X509_V_ERR`, 0 = OK).
+    pub c_verify: i32,
+    /// First verification error on the client leaf certificate (`ssl_c_err`, 0 = OK).
+    pub c_err: i32,
+    /// First verification error in the client CA chain (`ssl_c_ca_err`, 0 = OK).
+    pub c_ca_err: i32,
     /// The DER of the certificate this side presented (`ssl_f_*`); `None` for plaintext.
     pub local_crt: Option<&'a [u8]>,
     /// The handshake resumed an earlier session (`ssl_fc_is_resumed`).
@@ -849,8 +855,20 @@ pub struct SslFacts<'a> {
 
 impl SslFacts<'_> {
     /// A plaintext connection's: what [`Default`] gives.
-    pub const NONE: SslFacts<'static> =
-        SslFacts { used: false, sni: None, cipher: None, protocol: None, alpn: None, has_crt: false, local_crt: None, resumed: false, capture: None };
+    pub const NONE: SslFacts<'static> = SslFacts {
+        used: false,
+        sni: None,
+        cipher: None,
+        protocol: None,
+        alpn: None,
+        has_crt: false,
+        c_verify: 0,
+        c_err: 0,
+        c_ca_err: 0,
+        local_crt: None,
+        resumed: false,
+        capture: None,
+    };
 }
 
 /// One server's live state, as the server fetches read it.
@@ -4266,13 +4284,36 @@ impl Registry {
                 _ => ctx.ssl_fc().used.then_some(Sample::Sint(0)),
             },
         });
-        for name in ["ssl_c_err", "ssl_c_ca_err"] {
-            self.register_fetch(FetchDesc {
-                name,
-                out_type: SampleType::Sint,
-                func: |ctx, _args| ctx.ssl_fc().used.then_some(Sample::Sint(0)),
-            });
-        }
+        self.register_fetch(FetchDesc {
+            name: "ssl_c_verify",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| {
+                // HAProxy's `smp_fetch_ssl_c_verify` returns no sample while `CO_FL_WAIT_XPRT` is
+                // set (including on failed TLS handshakes logged via `error-log-format`), whereas
+                // `ssl_c_err` and `ssl_c_ca_err` do report errors once `conn->err_code` is set.
+                if ctx.conn_err.is_some_and(|e| e.tls) {
+                    return None;
+                }
+                let ssl = ctx.ssl_fc();
+                ssl.used.then_some(Sample::Sint(i64::from(ssl.c_verify)))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_c_err",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| {
+                let ssl = ctx.ssl_fc();
+                ssl.used.then_some(Sample::Sint(i64::from(ssl.c_err)))
+            },
+        });
+        self.register_fetch(FetchDesc {
+            name: "ssl_c_ca_err",
+            out_type: SampleType::Sint,
+            func: |ctx, _args| {
+                let ssl = ctx.ssl_fc();
+                ssl.used.then_some(Sample::Sint(i64::from(ssl.c_ca_err)))
+            },
+        });
         self.register_fetch(FetchDesc {
             name: "ssl_fc_is_resumed",
             out_type: SampleType::Bool,
@@ -11075,6 +11116,69 @@ mod compiled_multi_only {
         assert_eq!(Registry::eval_all_c(&c, &[], none, &ctx), vec![Sample::Sint(7), Sample::Sint(8)]);
         // And by name (R2: `eval_smp_g` falls back to the list for its first sample).
         assert_eq!(r.eval("t574_multi_only", &[], none, &ctx), Some(Sample::Sint(7)));
+    }
+}
+
+#[cfg(test)]
+mod ssl_c_verify_tests {
+    use super::{ConnErr, PhaseCtx, Registry, Sample, SslFacts};
+
+    #[test]
+    fn ssl_c_verify_err_and_ca_err_read_ssl_facts() {
+        let r = Registry::new();
+        let none: &[(&str, Vec<String>)] = &[];
+
+        // Plaintext: ssl_c_verify/ssl_c_err/ssl_c_ca_err give no sample; ssl_c_used is false.
+        let plain = PhaseCtx::EMPTY.as_ctx();
+        assert_eq!(r.eval("ssl_c_verify", &[], none, &plain), None);
+        assert_eq!(r.eval("ssl_c_err", &[], none, &plain), None);
+        assert_eq!(r.eval("ssl_c_ca_err", &[], none, &plain), None);
+        assert_eq!(r.eval("ssl_c_used", &[], none, &plain), Some(Sample::Bool(false)));
+
+        // TLS without client cert (verify optional or none): 0/0/0, used=0.
+        let mut tls_no_cert = PhaseCtx::EMPTY;
+        tls_no_cert.ssl_fc = SslFacts { used: true, ..SslFacts::NONE };
+        let ctx = tls_no_cert.as_ctx();
+        assert_eq!(r.eval("ssl_c_verify", &[], none, &ctx), Some(Sample::Sint(0)));
+        assert_eq!(r.eval("ssl_c_err", &[], none, &ctx), Some(Sample::Sint(0)));
+        assert_eq!(r.eval("ssl_c_ca_err", &[], none, &ctx), Some(Sample::Sint(0)));
+        assert_eq!(r.eval("ssl_c_used", &[], none, &ctx), Some(Sample::Bool(false)));
+
+        // Completed TLS session with leaf verify error (e.g. X509_V_ERR_CERT_HAS_EXPIRED = 10): 10/10/0.
+        let mut tls_leaf_err = PhaseCtx::EMPTY;
+        tls_leaf_err.ssl_fc = SslFacts { used: true, has_crt: true, c_verify: 10, c_err: 10, c_ca_err: 0, ..SslFacts::NONE };
+        let ctx = tls_leaf_err.as_ctx();
+        assert_eq!(r.eval("ssl_c_verify", &[], none, &ctx), Some(Sample::Sint(10)));
+        assert_eq!(r.eval("ssl_c_err", &[], none, &ctx), Some(Sample::Sint(10)));
+        assert_eq!(r.eval("ssl_c_ca_err", &[], none, &ctx), Some(Sample::Sint(0)));
+        assert_eq!(r.eval("ssl_c_used", &[], none, &ctx), Some(Sample::Bool(true)));
+
+        // Completed TLS session with CA chain error (depth > 0): 10/0/10.
+        let mut tls_ca_err = PhaseCtx::EMPTY;
+        tls_ca_err.ssl_fc = SslFacts { used: true, has_crt: true, c_verify: 10, c_err: 0, c_ca_err: 10, ..SslFacts::NONE };
+        let ctx = tls_ca_err.as_ctx();
+        assert_eq!(r.eval("ssl_c_verify", &[], none, &ctx), Some(Sample::Sint(10)));
+        assert_eq!(r.eval("ssl_c_err", &[], none, &ctx), Some(Sample::Sint(0)));
+        assert_eq!(r.eval("ssl_c_ca_err", &[], none, &ctx), Some(Sample::Sint(10)));
+
+        // Failed TLS handshake (`error-log-format` with `conn_err.tls = true`):
+        // `ssl_c_verify` gives no sample (matching HAProxy's `CO_FL_WAIT_XPRT`), while
+        // `ssl_c_err` and `ssl_c_ca_err` report the recorded X509_V_ERR codes.
+        let mut hs_fail = PhaseCtx::EMPTY;
+        hs_fail.ssl_fc = SslFacts { used: true, has_crt: true, c_verify: 10, c_err: 10, c_ca_err: 0, ..SslFacts::NONE };
+        hs_fail.conn_err = Some(ConnErr {
+            code: 34,
+            name: "SSL_HANDSHAKE",
+            text: "SSL handshake failure",
+            tls: true,
+            ssl_code: 0,
+            ssl_text: None,
+        });
+        let ctx = hs_fail.as_ctx();
+        assert_eq!(r.eval("ssl_c_verify", &[], none, &ctx), None);
+        assert_eq!(r.eval("ssl_c_err", &[], none, &ctx), Some(Sample::Sint(10)));
+        assert_eq!(r.eval("ssl_c_ca_err", &[], none, &ctx), Some(Sample::Sint(0)));
+        assert_eq!(r.eval("ssl_c_used", &[], none, &ctx), Some(Sample::Bool(true)));
     }
 }
 

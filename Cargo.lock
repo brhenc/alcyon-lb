@@ -233,6 +233,7 @@ dependencies = [
  "rustls-pemfile",
  "rustls-ring",
  "rustls-ringalcyon",
+ "rustls-webpki 0.104.0-alpha.7",
  "tempfile",
  "tracing",
 ]

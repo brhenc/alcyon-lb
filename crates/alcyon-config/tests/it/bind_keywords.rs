@@ -106,7 +106,7 @@ fn unknown_bind_keyword_is_refused_in_both_sections() {
 
 #[test]
 fn bind_keywords_missing_their_argument_are_refused() {
-    for kw in ["crt", "alpn", "proto", "verify", "name"] {
+    for kw in ["crt", "alpn", "proto", "verify", "ca-file", "name"] {
         for f in [in_listen, in_frontend] {
             let err = f(&format!("bind 127.0.0.1:8080 {kw}")).unwrap_err().to_string();
             assert!(err.contains(&format!("'{kw}'")), "{kw}: {err}");
@@ -117,8 +117,11 @@ fn bind_keywords_missing_their_argument_are_refused() {
 #[test]
 fn unimplemented_security_keywords_are_refused_in_both_sections() {
     let refused = [
-        "ssl verify required ca-file /tmp/ca.pem",
-        "ssl crt /tmp/c.pem ca-file /tmp/ca.pem",
+        "ssl crt /tmp/c.pem crl-file /tmp/crl.pem",
+        "ssl crt /tmp/c.pem ca-verify-file /tmp/ca.pem",
+        "ssl crt /tmp/c.pem crt-ignore-err all",
+        "ssl crt /tmp/c.pem ca-ignore-err all",
+        "ssl crt /tmp/c.pem no-ca-names",
         "ssl crt /tmp/c.pem strict-sni",
         "ssl crt /tmp/c.pem ciphers HIGH",
         "ssl crt-list /tmp/l",
@@ -132,6 +135,136 @@ fn unimplemented_security_keywords_are_refused_in_both_sections() {
             let named = b.split_whitespace().any(|w| err.contains(&format!("'{w}'")));
             assert!(named && err.contains("not supported"), "{b}: {err}");
         }
+    }
+}
+
+#[test]
+fn bind_verify_unknown_method_is_refused_with_haproxy_message() {
+    for f in [in_listen, in_frontend] {
+        let err = f("bind 127.0.0.1:8080 ssl crt /tmp/c.pem verify maybe").unwrap_err().to_string();
+        assert!(
+            err.contains("unknown verify method 'maybe', only 'none', 'optional', and 'required' are supported"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn bind_missing_ca_file_is_refused_with_haproxy_message() {
+    let missing = "/nonexistent/alcyon-bind-missing-ca.crt";
+    for f in [in_listen, in_frontend] {
+        let err = f(&format!("bind 127.0.0.1:8080 ssl crt /tmp/c.pem ca-file {missing} verify required"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&format!("'ca-file' : unable to load {missing}")), "{err}");
+    }
+}
+
+#[test]
+fn bind_verify_without_ca_file_is_refused_with_haproxy_message() {
+    for mode in ["required", "optional"] {
+        for f in [in_listen, in_frontend] {
+            let err = f(&format!("bind 127.0.0.1:8080 ssl crt /tmp/c.pem verify {mode}"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("Proxy 'x': verify is enabled but no CA file specified for bind '127.0.0.1:8080' at "),
+                "{mode}: {err}"
+            );
+        }
+    }
+    // Control: `verify none` needs no CA file.
+    for f in [in_listen, in_frontend] {
+        f("bind 127.0.0.1:8080 ssl crt /tmp/c.pem verify none")
+            .unwrap_or_else(|e| panic!("verify none without ca-file must load: {e}"));
+    }
+}
+
+#[test]
+fn bind_verify_and_ca_file_are_kept_and_rebased_under_ca_base() {
+    let ca_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../alcyon-rt/tests/data/client_auth");
+    let ca_abs = ca_dir.join("v3-ca.crt");
+    for (mode, expected) in [
+        ("none", alcyon_config::BindVerify::None),
+        ("optional", alcyon_config::BindVerify::Optional),
+        ("required", alcyon_config::BindVerify::Required),
+    ] {
+        for f in [in_listen, in_frontend] {
+            let cfg = f(&format!("bind 127.0.0.1:8080 ssl crt /tmp/c.pem ca-file {} verify {mode}", ca_abs.display()))
+                .unwrap_or_else(|e| panic!("{mode}: {e}"));
+            let b = cfg.listens.first().map(|l| &l.binds[0]).or_else(|| cfg.frontends.first().map(|fe| &fe.binds[0])).expect("bind");
+            assert_eq!(b.verify(), expected);
+            assert_eq!(b.ca_file(), Some(ca_abs.to_str().unwrap()));
+        }
+    }
+    let cfg = parse_str(&format!(
+        "global\n  ca-base {}\n{DEFAULTS}\
+         frontend x\n  bind 127.0.0.1:8080 ssl crt /tmp/c.pem ca-file v3-ca.crt verify required\n\
+         listen y\n  bind 127.0.0.1:8081 ssl crt /tmp/c.pem ca-file v3-ca.crt verify optional\n\
+         log-forward lf\n  bind /tmp/alcyon-lf-test.sock\n  bind 127.0.0.1:8082 ssl crt /tmp/c.pem ca-file v3-ca.crt verify optional\n",
+        ca_dir.display()
+    ))
+    .expect("ca-base must rebase relative bind ca-file in frontend, listen, and log-forward");
+    assert_eq!(cfg.frontends[0].binds[0].verify(), alcyon_config::BindVerify::Required);
+    assert_eq!(cfg.frontends[0].binds[0].ca_file(), Some(ca_abs.to_str().unwrap()));
+    assert_eq!(cfg.listens[0].binds[0].ca_file(), Some(ca_abs.to_str().unwrap()));
+    let lf_tcp = cfg.log_forwards[0]
+        .binds
+        .iter()
+        .find_map(|b| match b {
+            alcyon_config::LogForwardBind::Tcp(b) => Some(b),
+            alcyon_config::LogForwardBind::Unix { .. } => None,
+        })
+        .expect("expected TCP log-forward bind");
+    assert_eq!(lf_tcp.ca_file(), Some(ca_abs.to_str().unwrap()));
+
+    // `@system-ca` is accepted without reading a file on disk.
+    let sys_cfg = in_frontend("bind 127.0.0.1:8080 ssl crt /tmp/c.pem ca-file @system-ca verify required")
+        .expect("@system-ca must be accepted");
+    assert_eq!(sys_cfg.frontends[0].binds[0].ca_file(), Some("@system-ca"));
+
+    // Corrupt / empty PEM ca-file contents are refused with HAProxy's unable-to-load error.
+    let tmp = std::env::temp_dir().join(format!("alcyon-bad-ca-pem-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("mkdir");
+    for (name, body) in [
+        ("empty.pem", ""),
+        ("bad_char.pem", "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"),
+        ("early_pad.pem", "-----BEGIN CERTIFICATE-----\n=AAA\n-----END CERTIFICATE-----\n"),
+        ("after_pad.pem", "-----BEGIN CERTIFICATE-----\nAA=A\n-----END CERTIFICATE-----\n"),
+        ("short_b64.pem", "-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n"),
+    ] {
+        let p = tmp.join(name);
+        std::fs::write(&p, body).expect("write bad pem");
+        let err = in_frontend(&format!("bind 127.0.0.1:8080 ssl crt /tmp/c.pem ca-file {} verify required", p.display()))
+            .expect_err(name)
+            .to_string();
+        assert!(err.contains("'ca-file' : unable to load"), "{name}: {err}");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn bind_quic_verify_required_or_optional_is_refused() {
+    let ca_abs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../alcyon-rt/tests/data/client_auth/v3-ca.crt");
+    for mode in ["optional", "required"] {
+        for f in [in_listen, in_frontend] {
+            let err = f(&format!(
+                "bind quic4@127.0.0.1:8443 ssl crt /tmp/c.pem ca-file {} verify {mode}",
+                ca_abs.display()
+            ))
+            .expect_err(mode)
+            .to_string();
+            assert!(
+                err.contains("not supported on QUIC binds yet"),
+                "quic verify {mode} must be refused cleanly: {err}"
+            );
+        }
+    }
+    // Control: `verify none` on a QUIC bind stays accepted.
+    for f in [in_listen, in_frontend] {
+        f("bind quic4@127.0.0.1:8443 ssl crt /tmp/c.pem verify none")
+            .unwrap_or_else(|e| panic!("quic verify none must be accepted: {e}"));
     }
 }
 

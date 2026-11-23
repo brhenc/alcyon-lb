@@ -147,6 +147,17 @@ pub fn swap(p: TlsCryptoProvider) -> Result<usize, String> {
     Ok(built)
 }
 
+/// All signature verification algorithms supported by provider `p` for `rustls-webpki`.
+#[must_use]
+pub const fn verification_algs(
+    p: TlsCryptoProvider,
+) -> &'static [&'static dyn rustls24::pki_types::SignatureVerificationAlgorithm] {
+    match p {
+        TlsCryptoProvider::Ring => rustls24_ring::ALL_VERIFICATION_ALGS,
+        TlsCryptoProvider::RingAlcyon => rustls24_ringalcyon::ALL_VERIFICATION_ALGS,
+    }
+}
+
 /// The ticket-key factory of provider `p`: a session ticket is sealed by the provider of the
 /// configuration that issued it.
 pub(crate) fn ticketer(p: TlsCryptoProvider) -> Result<Arc<dyn rustls24::crypto::TicketProducer>, rustls24::Error> {
@@ -200,6 +211,7 @@ mod tests {
         for p in TlsCryptoProvider::ALL {
             assert_eq!(quic_initial_suite(p).common.suite, rustls24::crypto::CipherSuite::TLS13_AES_128_GCM_SHA256, "{p:?}");
             assert_eq!(quic_token_suite(p).common.suite, rustls24::crypto::CipherSuite::TLS13_AES_256_GCM_SHA384, "{p:?}");
+            assert!(!verification_algs(p).is_empty(), "{p:?}");
         }
     }
 

@@ -13,6 +13,7 @@ fn bind(crt: Vec<String>) -> BindConfig {
     BindConfig {
         line: 0,
         sock: None,
+        client_auth: None,
         addr: "127.0.0.1:443".parse().unwrap(),
         quic: false,
         ssl: true,

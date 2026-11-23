@@ -867,6 +867,7 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
     let (addr, quic) = parse_socket_addr(&tokens[1], None)?;
     let mut bind = BindConfig {
         sock: None,
+        client_auth: None,
         line: kw.line,
         addr,
         quic,
@@ -900,6 +901,42 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
             "ssl" => bind.ssl = true,
             "crt" => {
                 bind.crt.push(arg(i, "missing certificate location")?.text.clone());
+                i += 1;
+            }
+            "verify" => {
+                let a = arg(i, "missing verify method")?;
+                let mode = match a.text.as_str() {
+                    "none" => crate::ast::BindVerify::None,
+                    "optional" => crate::ast::BindVerify::Optional,
+                    "required" => crate::ast::BindVerify::Required,
+                    other => {
+                        return Err(ConfigError::new(
+                            a.line,
+                            a.col,
+                            format!(
+                                "{prefix} : 'verify' : unknown verify method '{other}', only 'none', 'optional', and 'required' are supported"
+                            ),
+                        ));
+                    }
+                };
+                let ca = bind.client_auth.get_or_insert_with(|| {
+                    Box::new(crate::ast::BindClientAuth {
+                        bind_arg: tokens[1].text.clone(),
+                        ..Default::default()
+                    })
+                });
+                ca.verify = mode;
+                i += 1;
+            }
+            "ca-file" => {
+                let a = arg(i, "missing CAfile path")?;
+                let ca = bind.client_auth.get_or_insert_with(|| {
+                    Box::new(crate::ast::BindClientAuth {
+                        bind_arg: tokens[1].text.clone(),
+                        ..Default::default()
+                    })
+                });
+                ca.ca_file = Some(a.text.clone());
                 i += 1;
             }
             "alpn" => {

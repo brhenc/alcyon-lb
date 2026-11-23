@@ -579,3 +579,60 @@ fn a_bind_whose_leaf_does_not_parse_is_refused() {
     let e = BindTls::single(vec![junk], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(id.key.clone())), vec![]).unwrap_err();
     assert!(e.contains("wrong tag"), "{e}");
 }
+
+/// A `BindTls::from_parts` whose `ServerConfig` holds a `BindClientVerifier` without setting
+/// `BindTls::client_verifier` falls back to `v.with_config()` (which calls `ClientVerifier::verify_identity`).
+#[test]
+fn verify_client_falls_back_to_config_verifier_when_sidecar_absent() {
+    use alcyon_tls::client_verify::BindClientVerifier;
+    use alcyon_tls::{provider, TlsCryptoProvider};
+    use rcgen::{BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair};
+    use rustls24::crypto::Identity;
+    use rustls24::server::danger::ClientVerifier;
+    use rustls24::{ClientConfig, RootCertStore, ServerConfig};
+
+    let srv_id = ident("localhost");
+    let base_bind = bind(&srv_id, vec![]);
+
+    // CA + valid v3 client cert
+    let mut ca_p = CertificateParams::new(Vec::<String>::new()).expect("ca");
+    ca_p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_p.distinguished_name.push(DnType::CommonName, "Fallback Test CA");
+    let ca_k = KeyPair::generate().expect("ca key");
+    let ca_c = ca_p.self_signed(&ca_k).expect("ca cert");
+
+    let mut cli_p = CertificateParams::new(Vec::<String>::new()).expect("cli");
+    cli_p.distinguished_name.push(DnType::CommonName, "fallback-client");
+    cli_p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let cli_k = KeyPair::generate().expect("cli key");
+    let cli_c = cli_p.signed_by(&cli_k, &ca_c, &ca_k).expect("cli cert");
+
+    let mut ca_roots = RootCertStore::empty();
+    ca_roots.add(ca_c.der().clone()).expect("root");
+    let prov = provider::of(TlsCryptoProvider::Ring, true, true);
+    let verifier = BindClientVerifier::new(Arc::new(ca_roots), true, TlsCryptoProvider::Ring, &prov);
+    let srv_cfg = Arc::new(
+        ServerConfig::builder(Arc::clone(&prov))
+            .with_client_cert_verifier(verifier as Arc<dyn ClientVerifier>)
+            .with_server_credential_resolver(Arc::clone(&base_bind.resolver) as Arc<dyn rustls24::server::ServerCredentialResolver>)
+            .expect("server config"),
+    );
+    // `BindTls::from_parts` leaves `client_verifier: None`, exercising `v.with_config()`.
+    let b = Arc::new(BindTls::from_parts(Arc::clone(&srv_cfg), srv_cfg, Arc::clone(&base_bind.resolver), TlsCryptoProvider::Ring));
+
+    let mut srv_roots = RootCertStore::empty();
+    srv_roots.add(srv_id.der.clone()).expect("srv root");
+    let cli_id = Arc::new(Identity::from_cert_chain(vec![cli_c.der().clone()]).expect("cli id"));
+    let cli_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cli_k.serialize_der()));
+    let cli_cfg = Arc::new(
+        ClientConfig::builder(prov)
+            .with_root_certificates(srv_roots)
+            .with_client_auth_cert(cli_id, cli_key)
+            .expect("client config"),
+    );
+    let mut p = Pair::with(b, &cli_cfg);
+    let (s, c) = p.handshake();
+    s.expect("server handshake");
+    c.expect("client handshake");
+    assert!(p.srv.tls_info.peer_has_cert);
+}

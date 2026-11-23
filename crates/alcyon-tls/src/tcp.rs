@@ -16,6 +16,7 @@
 //!   provider's factory, and [`Hint`] advertises the lifetime 0.23 advertised (twice the
 //!   rotation period: the time a key decrypts for).
 
+use crate::client_verify::BindClientVerifier;
 use crate::config::{
     cert_covers_name, cert_names, key_mismatch, load_crl_file, load_server_ca, shared_key, spoken_versions, unix_now,
     versions_between, wrong_tag, BackendTlsOptions, BindPlan, SESSION_CACHE_SIZE, SESSION_LIFETIME,
@@ -23,9 +24,10 @@ use crate::config::{
 use crate::provider;
 use crate::resolver::AlcyonCertResolver;
 use crate::TlsCryptoProvider;
-use alcyon_config::ast::BindConfig;
+use alcyon_config::ast::{BindConfig, BindVerify};
 use rustls24::crypto::{CryptoProvider, Credentials, Identity, SelectedCredential, TicketProducer};
 use rustls24::pki_types::ServerName;
+use rustls24::server::danger::ClientVerifier;
 use rustls24::server::{ClientHello, ServerCredentialResolver, ServerSessionKey, StoresServerSessions};
 use rustls24::{ClientConfig, ServerConfig};
 use std::sync::Arc;
@@ -215,6 +217,9 @@ pub struct BindTls {
     pub config: Arc<ServerConfig>,
     pub no_alpn: Arc<ServerConfig>,
     pub resolver: Arc<CertResolver>,
+    /// Client certificate verifier for `verify optional|required`; `None` for `verify none`
+    /// (which keeps `with_no_client_auth()` and the unchanged zero-cost handshake path).
+    pub client_verifier: Option<Arc<BindClientVerifier>>,
     /// The crypto provider both configurations run on (T460).
     pub provider: TlsCryptoProvider,
     /// The line it was built from, for a swap to build it again (`None`: built in memory).
@@ -227,7 +232,7 @@ impl BindTls {
     /// A bind of these parts, which a swap does not build again.
     #[must_use]
     pub fn from_parts(config: Arc<ServerConfig>, no_alpn: Arc<ServerConfig>, resolver: Arc<CertResolver>, provider: TlsCryptoProvider) -> Self {
-        Self { config, no_alpn, resolver, provider, source: None, other: std::sync::OnceLock::new() }
+        Self { config, no_alpn, resolver, client_verifier: None, provider, source: None, other: std::sync::OnceLock::new() }
     }
 
     /// What a handshake starting now uses: this bind, or its build on the provider a swap made
@@ -319,7 +324,12 @@ impl BindTls {
         alpn: Vec<Vec<u8>>,
         kind: TlsCryptoProvider,
     ) -> Result<Arc<Self>, String> {
-        let plan = BindPlan { alpn, pairs: vec![(certs, key, std::path::PathBuf::from("(memory)"))] };
+        let plan = BindPlan {
+            alpn,
+            pairs: vec![(certs, key, std::path::PathBuf::from("(memory)"))],
+            verify: BindVerify::None,
+            ca_file: None,
+        };
         build(&plan, kind, true, true).map(Arc::new)
     }
 
@@ -333,7 +343,12 @@ impl BindTls {
         key: rustls24::pki_types::PrivateKeyDer<'static>,
         alpn: Vec<Vec<u8>>,
     ) -> Result<Arc<Self>, String> {
-        let plan = BindPlan { alpn, pairs: vec![(certs, key, std::path::PathBuf::from("(memory)"))] };
+        let plan = BindPlan {
+            alpn,
+            pairs: vec![(certs, key, std::path::PathBuf::from("(memory)"))],
+            verify: BindVerify::None,
+            ca_file: None,
+        };
         build(&plan, provider::active(), false, true).map(Arc::new)
     }
 }
@@ -364,8 +379,23 @@ fn build(plan: &BindPlan, kind: TlsCryptoProvider, tls12: bool, tls13: bool) -> 
         }
     }
     let resolver = Arc::new(resolver);
-    let mut config = ServerConfig::builder(provider::of(kind, tls12, tls13))
-        .with_no_client_auth()
+    let prov = provider::of(kind, tls12, tls13);
+    let (builder_with_auth, client_verifier) = match plan.verify {
+        BindVerify::None => (ServerConfig::builder(prov).with_no_client_auth(), None),
+        BindVerify::Optional | BindVerify::Required => {
+            let Some(ca_path) = plan.ca_file.as_deref() else {
+                return Err("verify is enabled but no CA file specified".to_string());
+            };
+            let roots = load_server_ca(ca_path)
+                .map_err(|_| format!("'ca-file' : unable to load {}", ca_path.display()))?;
+            let verifier =
+                BindClientVerifier::new(Arc::new(roots), plan.verify == BindVerify::Required, kind, &prov);
+            let builder = ServerConfig::builder(prov)
+                .with_client_cert_verifier(Arc::clone(&verifier) as Arc<dyn ClientVerifier>);
+            (builder, Some(verifier))
+        }
+    };
+    let mut config = builder_with_auth
         .with_server_credential_resolver(Arc::clone(&resolver) as Arc<dyn ServerCredentialResolver>)
         .map_err(|e| format!("Protocol version error: {e:?}"))?;
     config.alpn_protocols = plan.alpn.iter().map(|p| p.clone().into()).collect();
@@ -378,7 +408,9 @@ fn build(plan: &BindPlan, kind: TlsCryptoProvider, tls12: bool, tls13: bool) -> 
     )));
     let mut no_alpn = config.clone();
     no_alpn.alpn_protocols.clear();
-    Ok(BindTls::from_parts(Arc::new(config), Arc::new(no_alpn), resolver, kind))
+    let mut bind_tls = BindTls::from_parts(Arc::new(config), Arc::new(no_alpn), resolver, kind);
+    bind_tls.client_verifier = client_verifier;
+    Ok(bind_tls)
 }
 
 /// `verify none`: no server authentication, signatures still checked.

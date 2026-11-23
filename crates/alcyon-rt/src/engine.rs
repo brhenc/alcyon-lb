@@ -5182,6 +5182,7 @@ fn frontend_binds(frontend: &alcyon_config::FrontendSection) -> Vec<alcyon_confi
         if !all_binds.iter().any(|b| b.addr == ba) {
             all_binds.insert(0, alcyon_config::ast::BindConfig {
                 sock: None,
+                client_auth: None,
                 line: 0,
                 addr: ba,
                 quic: false,
@@ -6124,6 +6125,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             let binds = if listen.binds.is_empty() {
                 vec![alcyon_config::ast::BindConfig {
                     sock: None,
+                    client_auth: None,
                     line: 0,
                     addr: listen.addr,
                     quic: false,

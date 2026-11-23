@@ -581,8 +581,9 @@ pub fn parse_str(input: &str) -> Result<Config, ConfigError> {
     }
 
     if let Some(g) = global.as_ref() {
-        apply_ssl_bases(g, &mut listens, &mut frontends, &mut backends);
+        apply_ssl_bases(g, &mut listens, &mut frontends, &mut backends, &mut log_forwards);
     }
+    check_bind_client_auth(&listens, &frontends, &log_forwards)?;
     apply_ssl_server_verify(global.as_ref().and_then(|g| g.ssl_server_verify), &mut listens, &mut backends)?;
     if let Some(g) = global.as_ref() {
         apply_ssl_default_versions(g, &mut listens, &mut frontends, &mut backends)?;
@@ -811,15 +812,28 @@ fn apply_ssl_bases(
     listens: &mut [ListenSection],
     frontends: &mut [FrontendSection],
     backends: &mut [BackendSection],
+    log_forwards: &mut [LogForwardSection],
 ) {
     let (crt_base, ca_base) = (global.crt_base.as_deref(), global.ca_base.as_deref());
     if crt_base.is_none() && ca_base.is_none() {
         return;
     }
-    let binds = listens.iter_mut().flat_map(|l| l.binds.iter_mut()).chain(frontends.iter_mut().flat_map(|f| f.binds.iter_mut()));
+    let lf_binds = log_forwards.iter_mut().flat_map(|lf| lf.binds.iter_mut()).filter_map(|b| {
+        if let crate::ast::LogForwardBind::Tcp(bind) = b { Some(bind) } else { None }
+    });
+    let binds = listens
+        .iter_mut()
+        .flat_map(|l| l.binds.iter_mut())
+        .chain(frontends.iter_mut().flat_map(|f| f.binds.iter_mut()))
+        .chain(lf_binds);
     for bind in binds {
         for crt in &mut bind.crt {
             under_base(crt_base, crt);
+        }
+        if let Some(ca) = bind.client_auth.as_deref_mut() {
+            if let Some(p) = ca.ca_file.as_mut().filter(|p| !p.starts_with('@')) {
+                under_base(ca_base, p);
+            }
         }
     }
     let mut servers: Vec<&mut Server> = Vec::new();
@@ -834,6 +848,153 @@ fn apply_ssl_bases(
     for ds in defaults {
         rebase_server_ssl(&mut ds.ssl, crt_base, ca_base);
     }
+}
+
+/// Decodes one base64 block (ignoring ASCII whitespace) into DER bytes; `None` if malformed.
+fn decode_pem_base64(body: &str) -> Option<Vec<u8>> {
+    fn val(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::new();
+    let mut quad = [0u8; 4];
+    let mut qlen = 0usize;
+    let mut pad = 0usize;
+    for b in body.bytes() {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        if b == b'=' {
+            if qlen < 2 {
+                return None;
+            }
+            quad[qlen] = 0;
+            qlen += 1;
+            pad += 1;
+        } else {
+            if pad > 0 {
+                return None;
+            }
+            quad[qlen] = val(b)?;
+            qlen += 1;
+        }
+        if qlen == 4 {
+            let n = (u32::from(quad[0]) << 18) | (u32::from(quad[1]) << 12) | (u32::from(quad[2]) << 6) | u32::from(quad[3]);
+            out.push((n >> 16) as u8);
+            if pad < 2 {
+                out.push((n >> 8) as u8);
+            }
+            if pad == 0 {
+                out.push(n as u8);
+            }
+            qlen = 0;
+            if pad > 0 {
+                break;
+            }
+        }
+    }
+    if qlen != 0 || out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Checks that `path` is readable and contains at least one PEM X.509 certificate block
+/// (`ssl_store_load_locations_file` in `HAProxy` `src/cfgparse-ssl.c`).
+fn pem_ca_file_is_loadable(path: &str) -> bool {
+    if path == "@system-ca" {
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let mut rest = text.as_str();
+    while let Some(pos) = rest.find("-----BEGIN ") {
+        let after_begin = &rest[pos + "-----BEGIN ".len()..];
+        let Some(end_hdr) = after_begin.find("-----") else { break };
+        let label = &after_begin[..end_hdr];
+        let body_start = &after_begin[end_hdr + "-----".len()..];
+        let end_marker = format!("-----END {label}-----");
+        let Some(end_pos) = body_start.find(&end_marker) else { break };
+        let body = &body_start[..end_pos];
+        rest = &body_start[end_pos + end_marker.len()..];
+        if matches!(label, "CERTIFICATE" | "X509 CERTIFICATE" | "TRUSTED CERTIFICATE") {
+            if let Some(der) = decode_pem_base64(body) {
+                if der.first() == Some(&0x30) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Validates bind `ca-file` loadability and `verify optional|required` requiring a `ca-file`,
+/// matching `HAProxy`'s `bind_parse_ca_file` (`src/cfgparse-ssl.c`) and
+/// `ssl_sock_prepare_bind_conf` (`src/ssl_sock.c`).
+fn check_bind_client_auth(
+    listens: &[ListenSection],
+    frontends: &[FrontendSection],
+    log_forwards: &[LogForwardSection],
+) -> Result<(), ConfigError> {
+    let check_one = |section: &str, proxy_name: &str, bind: &BindConfig| -> Result<(), ConfigError> {
+        let Some(ca) = bind.client_auth.as_deref() else {
+            return Ok(());
+        };
+        let bind_arg = if ca.bind_arg.is_empty() { bind.addr.to_string() } else { ca.bind_arg.clone() };
+        if let Some(path) = ca.ca_file.as_deref() {
+            if !pem_ca_file_is_loadable(path) {
+                return Err(ConfigError::new(
+                    bind.line,
+                    1,
+                    format!("'bind {bind_arg}' in section '{section}' : 'ca-file' : unable to load {path}"),
+                ));
+            }
+        }
+        if bind.quic
+            && matches!(ca.verify, crate::ast::BindVerify::Optional | crate::ast::BindVerify::Required)
+        {
+            return Err(ConfigError::new(
+                bind.line,
+                1,
+                format!("'bind {bind_arg}' in section '{section}' : 'verify' is not supported on QUIC binds yet"),
+            ));
+        }
+        if bind.ssl
+            && matches!(ca.verify, crate::ast::BindVerify::Optional | crate::ast::BindVerify::Required)
+            && ca.ca_file.is_none()
+        {
+            return Err(ConfigError::alerts(vec![(
+                bind.line,
+                format!("Proxy '{proxy_name}': verify is enabled but no CA file specified for bind '{bind_arg}' at {{at}}."),
+            )]));
+        }
+        Ok(())
+    };
+    for l in listens {
+        for bind in &l.binds {
+            check_one("listen", &l.name, bind)?;
+        }
+    }
+    for f in frontends {
+        for bind in &f.binds {
+            check_one("frontend", &f.name, bind)?;
+        }
+    }
+    for lf in log_forwards {
+        for b in &lf.binds {
+            if let crate::ast::LogForwardBind::Tcp(bind) = b {
+                check_one("log-forward", &lf.name, bind)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Global `ssl-server-verify`: what a `server` line's `verify` is when it does not say
