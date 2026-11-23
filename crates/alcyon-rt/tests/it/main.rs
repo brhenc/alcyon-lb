@@ -567,3 +567,4 @@ mod size_map;
 mod server_observe;
 mod del_server_gaps;
 mod cli_del_backend;
+mod tcp_info_fetches;

@@ -332,21 +332,10 @@ fn srv_id_and_srv_name_in_http_response() {
     assert_eq!((header(&r2, "srv-id").as_deref(), header(&r2, "srv-name").as_deref()), (Some("2"), Some("srv2")), "{r2}");
 }
 
-/// The TCP_INFO counters need `getsockopt(TCP_INFO)`, which the memory-safe crates cannot call.
-/// They are refused with a reason, rather than loaded and left empty on every request.
-#[test]
-fn tcp_info_counters_are_refused_with_a_reason() {
-    // T351: `fc_rtt`, `fc_rttvar`, `bc_rtt` and `bc_rttvar` read TCP_INFO as well; they were
-    // registered and always answered 0.
-    for f in [
-        "fc_unacked", "fc_sacked", "fc_lost", "fc_retrans", "fc_fackets", "fc_reordering", "fc_rtt", "fc_rttvar", "bc_rtt",
-        "bc_rttvar",
-    ] {
-        let (code, out) = load(&format!("http-request set-header x \"%[{f}]\""));
-        assert_ne!(code, Some(0), "{f} loaded: {out}");
-        assert!(out.contains("not implemented in Alcyon"), "{f}: {out}");
-    }
-}
+/// The TCP_INFO fetches (`fc_rtt`, `fc_rttvar`, `bc_rtt`, `bc_rttvar`, `fc_unacked`,
+/// `fc_sacked`, `fc_lost`, `fc_retrans`, `fc_fackets`, `fc_reordering`) read
+/// `getsockopt(TCP_INFO)` at the fetch: `tcp_info_fetches.rs` checks their values and
+/// sample/no-sample matrix against the oracle.
 
 /// `tcp-request content` runs for every request of a kept-alive connection, so a `req.` variable
 /// it sets is there in each request's `http-request` rules (HAProxy 3.5-dev8: the same three

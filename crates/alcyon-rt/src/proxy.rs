@@ -665,6 +665,12 @@ pub struct H2Child {
     /// The connection's session variables as the stream got them: what it changed of them
     /// goes back to the connection, and only that, as other streams may have set others.
     pub sess_vars_at_start: alcyon_sample::VarStore,
+    /// The owner's client socket, as a raw fd: what the `fc_*` TCP_INFO fetches read in
+    /// this stream ([`TcpSession::fc_tcp_fd`]), as `HAProxy` reads `smp->sess->origin`,
+    /// the client connection, whatever the mux. Read only while [`Self::owner`] is
+    /// `Some`: the owner closes the socket when it is freed, and forgets its children
+    /// first. `None` when the owner's socket is not a TCP one (QUIC).
+    pub owner_fd: Option<i32>,
 }
 
 impl H2Child {
@@ -1524,6 +1530,19 @@ impl TcpSession {
         self.cli.fd()
     }
 
+    /// The client connection's TCP socket as a raw fd, what the `fc_*` TCP_INFO fetches
+    /// read: the session's own socket, or for a stream of an HTTP/2 connection its
+    /// owner's while the owner lives ([`H2Child::owner_fd`]). `None` on QUIC.
+    #[must_use]
+    #[inline]
+    pub fn fc_tcp_fd(&self) -> Option<i32> {
+        match self.h2_role.as_deref() {
+            Some(H2Role::Child(H2Child { owner: Some(_), owner_fd, .. })) => *owner_fd,
+            Some(H2Role::Child(_)) => None,
+            _ => self.cli_fd().map(|f| std::os::fd::AsRawFd::as_raw_fd(&f)),
+        }
+    }
+
     /// Whether the session speaks HTTP/2 to its client: the connection's owner, or one of
     /// its streams.
     #[must_use]
@@ -1837,8 +1856,9 @@ impl TcpSession {
         c.is_first_req = owner.is_first_req;
         // A session that served a stream before has its role and its strings still.
         if let Some(H2Role::Child(ch)) = c.h2_role.as_deref_mut() {
-            let H2Child { owner: o, stream: st, late_trailers, rsp_head, reset, finished, conn_end, owner_tx_pending, rst, goaway, tls: _, quic_ack, req_abs, sess_vars_at_start } = ch;
+            let H2Child { owner: o, stream: st, late_trailers, rsp_head, reset, finished, conn_end, owner_tx_pending, rst, goaway, tls: _, quic_ack, req_abs, sess_vars_at_start, owner_fd } = ch;
             *o = Some(owner_ref);
+            *owner_fd = owner.cli_fd().map(|f| std::os::fd::AsRawFd::as_raw_fd(&f));
             *st = stream;
             *late_trailers = None;
             *rsp_head = None;
@@ -1882,6 +1902,7 @@ impl TcpSession {
             tls,
             quic_ack: None,
             req_abs: ReqText::default(),
+            owner_fd: owner.cli_fd().map(|f| std::os::fd::AsRawFd::as_raw_fd(&f)),
             sess_vars_at_start: {
                 let mut v = alcyon_sample::VarStore::new();
                 v.copy_scope_from(&owner.strm.vars, alcyon_sample::VarScope::Sess);
@@ -5984,6 +6005,7 @@ mod tests {
             quic_ack: None,
             req_abs: Default::default(),
             sess_vars_at_start: Default::default(),
+            owner_fd: None,
         })));
         assert!(ConnView::from_conn(&s).is_none());
     }

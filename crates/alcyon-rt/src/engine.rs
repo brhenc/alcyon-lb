@@ -3442,8 +3442,27 @@ fn stream_has_strm(s: &TcpSession) -> bool {
     s.mode == Mode::Tcp || s.strm.txn.as_ref().is_some_and(|t| t.req_len_hdrs.is_some())
 }
 
+/// The `fc_*`/`bc_*` TCP_INFO sources of a session: the raw fds the fetches read
+/// `getsockopt(TCP_INFO)` on, only when one of them is evaluated (`raw::tcp_info_val`).
+/// A side whose socket is not a plain TCP fd (QUIC, HTTP/2 child) gives no fd, and the
+/// fetch gives no sample there, as in `HAProxy` where the socket is not the client's TCP
+/// connection. Reading two `Option`s; no syscall, nothing stored on the connection.
+fn tcp_info_from_sess(sess: &TcpSession) -> (Option<i32>, Option<i32>, Option<fn(i32, u8) -> Option<u32>>) {
+    let fc_fd = sess.fc_tcp_fd();
+    let bc_fd = sess.srv.as_ref().map(|f| f.as_raw_fd());
+    (fc_fd, bc_fd, (fc_fd.is_some() || bc_fd.is_some()).then_some(crate::raw::tcp_info_val))
+}
+
+/// The reader half of `tcp_info_from_sess`, for the rule-phase contexts that build their
+/// `PhaseCtx` literal field by field without a let: present exactly when a side's socket
+/// is a TCP fd, read only when one of the TCP_INFO fetches is evaluated.
+fn tcp_info_reader(sess: &TcpSession) -> Option<fn(i32, u8) -> Option<u32>> {
+    (sess.fc_tcp_fd().is_some() || sess.srv.is_some()).then_some(crate::raw::tcp_info_val)
+}
+
 /// The sample context a log line's `%[...]` reads.
 fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: &'a ProxiesView<'a>, stick: &'a StickView<'a>, fc: Option<&'a crate::proxy::ConnView<'a>>) -> alcyon_sample::PhaseCtx<'a> {
+    let (fc_fd, bc_fd, tcp_info_reader) = tcp_info_from_sess(s);
     alcyon_sample::PhaseCtx {
         proxies: Some(view),
         stick: Some(stick),
@@ -3457,6 +3476,9 @@ fn stream_sample_ctx<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, view: 
         saved_syn: s.saved_syn(),
         ssl_fc: crate::proxy::ssl_fc(&s.cli_xprt, s.h2_role.as_deref()),
         quic_acks: s.quic_facts(),
+        fc_tcp_fd: fc_fd,
+        bc_tcp_fd: bc_fd,
+        tcp_info: tcp_info_reader,
         fc_http_major: s.fc_http_major(),
         bc_http_major: s.bc_http_major(),
         req_version: s.client_version(),
@@ -6858,7 +6880,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 let mut tracked: [Option<(usize, StickKey)>; 3] = [None, None, None];
                 let emit_val = LogEmit { targets: &self.log_targets, tag: &self.log_tag, pid: self.pid, any_connect: self.any_connect_log };
                 let step_emit = self.any_step_log.then_some(&emit_val);
-                let admitted = match eval_tcp_req_conn_rules(&self.proxies[proxy_idx], &self.proxies, sample_registry(), peer, local, Some(&mut tracked), step_emit) {
+                let admitted = match eval_tcp_req_conn_rules(&self.proxies[proxy_idx], &self.proxies, sample_registry(), peer, local, Some(&mut tracked), step_emit, None) {
                     ConnEvalOutcome::Accept(c, s, fs, fd, _, _) => Some((c, s, fs, fd)),
                     ConnEvalOutcome::Reject | ConnEvalOutcome::SilentDrop(_) => {
                         self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
@@ -7966,6 +7988,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 local_addr,
                 Some(&mut tracked_sc),
                 step_emit,
+                Some(cli_fd.as_raw_fd()),
             ) {
                 ConnEvalOutcome::Accept(c, s, fs, fd, ep, ec) => (c, s, fs, fd, ep, ec),
                 ConnEvalOutcome::Reject => {
@@ -8522,6 +8545,7 @@ fn eval_tcp_req_conn_rules(
     local_addr: SocketAddr,
     mut tracked: Option<&mut [Option<(usize, StickKey)>; 3]>,
     step_emit: Option<&LogEmit<'_>>,
+    client_fd: Option<i32>,
 ) -> ConnEvalOutcome {
     let mut client_addr = peer_addr;
     let mut server_addr = local_addr;
@@ -8538,6 +8562,10 @@ fn eval_tcp_req_conn_rules(
         server_addr: Some(server_addr),
         fc_src: Some(fc_src),
         fc_dst: Some(fc_dst),
+        // `HAProxy` reads the client socket's TCP_INFO in `tcp-request connection` rules
+        // too (`s->conn_x`); the QUIC admission path has no TCP fd, so no sample there.
+        fc_tcp_fd: client_fd,
+        tcp_info: client_fd.is_some().then_some(crate::raw::tcp_info_val),
         act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
         ..Default::default()
     };
@@ -8659,6 +8687,9 @@ fn eval_tcp_req_session_rules(
         so_id: sess.so_id_opt(),
         fe_id: Some(proxy.ids.iid),
         fc_dst: sess.fc_dst(),
+        fc_tcp_fd: sess.fc_tcp_fd(),
+        bc_tcp_fd: sess.srv.as_ref().map(|f| f.as_raw_fd()),
+        tcp_info: tcp_info_reader(sess),
         proxy_tlvs: sess.proxy_info.as_ref().map(|p| p.tlv_data.as_slice()),
         ssl_fc: crate::proxy::ssl_fc(&sess.cli_xprt, sess.h2_role.as_deref()),
         quic_acks: sess.quic_facts(),
@@ -8908,6 +8939,9 @@ fn eval_tcp_req_content_rules(
         ssl_bc: sess.srv_xprt.ssl_facts(),
         req_body: if has_content { Some(req_bytes) } else { None },
         raw_req: (sess.mode == Mode::Tcp).then_some(req_bytes),
+        fc_tcp_fd: sess.fc_tcp_fd(),
+        bc_tcp_fd: sess.srv.as_ref().map(|f| f.as_raw_fd()),
+        tcp_info: tcp_info_reader(sess),
         // In HTTP mode the request is parsed by the time these rules run, and `path`,
         // `hdr()` and the like read it, as they do in `HAProxy`. Built from the fields: the
         // rules change `vars` while this borrows.
@@ -9212,6 +9246,9 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &crate::table::Table, regi
         ssl_bc: sess.srv_xprt.ssl_facts(),
         res_body: Some(rep_bytes),
         raw_res: Some(rep_bytes),
+        fc_tcp_fd: sess.fc_tcp_fd(),
+        bc_tcp_fd: sess.srv.as_ref().map(|f| f.as_raw_fd()),
+        tcp_info: tcp_info_reader(sess),
         act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
         unique_id: sess.strm.log.unique_id.as_deref(),
         accept_date: Some(sess.strm.log.date()),
@@ -11432,6 +11469,9 @@ impl EngineDispatcher<'_> {
         alcyon_sample::PhaseCtx {
             proxies: Some(view),
             stick: Some(stick),
+            fc_tcp_fd: sess.fc_tcp_fd(),
+            bc_tcp_fd: sess.srv.as_ref().map(|f| f.as_raw_fd()),
+            tcp_info: tcp_info_reader(sess),
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
             fc_src: sess.fc_src(),
@@ -12877,6 +12917,7 @@ impl EngineDispatcher<'_> {
             let Some(c) = self.sessions.get_mut(link.idx).filter(|c| c.task == link.task) else { continue };
             if let Some(ch) = c.sess.h2_child_mut() {
                 ch.owner = None;
+                ch.owner_fd = None;
             }
             // (Its owner's pass has usually told it the connection is closed already.)
             if c.sess.cli_state != ScState::Error {
@@ -14419,6 +14460,9 @@ impl EngineDispatcher<'_> {
             client_addr: entry.sess.client_addr,
             server_addr: entry.sess.server_addr,
             fc_src: entry.sess.fc_src(),
+            fc_tcp_fd: entry.sess.fc_tcp_fd(),
+            bc_tcp_fd: entry.sess.srv.as_ref().map(|f| f.as_raw_fd()),
+            tcp_info: tcp_info_reader(&entry.sess),
             so_name: entry.sess.so_name.as_deref(),
             so_id: entry.sess.so_id_opt(),
             fc_dst: entry.sess.fc_dst(),
@@ -15567,6 +15611,7 @@ impl EngineDispatcher<'_> {
         let eval_http_rules_held = |rules: &[alcyon_config::HttpReqRule], compiled: &[crate::rule_compiled::Rule], acls: &alcyon_sample::Acls, sess: &mut TcpSession, be_retries: u16, fe_name: Option<&str>, be_name: Option<&str>, pages_idx: usize, be_stage: bool, start: usize| -> Result<RuleFlow, u16> {
             // CP4a-2: what does not change while the rules run, once for the phase; each rule's
             // context is this and the live session, read at the fetch (`LiveReq`).
+            let (fc_fd, bc_fd, tcp_info_reader) = tcp_info_from_sess(sess);
             let phase = alcyon_sample::PhaseCtx {
                 proxies: Some(&ProxiesView(proxies)),
                 fc: fc.as_ref().map(|c| c as &dyn alcyon_sample::FrontConnState),
@@ -15574,6 +15619,9 @@ impl EngineDispatcher<'_> {
                 so_id: sess.so_id_opt(),
                 fc_dst: sess.fc_dst(),
                 is_first_req: sess.is_first_req,
+                fc_tcp_fd: fc_fd,
+                bc_tcp_fd: bc_fd,
+                tcp_info: tcp_info_reader,
                 quic_acks: sess.quic_facts(),
                 fc_http_major: sess.fc_http_major(),
                 bc_http_major: sess.bc_http_major(),
@@ -20298,6 +20346,9 @@ fn after_res_on_reply<'r>(
             proxies: Some(&view),
             stick: Some(&stick),
             prio: (sess.strm.log.prio_class, sess.strm.log.prio_offset),
+            fc_tcp_fd: sess.fc_tcp_fd(),
+            bc_tcp_fd: sess.srv.as_ref().map(|f| f.as_raw_fd()),
+            tcp_info: tcp_info_reader(sess),
             client_addr: sess.client_addr,
             server_addr: sess.server_addr,
             fc_src: sess.fc_src(),
@@ -20683,6 +20734,7 @@ mod arena_tests {
                 quic_ack: None,
                 req_abs: Default::default(),
                 sess_vars_at_start: Default::default(),
+                owner_fd: None,
             })
         };
         // Slot 0 = child pointing to owner at slot 1 (a < b), slot 1 = owner.
