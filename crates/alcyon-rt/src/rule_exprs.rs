@@ -204,6 +204,37 @@ pub fn server_part(fetch: &str) -> Option<&'static str> {
     }
 }
 
+/// What a `set-proxy-v2-tlv-fmt(<id>) <fmt>` format cannot read, in `HAProxy`'s words: it is
+/// rendered when the server connection opens, before any response, and `HAProxy` compiles it
+/// against that location (`parse_logformat_string(..., SMP_VAL_BE_SRV_CON, ...)` in
+/// `src/server.c`), which refuses a fetch whose sources are not in the location's
+/// capabilities (`fetch_cap`, `src/sample.c`): the response's sources (`SMP_USE_HRSHV` =
+/// "HTTP response headers", `SMP_USE_HRSHP` = "HTTP response", `SMP_USE_L6RES` = "response
+/// buffer", `SMP_USE_HRSBO` = "HTTP response body") and the server's own address and
+/// connection (`SMP_USE_L4SRV`, `SMP_USE_L5SRV`) are not in. The request's sources, the
+/// server itself (`SMP_USE_SERVR` = "server") and the final statistics (`SMP_USE_RSFIN`,
+/// `SMP_USE_RQFIN`, ...) are. Measured on 3.5-dev11: `%[status]` refuses "HTTP response",
+/// `%[res.hdr(y)]` "HTTP response headers", `%[res.len]` "response buffer",
+/// `%[bc.timer.connect]` "server address", `%[ssl_bc_sni]` "server-side connection", while
+/// `%[req.hdr(host)]`, `%[srv_name]` and `%[res.timer.data]` load.
+#[must_use]
+pub fn srv_connect_part(fetch: &str) -> Option<&'static str> {
+    match fetch {
+        // `SMP_USE_L4SRV` (the same fetches as `server_part`'s "server address").
+        "bc_err" | "bc_err_name" | "bc_err_str" | "bc_glitches" | "bc_http_major" | "bc_be_queue" | "bc_srv_queue"
+        | "bc.timer.connect" | "req.timer.queue" | "txn.conn_retries" | "txn.redispatched" | "bc_dst" | "bc_dst_port"
+        | "bc_reused" | "bc_src" | "bc_src_port" => Some("server address"),
+        // `SMP_USE_L5SRV` (the same fetches as `server_part`'s "server-side connection").
+        "bc_nb_streams" | "bc_settings_streams_limit" | "bs.aborted" | "bs.debug_str" | "bs.id" | "bs.rst_code"
+        | "ssl_bc" | "ssl_bc_alg_keysize" | "ssl_bc_alpn" | "ssl_bc_cipher" | "ssl_bc_client_random" | "ssl_bc_curve"
+        | "ssl_bc_err" | "ssl_bc_err_str" | "ssl_bc_is_resumed" | "ssl_bc_npn" | "ssl_bc_protocol"
+        | "ssl_bc_server_random" | "ssl_bc_session_id" | "ssl_bc_session_key" | "ssl_bc_sni" | "ssl_bc_unique_id"
+        | "ssl_bc_use_keysize" => Some("server-side connection"),
+        // The response's sources, minus `SMP_USE_RSFIN` (`res.timer.data`), which is in.
+        _ => response_part(fetch).filter(|part| *part != "response buffer statistics"),
+    }
+}
+
 const REQUEST_HEADER_FETCHES: &[&str] = &[
     "base",
     "base32",
@@ -721,7 +752,7 @@ pub fn validate_formats(config: &Config, registry: &Registry) -> Result<(), Stri
                 if tlv.fmt.is_empty() {
                     continue;
                 }
-                LogFormat::compile_rule(&tlv.fmt, registry, false)
+                LogFormat::compile_tlv(&tlv.fmt, registry)
                     .map(|_| ())
                     .map_err(|e| format!("'server {name}/{srv}' : {e}"))?;
             }

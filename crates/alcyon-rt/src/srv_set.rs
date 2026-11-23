@@ -383,7 +383,7 @@ fn pp_tlv_fmts(count: usize, extras: &alcyon_config::ast::ServerExtras) -> Optio
             .iter()
             .map(|t| {
                 let fmt = (!t.fmt.is_empty())
-                    .then(|| crate::logfmt::LogFormat::compile_rule(&t.fmt, &crate::engine::sample_registry(), false).ok())
+                    .then(|| crate::logfmt::LogFormat::compile_tlv(&t.fmt, &crate::engine::sample_registry()).ok())
                     .flatten()
                     .map(Arc::new);
                 (t.id, fmt)

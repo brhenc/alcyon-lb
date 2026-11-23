@@ -559,6 +559,32 @@ impl LogFormat {
         Ok(f)
     }
 
+    /// Compiles a `set-proxy-v2-tlv-fmt(<id>) <fmt>` value: as [`LogFormat::compile_rule`],
+    /// but every sample is checked against the server-connect location
+    /// (`parse_logformat_string(..., SMP_VAL_BE_SRV_CON, ...)`, `src/server.c`): the format
+    /// is rendered when the server connection opens, before any response, so a fetch that
+    /// reads the response or the server's own address and connection is refused, in
+    /// `HAProxy`'s words.
+    ///
+    /// # Errors
+    /// As [`LogFormat::compile_rule`], or `HAProxy`'s "sample fetch <name> may not be
+    /// reliably used here because it needs '<part>' which is not available here" for a
+    /// fetch the location cannot read.
+    pub fn compile_tlv(fmt: &str, registry: &Registry) -> Result<Self, String> {
+        let f = Self::compile_rule(fmt, registry, false)?;
+        for n in &f.nodes {
+            if let Node::Expr(e, ..) = n {
+                if let Some(part) = crate::rule_exprs::srv_connect_part(&e.fetch_name) {
+                    return Err(format!(
+                        "sample fetch <{}> may not be reliably used here because it needs '{}' which is not available here",
+                        e.fetch_name, part
+                    ));
+                }
+            }
+        }
+        Ok(f)
+    }
+
     /// `_lf_expr_postcheck_node_opt` for a format compiled with `LOG_OPT_HTTP` (a header's or a
     /// path's value): the encodings (`+json`, `+cbor`, `+bin`, `+utf8`) are ignored, whether
     /// per node or global, and a sample is not quoted (`+Q`), since it goes through
