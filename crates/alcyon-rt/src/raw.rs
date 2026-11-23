@@ -298,6 +298,29 @@ pub fn reset_pending(fd: BorrowedFd<'_>) -> bool {
     matches!(poll(&mut fds, 0), Ok(n) if n > 0) && fds[0].revents().contains(PollFlags::ERR)
 }
 
+/// One value of `getsockopt(fd, IPPROTO_TCP, TCP_INFO)`: what the `fc_*`/`bc_*` fetches
+/// (`smp_fetch_fc_*`/`smp_fetch_bc_*`, `HAProxy`'s `src/tcp_sample.c`) read, only when one
+/// of them is evaluated. `val` is `HAProxy`'s `tcp_get_info` numbering (`src/proto_tcp.c`):
+/// 0 `tcpi_rtt`, 1 `tcpi_rttvar`, 2 `tcpi_unacked`, 3 `tcpi_sacked`, 4 `tcpi_lost`,
+/// 5 `tcpi_retrans`, 6 `tcpi_fackets`, 7 `tcpi_reordering`; the two time values are
+/// microseconds. `None` when the socket is not TCP or the kernel refuses the read, as
+/// `HAProxy`'s `get_tcp_info` returns no value there: the fetch gives no sample.
+#[must_use]
+pub fn tcp_info_val(fd: i32, val: u8) -> Option<u32> {
+    alcyon_mmsg::get_tcp_info(fd)
+        .map(|info| match val {
+            0 => info.tcpi_rtt,
+            1 => info.tcpi_rttvar,
+            2 => info.tcpi_unacked,
+            3 => info.tcpi_sacked,
+            4 => info.tcpi_lost,
+            5 => info.tcpi_retrans,
+            6 => info.tcpi_fackets,
+            7 => info.tcpi_reordering,
+            _ => 0,
+        })
+}
+
 /// The SYN the kernel recorded for this connection (`bind tcp-ss`): `getsockopt` with
 /// `TCP_SAVED_SYN`. The kernel answers with the data only once — a second read has none —
 /// so the session reads it a single time at accept and keeps the bytes (`HAProxy` instead

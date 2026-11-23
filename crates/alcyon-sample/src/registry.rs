@@ -369,6 +369,20 @@ pub struct PhaseCtx<'a> {
     pub fc_rttvar: Option<u32>,
     pub bc_rtt: Option<u32>,
     pub bc_rttvar: Option<u32>,
+    /// The client's TCP socket as a raw fd: what the `fc_*` TCP_INFO fetches
+    /// (`fc_rtt`, `fc_rttvar`, `fc_unacked`, ...) `getsockopt(TCP_INFO)` on, read only
+    /// when one of them is evaluated (`smp_fetch_fc_*`, `HAProxy`'s `src/tcp_sample.c`).
+    /// `None` where the client socket is not a TCP one (a QUIC frontend refuses those
+    /// fetches at load; an HTTP/2 child stream has its owner's socket).
+    pub fc_tcp_fd: Option<i32>,
+    /// The server's TCP socket as a raw fd: the `bc_rtt`/`bc_rttvar` fetches. `None`
+    /// until the stream's connection exists.
+    pub bc_tcp_fd: Option<i32>,
+    /// The reader of the `tcp_info` fields of those sockets (`alcyon-rt`'s
+    /// `getsockopt` wrapper), `Some` while at least one of the two is a TCP socket.
+    /// The fetches call it only when evaluated: nothing is read for a configuration
+    /// that uses none of those fetches.
+    pub tcp_info: Option<fn(i32, u8) -> Option<u32>>,
     /// The backend connection's error (`conn->err_code` of the stream's `scb`): `CO_ER_NONE`
     /// once it is connected, the code of a connect that failed, `None` while there is no
     /// connection or it is still connecting. What `bc_err` and `bc_err_str` read.
@@ -500,6 +514,9 @@ impl PhaseCtx<'_> {
         fc_rttvar: None,
         bc_rtt: None,
         bc_rttvar: None,
+        fc_tcp_fd: None,
+        bc_tcp_fd: None,
+        tcp_info: None,
         bc_err: None,
         bc_reused: None,
         term_state: None,
@@ -1046,17 +1063,6 @@ pub struct CtxConvDesc {
 /// (`alcyon-rt`'s load-time checks), rather than evaluated to a constant: each of these used
 /// to load and return 0 or 1, which an ACL then compared as if it were the state.
 pub const NOT_IMPLEMENTED: &[(&str, &str)] = &[
-    ("fc_unacked", "Alcyon does not read TCP_INFO"),
-    ("fc_sacked", "Alcyon does not read TCP_INFO"),
-    ("fc_lost", "Alcyon does not read TCP_INFO"),
-    ("fc_retrans", "Alcyon does not read TCP_INFO"),
-    ("fc_fackets", "Alcyon does not read TCP_INFO"),
-    ("fc_reordering", "Alcyon does not read TCP_INFO"),
-    // T351: registered, and always 0.
-    ("fc_rtt", "Alcyon does not read TCP_INFO"),
-    ("fc_rttvar", "Alcyon does not read TCP_INFO"),
-    ("bc_rtt", "Alcyon does not read TCP_INFO"),
-    ("bc_rttvar", "Alcyon does not read TCP_INFO"),
     // BYTESFETCH: registered, and a copy of `req.bytes_in`/`res.bytes_in`.
     ("req.bytes_out", "Alcyon does not count the bytes it forwards after rewriting the message"),
     ("res.bytes_out", "Alcyon does not count the bytes it forwards after rewriting the message"),
@@ -1073,6 +1079,30 @@ pub fn not_implemented(name: &str) -> Option<&'static str> {
 #[must_use]
 pub fn not_implemented_message(name: &str) -> Option<String> {
     not_implemented(name).map(|why| format!("'{name}' : not implemented in Alcyon ({why})"))
+}
+
+/// The `fc_*`/`bc_*` RTT fetches (`smp_fetch_fc_rtt`/`smp_fetch_bc_rtt`,
+/// `src/tcp_sample.c`): `tcpi_rtt` (`val` 0) or `tcpi_rttvar` (`val` 1) of the
+/// direction's socket, `getsockopt(TCP_INFO)` read at the fetch, never cached — a
+/// stream moves, and its RTT moves with it. Milliseconds by default, microseconds with
+/// the `us` argument, rounded as `HAProxy` rounds them (`(us + 500) / 1000`). No sample
+/// where the socket is missing or not TCP, and for `bc_*` until the server connection
+/// exists.
+fn tcp_info_rtt(ctx: &SampleContext, args: &[String], fd: Option<i32>, val: u8) -> Option<Sample> {
+    let us = ctx.phase.tcp_info?(fd?, val)?;
+    // Any other argument was already refused at load by the `val_fc_time_value` argument
+    // check, so it defaults to the `ms` rendering, like a missing one.
+    let v = match args.first().map(String::as_str) {
+        Some("us") => i64::from(us),
+        _ => i64::from((us + 500) / 1000),
+    };
+    Some(Sample::Sint(v))
+}
+
+/// A `fc_*` counter fetch (`fc_unacked`, ...): one `tcp_info` field as a sint
+/// (`var_fc_counter`); `HAProxy` accepts an argument there, warns, and ignores it.
+fn tcp_info_counter(ctx: &SampleContext, _args: &[String], fd: Option<i32>, val: u8) -> Option<Sample> {
+    ctx.phase.tcp_info?(fd?, val).map(|v| Sample::Sint(i64::from(v)))
 }
 
 /// `smp_fetch_srv_*`'s server argument, `[<backend>/]<server>`, with the backend defaulting
@@ -2135,6 +2165,64 @@ impl Registry {
             name: "fc_rcvd_proxy",
             out_type: SampleType::Bool,
             func: fc_rcvd_proxy_fetch,
+        });
+        // `smp_fetch_fc_rtt`/`smp_fetch_bc_rtt` and the `fc_*` counters (`src/tcp_sample.c`,
+        // the keyword table near line 610: `val_fc_time_value` for the RTTs,
+        // `var_fc_counter` for the counters): fields of `getsockopt(TCP_INFO)` of the
+        // stream's client socket (`fc_*`) or server socket (`bc_*`), read only when one
+        // of these fetches is evaluated — nothing is read for a configuration that uses
+        // none of them. `SMP_USE_L4CLI`: the values come from the session's sockets, so
+        // they sample in every rule position the session exists in; the `bc_*` ones
+        // wait for the server connection.
+        self.register_fetch(FetchDesc {
+            name: "fc_rtt",
+            out_type: SampleType::Sint,
+            func: |ctx, args| tcp_info_rtt(ctx, args, ctx.phase.fc_tcp_fd, 0),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_rttvar",
+            out_type: SampleType::Sint,
+            func: |ctx, args| tcp_info_rtt(ctx, args, ctx.phase.fc_tcp_fd, 1),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_rtt",
+            out_type: SampleType::Sint,
+            func: |ctx, args| tcp_info_rtt(ctx, args, ctx.phase.bc_tcp_fd, 0),
+        });
+        self.register_fetch(FetchDesc {
+            name: "bc_rttvar",
+            out_type: SampleType::Sint,
+            func: |ctx, args| tcp_info_rtt(ctx, args, ctx.phase.bc_tcp_fd, 1),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_unacked",
+            out_type: SampleType::Sint,
+            func: |ctx, args| tcp_info_counter(ctx, args, ctx.phase.fc_tcp_fd, 2),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_sacked",
+            out_type: SampleType::Sint,
+            func: |ctx, args| tcp_info_counter(ctx, args, ctx.phase.fc_tcp_fd, 3),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_lost",
+            out_type: SampleType::Sint,
+            func: |ctx, args| tcp_info_counter(ctx, args, ctx.phase.fc_tcp_fd, 4),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_retrans",
+            out_type: SampleType::Sint,
+            func: |ctx, args| tcp_info_counter(ctx, args, ctx.phase.fc_tcp_fd, 5),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_fackets",
+            out_type: SampleType::Sint,
+            func: |ctx, args| tcp_info_counter(ctx, args, ctx.phase.fc_tcp_fd, 6),
+        });
+        self.register_fetch(FetchDesc {
+            name: "fc_reordering",
+            out_type: SampleType::Sint,
+            func: |ctx, args| tcp_info_counter(ctx, args, ctx.phase.fc_tcp_fd, 7),
         });
         // `smp_fetch_fc_saved_syn` (`src/tcp_sample.c`): the SYN the kernel recorded for
         // the client connection (`bind tcp-ss`), read once at accept and kept on the

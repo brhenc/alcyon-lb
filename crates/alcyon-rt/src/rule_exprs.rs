@@ -99,6 +99,42 @@ pub fn check_fc_glitches(config: &Config, section: SectionKind, proxy: Option<&s
     }
 }
 
+/// The `fc_*` TCP_INFO fetches on a QUIC frontend. `HAProxy` answers `fc_rtt`,
+/// `fc_rttvar`, `fc_lost` and `fc_reordering` from the QUIC connection's own statistics
+/// there (`quic_get_info`, `src/proto_quic.c`: `srtt`, `rtt_var`, `nb_lost_pkt`,
+/// `nb_reordered_pkt`), which Alcyon does not read. On a frontend or `listen` section
+/// with a QUIC bind those four fetches are refused at load, rather than answered from a
+/// socket that is not the client's (or left empty where `HAProxy` would give a value).
+/// The `fc_*` counters `HAProxy` never answers on QUIC (`quic_get_info` has no value for
+/// them) stay accepted: they give no sample there, as here, where the client socket has
+/// no TCP fd. `bc_*` are answered from the server connection's TCP socket in both, and
+/// stay accepted.
+pub fn check_tcp_info_quic(config: &Config, section: SectionKind, proxy: Option<&str>, fetch: &str) -> Result<(), String> {
+    if !matches!(fetch, "fc_rtt" | "fc_rttvar" | "fc_lost" | "fc_reordering") {
+        return Ok(());
+    }
+    let quic = match (section, proxy) {
+        (SectionKind::Frontend, Some(name)) => config
+            .frontends
+            .iter()
+            .find(|f| f.name == name)
+            .is_some_and(|f| f.binds.iter().any(|b| b.quic)),
+        (SectionKind::Listen, Some(name)) => config
+            .listens
+            .iter()
+            .find(|l| l.name == name)
+            .is_some_and(|l| l.binds.iter().any(|b| b.quic)),
+        _ => false,
+    };
+    if quic {
+        Err(format!(
+            "'{fetch}' : not implemented in Alcyon (Alcyon reads no QUIC RTT; on a QUIC bind HAProxy answers it from the QUIC connection's own statistics, and Alcyon would answer from a socket that is not the client's)"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// Checks the fetch and every converter `expr` names, as `sample_parse_expr` resolves
 /// them: the fetch is the leading run of name characters, exactly as written (`hdr_beg`
 /// and `path_beg` are ACL keywords, not fetches, and names are case-sensitive), and

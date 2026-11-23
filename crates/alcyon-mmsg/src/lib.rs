@@ -600,6 +600,36 @@ pub fn get_saved_syn(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
     }
 }
 
+/// The kernel's `TCP_INFO` of a TCP socket: `getsockopt(fd, IPPROTO_TCP, TCP_INFO)`, what
+/// `HAProxy`'s `tcp_get_info` (`src/proto_tcp.c`) reads behind the `fc_*`/`bc_*` fetches.
+/// `fd` is one of the calling stream's own sockets, kept open and single-threaded for the
+/// duration. `None` when the socket is not TCP or the kernel refuses the read: the fetch
+/// then gives no sample, as `HAProxy` does.
+pub fn get_tcp_info(fd: i32) -> Option<libc::tcp_info> {
+    const TCP_INFO: libc::c_int = 11; // linux/tcp.h
+    // SAFETY: `fd` is the stream's own socket, alive and owned by the session while the
+    // fetch evaluates on it, so the raw borrow is sound.
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    // SAFETY: `tcp_info` is a plain C struct, all zero is a valid state, and `getsockopt`
+    // writes at most `len` bytes into it and shrinks `len` to what it wrote.
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    // SAFETY: `info` is valid for `len` bytes and `getsockopt` writes back the length it used.
+    if unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            TCP_INFO,
+            &mut info as *mut libc::tcp_info as *mut libc::c_void,
+            &mut len,
+        )
+    } < 0
+    {
+        return None;
+    }
+    Some(info)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
