@@ -229,12 +229,35 @@ pub struct SocketTuning {
     pub quic_force_retry: bool,
 }
 
+/// Client certificate verification mode on a `bind ... ssl` line (`verify none|optional|required`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BindVerify {
+    #[default]
+    None,
+    Optional,
+    Required,
+}
+
+/// Client certificate authentication settings of a `bind` line (`verify`, `ca-file`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BindClientAuth {
+    /// `verify none|optional|required` (`None` when omitted).
+    pub verify: BindVerify,
+    /// `ca-file <path>`: the trust anchors for client verification and CA hints.
+    pub ca_file: Option<String>,
+    /// Raw bind address token as written (`:443`, `127.0.0.1:8443`), for `HAProxy`'s alert text.
+    pub bind_arg: String,
+}
+
 /// Bind configuration for frontend listeners.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindConfig {
     /// Socket options from the `bind` line; `None` when it sets none (boxed: a frontend
     /// and a bind are paid for 60,000 times over in `request_allocations`).
     pub sock: Option<Box<SocketTuning>>,
+    /// Client certificate verification settings (`verify`, `ca-file`), `None` when the bind
+    /// sets neither (boxed for the same reason as `sock`).
+    pub client_auth: Option<Box<BindClientAuth>>,
     /// The configuration line of the `bind` (0 for one made in code), for the messages that
     /// name it.
     pub line: usize,
@@ -259,6 +282,20 @@ pub struct BindConfig {
     pub min_ver: Option<TlsVersion>,
     /// `ssl-max-ver`, likewise.
     pub max_ver: Option<TlsVersion>,
+}
+
+impl BindConfig {
+    /// Effective client verification mode (`BindVerify::None` when unset).
+    #[must_use]
+    pub fn verify(&self) -> BindVerify {
+        self.client_auth.as_deref().map_or(BindVerify::None, |c| c.verify)
+    }
+
+    /// Configured `ca-file` path, if any.
+    #[must_use]
+    pub fn ca_file(&self) -> Option<&str> {
+        self.client_auth.as_deref().and_then(|c| c.ca_file.as_deref())
+    }
 }
 
 /// A `listen` proxy section combining frontend and backend.

@@ -392,7 +392,23 @@ impl TlsCtx {
             let Some(session) = self.session.take() else { return Ok(()) };
             match session {
                 Session::Hello(n, bind) | Session::ServerHs(n, bind) => {
-                    let next = n.process(input, &mut self.tx)?;
+                    let next = match n.process(input, &mut self.tx) {
+                        Ok(next) => next,
+                        Err(e) => {
+                            // TLS 1.2 predates RFC 8446's `certificate_required` (116) alert;
+                            // OpenSSL / HAProxy send plaintext `handshake_failure` (40) when
+                            // `verify required` receives an empty TLS 1.2 client Certificate.
+                            if self.tls12
+                                && matches!(e, Error::PeerMisbehaved(rustls24::error::PeerMisbehaved::NoCertificatesPresented))
+                                && self.tx.ends_with(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 116])
+                            {
+                                if let Some(last) = self.tx.last_mut() {
+                                    *last = 40;
+                                }
+                            }
+                            return Err(e);
+                        }
+                    };
                     if self.server_next(next, bind)? {
                         return Ok(());
                     }
@@ -434,6 +450,27 @@ impl TlsCtx {
                 self.tls12 = server_hello_is_tls12(&self.tx[start..]);
                 self.server_next(next?, bind)?;
                 // The rest of the input may hold more of the client's flight.
+                Ok(false)
+            }
+            Srv::VerifyClient(v) => {
+                // Only reached on binds with `verify optional|required` (`with_no_client_auth`
+                // never enters this state). Verify via webpki here so OpenSSL X509_V_ERR codes
+                // are recorded on `tls_info` before rustls continues or emits its alert.
+                self.tls_info.peer_has_cert = true;
+                let next = match bind.client_verifier.as_deref() {
+                    Some(verifier) => {
+                        let presented = v.presented_identity()?;
+                        let (result, codes) = verifier.verify_detailed(&presented);
+                        self.tls_info.peer_verify_codes = codes;
+                        self.tls_info.peer_verify = codes.to_verify_result();
+                        let owned = result.map(rustls24::crypto::VerifiedIdentity::into_owned);
+                        v.continue_with(owned, &mut self.tx)?
+                    }
+                    None => v.with_config(&mut self.tx)?,
+                };
+                self.server_next(next, bind)?;
+                // The rest of the client's flight (`CertificateVerify`, `Finished`) is still in
+                // the input: rustls stopped at the identity to verify.
                 Ok(false)
             }
             Srv::Done(split) => {
@@ -482,11 +519,11 @@ impl TlsCtx {
         info.alpn = outputs.alpn_protocol().map(|p| p.as_ref().to_vec());
         info.session_resumed =
             matches!(outputs.handshake_kind(), Some(HandshakeKind::Resumed | HandshakeKind::ResumedWithHelloRetryRequest));
-        // A server asks no client for a certificate (no `verify` on binds yet); a client got the
-        // server's chain, verified, or the handshake would have failed.
         let has_peer = outputs.peer_identity().is_some();
         info.peer_has_cert = has_peer;
-        info.peer_verify = if has_peer { VerifyResult::Ok } else { VerifyResult::NotRequested };
+        if info.peer_verify == VerifyResult::NotRequested {
+            info.peer_verify = if has_peer { VerifyResult::Ok } else { VerifyResult::NotRequested };
+        }
         // No ClientHello comes after the handshake (rustls does not renegotiate): the tap
         // and its buffers go now (`ssl_sock_capture_free_func` frees with the connection).
         if let Some(tap) = self.hello_tap.take() {
@@ -602,15 +639,17 @@ impl TlsCtx {
 enum Srv {
     Wait(NeedsInput<ServerSide>),
     Hello(rustls24::server::Accepted<rustls24::Tcp>),
+    VerifyClient(rustls24::VerifyPeerIdentity<ServerSide, rustls24::Tcp>),
     Done(rustls24::split::SplitConnection<ServerSide>),
 }
 
-/// rustls yields `VerifyClientIdentity` only to a config with a client verifier, and a bind
-/// has none (`with_no_client_auth`); the enum is `non_exhaustive`. Either is a failure.
+/// Maps rustls 0.24's `ServerHandshake` (`non_exhaustive`): `VerifyClientIdentity` is yielded
+/// only when a bind has `verify optional|required` (`with_no_client_auth` never enters it).
 fn srv_state(s: ServerHandshake) -> Result<Srv, Error> {
     Ok(match s {
         ServerHandshake::NeedsInput(n) => Srv::Wait(n),
         ServerHandshake::Accepted(a) => Srv::Hello(a),
+        ServerHandshake::VerifyClientIdentity(v) => Srv::VerifyClient(v),
         ServerHandshake::Complete(c) => Srv::Done(c), _ => return Err(Error::General("unexpected server handshake state".into())),
     })
 }

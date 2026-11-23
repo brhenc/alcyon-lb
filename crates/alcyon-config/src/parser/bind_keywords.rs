@@ -58,7 +58,6 @@ pub(crate) const UNIMPLEMENTED_BIND_KEYWORDS: &[BindKeyword] = &[
     refuse!("uid", 1),
     refuse!("user", 1),
     refuse!("allow-0rtt", 0),
-    refuse!("ca-file", 1),
     refuse!("ca-ignore-err", 1),
     refuse!("ca-sign-file", 1),
     refuse!("ca-sign-pass", 1),
@@ -84,7 +83,6 @@ pub(crate) const UNIMPLEMENTED_BIND_KEYWORDS: &[BindKeyword] = &[
     refuse!("strict-sni", 0),
     refuse!("tls-ticket-keys", 1),
     refuse!("tls-tickets", 0),
-    refuse!("verify", 1),
     refuse!("quic-cc-algo", 1),
     refuse!("quic-socket", 1),
 ];

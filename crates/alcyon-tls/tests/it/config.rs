@@ -27,6 +27,7 @@ fn default_bind() -> BindConfig {
     BindConfig {
         line: 0,
         sock: None,
+        client_auth: None,
         addr: "127.0.0.1:443".parse().unwrap(),
         quic: false, ssl: true,
         crt: vec![],
@@ -237,6 +238,7 @@ mod alpn {
         BindConfig {
             line: 0,
             sock: None,
+            client_auth: None,
             addr: "127.0.0.1:8443".parse().expect("addr"),
             quic: false, ssl: true,
             crt: vec![crt],
@@ -308,6 +310,7 @@ mod versions {
         let b = BindConfig {
             line: 0,
             sock: None,
+            client_auth: None,
             addr: "127.0.0.1:8443".parse().expect("addr"),
             quic,
             ssl: true,
@@ -372,6 +375,29 @@ mod resumption_lifetime {
         let cfg = from_bind_config(&super::a_test_bind(crt)).expect("build");
         let ticketer = cfg.config.ticketer.as_ref().expect("tickets are on by default, as in HAProxy");
         assert_eq!(ticketer.lifetime(), std::time::Duration::from_secs(7200), "the NewSessionTicket lifetime hint");
+    }
+
+    #[test]
+    fn bind_verify_errors_when_ca_file_missing_or_unreadable() {
+        use alcyon_config::{BindClientAuth, BindVerify};
+        let (_dir, crt) = super::a_test_cert();
+        let mut no_ca = super::a_test_bind(crt.clone());
+        no_ca.client_auth = Some(Box::new(BindClientAuth {
+            verify: BindVerify::Required,
+            ca_file: None,
+            bind_arg: "127.0.0.1:8443".into(),
+        }));
+        let err = from_bind_config(&no_ca).expect_err("missing ca_file");
+        assert!(err.contains("no CA file specified"), "{err}");
+
+        let mut bad_ca = super::a_test_bind(crt);
+        bad_ca.client_auth = Some(Box::new(BindClientAuth {
+            verify: BindVerify::Required,
+            ca_file: Some("/nonexistent/alcyon-tls-missing-ca.crt".into()),
+            bind_arg: "127.0.0.1:8443".into(),
+        }));
+        let err = from_bind_config(&bad_ca).expect_err("unreadable ca_file");
+        assert!(err.contains("'ca-file' : unable to load"), "{err}");
     }
 }
 

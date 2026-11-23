@@ -15,6 +15,8 @@ pub struct RustlsTlsInfo {
     pub alpn: Option<Vec<u8>>,
     pub session_resumed: bool,
     pub peer_verify: VerifyResult,
+    /// OpenSSL `X509_V_ERR` verification results (`ssl_c_verify`, `ssl_c_err`, `ssl_c_ca_err`).
+    pub peer_verify_codes: crate::client_verify::ClientVerifyCodes,
     pub peer_subject_dn: Option<String>,
     pub peer_issuer_dn: Option<String>,
     pub peer_not_after: Option<i64>,
@@ -54,6 +56,7 @@ impl Default for RustlsTlsInfo {
             alpn: None,
             session_resumed: false,
             peer_verify: VerifyResult::NotRequested,
+            peer_verify_codes: crate::client_verify::ClientVerifyCodes::OK,
             peer_subject_dn: None,
             peer_issuer_dn: None,
             peer_not_after: None,

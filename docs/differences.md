@@ -964,3 +964,56 @@ thread sleeps until a signal arrives or a worker ends. What is left, each with i
   master process still naps 20 ms in its loop (`bin/alcyon/master.rs`);
 * while a reload is in progress, the old process looks at its child every 20 ms;
 * a server queue with waiters: every 2 ms (`QueueWait`), as before.
+
+## Bind client certificate verification: webpki vs OpenSSL `X509_V_ERR` (T655 C1a)
+
+`bind ... ssl verify none|optional|required ca-file <file>` validates client certificate chains
+exclusively with `rustls-webpki` (`crates/alcyon-tls/src/client_verify.rs`), keeping the result
+as OpenSSL `X509_V_ERR_*` codes for `ssl_c_verify`, `ssl_c_err` and `ssl_c_ca_err`. Because
+webpki enforces a stricter X.509 v3 profile and defines fewer, coarser error variants than
+OpenSSL, three operator-visible differences apply:
+
+* **X.509 v1 client certificates:** HAProxy (OpenSSL) accepts X.509 v1 client certificates
+  (such as `reg-tests/ssl/certs/client1.pem`); Alcyon refuses them because `rustls-webpki`
+  validates X.509 v3 certificates only (`UnsupportedCertVersion`), recording
+  `X509_V_ERR_UNSPECIFIED` (1) and sending TLS alert 46 (`certificate_unknown`). Issue X.509 v3
+  client certificates instead.
+* **Not-yet-valid alert:** for a certificate with `notBefore` in the future (`X509_V_ERR_CERT_NOT_YET_VALID` = 9),
+  rustls sends TLS alert 45 (`certificate_expired`, per RFC 8446 §6.2) where OpenSSL sends alert 42 (`bad_certificate`).
+* **webpki → `X509_V_ERR` mapping table:** webpki variants with an exact OpenSSL twin map to
+  that code; coarser webpki errors map to the closest OpenSSL code below. Where webpki does not
+  expose chain depth (signature, name-constraint, or unknown-future errors), errors default to
+  `ssl_c_err` (leaf); validity, `UnknownIssuer`, EKU, intermediate parse errors, and inherently
+  CA/CRL errors distinguish `ssl_c_err` (depth 0) from `ssl_c_ca_err` (depth > 0).
+
+| `webpki::Error` | OpenSSL `X509_V_ERR` | Code | Notes |
+|---|---|---:|---|
+| `CertNotValidYet` | `X509_V_ERR_CERT_NOT_YET_VALID` | 9 | exact twin |
+| `CertExpired` | `X509_V_ERR_CERT_HAS_EXPIRED` | 10 | exact twin |
+| `InvalidCertValidity` | `X509_V_ERR_ERROR_IN_CERT_NOT_AFTER_FIELD` | 14 | coarse (`notBefore > notAfter`; OpenSSL splits 13/14) |
+| `CertRevoked` | `X509_V_ERR_CERT_REVOKED` | 23 | exact twin |
+| `CrlExpired` | `X509_V_ERR_CRL_HAS_EXPIRED` | 12 | exact twin |
+| `UnknownRevocationStatus` | `X509_V_ERR_UNABLE_TO_GET_CRL` | 3 | exact twin |
+| `InvalidCrlSignatureForPublicKey` | `X509_V_ERR_CRL_SIGNATURE_FAILURE` | 8 | exact twin |
+| `IssuerNotCrlSigner` | `X509_V_ERR_KEYUSAGE_NO_CRL_SIGN` | 35 | exact twin |
+| `InvalidSignatureForPublicKey` | `X509_V_ERR_CERT_SIGNATURE_FAILURE` | 7 | exact twin |
+| `UnknownIssuer` | `X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT` / `SELF_SIGNED_CERT_IN_CHAIN` / `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` | 18 / 19 / 20 | exact twin (refined from leaf/chain subject vs issuer) |
+| `RequiredEkuNotFound` | `X509_V_ERR_INVALID_PURPOSE` | 26 | exact twin |
+| `EmptyEkuExtension`, `CaUsedAsEndEntity` | `X509_V_ERR_INVALID_PURPOSE` | 26 | coarse (no dedicated OpenSSL code) |
+| `EndEntityUsedAsCa` | `X509_V_ERR_INVALID_CA` | 79 | exact twin |
+| `PathLenConstraintViolated` | `X509_V_ERR_PATH_LENGTH_EXCEEDED` | 25 | exact twin |
+| `MaximumPathDepthExceeded` | `X509_V_ERR_CERT_CHAIN_TOO_LONG` | 22 | exact twin |
+| `MaximumPathBuildCallsExceeded`, `MaximumSignatureChecksExceeded` | `X509_V_ERR_CERT_CHAIN_TOO_LONG` | 22 | coarse (webpki DoS budget; no OpenSSL twin) |
+| `NameConstraintViolation` | `X509_V_ERR_PERMITTED_VIOLATION` | 47 | coarse (webpki merges permitted=47 and excluded=48) |
+| `InvalidNetworkMaskConstraint`, `MalformedNameConstraint` | `X509_V_ERR_UNSUPPORTED_CONSTRAINT_SYNTAX` | 52 | coarse |
+| `UnsupportedCriticalExtension` | `X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION` | 34 | exact twin |
+| `SignatureAlgorithmMismatch` | `X509_V_ERR_SIGNATURE_ALGORITHM_MISMATCH` | 77 | exact twin |
+| `UnsupportedSignatureAlgorithm`, `UnsupportedCrlSignatureAlgorithm` | `X509_V_ERR_UNSUPPORTED_SIGNATURE_ALGORITHM` | 76 | exact twin |
+| `UnsupportedSignatureAlgorithmForPublicKey`, `UnsupportedCrlSignatureAlgorithmForPublicKey` | `X509_V_ERR_SIGNATURE_ALGORITHM_INCONSISTENCY` | 78 | near twin |
+| `ExtensionValueInvalid`, `MalformedExtensions` | `X509_V_ERR_INVALID_EXTENSION` | 41 | exact/near twin |
+| `CertNotValidForName` | `X509_V_ERR_HOSTNAME_MISMATCH` | 62 | exact twin |
+| `MalformedDnsIdentifier`, `UnsupportedNameType` | `X509_V_ERR_UNSUPPORTED_NAME_SYNTAX` | 53 | coarse |
+| `BadDerTime` | `X509_V_ERR_ERROR_IN_CERT_NOT_BEFORE_FIELD` | 13 | coarse (OpenSSL splits 13/14) |
+| `UnsupportedDeltaCrl`, `UnsupportedRevocationReason` | `X509_V_ERR_UNSUPPORTED_EXTENSION_FEATURE` | 45 | coarse (CRL) |
+| `UnsupportedIndirectCrl`, `UnsupportedRevocationReasonsPartitioning`, `UnsupportedCrlIssuingDistributionPoint` | `X509_V_ERR_DIFFERENT_CRL_SCOPE` | 44 | coarse (CRL) |
+| `UnsupportedCertVersion`, `BadDer`, `TrailingData`, `InvalidSerialNumber`, `InvalidCrlNumber`, `UnsupportedCrlVersion`, `MaximumNameConstraintComparisonsExceeded`, other | `X509_V_ERR_UNSPECIFIED` | 1 | coarse (no OpenSSL twin; v1 certs land here) |

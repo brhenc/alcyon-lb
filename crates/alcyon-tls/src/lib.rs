@@ -17,6 +17,7 @@
 pub mod blocking;
 pub mod capture;
 pub mod cipher_names;
+pub mod client_verify;
 pub mod config;
 pub mod conn;
 pub mod ja4;
@@ -25,6 +26,8 @@ pub mod resolver;
 pub mod tcp;
 pub mod transport;
 pub mod x509;
+
+pub use client_verify::ClientVerifyCodes;
 
 pub use config::{
     extract_dns_sans, extract_subject_cn, hostcheck, load_ca_file, load_cert_file, load_server_ca, load_system_ca_roots,

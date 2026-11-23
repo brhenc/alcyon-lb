@@ -231,14 +231,16 @@ pub fn parse_server_name(name: &str) -> Result<ServerName<'static>, String> {
         .map_err(|e| format!("Invalid server name '{name}': {e:?}"))
 }
 
-use alcyon_config::ast::BindConfig;
+use alcyon_config::ast::{BindConfig, BindVerify};
 
-/// What a `bind ... ssl` line asks for, whichever rustls builds it: the ALPN list it advertises
-/// and the certificates of its `crt` files, loaded. What [`crate::tcp`] builds a bind from
-/// (TCP and QUIC alike).
+/// What a `bind ... ssl` line asks for, whichever rustls builds it: the ALPN list it advertises,
+/// the certificates of its `crt` files (loaded), and optional client verification settings.
+/// What [`crate::tcp`] builds a bind from (TCP and QUIC alike).
 pub(crate) struct BindPlan {
     pub(crate) alpn: Vec<Vec<u8>>,
     pub(crate) pairs: Vec<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, std::path::PathBuf)>,
+    pub(crate) verify: BindVerify,
+    pub(crate) ca_file: Option<std::path::PathBuf>,
 }
 
 impl BindPlan {
@@ -283,7 +285,12 @@ impl BindPlan {
         if pairs.is_empty() {
             return Err("No certificates loaded for bind".to_string());
         }
-        Ok(Self { alpn: supported.iter().map(|s| s.as_bytes().to_vec()).collect(), pairs })
+        Ok(Self {
+            alpn: supported.iter().map(|s| s.as_bytes().to_vec()).collect(),
+            pairs,
+            verify: bind.verify(),
+            ca_file: bind.ca_file().map(std::path::PathBuf::from),
+        })
     }
 
     /// The protocol versions the bind offers.
@@ -329,7 +336,21 @@ pub(crate) fn cert_names(certs: &[CertificateDer<'static>]) -> Vec<String> {
 /// when a file cannot be inspected (the build then reports the real error).
 pub(crate) fn shared_key(bind: &BindConfig) -> Option<String> {
     use std::fmt::Write as _;
-    let mut k = format!("{:?}|{:?}|{}|{:?}|{:?}", bind.crt, bind.alpn, bind.quic, bind.min_ver, bind.max_ver);
+    let mut k = format!(
+        "{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+        bind.crt,
+        bind.alpn,
+        bind.quic,
+        bind.min_ver,
+        bind.max_ver,
+        bind.verify(),
+        bind.ca_file(),
+    );
+    if let Some(ca) = bind.ca_file().filter(|p| !p.starts_with('@')) {
+        let m = std::fs::metadata(ca).ok()?;
+        let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        let _ = write!(k, "|ca:{ca}:{}:{}", m.len(), t.as_nanos());
+    }
     for c in &bind.crt {
         let path = std::path::Path::new(c);
         let mut files = Vec::new();
