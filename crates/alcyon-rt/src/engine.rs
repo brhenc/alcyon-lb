@@ -9305,6 +9305,23 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &crate::table::Table, regi
                 store_var(&mut sess.strm.vars, &rc.var(var_name), render_rule_fmt(rc, &ctx, registry));
             }
             alcyon_config::TcpResAction::UnsetVar { var_name } => unset_var(&mut sess.strm.vars, &rc.var(var_name)),
+            // The stick-counter actions, on the entries `track-sc*` bound to this connection;
+            // the value samples the response, as `SMP_OPT_DIR_RES` does in `action_set_gpt`.
+            alcyon_config::TcpResAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
+            alcyon_config::TcpResAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
+            alcyon_config::TcpResAction::ScSetGpt0 { sc, expr } => {
+                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx);
+                sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::SetTag(val));
+            }
+            alcyon_config::TcpResAction::ScIncGpc { idx, sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Inc),
+            alcyon_config::TcpResAction::ScAddGpc { idx, sc, expr } => {
+                let n = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx);
+                sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Add(u64::from(n)));
+            }
+            alcyon_config::TcpResAction::ScSetGpt { idx, sc, expr } => {
+                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx);
+                sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::SetTag(val));
+            }
         }
     }
     ContentEvalResult::Done
@@ -14616,6 +14633,22 @@ impl EngineDispatcher<'_> {
                     }
                     alcyon_config::TcpResAction::UnsetVar { var_name } => {
                         unset_var(&mut entry.sess.strm.vars, &rc.var(var_name));
+                    }
+                    // The stick-counter actions, as in the TCP-mode loop above.
+                    alcyon_config::TcpResAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &entry.sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
+                    alcyon_config::TcpResAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &entry.sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
+                    alcyon_config::TcpResAction::ScSetGpt0 { sc, expr } => {
+                        let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, tcp_ctx);
+                        sc_gpc_rule(proxies, &entry.sess.tracked_sc, *sc, Gpc::Zero, GpcOp::SetTag(val));
+                    }
+                    alcyon_config::TcpResAction::ScIncGpc { idx, sc } => sc_gpc_rule(proxies, &entry.sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Inc),
+                    alcyon_config::TcpResAction::ScAddGpc { idx, sc, expr } => {
+                        let n = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, tcp_ctx);
+                        sc_gpc_rule(proxies, &entry.sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Add(u64::from(n)));
+                    }
+                    alcyon_config::TcpResAction::ScSetGpt { idx, sc, expr } => {
+                        let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, tcp_ctx);
+                        sc_gpc_rule(proxies, &entry.sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::SetTag(val));
                     }
                 }
             }

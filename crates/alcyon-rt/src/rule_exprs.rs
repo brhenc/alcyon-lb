@@ -478,11 +478,18 @@ fn tcp_content(a: &TcpReqContentAction) -> Exprs<'_> {
 fn tcp_res(a: &TcpResAction) -> Exprs<'_> {
     match a {
         TcpResAction::SetVar { var_name, expr } => vec![(format!("set-var({var_name})"), expr, false)],
+        // The value is an integer, `SMP_T_SINT` like the request side (`action_set_gpt`).
+        TcpResAction::ScSetGpt0 { sc, expr } => vec![(format!("sc-set-gpt0({sc})"), expr, true)],
+        TcpResAction::ScAddGpc { idx, sc, expr } => vec![(format!("sc-add-gpc({idx},{sc})"), expr, true)],
+        TcpResAction::ScSetGpt { idx, sc, expr } => vec![(format!("sc-set-gpt({idx},{sc})"), expr, true)],
         TcpResAction::Accept
         | TcpResAction::Reject
         | TcpResAction::SilentDrop
         | TcpResAction::SetVarFmt { .. }
-        | TcpResAction::UnsetVar { .. } => Vec::new(),
+        | TcpResAction::UnsetVar { .. }
+        | TcpResAction::ScIncGpc0 { .. }
+        | TcpResAction::ScIncGpc1 { .. }
+        | TcpResAction::ScIncGpc { .. } => Vec::new(),
     }
 }
 

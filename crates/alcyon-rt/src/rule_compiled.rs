@@ -748,6 +748,10 @@ pub fn tcp_res_content(rules: &[alcyon_config::TcpResContentRule], acls: &Acls) 
             TcpResAction::SetVar { expr, var_name } => Rule::new(r.cond.as_ref(), acls, Some(expr), None).with_var(var_name),
             TcpResAction::SetVarFmt { fmt, var_name } => Rule::new(r.cond.as_ref(), acls, None, Some((fmt, false))).with_var(var_name),
             TcpResAction::UnsetVar { var_name } => Rule::new(r.cond.as_ref(), acls, None, None).with_var(var_name),
+            // The value is compiled once, as `tcp_req_content` does for its twins.
+            TcpResAction::ScSetGpt0 { expr, .. }
+            | TcpResAction::ScAddGpc { expr, .. }
+            | TcpResAction::ScSetGpt { expr, .. } => Rule::new(r.cond.as_ref(), acls, Some(expr), None),
             _ => Rule::new(r.cond.as_ref(), acls, None, None),
         })
         .collect()
