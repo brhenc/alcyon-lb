@@ -365,10 +365,6 @@ pub struct PhaseCtx<'a> {
     pub srv_name: Option<&'a str>,
     pub so_id: Option<u32>,
     pub so_name: Option<&'a str>,
-    pub fc_rtt: Option<u32>,
-    pub fc_rttvar: Option<u32>,
-    pub bc_rtt: Option<u32>,
-    pub bc_rttvar: Option<u32>,
     /// The client's TCP socket as a raw fd: what the `fc_*` TCP_INFO fetches
     /// (`fc_rtt`, `fc_rttvar`, `fc_unacked`, ...) `getsockopt(TCP_INFO)` on, read only
     /// when one of them is evaluated (`smp_fetch_fc_*`, `HAProxy`'s `src/tcp_sample.c`).
@@ -510,10 +506,6 @@ impl PhaseCtx<'_> {
         srv_name: None,
         so_id: None,
         so_name: None,
-        fc_rtt: None,
-        fc_rttvar: None,
-        bc_rtt: None,
-        bc_rttvar: None,
         fc_tcp_fd: None,
         bc_tcp_fd: None,
         tcp_info: None,
