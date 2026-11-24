@@ -5,7 +5,8 @@ running HAProxy binary as the oracle. Most of what that took was ordinary portin
 things could not be done well in Rust as it is today: the language, the compiler or the standard
 library was missing a piece, and Alcyon worked around it. This file lists the first five, with
 the evidence in this tree. Each one is a candidate for work in rustc, std or a crate, not in
-Alcyon.
+Alcyon. A sixth (§6, a stable ABI) did not block the port; it is about how Rust programs are
+shipped and updated, and it was added on 2026-11-23.
 
 Nothing here has been proposed upstream. Whether and how to do that is the maintainer's decision.
 
@@ -110,3 +111,69 @@ signals); that is their job, and it is audited there.
 
 **Candidate.** The two rows that are not tests or vendored crates come down to §3 and §4, plus an
 allocator hook (zero on free, trim) that would let the global-allocator wrapper go.
+
+## 6. A stable ABI for Rust-to-Rust linking
+
+This one did not block the port. Alcyon ships as one static binary. The problem shows when Rust
+programs are packaged, updated and fitted onto small systems.
+
+**What is needed.** One shared copy of a library that many programs link against, versioned
+by soname, the way a C system shares libc, libssl and libpcre2:
+- **On an embedded system with little storage,** each program would carry only its own code.
+- **On a distribution,** a security fix in a library would mean shipping one package, not
+  rebuilding every program that uses it.
+- **For an operating system written in Rust from top to bottom,** this is a precondition: its
+  system libraries would need an interface that stays stable across compiler releases.
+
+**What Rust has.**
+- **A C boundary only.** `extern "C"`, `#[repr(C)]` and `crate-type = "cdylib"` (with `cargo-c`
+  for the soname and pkg-config) give a C-style shared library. Across that boundary there are
+  no generics, enums with data, slices, `String`, `Vec` or traits.
+- **No stable layout for Rust's own types.** The default layout (`repr(Rust)`) and calling
+  convention are unspecified on purpose, so the compiler can reorder fields and pack enum tags
+  into unused bit patterns. That is how `Option<&T>` is the size of a pointer.
+- **A `dylib` that works with one compiler only.** A Rust `dylib` links only with the exact
+  compiler that built it. Generic code is compiled into the caller for each type, so most of a
+  Rust API could not live in a shared library even with a stable layout.
+- **Unstable or third-party attempts.** An opt-in stable ABI, crABI (`extern "crabi"`,
+  `repr(crabi)`; rust-lang/rfcs#3470, tracking rust-lang/rust#111423), is not in stable Rust as
+  far as this file knows. Check its status before proposing anything. The crates `abi_stable` and
+  `stabby` build stable layouts on top of the C ABI.
+
+**Evidence.** Measured on 2026-11-23 with Fedora's rustc 1.100.0, x86-64, `-C opt-level=s`,
+stripped:
+
+| program | size |
+|---|---|
+| C `puts("hello")`, glibc linked dynamically | 11,176 bytes |
+| Rust `println!("hello")`, std linked statically (the default) | 337,584 bytes |
+| Rust `println!("hello")`, `-C prefer-dynamic` | 11,080 bytes |
+
+- **The shared std is tied to one compiler build.** The 11,080-byte binary needs
+  `libstd-b77c5b484b975315.so` (1,249,768 bytes). The hash in that file name changes with each
+  compiler build, and Fedora installs it under `/usr/lib/rustlib/`, outside the loader's path, so
+  the binary does not run as built. In practice every Rust program carries its own copy of std
+  and its crates.
+- **Every crate update means a rebuild.** Alcyon's `alcyon-rt` links 125 third-party crates
+  (`cargo tree -p alcyon-rt -e normal`, 2026-11-23). A fix in any one of them means rebuilding
+  Alcyon, and every other program that uses that crate.
+
+**What Swift did.** Swift became ABI-stable in Swift 5 (2019) so that Apple's system frameworks
+could be shared libraries. It uses "library evolution": inside a library the compiler optimises
+freely, and across the library boundary, layouts, sizes and generic code go through indirection
+(type metadata and witness tables, looked up at run time). Aria Beingessner, "How Swift Achieved
+Dynamic Linking Where Rust Couldn't" (2019, faultlore.com/blah/swift-abi/), explains the design
+and why Rust's choices (monomorphization, static layout) make the same thing harder. It is the
+best starting point for this work.
+
+**What C++ shows about the other extreme.** C++ keeps a de facto stable ABI (Itanium), and in
+2020 its committee declined to break it. Known-slow designs (`std::regex`, `std::unordered_map`,
+`unique_ptr` not passed in registers) are now frozen ("ABI: Now or Never", P1863). A Rust ABI
+should be opt-in at chosen boundaries, as Swift's is, not a freeze of the whole language.
+
+**Candidate.** Compiler work, to try in the Swift manner:
+- An opt-in ABI-stable boundary for a crate (crABI or a successor) that covers enums with data,
+  slices, `str`, `Option` and `Result`, and trait objects.
+- A resilient mode in which generic functions and types can cross a shared-library boundary
+  through indirection, at a cost paid only there.
+- A versioned, shareable std built on top of those two.
