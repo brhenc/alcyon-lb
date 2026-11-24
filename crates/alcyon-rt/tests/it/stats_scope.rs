@@ -212,3 +212,21 @@ fn bare_stats_scope_check_mode_message() {
         "the load error is {text:?}"
     );
 }
+
+/// The dashboard's live data (`<uri>/api/data`, Alcyon's own: the HTML page fetches it to
+/// refresh) follows the same scope as the page, or the page's refresh would show every proxy.
+/// Alcyon only: HAProxy has no such URL.
+#[test]
+fn the_dashboard_data_follows_the_scope() {
+    if std::env::var_os("T281_ORACLE").is_some() {
+        return;
+    }
+    for (scope, _, want_names) in ROWS {
+        let (proc, stats) = start(scope);
+        let (st, body) = get(stats, "/s/api/data");
+        assert!(st.starts_with("HTTP/1.1 200"), "the dashboard data answered {st:?}");
+        let names = html_names(&body);
+        assert_eq!(&names[..], *want_names, "the names in the dashboard data for the scope {scope:?}");
+        drop(proc);
+    }
+}

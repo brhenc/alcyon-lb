@@ -103,7 +103,7 @@ fn next_unit(page: &mut Page, ctx: &Ctx<'_>, out: &mut String) -> bool {
             cur.next_unit(ctx.proxies, ctx.checks, ctx.pid, ctx.cfg, ctx.serving, banner.as_deref(), out)
         }
         Page::Rows(cur) => cur.next_unit(ctx.proxies, ctx.checks, ctx.pid, ctx.serving, out),
-        Page::Json(cur) => cur.next_unit(ctx.proxies, ctx.checks, ctx.pid, out),
+        Page::Json(cur) => cur.next_unit(ctx.proxies, ctx.checks, ctx.pid, ctx.cfg.scope_names(), ctx.serving, out),
         Page::Text(text, sent) => {
             if *sent {
                 return false;
