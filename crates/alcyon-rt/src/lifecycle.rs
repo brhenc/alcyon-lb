@@ -241,6 +241,11 @@ impl Lifecycle {
     pub fn soft_stop_requested(&self) -> bool {
         self.soft_stop.load(Ordering::Relaxed)
     }
+
+    #[cfg(test)]
+    pub(crate) fn request_soft_stop(&self) {
+        self.soft_stop.store(true, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]

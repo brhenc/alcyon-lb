@@ -8229,15 +8229,23 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// # Errors
     /// Propagates polling errors.
     pub fn run_loop(&mut self) -> io::Result<()> {
-        // Whether the last step found nothing to run. HAProxy closes the idle front
-        // connections of a stopping process only when a thread has nothing left to do
-        // (`run_poll_loop`, `src/haproxy.c`, wakes `mux_stopping_data`). Under constant
+        // Whether the last stopping pass timed out genuinely idle with nothing to run.
+        // HAProxy closes the idle front connections of a stopping process only when a thread
+        // has nothing left to do (`run_poll_loop`, `src/haproxy.c:3093-3103`, wakes
+        // `mux_stopping_data`; `src/mux_h1.c:4505`, `H1C_F_WAIT_NEXT_REQ`). Under constant
         // keep-alive load that moment rarely comes, so a client is answered with
-        // `Connection: close` instead of having its connection closed between two
-        // requests -- the race it can only survive by retrying. Closing them at once, on
-        // every turn of the loop, made 311 requests in 100 reloads hit a closed connection
-        // where HAProxy has 23 (T166, `tools/measure/reload_under_load.py`).
-        let mut quiet = true;
+        // `Connection: close` (`h1_set_cli_conn_mode`, `src/mux_h1.c:1645`) instead of having
+        // its connection closed between two requests -- the race it can only survive by
+        // retrying. Closing them at once, on every turn of the loop, made 311 requests in
+        // 100 reloads hit a closed connection where HAProxy has 23 (T166,
+        // `tools/measure/reload_under_load.py`).
+        //
+        // A signal wakeup (`Lifecycle::wait` -> `Mailboxes::kick_all`, T659) wakes epoll on
+        // `FdState::Mailbox` with zero tasks run, and a lazy timer repair (T659b) wakes on a
+        // stale key with zero tasks run: neither means the thread was idle, so `quiet` starts
+        // false on soft stop and becomes true only after a stopping pass with no polled events,
+        // no runnable tasks, and no lazy timer repairs (T660R).
+        let mut quiet = false;
         while self.is_running {
             if !self.stopping
                 && self
@@ -8246,6 +8254,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     .is_some_and(crate::lifecycle::Lifecycle::soft_stop_requested)
             {
                 self.begin_soft_stop();
+                quiet = false;
             }
             // SIGQUIT (`dump`): every worker empties its caches at its next pass (T445).
             if self.lifecycle.as_ref().is_some_and(crate::lifecycle::Lifecycle::take_flush_request) {
@@ -8291,8 +8300,13 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             // One clock read a pass, after the poller (`pass_start`): the deadlines the poller
             // waits for are measured from the previous pass's, as HAProxy's `now_ms` is (T579, C2).
             let at = crate::txnlog::loop_now();
+            let repairs_before = if self.stopping { self.scheduler.stats().timer_lazy_repairs } else { 0 };
             let ran = self.step_at(self.tick_at(at), at, true)?;
-            quiet = ran == 0 && self.scheduler.run_queue_len() == 0;
+            quiet = self.stopping
+                && ran == 0
+                && self.scheduler.run_queue_len() == 0
+                && self.events.is_empty()
+                && self.scheduler.stats().timer_lazy_repairs == repairs_before;
         }
         Ok(())
     }
@@ -22034,5 +22048,196 @@ mod status_line_tests {
         ] {
             assert_eq!(usual_status_line(line), None, "{:?}", String::from_utf8_lossy(line));
         }
+    }
+}
+
+#[cfg(test)]
+mod soft_stop_idle_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+
+    fn read_http_response(s: &mut TcpStream) -> String {
+        s.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        while let Ok(n) = s.read(&mut tmp) {
+            if n == 0 { break; }
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..pos]);
+                let cl = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if buf.len() >= pos + 4 + cl {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn post_show_sess_barrier(boxes: &Arc<crate::mailbox::Mailboxes>) -> Vec<crate::mailbox::SessSnap> {
+        let g = crate::mailbox::Gather::new(boxes, 0, TaskRef::NONE);
+        boxes.post(0, crate::mailbox::Msg::ShowSess(Arc::clone(&g)));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(mut v) = g.take() {
+                return v.pop().unwrap_or_default();
+            }
+            assert!(Instant::now() < deadline, "worker did not answer ShowSess mailbox barrier");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// T660R: `Lifecycle::wait` wakes workers on `SIGUSR1` through `Mailboxes::kick_all`
+    /// (`FdState::Mailbox`). That wakeup runs zero tasks (`ran == 0`), which must not
+    /// be mistaken for a quiet thread when `begin_soft_stop()` runs or during later
+    /// mailbox wakes while stopping: active keep-alive connections must stay open until
+    /// an actual quiet poll pass so they receive `Connection: close` instead of an EOF,
+    /// while a truly idle keep-alive connection is closed once the worker is quiet, a
+    /// fresh connection before its first request stays open (T252), and an in-flight
+    /// response completes.
+    #[test]
+    fn mailbox_kick_on_soft_stop_does_not_close_active_keepalive_before_quiet_poll() {
+        let (slow_arrived_tx, slow_arrived_rx) = mpsc::channel::<()>();
+        let (slow_release_tx, slow_release_rx) = mpsc::channel::<()>();
+        let slow_release_rx = Arc::new(std::sync::Mutex::new(slow_release_rx));
+        let slow_arrived_tx = Arc::new(std::sync::Mutex::new(Some(slow_arrived_tx)));
+
+        let be_listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+        let be_addr = be_listener.local_addr().expect("be addr");
+        std::thread::spawn(move || {
+            for stream in be_listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let arrived = Arc::clone(&slow_arrived_tx);
+                let release = Arc::clone(&slow_release_rx);
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 2048];
+                    while let Ok(n) = s.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        if buf[..n].starts_with(b"GET /slow ") {
+                            if let Some(tx) = arrived.lock().expect("lock").take() {
+                                let _ = tx.send(());
+                            }
+                            let _ = release.lock().expect("lock").recv();
+                            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nslow");
+                        } else {
+                            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+                        }
+                    }
+                });
+            }
+        });
+
+        let cfg = alcyon_config::parse_str(&format!(
+            "global\n  hard-stop-after 5s\n\
+             defaults\n  mode http\n  timeout connect 2s\n  timeout client 10s\n  timeout server 10s\n\
+             frontend fe\n  bind 127.0.0.1:0\n  default_backend be\n\
+             backend be\n  server s1 {be_addr}\n"
+        ))
+        .expect("parse");
+        let lifecycle = crate::lifecycle::Lifecycle::new();
+        let lifecycle_worker = lifecycle.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut engine = Engine::new(&cfg, 64).expect("engine");
+            let fe_addr = engine.listeners[0].addr();
+            let boxes = Arc::clone(&engine.mailboxes);
+            engine.set_lifecycle(lifecycle_worker);
+            ready_tx.send((fe_addr, boxes)).expect("send ready");
+            engine.run_loop()
+        });
+        let (fe_addr, boxes) = ready_rx.recv_timeout(Duration::from_secs(3)).expect("engine ready");
+
+        // 1. Fresh connection that has not sent its first request yet.
+        let mut c_fresh = TcpStream::connect(fe_addr).expect("connect fresh");
+        // 2. Keep-alive connection that will send a second request right after the soft-stop kick.
+        let mut c_ka_active = TcpStream::connect(fe_addr).expect("connect ka_active");
+        c_ka_active.write_all(b"GET /ok HTTP/1.1\r\nHost: t\r\n\r\n").expect("ka_active req1");
+        let r1 = read_http_response(&mut c_ka_active);
+        assert!(r1.starts_with("HTTP/1.1 200") && !r1.to_ascii_lowercase().contains("connection: close"), "setup ka_active: {r1:?}");
+        // 3. Keep-alive connection that stays silent (control: must be closed once quiet).
+        let mut c_ka_idle = TcpStream::connect(fe_addr).expect("connect ka_idle");
+        c_ka_idle.write_all(b"GET /ok HTTP/1.1\r\nHost: t\r\n\r\n").expect("ka_idle req1");
+        let r2 = read_http_response(&mut c_ka_idle);
+        assert!(r2.starts_with("HTTP/1.1 200") && !r2.to_ascii_lowercase().contains("connection: close"), "setup ka_idle: {r2:?}");
+        // 4. Mid-response in-flight connection.
+        let mut c_inflight = TcpStream::connect(fe_addr).expect("connect inflight");
+        c_inflight.write_all(b"GET /slow HTTP/1.1\r\nHost: t\r\n\r\n").expect("inflight req");
+        slow_arrived_rx.recv_timeout(Duration::from_secs(3)).expect("slow request reached backend");
+
+        // Synchronize with the worker loop: c_fresh connected before c_ka_active/c_ka_idle/c_inflight,
+        // and c_inflight has already reached the backend, so all 4 connections are accepted.
+        let _ = post_show_sess_barrier(&boxes);
+        // Let the worker enter epoll_wait with nothing to run.
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Trigger soft stop via the exact T659 sequence: flag + mailbox kick.
+        lifecycle.request_soft_stop();
+        boxes.kick_all();
+
+        // Three mailbox barriers (zero listener connects, zero sleeps):
+        // - #1 rides or follows the kick and returns once the pre-stop step_at completed;
+        // - #2 returns after begin_soft_stop()'s loop turn (including any stop_passes==0 close_idle);
+        // - #3 returns after a subsequent zero-task FdState::Mailbox wakeup while stopping.
+        let _ = post_show_sess_barrier(&boxes);
+        let _ = post_show_sess_barrier(&boxes);
+        let _ = post_show_sess_barrier(&boxes);
+        assert!(TcpStream::connect(fe_addr).is_err(), "listener must be closed after begin_soft_stop");
+
+        // Active keep-alive connection must NOT have been closed by the mailbox kicks:
+        // its next request must be served with `Connection: close`.
+        c_ka_active.write_all(b"GET /ok HTTP/1.1\r\nHost: t\r\n\r\n").expect("ka_active req2");
+        let r_after = read_http_response(&mut c_ka_active);
+        let lower = r_after.to_ascii_lowercase();
+        assert!(
+            lower.starts_with("http/1.1 200") && lower.contains("\r\nconnection: close\r\n"),
+            "active keep-alive connection was closed prematurely on soft-stop mailbox kick instead of answering Connection: close; got {r_after:?}"
+        );
+
+        // In-flight request completes with `Connection: close`.
+        slow_release_tx.send(()).expect("release slow");
+        let r_slow = read_http_response(&mut c_inflight);
+        let slow_lower = r_slow.to_ascii_lowercase();
+        assert!(
+            slow_lower.starts_with("http/1.1 200") && r_slow.ends_with("slow") && slow_lower.contains("\r\nconnection: close\r\n"),
+            "in-flight request failed through soft stop: {r_slow:?}"
+        );
+
+        // Control: once active work ends and the worker actually hits its quiet poll pass,
+        // the silent keep-alive connection IS closed promptly (well before hard-stop-after 5s).
+        let quiet_start = Instant::now();
+        c_ka_idle.set_read_timeout(Some(Duration::from_secs(3))).expect("idle timeout");
+        let mut buf = [0u8; 64];
+        let n = c_ka_idle.read(&mut buf).expect("idle ka should receive EOF once quiet");
+        assert_eq!(n, 0, "idle keep-alive connection should close cleanly with EOF, got {:?}", &buf[..n]);
+        assert!(
+            quiet_start.elapsed() < Duration::from_millis(2500),
+            "idle keep-alive took {:?} to close (should close on quiet poll, not hard-stop-after)",
+            quiet_start.elapsed()
+        );
+
+        // Fresh connection (is_first_req == true) must still be open even after the quiet pass,
+        // and its first request must be served with `Connection: close`.
+        c_fresh.write_all(b"GET /ok HTTP/1.1\r\nHost: t\r\n\r\n").expect("fresh req1");
+        let r_fresh = read_http_response(&mut c_fresh);
+        let fresh_lower = r_fresh.to_ascii_lowercase();
+        assert!(
+            fresh_lower.starts_with("http/1.1 200") && fresh_lower.contains("\r\nconnection: close\r\n"),
+            "fresh connection's first request failed after quiet pass: {r_fresh:?}"
+        );
+
+        let res = worker.join().expect("worker join");
+        assert!(res.is_ok(), "run_loop returned error: {res:?}");
     }
 }
