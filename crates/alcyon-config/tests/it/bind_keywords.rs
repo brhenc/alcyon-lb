@@ -106,7 +106,18 @@ fn unknown_bind_keyword_is_refused_in_both_sections() {
 
 #[test]
 fn bind_keywords_missing_their_argument_are_refused() {
-    for kw in ["crt", "alpn", "proto", "verify", "ca-file", "name"] {
+    for kw in [
+        "crt",
+        "alpn",
+        "proto",
+        "verify",
+        "ca-file",
+        "ca-verify-file",
+        "crl-file",
+        "crt-ignore-err",
+        "ca-ignore-err",
+        "name",
+    ] {
         for f in [in_listen, in_frontend] {
             let err = f(&format!("bind 127.0.0.1:8080 {kw}")).unwrap_err().to_string();
             assert!(err.contains(&format!("'{kw}'")), "{kw}: {err}");
@@ -117,11 +128,6 @@ fn bind_keywords_missing_their_argument_are_refused() {
 #[test]
 fn unimplemented_security_keywords_are_refused_in_both_sections() {
     let refused = [
-        "ssl crt /tmp/c.pem crl-file /tmp/crl.pem",
-        "ssl crt /tmp/c.pem ca-verify-file /tmp/ca.pem",
-        "ssl crt /tmp/c.pem crt-ignore-err all",
-        "ssl crt /tmp/c.pem ca-ignore-err all",
-        "ssl crt /tmp/c.pem no-ca-names",
         "ssl crt /tmp/c.pem strict-sni",
         "ssl crt /tmp/c.pem ciphers HIGH",
         "ssl crt-list /tmp/l",
@@ -265,6 +271,192 @@ fn bind_quic_verify_required_or_optional_is_refused() {
     for f in [in_listen, in_frontend] {
         f("bind quic4@127.0.0.1:8443 ssl crt /tmp/c.pem verify none")
             .unwrap_or_else(|e| panic!("quic verify none must be accepted: {e}"));
+    }
+}
+
+#[test]
+fn bind_crl_file_and_ca_verify_file_errors_and_rebasing() {
+    let fx_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../alcyon-rt/tests/data/client_auth");
+    let ca_abs = fx_dir.join("crl-root-ca.crt");
+    let cav_abs = fx_dir.join("crl-ca-verify-only.crt");
+    let crl_abs = fx_dir.join("crl-all.pem");
+
+    // Missing arguments match HAProxy's exact text.
+    for f in [in_listen, in_frontend] {
+        let err = f("bind 127.0.0.1:8080 ssl crt /tmp/c.pem crl-file").unwrap_err().to_string();
+        assert!(err.contains("'crl-file' : missing CRLfile path"), "{err}");
+        let err = f("bind 127.0.0.1:8080 ssl crt /tmp/c.pem ca-verify-file").unwrap_err().to_string();
+        assert!(err.contains("'ca-verify-file' : missing CAfile path"), "{err}");
+    }
+
+    // Nonexistent files match HAProxy's unable-to-load message.
+    let missing_crl = "/nonexistent/alcyon-bind-missing.crl";
+    let missing_cav = "/nonexistent/alcyon-bind-missing-cav.crt";
+    for f in [in_listen, in_frontend] {
+        let err = f(&format!(
+            "bind 127.0.0.1:8080 ssl crt /tmp/c.pem ca-file {} crl-file {missing_crl} verify required",
+            ca_abs.display()
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(&format!("'crl-file' : unable to load {missing_crl}")), "{err}");
+
+        let err = f(&format!(
+            "bind 127.0.0.1:8080 ssl crt /tmp/c.pem ca-verify-file {missing_cav} verify required"
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(&format!("'ca-verify-file' : unable to load {missing_cav}")), "{err}");
+    }
+
+    // Empty, garbage, or wrong-PEM files are refused.
+    let tmp = std::env::temp_dir().join(format!("alcyon-bad-crl-cav-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("mkdir");
+    let empty_f = tmp.join("empty.pem");
+    let bad_f = tmp.join("garbage.pem");
+    std::fs::write(&empty_f, "").expect("write empty");
+    std::fs::write(&bad_f, "not a pem\n").expect("write bad");
+    for p in [&empty_f, &bad_f, &ca_abs] {
+        let err = in_frontend(&format!(
+            "bind 127.0.0.1:8080 ssl crt /tmp/c.pem ca-file {} crl-file {} verify required",
+            ca_abs.display(),
+            p.display()
+        ))
+        .expect_err("bad crl-file")
+        .to_string();
+        assert!(err.contains("'crl-file' : unable to load"), "{}: {err}", p.display());
+    }
+    for p in [&empty_f, &bad_f] {
+        let err = in_frontend(&format!(
+            "bind 127.0.0.1:8080 ssl crt /tmp/c.pem ca-verify-file {} verify required",
+            p.display()
+        ))
+        .expect_err("bad ca-verify-file")
+        .to_string();
+        assert!(err.contains("'ca-verify-file' : unable to load"), "{}: {err}", p.display());
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // Measured on oracle: `ca-verify-file` WITHOUT `ca-file` satisfies `verify required|optional`.
+    for mode in ["optional", "required"] {
+        for f in [in_listen, in_frontend] {
+            f(&format!("bind 127.0.0.1:8080 ssl crt /tmp/c.pem ca-verify-file {} verify {mode}", cav_abs.display()))
+                .unwrap_or_else(|e| panic!("ca-verify-file alone with verify {mode} must load: {e}"));
+        }
+    }
+    in_frontend("bind 127.0.0.1:8080 ssl crt /tmp/c.pem ca-verify-file @system-ca verify required")
+        .expect("@system-ca for ca-verify-file must load");
+
+    // `ca-base` rebases relative `ca-verify-file` and `crl-file` in frontend, listen, and log-forward.
+    parse_str(&format!(
+        "global\n  ca-base {}\n{DEFAULTS}\
+         frontend x\n  bind 127.0.0.1:8080 ssl crt /tmp/c.pem ca-file crl-root-ca.crt ca-verify-file crl-ca-verify-only.crt crl-file crl-all.pem verify required no-ca-names\n\
+         listen y\n  bind 127.0.0.1:8081 ssl crt /tmp/c.pem ca-verify-file crl-ca-verify-only.crt crl-file crl-all.pem verify optional\n\
+         log-forward lf\n  bind 127.0.0.1:8082 ssl crt /tmp/c.pem ca-verify-file crl-ca-verify-only.crt crl-file crl-all.pem verify optional\n",
+        fx_dir.display()
+    ))
+    .expect("ca-base must rebase relative ca-verify-file and crl-file");
+
+    // Valid absolute crl-file + ca-file + ca-verify-file + no-ca-names.
+    let cfg = in_frontend(&format!(
+        "bind 127.0.0.1:8080 ssl crt /tmp/c.pem ca-file {} ca-verify-file {} crl-file {} verify required no-ca-names",
+        ca_abs.display(),
+        cav_abs.display(),
+        crl_abs.display()
+    ))
+    .expect("valid C1b bind must load");
+    let b = &cfg.frontends[0].binds[0];
+    assert_eq!(b.ca_verify_file(), Some(cav_abs.to_str().unwrap()));
+    assert_eq!(b.crl_file(), Some(crl_abs.to_str().unwrap()));
+    assert!(b.no_ca_names());
+    assert!(b.crt_ignore_err().is_empty());
+    assert!(b.ca_ignore_err().is_empty());
+}
+
+#[test]
+fn bind_ignore_err_parses_all_ids_and_names_and_refuses_bad_values() {
+    for kw in ["crt-ignore-err", "ca-ignore-err"] {
+        for f in [in_listen, in_frontend] {
+            // Missing argument -> HAProxy's `missing error IDs list`; empty quoted argument ->
+            // HAProxy's lexer `is empty and marks the end of the argument list` (both measured).
+            let err = f(&format!("bind 127.0.0.1:8080 ssl crt /tmp/c.pem {kw}")).unwrap_err().to_string();
+            assert!(err.contains(&format!("'{kw}' : missing error IDs list")), "{kw}: {err}");
+            let err = f(&format!("bind 127.0.0.1:8080 ssl crt /tmp/c.pem {kw} \"\"")).unwrap_err().to_string();
+            assert!(err.contains("is empty and marks the end of the argument list"), "{kw} empty: {err}");
+
+            // Out-of-range numeric IDs (measured: 1..94).
+            for (list, bad_id) in [("99999", "99999"), ("0", "0"), ("95", "95"), ("10,99999", "99999")] {
+                let err = f(&format!("bind 127.0.0.1:8080 ssl crt /tmp/c.pem {kw} {list}")).unwrap_err().to_string();
+                let expected = format!("'{kw}' : ID '{bad_id}' out of range (1..94) in error IDs list '{list}'");
+                assert!(err.contains(&expected), "{kw} {list}: expected `{expected}`, got `{err}`");
+            }
+
+            // Unknown constant names (including `-1`, since `isdigit('-')` is false in HAProxy).
+            for (list, bad_tok) in [
+                ("X509_V_ERR_BOGUS", "X509_V_ERR_BOGUS"),
+                ("BOGUS", "BOGUS"),
+                ("-1", "-1"),
+                ("10,NOPE", "NOPE"),
+            ] {
+                let err = f(&format!("bind 127.0.0.1:8080 ssl crt /tmp/c.pem {kw} {list}")).unwrap_err().to_string();
+                let expected = format!("'{kw}' : error constant '{bad_tok}' unknown in error IDs list '{list}'");
+                assert!(err.contains(&expected), "{kw} {list}: expected `{expected}`, got `{err}`");
+            }
+
+            // Valid values (measured on oracle).
+            for ok in [
+                "all",
+                "1",
+                "94",
+                "10,23",
+                "X509_V_ERR_CERT_REVOKED,X509_V_ERR_CERT_HAS_EXPIRED",
+                "X509_V_OK",
+                ",",
+                "10abc",
+            ] {
+                f(&format!("bind 127.0.0.1:8080 ssl crt /tmp/c.pem {kw} {ok}"))
+                    .unwrap_or_else(|e| panic!("{kw} {ok} must be accepted: {e}"));
+            }
+        }
+    }
+    // Repeated ignore-err directives on one bind line are accepted and combined.
+    let cfg = in_frontend(
+        "bind 127.0.0.1:8080 ssl crt /tmp/c.pem crt-ignore-err 10 crt-ignore-err 23 ca-ignore-err X509_V_ERR_CERT_REVOKED ca-ignore-err 10",
+    )
+    .expect("repeated ignore-err directives must be accepted");
+    let b = &cfg.frontends[0].binds[0];
+    assert!(b.crt_ignore_err().contains(10) && b.crt_ignore_err().contains(23) && !b.crt_ignore_err().contains(18));
+    assert!(b.ca_ignore_err().contains(10) && b.ca_ignore_err().contains(23) && !b.ca_ignore_err().contains(18));
+}
+
+#[test]
+fn bind_quic_c1b_verifier_keywords_refused_and_no_ca_names_accepted() {
+    let fx_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../alcyon-rt/tests/data/client_auth");
+    let cav_abs = fx_dir.join("crl-ca-verify-only.crt");
+    let crl_abs = fx_dir.join("crl-all.pem");
+
+    for (kw, arg) in [
+        ("crl-file", crl_abs.to_str().unwrap()),
+        ("ca-verify-file", cav_abs.to_str().unwrap()),
+        ("crt-ignore-err", "all"),
+        ("ca-ignore-err", "all"),
+    ] {
+        for f in [in_listen, in_frontend] {
+            let err = f(&format!("bind quic4@127.0.0.1:8443 ssl crt /tmp/c.pem {kw} {arg}"))
+                .expect_err(kw)
+                .to_string();
+            assert!(
+                err.contains("not supported on QUIC binds yet"),
+                "quic {kw} must be refused cleanly: {err}"
+            );
+        }
+    }
+    // `no-ca-names` needs no verifier (QUIC never sends a CertificateRequest without `verify`),
+    // so it is harmless and accepted on QUIC binds just like `verify none`.
+    for f in [in_listen, in_frontend] {
+        f("bind quic4@127.0.0.1:8443 ssl crt /tmp/c.pem no-ca-names")
+            .unwrap_or_else(|e| panic!("quic no-ca-names must be accepted: {e}"));
     }
 }
 

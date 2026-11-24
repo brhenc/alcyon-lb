@@ -566,18 +566,19 @@ fn bind_client_auth_config_checks_match_oracle() {
         assert_eq!(code, 0, "{name} should be valid, got exit {code}:\n{text}");
     }
 
-    // 5. C1b keywords stay refused in Alcyon (HAProxy accepts them)
+    // 5. Still-unimplemented TLS bind keywords stay refused in Alcyon (HAProxy accepts them);
+    //    the five C1b keywords moved to `bind_crl.rs` once implemented.
     if !is_oracle() {
         for kw in [
-            format!("ssl crt {} ca-file {} verify required crl-file /tmp/crl.pem", srv_crt.display(), ca_file.display()),
-            format!("ssl crt {} ca-verify-file {} verify required", srv_crt.display(), ca_file.display()),
-            format!("ssl crt {} ca-file {} verify required crt-ignore-err all", srv_crt.display(), ca_file.display()),
-            format!("ssl crt {} ca-file {} verify required ca-ignore-err all", srv_crt.display(), ca_file.display()),
-            format!("ssl crt {} ca-file {} verify required no-ca-names", srv_crt.display(), ca_file.display()),
+            format!("ssl crt {} strict-sni", srv_crt.display()),
+            format!("ssl crt {} ciphers HIGH", srv_crt.display()),
+            format!("ssl crt {} ca-sign-file {}", srv_crt.display(), ca_file.display()),
+            format!("ssl crt {} generate-certificates", srv_crt.display()),
+            format!("ssl crt {} allow-0rtt", srv_crt.display()),
         ] {
-            let (code, text, _) = run_check("c1b_refused", &kw);
-            assert_eq!(code, 1, "C1b keyword must stay refused ({kw}):\n{text}");
-            assert!(text.contains("not supported"), "C1b keyword refusal must explain why ({kw}):\n{text}");
+            let (code, text, _) = run_check("unimpl_refused", &kw);
+            assert_eq!(code, 1, "unimplemented TLS keyword must stay refused ({kw}):\n{text}");
+            assert!(text.contains("not supported"), "unimplemented TLS keyword refusal must explain why ({kw}):\n{text}");
         }
     }
 

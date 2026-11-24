@@ -849,6 +849,63 @@ pub(crate) fn parse_backend_directive(
     }
 }
 
+/// Parses `all` or a comma-separated list of numeric IDs (`1..=94`) and `X509_V_ERR_*` names
+/// (`bind_parse_ignore_err` in `HAProxy` `src/cfgparse-ssl.c`).
+fn parse_ignore_err_list(
+    kw_name: &str,
+    tok: &Token,
+    prefix: &str,
+) -> Result<crate::ast::X509ErrMask, ConfigError> {
+    if tok.text == "all" {
+        return Ok(crate::ast::X509ErrMask::ALL);
+    }
+    let mut mask = crate::ast::X509ErrMask::EMPTY;
+    for item in tok.text.split(',').filter(|s| !s.is_empty()) {
+        if item.as_bytes()[0].is_ascii_digit() {
+            let end = item.bytes().position(|b| !b.is_ascii_digit()).unwrap_or(item.len());
+            let code = item[..end].parse::<i32>().unwrap_or(i32::MAX);
+            if !(1..=crate::ast::X509_V_ERR_MAX).contains(&code) {
+                return Err(ConfigError::new(
+                    tok.line,
+                    tok.col,
+                    format!(
+                        "{prefix} : '{kw_name}' : ID '{code}' out of range (1..{}) in error IDs list '{}'",
+                        crate::ast::X509_V_ERR_MAX,
+                        tok.text
+                    ),
+                ));
+            }
+            if let Ok(c) = u8::try_from(code) {
+                mask.insert(c);
+            }
+        } else {
+            let Some(code) = crate::ast::x509_v_err_code(item) else {
+                return Err(ConfigError::new(
+                    tok.line,
+                    tok.col,
+                    format!(
+                        "{prefix} : '{kw_name}' : error constant '{item}' unknown in error IDs list '{}'",
+                        tok.text
+                    ),
+                ));
+            };
+            if let Ok(c) = u8::try_from(code) {
+                mask.insert(c);
+            }
+        }
+    }
+    Ok(mask)
+}
+
+fn client_auth_mut<'a>(bind: &'a mut BindConfig, bind_arg: &str) -> &'a mut crate::ast::BindClientAuth {
+    bind.client_auth.get_or_insert_with(|| {
+        Box::new(crate::ast::BindClientAuth {
+            bind_arg: bind_arg.to_string(),
+            ..Default::default()
+        })
+    })
+}
+
 /// Parses one `bind` line of a `listen` or a `frontend` (`section` names which, for the
 /// messages): the address, then the keywords. Both sections share this, so a keyword is
 /// honoured or refused the same way in either (T110).
@@ -919,25 +976,38 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
                         ));
                     }
                 };
-                let ca = bind.client_auth.get_or_insert_with(|| {
-                    Box::new(crate::ast::BindClientAuth {
-                        bind_arg: tokens[1].text.clone(),
-                        ..Default::default()
-                    })
-                });
-                ca.verify = mode;
+                client_auth_mut(&mut bind, &tokens[1].text).verify = mode;
                 i += 1;
             }
             "ca-file" => {
                 let a = arg(i, "missing CAfile path")?;
-                let ca = bind.client_auth.get_or_insert_with(|| {
-                    Box::new(crate::ast::BindClientAuth {
-                        bind_arg: tokens[1].text.clone(),
-                        ..Default::default()
-                    })
-                });
-                ca.ca_file = Some(a.text.clone());
+                client_auth_mut(&mut bind, &tokens[1].text).ca_file = Some(a.text.clone());
                 i += 1;
+            }
+            "ca-verify-file" => {
+                let a = arg(i, "missing CAfile path")?;
+                client_auth_mut(&mut bind, &tokens[1].text).ca_verify_file = Some(a.text.clone());
+                i += 1;
+            }
+            "crl-file" => {
+                let a = arg(i, "missing CRLfile path")?;
+                client_auth_mut(&mut bind, &tokens[1].text).crl_file = Some(a.text.clone());
+                i += 1;
+            }
+            "crt-ignore-err" => {
+                let a = arg(i, "missing error IDs list")?;
+                let mask = parse_ignore_err_list("crt-ignore-err", a, &prefix)?;
+                client_auth_mut(&mut bind, &tokens[1].text).crt_ignore_err.union_with(mask);
+                i += 1;
+            }
+            "ca-ignore-err" => {
+                let a = arg(i, "missing error IDs list")?;
+                let mask = parse_ignore_err_list("ca-ignore-err", a, &prefix)?;
+                client_auth_mut(&mut bind, &tokens[1].text).ca_ignore_err.union_with(mask);
+                i += 1;
+            }
+            "no-ca-names" => {
+                client_auth_mut(&mut bind, &tokens[1].text).no_ca_names = true;
             }
             "alpn" => {
                 bind.alpn = arg(i, "missing ALPN protocol list")?

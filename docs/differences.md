@@ -965,23 +965,36 @@ thread sleeps until a signal arrives or a worker ends. What is left, each with i
 * while a reload is in progress, the old process looks at its child every 20 ms;
 * a server queue with waiters: every 2 ms (`QueueWait`), as before.
 
-## Bind client certificate verification: webpki vs OpenSSL `X509_V_ERR` (T655 C1a)
+## Bind client certificate verification: webpki vs OpenSSL `X509_V_ERR` (T655 C1a, C1b)
 
-`bind ... ssl verify none|optional|required ca-file <file>` validates client certificate chains
-exclusively with `rustls-webpki` (`crates/alcyon-tls/src/client_verify.rs`), keeping the result
-as OpenSSL `X509_V_ERR_*` codes for `ssl_c_verify`, `ssl_c_err` and `ssl_c_ca_err`. Because
-webpki enforces a stricter X.509 v3 profile and defines fewer, coarser error variants than
-OpenSSL, four operator-visible differences apply:
+`bind ... ssl verify none|optional|required ca-file <file> [ca-verify-file <file>] [crl-file <file>]
+[crt-ignore-err <all|list>] [ca-ignore-err <all|list>] [no-ca-names]` validates client certificate
+chains and CRLs exclusively with `rustls-webpki` (`crates/alcyon-tls/src/client_verify.rs`),
+keeping the result as OpenSSL `X509_V_ERR_*` codes for `ssl_c_verify`, `ssl_c_err` and
+`ssl_c_ca_err`. Because webpki enforces a stricter RFC 5280 profile (X.509 v3 certificates and
+v2 CRLs) and defines fewer, coarser error variants than OpenSSL, five operator-visible differences
+apply:
 
-* **QUIC binds:** `verify optional` and `verify required` are refused at load on `quic4@`/`quic6@`
-  binds (`'verify' is not supported on QUIC binds yet`); `verify none` stays accepted.
+* **QUIC binds:** `verify optional`, `verify required`, `ca-verify-file`, `crl-file`,
+  `crt-ignore-err` and `ca-ignore-err` are refused at load on `quic4@`/`quic6@` binds
+  (`'<kw>' is not supported on QUIC binds yet`); `verify none` and `no-ca-names` (which require no
+  verifier) stay accepted.
 * **X.509 v1 client certificates:** HAProxy (OpenSSL) accepts X.509 v1 client certificates
   (such as `reg-tests/ssl/certs/client1.pem`); Alcyon refuses them because `rustls-webpki`
   validates X.509 v3 certificates only (`UnsupportedCertVersion`), recording
-  `X509_V_ERR_UNSPECIFIED` (1) and sending TLS alert 46 (`certificate_unknown`). Issue X.509 v3
-  client certificates instead.
-* **Not-yet-valid alert:** for a certificate with `notBefore` in the future (`X509_V_ERR_CERT_NOT_YET_VALID` = 9),
-  rustls sends TLS alert 45 (`certificate_expired`, per RFC 8446 §6.2) where OpenSSL sends alert 42 (`bad_certificate`).
+  `X509_V_ERR_UNSPECIFIED` (1) and sending TLS alert 46 (`certificate_unknown`). Even under
+  `crt-ignore-err all`, where `UnsupportedCertVersion` (1) is ignored during
+  `VerifyClientIdentity` (`ssl_c_err = 1`), the handshake still fails at `CertificateVerify` with
+  alert 46 because `rustls24::crypto::verify_tls1{2,3}_signature` parses the leaf via
+  `rustls-webpki`. Issue X.509 v3 client certificates instead.
+* **X.509 v1 CRLs:** HAProxy (OpenSSL) accepts v1 CRLs, while `rustls-webpki`
+  (`OwnedCertRevocationList::from_der`) requires RFC 5280 v2 CRLs (`UnsupportedCrlVersion`).
+  Issue v2 CRLs (e.g. with `crlnumber` enabled in OpenSSL).
+* **Not-yet-valid and expired-CRL alerts:** for a certificate with `notBefore` in the future
+  (`X509_V_ERR_CERT_NOT_YET_VALID` = 9), rustls sends TLS alert 45 (`certificate_expired`, per
+  RFC 8446 §6.2) where OpenSSL sends alert 42 (`bad_certificate`). For an expired CRL
+  (`X509_V_ERR_CRL_HAS_EXPIRED` = 12), rustls sends alert 48 (`unknown_ca`) where OpenSSL sends
+  alert 45 (`certificate_expired`).
 * **webpki → `X509_V_ERR` mapping table:** webpki variants with an exact OpenSSL twin map to
   that code; coarser webpki errors map to the closest OpenSSL code below. Where webpki does not
   expose chain depth (signature, name-constraint, or unknown-future errors), errors default to

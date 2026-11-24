@@ -231,7 +231,7 @@ pub fn parse_server_name(name: &str) -> Result<ServerName<'static>, String> {
         .map_err(|e| format!("Invalid server name '{name}': {e:?}"))
 }
 
-use alcyon_config::ast::{BindConfig, BindVerify};
+use alcyon_config::ast::{BindConfig, BindVerify, X509ErrMask};
 
 /// What a `bind ... ssl` line asks for, whichever rustls builds it: the ALPN list it advertises,
 /// the certificates of its `crt` files (loaded), and optional client verification settings.
@@ -241,9 +241,32 @@ pub(crate) struct BindPlan {
     pub(crate) pairs: Vec<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>, std::path::PathBuf)>,
     pub(crate) verify: BindVerify,
     pub(crate) ca_file: Option<std::path::PathBuf>,
+    pub(crate) ca_verify_file: Option<std::path::PathBuf>,
+    pub(crate) crl_file: Option<std::path::PathBuf>,
+    pub(crate) crt_ignore_err: X509ErrMask,
+    pub(crate) ca_ignore_err: X509ErrMask,
+    pub(crate) no_ca_names: bool,
 }
 
 impl BindPlan {
+    pub(crate) fn single(
+        certs: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        alpn: Vec<Vec<u8>>,
+    ) -> Self {
+        Self {
+            alpn,
+            pairs: vec![(certs, key, std::path::PathBuf::from("(memory)"))],
+            verify: BindVerify::None,
+            ca_file: None,
+            ca_verify_file: None,
+            crl_file: None,
+            crt_ignore_err: X509ErrMask::EMPTY,
+            ca_ignore_err: X509ErrMask::EMPTY,
+            no_ca_names: false,
+        }
+    }
+
     pub(crate) fn of(bind: &BindConfig) -> Result<Self, String> {
         // Advertise only what the runtime can actually serve.
         //
@@ -290,6 +313,11 @@ impl BindPlan {
             pairs,
             verify: bind.verify(),
             ca_file: bind.ca_file().map(std::path::PathBuf::from),
+            ca_verify_file: bind.ca_verify_file().map(std::path::PathBuf::from),
+            crl_file: bind.crl_file().map(std::path::PathBuf::from),
+            crt_ignore_err: bind.crt_ignore_err(),
+            ca_ignore_err: bind.ca_ignore_err(),
+            no_ca_names: bind.no_ca_names(),
         })
     }
 
@@ -337,7 +365,7 @@ pub(crate) fn cert_names(certs: &[CertificateDer<'static>]) -> Vec<String> {
 pub(crate) fn shared_key(bind: &BindConfig) -> Option<String> {
     use std::fmt::Write as _;
     let mut k = format!(
-        "{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+        "{:?}|{:?}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
         bind.crt,
         bind.alpn,
         bind.quic,
@@ -345,11 +373,22 @@ pub(crate) fn shared_key(bind: &BindConfig) -> Option<String> {
         bind.max_ver,
         bind.verify(),
         bind.ca_file(),
+        bind.ca_verify_file(),
+        bind.crl_file(),
+        bind.crt_ignore_err(),
+        bind.ca_ignore_err(),
+        bind.no_ca_names(),
     );
-    if let Some(ca) = bind.ca_file().filter(|p| !p.starts_with('@')) {
-        let m = std::fs::metadata(ca).ok()?;
-        let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
-        let _ = write!(k, "|ca:{ca}:{}:{}", m.len(), t.as_nanos());
+    for (tag, opt) in [
+        ("ca", bind.ca_file()),
+        ("cav", bind.ca_verify_file()),
+        ("crl", bind.crl_file()),
+    ] {
+        if let Some(p) = opt.filter(|p| !p.starts_with('@')) {
+            let m = std::fs::metadata(p).ok()?;
+            let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+            let _ = write!(k, "|{tag}:{p}:{}:{}", m.len(), t.as_nanos());
+        }
     }
     for c in &bind.crt {
         let path = std::path::Path::new(c);

@@ -14,6 +14,7 @@ use crate::config::Der;
 use crate::provider;
 use crate::x509;
 use crate::TlsCryptoProvider;
+use alcyon_config::X509ErrMask;
 use alcyon_proto::transport::{VerifyError, VerifyResult};
 use rustls24::client::danger::HandshakeSignatureValid;
 use rustls24::crypto::{
@@ -27,7 +28,11 @@ use rustls24::pki_types::{CertificateDer, SignatureVerificationAlgorithm, UnixTi
 use rustls24::server::danger::{ClientIdentity, ClientVerifier, SignatureVerificationInput};
 use rustls24::{DistinguishedName, RootCertStore};
 use std::sync::Arc;
-use webpki::{EndEntityCert, ExtendedKeyUsage, ExtendedKeyUsageValidator, KeyPurposeIdIter};
+use webpki::{
+    CertRevocationList, EndEntityCert, ExpirationPolicy, ExtendedKeyUsage,
+    ExtendedKeyUsageValidator, KeyPurposeIdIter, RevocationCheckDepth, RevocationOptions,
+    RevocationOptionsBuilder, UnknownStatusPolicy,
+};
 
 /// OpenSSL `X509_V_ERR_*` numeric codes (`include/openssl/x509_vfy.h`), matching
 /// `HAProxy`'s `ssl_c_verify`, `ssl_c_err`, `ssl_c_ca_err` and `x509_v_err_str`.
@@ -89,6 +94,17 @@ impl ClientVerifyCodes {
         Self { verify: code, crt_err: 0, ca_err: code }
     }
 
+    fn record(&mut self, code: i32, is_leaf: bool) {
+        if is_leaf {
+            if self.crt_err == 0 {
+                self.crt_err = code;
+            }
+        } else if self.ca_err == 0 {
+            self.ca_err = code;
+        }
+        self.verify = if self.crt_err != 0 { self.crt_err } else { self.ca_err };
+    }
+
     /// Provider-neutral summary for [`alcyon_proto::transport::TlsInfo::peer_verify`].
     #[must_use]
     pub const fn to_verify_result(self) -> VerifyResult {
@@ -110,16 +126,39 @@ impl ClientVerifyCodes {
     }
 }
 
-/// Client certificate verifier for a `bind ... ssl verify optional|required ca-file <f>` line.
+/// Configuration for [`BindClientVerifier`]: combined trust roots (`ca-file` + `ca-verify-file`),
+/// `CertificateRequest` hint subjects (`ca-file` only, empty when `no-ca-names` or `ca-verify-file`
+/// alone), parsed v2 CRLs (`crl-file`), mandatory flag, and leaf/CA ignore-error masks.
+#[derive(Debug)]
+pub struct BindClientVerifyOpts {
+    pub roots: Arc<RootCertStore>,
+    pub root_hint_subjects: Vec<DistinguishedName>,
+    pub crls: Vec<CertRevocationList<'static>>,
+    pub mandatory: bool,
+    pub crt_ignore_err: X509ErrMask,
+    pub ca_ignore_err: X509ErrMask,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RevMode {
+    Chain,
+    EndEntity,
+    None,
+}
+
+/// Client certificate verifier for a `bind ... ssl verify optional|required` line.
 ///
-/// Advertises the subjects of every trust anchor in `ca-file` in the `CertificateRequest`,
-/// verifies presented client chains with `rustls-webpki`, and maps the outcome into OpenSSL
-/// `X509_V_ERR` codes.
+/// Advertises the configured CA hints in the `CertificateRequest`, verifies presented client
+/// chains (and optional chain-wide CRLs) with `rustls-webpki`, honors `crt-ignore-err` (depth 0)
+/// and `ca-ignore-err` (depth > 0), and maps the outcome into OpenSSL `X509_V_ERR` codes.
 #[derive(Debug)]
 pub struct BindClientVerifier {
     roots: Arc<RootCertStore>,
     root_hint_subjects: Arc<[DistinguishedName]>,
+    crls: Vec<CertRevocationList<'static>>,
     mandatory: bool,
+    crt_ignore_err: X509ErrMask,
+    ca_ignore_err: X509ErrMask,
     supported_algs: WebPkiSupportedAlgorithms,
     all_algs: &'static [&'static dyn SignatureVerificationAlgorithm],
 }
@@ -134,11 +173,36 @@ impl BindClientVerifier {
         kind: TlsCryptoProvider,
         provider: &CryptoProvider,
     ) -> Arc<Self> {
-        let root_hint_subjects = Arc::from(roots.subjects());
+        let root_hint_subjects = roots.subjects();
+        Self::from_opts(
+            BindClientVerifyOpts {
+                roots,
+                root_hint_subjects,
+                crls: Vec::new(),
+                mandatory,
+                crt_ignore_err: X509ErrMask::EMPTY,
+                ca_ignore_err: X509ErrMask::EMPTY,
+            },
+            kind,
+            provider,
+        )
+    }
+
+    /// Builds a client verifier with full C1a+C1b options (`ca-verify-file`, `crl-file`,
+    /// `crt-ignore-err`, `ca-ignore-err`, `no-ca-names`).
+    #[must_use]
+    pub fn from_opts(
+        opts: BindClientVerifyOpts,
+        kind: TlsCryptoProvider,
+        provider: &CryptoProvider,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            roots,
-            root_hint_subjects,
-            mandatory,
+            roots: opts.roots,
+            root_hint_subjects: Arc::from(opts.root_hint_subjects),
+            crls: opts.crls,
+            mandatory: opts.mandatory,
+            crt_ignore_err: opts.crt_ignore_err,
+            ca_ignore_err: opts.ca_ignore_err,
             supported_algs: provider.signature_verification_algorithms,
             all_algs: provider::verification_algs(kind),
         })
@@ -149,7 +213,7 @@ impl BindClientVerifier {
     /// `ssl_c_err`, and `ssl_c_ca_err`.
     ///
     /// # Errors
-    /// The returned `Result` is `Err` whenever verification fails.
+    /// The returned `Result` is `Err` whenever a non-ignored verification error occurs.
     pub fn verify_detailed<'a>(
         &self,
         identity: &ClientIdentity<'a, '_>,
@@ -174,53 +238,291 @@ impl BindClientVerifier {
             Ok(cert) => cert,
             Err(err) => {
                 let code = webpki_error_to_x509(&err);
-                return (Err(webpki_error_to_rustls(err)), ClientVerifyCodes::leaf_err(code));
+                let codes = ClientVerifyCodes::leaf_err(code);
+                if self.crt_ignore_err.contains(code) {
+                    return (Ok(VerifiedIdentity::assertion(identity.clone())), codes);
+                }
+                return (Err(webpki_error_to_rustls(err)), codes);
             }
         };
 
-        let eku = ExtendedKeyUsage::client_auth();
-        match cert.verify_for_usage(
-            self.all_algs,
-            &self.roots.roots,
-            &certificates.intermediates,
-            now,
-            &eku,
-            None,
-            None,
-        ) {
-            Ok(_) => (Ok(VerifiedIdentity::assertion(identity.clone())), ClientVerifyCodes::OK),
-            Err(err) => {
-                // webpki checks EKU before building the chain to a trust anchor; OpenSSL builds
-                // the trust chain first. When an untrusted server certificate (such as `common.pem`)
-                // is presented as a client cert, re-check with a permissive EKU so an untrusted
-                // issuer still reports `UnknownIssuer` (alert 48 / code 20) as HAProxy does, while
-                // a trusted cert with the wrong EKU still reports `RequiredEkuNotFound` (alert 43 / 26).
-                let effective = if matches!(err, webpki::Error::RequiredEkuNotFound(_)) {
-                    match cert.verify_for_usage(
-                        self.all_algs,
-                        &self.roots.roots,
-                        &certificates.intermediates,
-                        now,
-                        &AnyEku,
-                        None,
-                        None,
-                    ) {
-                        Ok(_) => err,
-                        Err(chain_err) => chain_err,
+        let crl_refs: Vec<&CertRevocationList<'_>> = self.crls.iter().collect();
+        let client_eku = ExtendedKeyUsage::client_auth();
+        let mut state = VerifyState {
+            check_time: now,
+            shifted_time: false,
+            allow_any_eku: false,
+            rev_mode: if crl_refs.is_empty() { RevMode::None } else { RevMode::Chain },
+            exp_policy: ExpirationPolicy::Enforce,
+        };
+        let mut codes = ClientVerifyCodes::OK;
+
+        loop {
+            let eku: &dyn ExtendedKeyUsageValidator = if state.allow_any_eku { &AnyEku } else { &client_eku };
+            let rev = build_revocation(&crl_refs, state.rev_mode, state.exp_policy);
+            match cert.verify_for_usage(
+                self.all_algs,
+                &self.roots.roots,
+                &certificates.intermediates,
+                state.check_time,
+                eku,
+                rev,
+                None,
+            ) {
+                Ok(path) => {
+                    if state.shifted_time {
+                        if let Some(err) = self.check_inter_now_validity(&path, now, &mut codes) {
+                            return (Err(err), codes);
+                        }
                     }
-                } else {
-                    err
-                };
-                let codes = classify_webpki_error(
-                    &effective,
-                    leaf_der,
-                    &certificates.intermediates,
-                    now,
-                );
-                (Err(webpki_error_to_rustls(effective)), codes)
+                    return (Ok(VerifiedIdentity::assertion(identity.clone())), codes);
+                }
+                Err(err) => {
+                    // webpki checks EKU before building the chain to a trust anchor; OpenSSL builds
+                    // the trust chain first. Re-check with a permissive EKU so an untrusted server
+                    // cert still reports `UnknownIssuer` (alert 48 / code 20) as HAProxy does.
+                    let effective = if !state.allow_any_eku && matches!(err, webpki::Error::RequiredEkuNotFound(_)) {
+                        let rev2 = build_revocation(&crl_refs, state.rev_mode, state.exp_policy);
+                        match cert.verify_for_usage(
+                            self.all_algs,
+                            &self.roots.roots,
+                            &certificates.intermediates,
+                            state.check_time,
+                            &AnyEku,
+                            rev2,
+                            None,
+                        ) {
+                            Ok(_) => err,
+                            Err(chain_err) => chain_err,
+                        }
+                    } else {
+                        err
+                    };
+                    let (code, is_leaf) = self.classify_with_depth(
+                        &cert,
+                        &effective,
+                        leaf_der,
+                        &certificates.intermediates,
+                        state.check_time,
+                        eku,
+                        &crl_refs,
+                        state.rev_mode,
+                        state.exp_policy,
+                    );
+                    codes.record(code, is_leaf);
+                    let ignored = if is_leaf {
+                        self.crt_ignore_err.contains(code)
+                    } else {
+                        self.ca_ignore_err.contains(code)
+                    };
+                    if !ignored {
+                        return (Err(webpki_error_to_rustls(effective)), codes);
+                    }
+                    if !state.relax(&effective, is_leaf, leaf_der.as_ref(), &certificates.intermediates) {
+                        return (Ok(VerifiedIdentity::assertion(identity.clone())), codes);
+                    }
+                }
             }
         }
     }
+
+    /// Attributes `effective` to leaf (depth 0) or CA chain (depth > 0), probing
+    /// `RevocationCheckDepth::EndEntity` when a chain-wide CRL check fails.
+    #[allow(clippy::too_many_arguments)]
+    fn classify_with_depth(
+        &self,
+        cert: &EndEntityCert<'_>,
+        effective: &webpki::Error,
+        leaf_der: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        check_time: UnixTime,
+        eku: &dyn ExtendedKeyUsageValidator,
+        crl_refs: &[&CertRevocationList<'_>],
+        rev_mode: RevMode,
+        exp_policy: ExpirationPolicy,
+    ) -> (i32, bool) {
+        if is_revocation_error(effective) {
+            let code = webpki_error_to_x509(effective);
+            let is_leaf = match rev_mode {
+                RevMode::Chain => {
+                    let ee_rev = build_revocation(crl_refs, RevMode::EndEntity, exp_policy);
+                    matches!(
+                        cert.verify_for_usage(
+                            self.all_algs,
+                            &self.roots.roots,
+                            intermediates,
+                            check_time,
+                            eku,
+                            ee_rev,
+                            None,
+                        ),
+                        Err(ref ee_err) if webpki_error_to_x509(ee_err) == code
+                    )
+                }
+                RevMode::EndEntity | RevMode::None => true,
+            };
+            return (code, is_leaf);
+        }
+        let c = classify_webpki_error(effective, leaf_der, intermediates, check_time);
+        (c.verify, c.crt_err != 0)
+    }
+
+    /// After `check_time` was shifted to look past an ignored leaf validity error, re-checks `now`
+    /// validity of every intermediate in the verified path so a non-ignored CA expiry is still
+    /// enforced.
+    fn check_inter_now_validity(
+        &self,
+        path: &webpki::VerifiedPath<'_>,
+        now: UnixTime,
+        codes: &mut ClientVerifyCodes,
+    ) -> Option<Error> {
+        for inter in path.intermediate_certificates() {
+            if let Some(code) = cert_validity_err(inter.der().as_ref(), now) {
+                codes.record(code, false);
+                if !self.ca_ignore_err.contains(code) {
+                    return Some(validity_code_to_rustls(code));
+                }
+            }
+        }
+        None
+    }
+}
+
+struct VerifyState {
+    check_time: UnixTime,
+    shifted_time: bool,
+    allow_any_eku: bool,
+    rev_mode: RevMode,
+    exp_policy: ExpirationPolicy,
+}
+
+impl VerifyState {
+    /// Relaxes only the specific check that produced an ignored error so the next pass still
+    /// enforces every remaining non-ignored check (untrusted issuer, revocation, CA depth, etc.).
+    /// Strictly monotonic (at most 5 relaxations), guaranteeing loop termination.
+    fn relax(
+        &mut self,
+        effective: &webpki::Error,
+        is_leaf: bool,
+        leaf_der: &[u8],
+        intermediates: &[CertificateDer<'_>],
+    ) -> bool {
+        if !self.shifted_time
+            && matches!(effective, webpki::Error::CertExpired { .. } | webpki::Error::CertNotValidYet { .. })
+        {
+            if let Some(t) = common_valid_time(leaf_der, intermediates) {
+                self.check_time = t;
+                self.shifted_time = true;
+                return true;
+            }
+        }
+        if !self.allow_any_eku
+            && matches!(effective, webpki::Error::RequiredEkuNotFound(_) | webpki::Error::EmptyEkuExtension)
+        {
+            self.allow_any_eku = true;
+            return true;
+        }
+        if matches!(effective, webpki::Error::CrlExpired { .. }) && self.exp_policy == ExpirationPolicy::Enforce {
+            self.exp_policy = ExpirationPolicy::Ignore;
+            return true;
+        }
+        if is_revocation_error(effective) {
+            if !is_leaf && self.rev_mode == RevMode::Chain {
+                self.rev_mode = RevMode::EndEntity;
+                return true;
+            }
+            if is_leaf && self.rev_mode != RevMode::None {
+                self.rev_mode = RevMode::None;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn build_revocation<'a>(
+    crl_refs: &'a [&'a CertRevocationList<'a>],
+    mode: RevMode,
+    exp_policy: ExpirationPolicy,
+) -> Option<RevocationOptions<'a>> {
+    let depth = match mode {
+        RevMode::Chain => RevocationCheckDepth::Chain,
+        RevMode::EndEntity => RevocationCheckDepth::EndEntity,
+        RevMode::None => return None,
+    };
+    RevocationOptionsBuilder::new(crl_refs).ok().map(|b| {
+        b.with_depth(depth)
+            .with_status_policy(UnknownStatusPolicy::Deny)
+            .with_expiration_policy(exp_policy)
+            .build()
+    })
+}
+
+const fn is_revocation_error(err: &webpki::Error) -> bool {
+    matches!(
+        err,
+        webpki::Error::CertRevoked
+            | webpki::Error::UnknownRevocationStatus
+            | webpki::Error::CrlExpired { .. }
+            | webpki::Error::InvalidCrlSignatureForPublicKey
+            | webpki::Error::IssuerNotCrlSigner
+            | webpki::Error::UnsupportedCrlSignatureAlgorithm(_)
+            | webpki::Error::UnsupportedCrlSignatureAlgorithmForPublicKey(_)
+            | webpki::Error::InvalidCrlNumber
+            | webpki::Error::UnsupportedCrlVersion
+            | webpki::Error::UnsupportedDeltaCrl
+            | webpki::Error::UnsupportedIndirectCrl
+            | webpki::Error::UnsupportedRevocationReason
+            | webpki::Error::UnsupportedRevocationReasonsPartitioning
+            | webpki::Error::UnsupportedCrlIssuingDistributionPoint
+    )
+}
+
+fn validity_code_to_rustls(code: i32) -> Error {
+    if code == x509_err::CERT_NOT_YET_VALID {
+        CertificateError::NotValidYet.into()
+    } else {
+        CertificateError::Expired.into()
+    }
+}
+
+fn cert_validity_window(der: &[u8]) -> Option<(u64, u64)> {
+    let cert = x509::Cert::parse(der)?;
+    let nb = parse_asn1_time(cert.not_before)?;
+    let na = parse_asn1_time(cert.not_after)?;
+    Some((nb, na))
+}
+
+fn cert_validity_err(der: &[u8], now: UnixTime) -> Option<i32> {
+    let (nb, na) = cert_validity_window(der)?;
+    let t = now.as_secs();
+    if nb > na {
+        Some(x509_err::ERROR_IN_CERT_NOT_AFTER_FIELD)
+    } else if t < nb {
+        Some(x509_err::CERT_NOT_YET_VALID)
+    } else if t > na {
+        Some(x509_err::CERT_HAS_EXPIRED)
+    } else {
+        None
+    }
+}
+
+fn common_valid_time(leaf_der: &[u8], intermediates: &[CertificateDer<'_>]) -> Option<UnixTime> {
+    let (mut lo, mut hi) = cert_validity_window(leaf_der)?;
+    if lo > hi {
+        return None;
+    }
+    for inter in intermediates {
+        if let Some((nb, na)) = cert_validity_window(inter.as_ref()) {
+            let nlo = lo.max(nb);
+            let nhi = hi.min(na);
+            if nb <= na && nlo <= nhi {
+                lo = nlo;
+                hi = nhi;
+            }
+        }
+    }
+    Some(UnixTime::since_unix_epoch(std::time::Duration::from_secs(lo)))
 }
 
 impl ClientVerifier for BindClientVerifier {
@@ -945,5 +1247,165 @@ mod tests {
         let (res, codes) = check(&v, chain);
         assert!(matches!(res, Err(Error::InvalidCertificate(CertificateError::Other(_)))), "{res:?}");
         assert_eq!(codes, ClientVerifyCodes { verify: 1, crt_err: 1, ca_err: 0 });
+    }
+
+    #[test]
+    fn ignore_err_relaxation_covers_eku_untrusted_and_validity() {
+        let ca = make_ca("Ignore Test CA");
+        let other_ca = make_ca("Other CA");
+        let prov = provider::of(TlsCryptoProvider::Ring, true, true);
+        let make_v = |crt_ign: X509ErrMask, ca_ign: X509ErrMask| {
+            let mut roots = RootCertStore::empty();
+            roots.add(ca.cert.der().clone()).expect("root");
+            BindClientVerifier::from_opts(
+                BindClientVerifyOpts {
+                    roots: Arc::new(roots),
+                    root_hint_subjects: Vec::new(),
+                    crls: Vec::new(),
+                    mandatory: true,
+                    crt_ignore_err: crt_ign,
+                    ca_ignore_err: ca_ign,
+                },
+                TlsCryptoProvider::Ring,
+                &prov,
+            )
+        };
+
+        // 1. Trusted leaf with ServerAuth-only EKU ignored by crt-ignore-err 26 -> Ok, 26/26/0.
+        let mut eku_p = CertificateParams::new(Vec::<String>::new()).expect("p");
+        eku_p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let eku_k = KeyPair::generate().expect("k");
+        let eku_c = eku_p.signed_by(&eku_k, &ca.cert, &ca.key).expect("sign");
+        let mut mask_eku = X509ErrMask::EMPTY;
+        mask_eku.insert(26);
+        let (res, codes) = check(&make_v(mask_eku, X509ErrMask::EMPTY), vec![eku_c.der().clone()]);
+        assert!(res.is_ok(), "ignored EKU must pass: {res:?}");
+        assert_eq!(codes, ClientVerifyCodes { verify: 26, crt_err: 26, ca_err: 0 });
+
+        // 2. Untrusted self-signed leaf ignored by crt-ignore-err 18 -> Ok, 18/18/0.
+        let ss = rcgen::generate_simple_self_signed(vec!["ss.example".to_string()]).expect("ss");
+        let mut mask_ss = X509ErrMask::EMPTY;
+        mask_ss.insert(18);
+        let (res, codes) = check(&make_v(mask_ss, X509ErrMask::EMPTY), vec![ss.cert.der().clone()]);
+        assert!(res.is_ok(), "ignored self-signed must pass: {res:?}");
+        assert_eq!(codes, ClientVerifyCodes { verify: 18, crt_err: 18, ca_err: 0 });
+
+        // 3. Expired leaf under expired inter with crt-ignore-err 10 ONLY -> check_inter_now_validity
+        //    must still reject the expired intermediate (no CA bypass!).
+        let mut inter_p = CertificateParams::new(Vec::<String>::new()).expect("ip");
+        inter_p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        inter_p.not_before = date_time_ymd(2020, 1, 1);
+        inter_p.not_after = date_time_ymd(2021, 1, 1);
+        let inter_k = KeyPair::generate().expect("ik");
+        let exp_inter = inter_p.signed_by(&inter_k, &ca.cert, &ca.key).expect("inter");
+        let mut leaf_p = CertificateParams::new(Vec::<String>::new()).expect("lp");
+        leaf_p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        leaf_p.not_before = date_time_ymd(2020, 1, 1);
+        leaf_p.not_after = date_time_ymd(2021, 1, 1);
+        let leaf_k = KeyPair::generate().expect("lk");
+        let exp_leaf = leaf_p.signed_by(&leaf_k, &exp_inter, &inter_k).expect("leaf");
+        let mut mask_exp = X509ErrMask::EMPTY;
+        mask_exp.insert(10);
+        let (res, codes) = check(&make_v(mask_exp, X509ErrMask::EMPTY), vec![exp_leaf.der().clone(), exp_inter.der().clone()]);
+        assert!(matches!(res, Err(Error::InvalidCertificate(CertificateError::Expired))), "{res:?}");
+        assert_eq!(codes, ClientVerifyCodes { verify: 10, crt_err: 10, ca_err: 10 });
+
+        // 4. Not-yet-valid intermediate under future leaf + crt-ignore-err 9 ONLY -> rejects NotValidYet!
+        let mut future_ca_params = CertificateParams::new(Vec::<String>::new()).expect("fip");
+        future_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        future_ca_params.not_before = date_time_ymd(2035, 1, 1);
+        future_ca_params.not_after = date_time_ymd(2036, 1, 1);
+        let future_ca_key = KeyPair::generate().expect("fik");
+        let fut_inter = future_ca_params.signed_by(&future_ca_key, &ca.cert, &ca.key).expect("fi");
+        let mut future_leaf_params = CertificateParams::new(Vec::<String>::new()).expect("flp");
+        future_leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        future_leaf_params.not_before = date_time_ymd(2035, 1, 1);
+        future_leaf_params.not_after = date_time_ymd(2036, 1, 1);
+        let future_leaf_key = KeyPair::generate().expect("flk");
+        let fut_leaf = future_leaf_params.signed_by(&future_leaf_key, &fut_inter, &future_ca_key).expect("fl");
+        let mut mask_nyv = X509ErrMask::EMPTY;
+        mask_nyv.insert(9);
+        let (res, codes) = check(&make_v(mask_nyv, X509ErrMask::EMPTY), vec![fut_leaf.der().clone(), fut_inter.der().clone()]);
+        assert!(matches!(res, Err(Error::InvalidCertificate(CertificateError::NotValidYet))), "{res:?}");
+        assert_eq!(codes, ClientVerifyCodes { verify: 9, crt_err: 9, ca_err: 9 });
+
+        // 5. Inverted validity window (`not_before > not_after`) exercises `cert_validity_err` & `common_valid_time`.
+        let mut inv_p = CertificateParams::new(Vec::<String>::new()).expect("inv");
+        inv_p.not_before = date_time_ymd(2025, 1, 1);
+        inv_p.not_after = date_time_ymd(2020, 1, 1);
+        let inv_k = KeyPair::generate().expect("invk");
+        let inv_c = inv_p.signed_by(&inv_k, &other_ca.cert, &other_ca.key).expect("invc");
+        assert_eq!(cert_validity_err(inv_c.der().as_ref(), UnixTime::now()), Some(x509_err::ERROR_IN_CERT_NOT_AFTER_FIELD));
+        assert!(common_valid_time(inv_c.der().as_ref(), &[]).is_none());
+    }
+
+    #[test]
+    fn ignore_err_relaxation_covers_expired_and_partial_crls() {
+        let prov = provider::of(TlsCryptoProvider::Ring, true, true);
+        let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../alcyon-rt/tests/data/client_auth");
+        let fx_roots = Arc::new(crate::config::load_ca_file(&fx.join("crl-root-ca.crt")).expect("root"));
+
+        // 1. Expired CRL ignored by crt-ignore-err 12: valid leaf passes (12/12/0), while revoked leaf
+        //    in that same expired CRL is STILL rejected (Revoked)!
+        let exp_crl_ders = crate::config::load_crl_file(&fx.join("crl-root-expired.pem")).expect("exp crl");
+        let exp_crls: Vec<CertRevocationList<'static>> = exp_crl_ders
+            .into_iter()
+            .map(|d| CertRevocationList::Owned(webpki::OwnedCertRevocationList::from_der(d.as_ref()).expect("der")))
+            .collect();
+        let mut mask_crl_exp = X509ErrMask::EMPTY;
+        mask_crl_exp.insert(12);
+        let v_exp_crl = BindClientVerifier::from_opts(
+            BindClientVerifyOpts {
+                roots: Arc::clone(&fx_roots),
+                root_hint_subjects: Vec::new(),
+                crls: exp_crls,
+                mandatory: true,
+                crt_ignore_err: mask_crl_exp,
+                ca_ignore_err: X509ErrMask::EMPTY,
+            },
+            TlsCryptoProvider::Ring,
+            &prov,
+        );
+        let (ok_chain, _) = crate::config::load_cert_file(&fx.join("crl-direct-ok.pem")).expect("ok");
+        let (res, codes) = check(&v_exp_crl, ok_chain);
+        assert!(res.is_ok(), "ignored expired CRL must allow valid leaf: {res:?}");
+        assert_eq!(codes, ClientVerifyCodes { verify: 12, crt_err: 12, ca_err: 0 });
+        let (rev_chain, _) = crate::config::load_cert_file(&fx.join("crl-direct-revoked.pem")).expect("rev");
+        let (res, codes) = check(&v_exp_crl, rev_chain);
+        assert!(matches!(res, Err(Error::InvalidCertificate(CertificateError::Revoked))), "{res:?}");
+        assert_eq!(codes, ClientVerifyCodes { verify: 12, crt_err: 12, ca_err: 0 });
+
+        // 2. Missing root CRL (ca_err=3 ignored by ca-ignore-err 3) + revoked leaf (crt_err=23 NOT ignored):
+        //    exercises `RevMode::Chain -> EndEntity` then `EndEntity` rejecting leaf!
+        let inter1_crl_ders = crate::config::load_crl_file(&fx.join("crl-inter1.pem")).expect("i1 crl");
+        let inter1_crls: Vec<CertRevocationList<'static>> = inter1_crl_ders
+            .into_iter()
+            .map(|d| CertRevocationList::Owned(webpki::OwnedCertRevocationList::from_der(d.as_ref()).expect("der")))
+            .collect();
+        let mut mask_no_crl = X509ErrMask::EMPTY;
+        mask_no_crl.insert(3);
+        let v_ca_nocrl = BindClientVerifier::from_opts(
+            BindClientVerifyOpts {
+                roots: fx_roots,
+                root_hint_subjects: Vec::new(),
+                crls: inter1_crls,
+                mandatory: true,
+                crt_ignore_err: X509ErrMask::EMPTY,
+                ca_ignore_err: mask_no_crl,
+            },
+            TlsCryptoProvider::Ring,
+            &prov,
+        );
+        let (mut rev_leaf, _) = crate::config::load_cert_file(&fx.join("crl-leaf-revoked.pem")).expect("lr");
+        let inter1_pem = std::fs::read(fx.join("crl-inter1.crt")).expect("i1");
+        let mut rdr = std::io::BufReader::new(inter1_pem.as_slice());
+        for item in rustls_pemfile::read_all(&mut rdr) {
+            if let Ok(rustls_pemfile::Item::X509Certificate(c)) = item {
+                rev_leaf.push(c);
+            }
+        }
+        let (res, codes) = check(&v_ca_nocrl, rev_leaf);
+        assert!(matches!(res, Err(Error::InvalidCertificate(CertificateError::Revoked))), "{res:?}");
+        assert_eq!(codes, ClientVerifyCodes { verify: 23, crt_err: 23, ca_err: 3 });
     }
 }

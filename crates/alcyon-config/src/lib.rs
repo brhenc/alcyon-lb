@@ -48,7 +48,7 @@ pub use ast::{
     HashFunction, HashMethod, HashPreserveAffinity, HashType, UriHash,
     HeaderExp, HeadersBinOp, HttpAfterResAction, HttpAfterResRule, HttpReqAction, HttpReqRule, HttpResAction, RedirectCookie, RedirectKind, RedirectRule, DirectiveMessage,
     HeaderCapture, RE_CONN_FAILED, RE_DISCONNECTED, RE_EARLY_ERROR, RE_JUNK_RESPONSE, RE_STATUSES, RE_STATUS_MASK, RE_TIMEOUT, LOG_OPT_ASAP, LOG_STEP_ACCEPT, LOG_STEP_REQUEST, LOG_STEP_CONNECT, LOG_STEP_RESPONSE, LOG_STEP_CLOSE, LOG_STEP_ALL, H1_ADJ_CLIENT, H1_ADJ_SERVER, H1_DROP_REQ_TRAILERS, H1_DROP_RES_TRAILERS, LOG_OPT_DONTLOG_NORMAL, LOG_OPT_SEPARATE_ERRORS, HttpResRule, HttpReuse, ListenSection, LogConfig, LogFormatSpec, LogFacility, LogLevel, LogSample, LogTarget, LogForwardBind, LogForwardHost, LogForwardSection, Mode, RingFormat, RingSection, RingServer, RingServerAddr, RetriesValue,
-    ObserveMode, OnErrorMode, SampleRef, SectionKind, Server, ServerSsl, SslVerify, BindClientAuth, BindVerify, StatsConfig, StatusCodeSet, TlsCryptoProvider, TlsRange, TlsVersion,
+    ObserveMode, OnErrorMode, SampleRef, SectionKind, Server, ServerSsl, SslVerify, BindClientAuth, BindVerify, X509ErrMask, x509_v_err_code, X509_V_ERR_MAX, StatsConfig, StatusCodeSet, TlsCryptoProvider, TlsRange, TlsVersion,
     StickRule, StickRuleType, StickTableConfigAst, TcpReqConnAction, TcpReqConnRule,
     TcpReqContentAction, TcpReqContentRule, TcpResAction, TcpResContentRule, TcpReqSessionAction, TcpReqSessionRule,
     TimeoutConfig, UseBackendRule, UseServerRule, Userlist, UserlistUser,
