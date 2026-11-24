@@ -240,3 +240,66 @@ fn an_idle_keepalive_connection_does_not_hold_a_soft_stop_open() {
         started.elapsed()
     );
 }
+
+/// T660R: `SIGUSR1` wakes workers via `Lifecycle::wait` -> `Mailboxes::kick_all` (T659).
+/// A keep-alive client whose next request arrives right after `SIGUSR1` (once the
+/// listener is closed, before the stopping worker has gone genuinely quiet) must be
+/// answered with `Connection: close`, not dropped with an EOF by `close_idle_http_sessions`
+/// firing on the zero-task mailbox wakeup; meanwhile a silent keep-alive connection on the
+/// same process is still closed once the worker is quiet.
+#[test]
+fn sigusr1_mailbox_kick_does_not_close_active_keepalive_before_quiet_poll() {
+    let be = keepalive_backend();
+    let fe = common::reserve_addr();
+    let mut alcyon = Alcyon::start(
+        &http_config(fe, be, "  nbthread 1\n  hard-stop-after 5s\n"),
+        fe,
+    );
+
+    let mut active_ka = TcpStream::connect(fe).expect("connect active_ka");
+    active_ka.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("active req1");
+    active_ka.set_read_timeout(Some(Duration::from_secs(2))).expect("timeout");
+    let mut buf = [0u8; 4096];
+    let n = active_ka.read(&mut buf).expect("active resp1");
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+
+    let mut idle_ka = TcpStream::connect(fe).expect("connect idle_ka");
+    idle_ka.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("idle req1");
+    idle_ka.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+    let n = idle_ka.read(&mut buf).expect("idle resp1");
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+
+    // Let the worker settle into its idle poll before SIGUSR1 arrives.
+    thread::sleep(Duration::from_millis(50));
+
+    alcyon.signal(Signal::Usr1);
+    // Do NOT connect to `fe` here: an incoming connect before begin_soft_stop() wakes
+    // the listener with tasks_run > 0 and masks the mailbox-kick quiet bug. Wait 15 ms so
+    // SIGUSR1 -> Lifecycle::wait -> Mailboxes::kick_all -> begin_soft_stop() has run, while
+    // staying well below the 100 ms stopping quiet poll timeout.
+    thread::sleep(Duration::from_millis(15));
+    assert!(
+        TcpStream::connect(fe).is_err(),
+        "listener must be closed after SIGUSR1 soft stop"
+    );
+
+    active_ka.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").expect("active req2");
+    let resp = read_until_close(&mut active_ka, Duration::from_secs(2));
+    let lower = resp.to_ascii_lowercase();
+    assert!(
+        lower.starts_with("http/1.1 200") && lower.contains("\r\nconnection: close\r\n"),
+        "active keep-alive connection was closed immediately on SIGUSR1 instead of serving Connection: close; got {resp:?}"
+    );
+
+    // Control: the silent keep-alive connection is closed once the stopping worker goes quiet,
+    // and the process exits cleanly before hard-stop-after.
+    let started = Instant::now();
+    let n = idle_ka.read(&mut buf).expect("idle_ka EOF");
+    assert_eq!(n, 0, "idle_ka should close with EOF, got {:?}", &buf[..n]);
+    let st = alcyon.wait_exit(Duration::from_secs(3));
+    assert!(
+        st.is_some_and(|s| s.success()) && started.elapsed() < Duration::from_millis(3000),
+        "stopping process did not close silent keep-alive and exit cleanly; st={st:?} after {:?}",
+        started.elapsed()
+    );
+}
