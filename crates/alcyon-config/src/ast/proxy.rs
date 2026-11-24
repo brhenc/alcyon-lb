@@ -728,7 +728,8 @@ pub struct StatsConfig {
     pub show_node: Option<Box<str>>,
     /// A `stats` line of the proxy's own has dropped what `defaults` set (see `detach`).
     pub detached: bool,
-    /// `stats auth`, `realm`, `show-version` and `http-request`; boxed, as almost no proxy has them.
+    /// `stats auth`, `realm`, `show-version`, `http-request` and `scope`; boxed, as almost no
+    /// proxy has any of them.
     pub auth: Option<Box<StatsAuth>>,
     pub raw_timeouts: TimeoutConfig,
     pub forwardfor: Option<String>,
@@ -747,7 +748,8 @@ pub struct StatsConfig {
     pub accept_unsafe_response: bool,
 }
 
-/// What `stats auth`, `stats realm`, `stats show-version` and `stats http-request` set.
+/// What `stats auth`, `stats realm`, `stats show-version`, `stats http-request` and
+/// `stats scope` set.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StatsAuth {
     /// `stats auth <user>:<password>`, in the order written (a repeated user is ignored).
@@ -758,6 +760,10 @@ pub struct StatsAuth {
     pub show_version: bool,
     /// `stats http-request`, then the rule `stats auth` becomes (see `finish_stats_auth`).
     pub http_req_rules: Vec<HttpReqRule>,
+    /// `stats scope <proxy>`, in the order written (a repeated name is ignored, as in
+    /// HAProxy's `stats_add_scope`). `.` names the proxy serving the page. The stats page
+    /// shows a proxy only when its name is here, or when the list is empty (no scope line).
+    pub scopes: Vec<Box<str>>,
 }
 
 impl StatsConfig {
@@ -789,6 +795,13 @@ impl StatsConfig {
     #[must_use]
     pub fn show_version(&self) -> bool {
         self.auth.as_deref().is_some_and(|a| a.show_version)
+    }
+
+    /// The `stats scope` names, in the order written (HAProxy's `uri_auth->scope`); `None`
+    /// when no scope line was written, in which case every proxy is in scope.
+    #[must_use]
+    pub fn scope_names(&self) -> Option<&[Box<str>]> {
+        self.auth.as_deref().filter(|a| !a.scopes.is_empty()).map(|a| &*a.scopes)
     }
 
     /// What a proxy takes from the `defaults` it follows. HAProxy shares the defaults' whole

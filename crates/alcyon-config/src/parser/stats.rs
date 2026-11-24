@@ -142,8 +142,20 @@ pub(crate) fn parse_stats_directive(
             }
             Ok(())
         }
+        "scope" => {
+            // `stats_add_scope`: each name once, in the order written; `.` means the proxy
+            // serving the page (matched when the page is built).
+            let Some(name) = tokens.get(2).filter(|t| !t.text.is_empty()) else {
+                return Err(ConfigError::new(kw.line, kw.col, "'scope' needs a proxy name."));
+            };
+            let scopes = &mut stats.auth.get_or_insert_default().scopes;
+            if !scopes.iter().any(|s| &**s == name.text) {
+                scopes.push(name.text.as_str().into());
+            }
+            Ok(())
+        }
         // HAProxy's, which Alcyon does not implement: refused rather than dropped.
-        w @ ("scope" | "show-modules") => Err(ConfigError::new(
+        w @ "show-modules" => Err(ConfigError::new(
             kw.line,
             kw.col,
             format!("'stats {w}' is not implemented: Alcyon would serve the stats page without it."),

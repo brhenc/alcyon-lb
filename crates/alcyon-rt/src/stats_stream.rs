@@ -55,6 +55,10 @@ pub struct Ctx<'a> {
     pub pid: u32,
     /// The `stats` section of the proxy that serves the page.
     pub cfg: &'a alcyon_config::StatsConfig,
+    /// The index of the proxy that serves the page, for the `stats scope` check (a `.`
+    /// names it); `u32::MAX` when there is no serving proxy -- the CLI, which is never
+    /// scoped, as HAProxy passes no proxy to its scope check.
+    pub serving: u32,
     /// The text of the banner the page shows for a `;st=` code; called only when the unit
     /// that holds it is next.
     pub banner: &'a dyn Fn(crate::stats_post::StCode) -> String,
@@ -96,10 +100,10 @@ fn next_unit(page: &mut Page, ctx: &Ctx<'_>, out: &mut String) -> bool {
     match page {
         Page::Html(cur, code) => {
             let banner = code.filter(|_| cur.at_banner()).map(|c| (ctx.banner)(c));
-            cur.next_unit(ctx.proxies, ctx.checks, ctx.pid, ctx.cfg, banner.as_deref(), out)
+            cur.next_unit(ctx.proxies, ctx.checks, ctx.pid, ctx.cfg, ctx.serving, banner.as_deref(), out)
         }
-        Page::Rows(cur) => cur.next_unit(ctx.proxies, ctx.checks, ctx.pid, out),
-        Page::Json(cur) => cur.next_unit(ctx.proxies, ctx.checks, ctx.pid, out),
+        Page::Rows(cur) => cur.next_unit(ctx.proxies, ctx.checks, ctx.pid, ctx.serving, out),
+        Page::Json(cur) => cur.next_unit(ctx.proxies, ctx.checks, ctx.pid, ctx.cfg.scope_names(), ctx.serving, out),
         Page::Text(text, sent) => {
             if *sent {
                 return false;
@@ -251,13 +255,13 @@ mod tests {
         let checks: Vec<ServerCheckState> = Vec::new();
         let cfg = alcyon_config::StatsConfig::default();
         let banner = |c: crate::stats_post::StCode| c.banner("/s");
-        let ctx = Ctx { proxies: &proxies, checks: &checks, pid: 7, cfg: &cfg, banner: &banner };
+        let ctx = Ctx { proxies: &proxies, checks: &checks, pid: 7, cfg: &cfg, serving: u32::MAX, banner: &banner };
         let done = crate::stats_post::StCode::Done;
         type Make<'a> = Box<dyn Fn() -> (Page, String) + 'a>;
         let pages: [Make<'_>; 5] = [
-            Box::new(|| (Page::Html(HtmlCursor::new(), None), crate::stats_html::render_stats_html_for(&proxies, &checks, 7, &cfg))),
+            Box::new(|| (Page::Html(HtmlCursor::new(), None), crate::stats_html::render_stats_html_for(&proxies, &checks, 7, &cfg, u32::MAX))),
             Box::new(|| {
-                let html = crate::stats_html::render_stats_html_for(&proxies, &checks, 7, &cfg);
+                let html = crate::stats_html::render_stats_html_for(&proxies, &checks, 7, &cfg, u32::MAX);
                 (Page::Html(HtmlCursor::new(), Some(done)), crate::stats_post::with_banner(html, &done.banner("/s")))
             }),
             Box::new(|| (Page::Rows(StatCursor::csv()), crate::stats::format_show_stat(&proxies, &checks, 7))),
@@ -301,7 +305,7 @@ mod tests {
         let proxies = proxies(1, 2);
         let banner = |c: crate::stats_post::StCode| c.banner("/s");
         let cfg = alcyon_config::StatsConfig::default();
-        let ctx = Ctx { proxies: &proxies, checks: &[], pid: 1, cfg: &cfg, banner: &banner };
+        let ctx = Ctx { proxies: &proxies, checks: &[], pid: 1, cfg: &cfg, serving: u32::MAX, banner: &banner };
         let mut d = Dump::new(Page::Rows(StatCursor::csv()), true, 0);
         assert_eq!(fill(&mut d, &ctx, &mut [0u8; MIN_ROOM - 1]), 0);
         let mut buf = vec![0u8; 1 << 16];
@@ -329,7 +333,7 @@ mod tests {
         // Only server rows asked for, and there are none.
         let mut cur = StatCursor::new(crate::stats::StatFormat::Json, None, Some(4), None);
         let mut out = String::new();
-        while cur.next_unit(&proxies, &[], 1, &mut out) {}
+        while cur.next_unit(&proxies, &[], 1, u32::MAX, &mut out) {}
         assert_eq!(out, "[]\n");
     }
 }

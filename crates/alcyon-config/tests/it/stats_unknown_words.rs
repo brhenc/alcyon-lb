@@ -15,12 +15,29 @@ fn cfg(line: &str) -> Result<alcyon_config::Config, alcyon_config::ConfigError> 
 #[test]
 fn the_stats_words_alcyon_does_not_implement_are_refused() {
     for line in [
-        "stats scope be",
         "stats show-modules",
     ] {
         let e = cfg(line).expect_err(line);
         assert!(e.to_string().contains("is not implemented"), "{line}: {e}");
     }
+}
+
+#[test]
+fn stats_scope_parses_its_names() {
+    for (line, want) in [
+        ("stats scope be", &["be"][..]),
+        ("stats scope px1\n  stats scope px2", &["px1", "px2"][..]),
+        ("stats scope .", &["."][..]),
+    ] {
+        let c = cfg(line).expect(line);
+        let got: Vec<&str> = c.frontends[0].stats.scope_names().unwrap_or(&[]).iter().map(|s| &**s).collect();
+        assert_eq!(got.as_slice(), want, "{line}: the scope names in the order written");
+    }
+    // A repeated name is written once (HAProxy's `stats_add_scope`).
+    let c = cfg("stats scope be\n  stats scope be").expect("scope be twice");
+    assert_eq!(c.frontends[0].stats.scope_names().unwrap_or(&[]).len(), 1);
+    // No name: HAProxy's error, in the same words.
+    assert!(cfg("stats scope").expect_err("bare scope").to_string().contains("'scope' needs a proxy name."));
 }
 
 #[test]

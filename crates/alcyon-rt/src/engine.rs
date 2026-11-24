@@ -20296,7 +20296,7 @@ fn stats_stream_page(
     let head_only = entry.sess.strm.txn.as_ref().is_some_and(|t| t.client_head);
     let uri = entry.sess.req_uri.as_deref().unwrap_or("").to_string();
     let banner = |c: crate::stats_post::StCode| EngineDispatcher::stats_banner(proxies, serving, &uri, c);
-    let ctx = crate::stats_stream::Ctx { proxies, checks, pid, cfg: &proxies[serving].stats_config, banner: &banner };
+    let ctx = crate::stats_stream::Ctx { proxies, checks, pid, cfg: &proxies[serving].stats_config, serving: serving as u32, banner: &banner };
     if head_only {
         stats_write_page(entry, proxies, content_type, refresh, b"");
         return;
@@ -20340,7 +20340,7 @@ fn stats_pump(sess: &mut crate::proxy::TcpSession, mut d: crate::stats_stream::D
     let serving = d.serving as usize;
     let uri = sess.req_uri.as_deref().unwrap_or("");
     let banner = |c: crate::stats_post::StCode| EngineDispatcher::stats_banner(proxies, serving, uri, c);
-    let ctx = crate::stats_stream::Ctx { proxies, checks, pid, cfg: &proxies[serving].stats_config, banner: &banner };
+    let ctx = crate::stats_stream::Ctx { proxies, checks, pid, cfg: &proxies[serving].stats_config, serving: serving as u32, banner: &banner };
     // `writable` compacts a buffer whose consumed head leaves the tail exhausted.
     let n = crate::stats_stream::fill(&mut d, &ctx, sess.rep.writable());
     sess.rep.commit(n);

@@ -1418,7 +1418,7 @@ impl CliApplet {
         let Some(mut d) = self.stat_dump.take() else { return };
         let none = |_| String::new();
         let cfg = alcyon_config::StatsConfig::default();
-        let sctx = crate::stats_stream::Ctx { proxies: ctx.proxies, checks: ctx.checks, pid: ctx.pid, cfg: &cfg, banner: &none };
+        let sctx = crate::stats_stream::Ctx { proxies: ctx.proxies, checks: ctx.checks, pid: ctx.pid, cfg: &cfg, serving: u32::MAX, banner: &none };
         self.out_buf.resize(STAT_CHUNK, 0);
         let n = crate::stats_stream::fill(&mut d, &sctx, &mut self.out_buf);
         self.out_buf.truncate(n);
