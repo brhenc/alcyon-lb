@@ -1208,7 +1208,8 @@ pub fn format_show_stat_as(
 ) -> String {
     let mut out = String::with_capacity(4096);
     let mut cur = StatCursor::new(fmt, iid_filter, type_filter, sid_filter);
-    while cur.next_unit(proxies, checks, pid, &mut out) {}
+    // The CLI is never scoped: no serving proxy (`u32::MAX`), as in HAProxy.
+    while cur.next_unit(proxies, checks, pid, u32::MAX, &mut out) {}
     out
 }
 
@@ -1296,7 +1297,16 @@ impl StatCursor {
 
     /// Writes the next unit of the dump to `out` -- the header, one row, or the end -- and
     /// returns `true`; `false` once the dump is over (nothing written).
-    pub fn next_unit(&mut self, proxies: &crate::table::Table, checks: &[ServerCheckState], pid: u32, out: &mut String) -> bool {
+    ///
+    /// `serving_idx` is the index of the proxy that serves the page, for the config's
+    /// `stats scope` check (its `stats_config.scope_names()`); `u32::MAX` when there is no
+    /// serving proxy -- the CLI's `show stat`, which HAProxy never scopes.
+    pub fn next_unit(&mut self, proxies: &crate::table::Table, checks: &[ServerCheckState], pid: u32, serving_idx: u32, out: &mut String) -> bool {
+        // The `stats scope` names of the serving page, read once per unit: `None` (no
+        // serving proxy, or no scope line) means every proxy is in scope.
+        let scopes = (serving_idx != u32::MAX)
+            .then(|| proxies.get(serving_idx as usize).map_or(None, |sp| sp.stats_config.scope_names()))
+            .flatten();
         let start = out.len();
         loop {
             let i = self.px as usize;
@@ -1323,8 +1333,11 @@ impl StatCursor {
                     self.s = 0;
                     // The page's `;scope=` keeps out the proxies whose name does not hold
                     // the text (`STAT_PX_ST_INIT`, `strnistr` on the id): skipped whole.
+                    // The config's `stats scope` skips what the serving page does not name
+                    // exactly (its `.` being the serving proxy itself): skipped whole.
                     let skip = self.iid.is_some_and(|f| f != -1 && u32::try_from(f).ok() != Some(p.ids.iid))
-                        || !self.scope_in(p.name.as_str());
+                        || !self.scope_in(p.name.as_str())
+                        || !crate::stats_html::in_scope(p.name.as_str(), j == serving_idx as usize, scopes);
                     self.step = if skip { ST_PROXY } else { ST_FRONTEND };
                 }
                 ST_FRONTEND => {

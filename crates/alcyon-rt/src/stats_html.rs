@@ -36,7 +36,7 @@ pub fn format_bytes(bytes: u64) -> String {
 /// Renders the complete, modern single-page HTML stats and administration dashboard.
 #[must_use]
 pub fn render_stats_html(proxies: &crate::table::Table, checks: &[ServerCheckState], pid: u32) -> String {
-    render_stats_html_for(proxies, checks, pid, &alcyon_config::StatsConfig::default())
+    render_stats_html_for(proxies, checks, pid, &alcyon_config::StatsConfig::default(), u32::MAX)
 }
 
 /// `text` as HTML text and attribute content: a stick-table key is whatever a client sent
@@ -61,20 +61,33 @@ fn proxy_desc(proxy: &Proxy) -> String {
     proxy.desc.as_deref().map_or(String::new(), |d| format!(r#"<div class="desc">{d}</div>"#))
 }
 
+/// HAProxy's `stats_proxy_in_scope`: no `stats scope` line, every proxy is in scope; with
+/// one, a proxy is in scope only when a scope line names it exactly (case-sensitive, no
+/// prefix) or names `.` and it is the proxy serving the page.
+#[must_use]
+pub fn in_scope(name: &str, is_serving: bool, scopes: Option<&[Box<str>]>) -> bool {
+    let Some(scopes) = scopes else {
+        return true;
+    };
+    scopes.iter().any(|s| &**s == name || (is_serving && &**s == "."))
+}
+
 /// [`render_stats_html`] for the page served by the proxy whose `stats` section is
 /// `serving`: its `show-node` and `show-desc` go in the title and the report heading
 /// ("Statistics Report for pid N on <node>: <desc>", the description unescaped, as
-/// HAProxy prints it).
+/// HAProxy prints it). `serving_idx` is the serving proxy's index for the `stats scope`
+/// check; `u32::MAX` when there is none.
 #[must_use]
 pub fn render_stats_html_for(
     proxies: &crate::table::Table,
     checks: &[ServerCheckState],
     pid: u32,
     serving: &alcyon_config::StatsConfig,
+    serving_idx: u32,
 ) -> String {
     let mut out = String::with_capacity(32768);
     let mut cur = HtmlCursor::new();
-    while cur.next_unit(proxies, checks, pid, serving, None, &mut out) {}
+    while cur.next_unit(proxies, checks, pid, serving, serving_idx, None, &mut out) {}
     out
 }
 
@@ -135,7 +148,9 @@ impl HtmlCursor {
 
     /// Writes the next unit of the page to `out` and returns `true`; `false` once the page
     /// is over. `banner` is put after the opening of the container, in the unit
-    /// [`Self::at_banner`] names.
+    /// [`Self::at_banner`] names. A proxy is shown only when [`in_scope`] holds for it
+    /// against the serving page's `stats scope` lines (`serving.scope_names()`); `serving_idx`
+    /// is the serving proxy's index, `u32::MAX` when there is none.
     #[allow(clippy::too_many_arguments)]
     pub fn next_unit(
         &mut self,
@@ -143,9 +158,12 @@ impl HtmlCursor {
         checks: &[ServerCheckState],
         pid: u32,
         serving: &alcyon_config::StatsConfig,
+        serving_idx: u32,
         banner: Option<&str>,
         out: &mut String,
     ) -> bool {
+        // The `stats scope` names, read once per unit: `None` when the page has no scope.
+        let scopes = serving.scope_names();
         loop {
             match self.step {
                 H_CSS => {
@@ -530,11 +548,15 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                     return true;
                 }
                 H_FE => {
-                    let Some(proxy) = proxies.get(self.p as usize) else {
+                    let idx = self.p as usize;
+                    let Some(proxy) = proxies.get(idx) else {
                         self.step = H_FE_END;
                         continue;
                     };
                     self.p += 1;
+                    if !in_scope(proxy.name.as_str(), idx == serving_idx as usize, scopes) {
+                        continue;
+                    }
                     if proxy.addr.port() > 0
                         || proxy.ids.first_unix_bind.is_some()
                         || proxy.default_backend.is_some()
@@ -608,10 +630,15 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                     return true;
                 }
                 H_BE => {
-                    let Some(proxy) = proxies.get(self.p as usize) else {
+                    let idx = self.p as usize;
+                    let Some(proxy) = proxies.get(idx) else {
                         self.step = H_BE_END;
                         continue;
                     };
+                    if !in_scope(proxy.name.as_str(), idx == serving_idx as usize, scopes) {
+                        self.p += 1;
+                        continue;
+                    }
                     if proxy.srv_set().is_empty() {
                         self.p += 1;
                         continue;
@@ -839,10 +866,15 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                     return true;
                 }
                 H_ST => {
-                    let Some(proxy) = proxies.get(self.p as usize) else {
+                    let idx = self.p as usize;
+                    let Some(proxy) = proxies.get(idx) else {
                         self.step = H_TAIL;
                         continue;
                     };
+                    if !in_scope(proxy.name.as_str(), idx == serving_idx as usize, scopes) {
+                        self.p += 1;
+                        continue;
+                    }
                     let Some(ref tbl) = proxy.stick_table else {
                         self.p += 1;
                         continue;
