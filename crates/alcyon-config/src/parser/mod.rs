@@ -959,7 +959,7 @@ fn check_bind_client_auth(
         let Some(ca) = bind.client_auth.as_deref() else {
             return Ok(());
         };
-        let bind_arg = if ca.bind_arg.is_empty() { bind.addr.to_string() } else { ca.bind_arg.clone() };
+        let bind_arg = if ca.bind_arg.is_empty() { bind.display_addr() } else { ca.bind_arg.clone() };
         for (kw, path) in [
             ("ca-file", ca.ca_file.as_deref()),
             ("ca-verify-file", ca.ca_verify_file.as_deref()),

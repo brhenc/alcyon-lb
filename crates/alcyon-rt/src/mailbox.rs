@@ -81,8 +81,11 @@ pub struct SessSnap {
     /// What `age=` counts from: the request's first byte for HTTP (`request_ts`).
     pub since: std::time::Instant,
     pub proto: &'static str,
-    /// The client address, `None` for a CLI connection (`src=unix:1`).
+    /// The client address, `None` for a CLI or `AF_UNIX` bind connection (`src=unix:<so_id>`).
     pub src: Option<std::net::SocketAddr>,
+    /// Listener numeric id (`luid`, `so_id`): what `show sess` prints after `unix:` for an
+    /// `AF_UNIX` client (`1` for the CLI applet).
+    pub so_id: u32,
     /// Proxy indices: the frontend (`None`: the CLI's `GLOBAL`), the backend if it is one,
     /// and the server.
     pub fe: Option<usize>,

@@ -30,6 +30,9 @@ pub struct LogData<'a> {
     pub client: Option<SocketAddr>,
     /// The address the client connected to.
     pub frontend_addr: Option<SocketAddr>,
+    /// Listener numeric id (`luid`) when the client connected over a UNIX bind (`%ci`/`%fi`
+    /// print `unix`, `%cp`/`%fp` print this id); `0` for inet binds.
+    pub unix_luid: u32,
     /// The server connection's destination.
     pub server_addr: Option<SocketAddr>,
     /// The server connection's local address (`%bi`, `%bp`).
@@ -100,6 +103,11 @@ impl<'a> LogData<'a> {
         LogData {
             client: ctx.client_addr(),
             frontend_addr: ctx.server_addr(),
+            unix_luid: if ctx.client_addr().is_none() || ctx.server_addr().is_none() {
+                ctx.so_id.unwrap_or(0)
+            } else {
+                0
+            },
             server_addr: ctx.bc_dst,
             backend_addr: ctx.bc_src,
             frontend: ctx.fe_name.unwrap_or_default(),
@@ -129,6 +137,7 @@ impl Default for LogData<'_> {
         LogData {
             client: None,
             frontend_addr: None,
+            unix_luid: 0,
             server_addr: None,
             backend_addr: None,
             frontend: "",
@@ -1370,14 +1379,39 @@ fn port(out: &mut Out, a: Option<SocketAddr>, o: Opts) {
     }
 }
 
+fn ip_or_unix(out: &mut Out, a: Option<SocketAddr>, unix_luid: u32, o: Opts) {
+    if a.is_none() && unix_luid != 0 {
+        if o.quote {
+            out.push_str("\"unix\"");
+        } else {
+            out.push_str("unix");
+        }
+    } else {
+        ip(out, a, o);
+    }
+}
+
+fn port_or_unix(out: &mut Out, a: Option<SocketAddr>, unix_luid: u32, o: Opts) {
+    if a.is_none() && unix_luid != 0 {
+        // HAProxy prints `l->luid` in decimal for AF_UNIX even when `+X` is set.
+        let _ = write!(out, "{unix_luid}");
+    } else {
+        port(out, a, o);
+    }
+}
+
 /// The line `HAProxy` writes for a connection that failed before it was a stream
 /// (`session_embryonic_build_legacy_err`): `<src>:<port> [<accept date>] <fe>/<listener>:
-/// <message>`. The listener is its name if it has one, else its numeric id; a client with
-/// no address is `unknown`.
+/// <message>`. The listener is its name if it has one, else its numeric id; a client on a
+/// UNIX bind is `unix:<luid>`, and one with no address is `unknown`.
 #[must_use]
-pub fn connection_error_line(client: Option<SocketAddr>, accept_date: (i64, u32), frontend: &str, listener: &str, message: &str) -> String {
+pub fn connection_error_line(client: Option<SocketAddr>, unix_luid: u32, accept_date: (i64, u32), frontend: &str, listener: &str, message: &str) -> String {
     let mut out = Out(Vec::new());
-    let who = client.map_or_else(|| "unknown".to_string(), |a| format!("{}:{}", a.ip(), a.port()));
+    let who = match client {
+        Some(a) => format!("{}:{}", a.ip(), a.port()),
+        None if unix_luid != 0 => format!("unix:{unix_luid}"),
+        None => "unknown".to_string(),
+    };
     let _ = write!(out, "{who} [");
     date_ms(&mut out, accept_date.0, accept_date.1);
     let _ = write!(out, "] {frontend}/{listener}: {message}");
@@ -1557,10 +1591,10 @@ fn alias(out: &mut Out, a: Alias, o: Opts, d: &LogData, origin: Option<&'static 
             }
         }
         Alias::Server => text(out, Some(d.server.unwrap_or("<NOSRV>")), o),
-        Alias::ClientIp => ip(out, d.client, o),
-        Alias::ClientPort => port(out, d.client, o),
-        Alias::FrontendIp => ip(out, d.frontend_addr, o),
-        Alias::FrontendPort => port(out, d.frontend_addr, o),
+        Alias::ClientIp => ip_or_unix(out, d.client, d.unix_luid, o),
+        Alias::ClientPort => port_or_unix(out, d.client, d.unix_luid, o),
+        Alias::FrontendIp => ip_or_unix(out, d.frontend_addr, d.unix_luid, o),
+        Alias::FrontendPort => port_or_unix(out, d.frontend_addr, d.unix_luid, o),
         Alias::ServerIp => ip(out, d.server_addr, o),
         Alias::ServerPort => port(out, d.server_addr, o),
         Alias::BackendIp => ip(out, d.backend_addr, o),
@@ -1745,5 +1779,20 @@ fn sample(out: &mut Out, s: &Sample, o: Opts, cast: Cast, converted: bool) {
             }
         }
         Sample::Meth(v) => text(out, Some(v.as_str()), o),
+    }
+}
+
+#[cfg(test)]
+mod unix_logfmt_tests {
+    use super::*;
+
+    #[test]
+    fn connection_error_line_formats_inet_unix_and_unknown() {
+        let inet = connection_error_line(Some("127.0.0.1:5555".parse().expect("addr")), 0, (0, 0), "fe", "1", "err");
+        assert!(inet.starts_with("127.0.0.1:5555 ["), "{inet}");
+        let unix = connection_error_line(None, 23, (0, 0), "fe", "tlsbind", "err");
+        assert!(unix.starts_with("unix:23 ["), "{unix}");
+        let unk = connection_error_line(None, 0, (0, 0), "fe", "1", "err");
+        assert!(unk.starts_with("unknown ["), "{unk}");
     }
 }

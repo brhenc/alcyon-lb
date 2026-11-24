@@ -290,14 +290,14 @@ impl BindPlan {
             alcyon_config::stderr_line!(
                 "[alcyon] warning: bind {}: ALPN '{p}' is not served by this build and was \
                  not advertised",
-                bind.addr
+                bind.display_addr()
             );
         }
         if supported.is_empty() {
             return Err(format!(
                 "bind {}: none of the requested ALPN protocols ({}) are served by this \
                  build; a client offering only those would have nothing to negotiate",
-                bind.addr,
+                bind.display_addr(),
                 unsupported.join(", ")
             ));
         }
@@ -328,12 +328,12 @@ impl BindPlan {
             // QUIC is TLS 1.3 by definition (RFC 9001): never offer 1.2 there, whatever
             // the TCP binds of the proxy do.
             if !versions.tls13 {
-                return Err(format!("bind {}: QUIC needs TLS 1.3, which 'ssl-max-ver' rules out", bind.addr));
+                return Err(format!("bind {}: QUIC needs TLS 1.3, which 'ssl-max-ver' rules out", bind.display_addr()));
             }
             versions.tls12 = false;
         }
         if versions.is_empty() {
-            return Err(format!("all SSL/TLS versions are disabled for bind '{}'", bind.addr));
+            return Err(format!("all SSL/TLS versions are disabled for bind '{}'", bind.display_addr()));
         }
         Ok(versions)
     }

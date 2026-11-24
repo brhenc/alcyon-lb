@@ -48,7 +48,7 @@ use std::io::{self, IoSlice, IoSliceMut, Write};
 use std::net::SocketAddr;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -61,12 +61,21 @@ const SEND_BUDGET: Duration = Duration::from_secs(1);
 
 static EXPOSE_ENABLED: AtomicBool = AtomicBool::new(false);
 static EXPOSED: Mutex<Vec<(Kind, SocketAddr, OwnedFd)>> = Mutex::new(Vec::new());
+static EXPOSED_UNIX: Mutex<Vec<(PathBuf, OwnedFd)>> = Mutex::new(Vec::new());
 /// `_getsocks` has sent this process's listeners to another process, which may serve on
 /// them now: they are shared, and a pause must not disconnect them ([`handed_over`]).
 static HANDED_OVER: AtomicBool = AtomicBool::new(false);
 /// The sockets handed to one worker, by kind and address.
 type PerWorker = HashMap<(Kind, SocketAddr), Vec<OwnedFd>>;
 static INHERITED: Mutex<Vec<PerWorker>> = Mutex::new(Vec::new());
+static INHERITED_UNIX: std::sync::LazyLock<Mutex<HashMap<PathBuf, OwnedFd>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The sockets fetched from an old process over `_getsocks`.
+pub struct Fetched {
+    pub inet: Vec<(Kind, SocketAddr, OwnedFd)>,
+    pub unix: Vec<(PathBuf, OwnedFd)>,
+}
 
 /// What a handed-over socket is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -123,9 +132,25 @@ pub fn expose_kind(kind: Kind, addr: SocketAddr, fd: BorrowedFd<'_>) -> io::Resu
     Ok(())
 }
 
+/// Registers a UNIX domain listening socket so `_getsocks` can hand it over.
+///
+/// # Errors
+/// Propagates a failure to duplicate the descriptor.
+pub fn expose_unix(path: &Path, fd: BorrowedFd<'_>) -> io::Result<()> {
+    if !expose_enabled() {
+        return Ok(());
+    }
+    let dup = fd.try_clone_to_owned()?;
+    EXPOSED_UNIX.lock().map_err(|_| io::Error::other("poisoned"))?.push((path.to_path_buf(), dup));
+    Ok(())
+}
+
 /// Drops every registered listener. Called when a soft stop closes the listeners.
 pub fn withdraw_all() {
     if let Ok(mut g) = EXPOSED.lock() {
+        g.clear();
+    }
+    if let Ok(mut g) = EXPOSED_UNIX.lock() {
         g.clear();
     }
 }
@@ -143,18 +168,24 @@ pub fn serve_getsocks(stream: &UnixStream) -> io::Result<usize> {
     }
     // Duplicates, so that the registry is not held while a client that does not read keeps
     // the send waiting: listeners registering or withdrawing would wait with it.
-    let exposed: Vec<(Kind, SocketAddr, OwnedFd)> = {
+    let mut entries: Vec<(String, OwnedFd)> = {
         let reg = EXPOSED.lock().map_err(|_| io::Error::other("poisoned"))?;
-        reg.iter().map(|(k, a, fd)| fd.try_clone().map(|fd| (*k, *a, fd))).collect::<io::Result<_>>()?
+        reg.iter().map(|(k, a, fd)| fd.try_clone().map(|fd| (format!("{} {a}", k.word()), fd))).collect::<io::Result<_>>()?
     };
+    {
+        let reg = EXPOSED_UNIX.lock().map_err(|_| io::Error::other("poisoned"))?;
+        for (p, fd) in reg.iter() {
+            entries.push((format!("unix {}", p.display()), fd.try_clone()?));
+        }
+    }
     // The whole answer gets this long, not each message.
     let deadline = Instant::now() + SEND_BUDGET;
-    for chunk in exposed.chunks(BATCH) {
+    for chunk in entries.chunks(BATCH) {
         let mut text = format!("ALCYONFD {}\n", chunk.len());
-        for (kind, addr, _) in chunk {
-            let _ = writeln!(text, "{} {addr}", kind.word());
+        for (line, _) in chunk {
+            let _ = writeln!(text, "{line}");
         }
-        let fds: Vec<BorrowedFd<'_>> = chunk.iter().map(|(_, _, fd)| fd.as_fd()).collect();
+        let fds: Vec<BorrowedFd<'_>> = chunk.iter().map(|(_, fd)| fd.as_fd()).collect();
         let mut space = vec![0u8; rustix::cmsg_space!(ScmRights(BATCH))];
         let mut control = SendAncillaryBuffer::new(&mut space);
         if !control.push(SendAncillaryMessage::ScmRights(&fds)) {
@@ -164,10 +195,10 @@ pub fn serve_getsocks(stream: &UnixStream) -> io::Result<usize> {
     }
     let mut end = stream;
     end.write_all(b"END\n")?;
-    if !exposed.is_empty() {
+    if !entries.is_empty() {
         HANDED_OVER.store(true, Ordering::Relaxed);
     }
-    Ok(exposed.len())
+    Ok(entries.len())
 }
 
 /// Whether `_getsocks` has handed this process's listeners to another process. A `SIGTTOU`
@@ -211,7 +242,7 @@ fn retry_eagain<T>(deadline: Instant, mut f: impl FnMut() -> rustix::io::Result<
 /// # Errors
 /// Propagates connection, protocol, and descriptor-count failures. The caller treats any
 /// error as "bind fresh", which is a graceful reload rather than a hitless one.
-pub fn fetch(sock: &Path) -> io::Result<Vec<(Kind, SocketAddr, OwnedFd)>> {
+pub fn fetch(sock: &Path) -> io::Result<Fetched> {
     let mut stream = UnixStream::connect(sock)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.write_all(b"_getsocks\n")?;
@@ -249,24 +280,52 @@ pub fn fetch(sock: &Path) -> io::Result<Vec<(Kind, SocketAddr, OwnedFd)>> {
             format!("old process did not complete _getsocks: {}", text.trim()),
         ));
     }
-    let addrs: Vec<(Kind, SocketAddr)> = text
-        .lines()
-        .filter_map(|l| {
-            l.strip_prefix("tcp ")
-                .map(|a| (Kind::Tcp, a))
-                .or_else(|| l.strip_prefix("udp ").map(|a| (Kind::Udp, a)))
-                .or_else(|| l.strip_prefix("quic ").map(|a| (Kind::Quic, a)))
-        })
-        .map(|(k, a)| a.parse().map(|a| (k, a)))
-        .collect::<Result<_, _>>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad address: {e}")))?;
-    if addrs.len() != fds.len() {
+    enum Entry {
+        Inet(Kind, SocketAddr),
+        Unix(PathBuf),
+    }
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("unix ") {
+            entries.push(Entry::Unix(PathBuf::from(rest)));
+        } else if let Some((kind, addr)) = line
+            .strip_prefix("tcp ")
+            .map(|a| (Kind::Tcp, a))
+            .or_else(|| line.strip_prefix("udp ").map(|a| (Kind::Udp, a)))
+            .or_else(|| line.strip_prefix("quic ").map(|a| (Kind::Quic, a)))
+        {
+            let parsed = addr
+                .parse()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad address: {e}")))?;
+            entries.push(Entry::Inet(kind, parsed));
+        }
+    }
+    if entries.len() != fds.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{} addresses but {} descriptors", addrs.len(), fds.len()),
+            format!("{} addresses but {} descriptors", entries.len(), fds.len()),
         ));
     }
-    Ok(addrs.into_iter().zip(fds).map(|((k, a), fd)| (k, a, fd)).collect())
+    let mut inet = Vec::new();
+    let mut unix = Vec::new();
+    for (entry, fd) in entries.into_iter().zip(fds) {
+        match entry {
+            Entry::Inet(k, a) => inet.push((k, a, fd)),
+            Entry::Unix(p) => unix.push((p, fd)),
+        }
+    }
+    Ok(Fetched { inet, unix })
+}
+
+/// Spreads every socket from [`fetch`] across workers (inet) and the UNIX inheritance table.
+pub fn distribute_fetched(fetched: Fetched, nbthread: usize) {
+    distribute(fetched.inet, nbthread);
+    if let Ok(mut g) = INHERITED_UNIX.lock() {
+        g.clear();
+        for (path, fd) in fetched.unix {
+            g.insert(path, fd);
+        }
+    }
 }
 
 /// Spreads fetched sockets over `nbthread` workers: the i-th socket for an address goes to
@@ -285,6 +344,13 @@ pub fn distribute(sockets: Vec<(Kind, SocketAddr, OwnedFd)>, nbthread: usize) {
     if let Ok(mut g) = INHERITED.lock() {
         *g = per_worker;
     }
+}
+
+/// Takes the inherited UNIX domain listening socket for `path`, if the old process handed
+/// one over.
+#[must_use]
+pub fn take_inherited_unix(path: &Path) -> Option<OwnedFd> {
+    INHERITED_UNIX.lock().ok().and_then(|mut g| g.remove(path))
 }
 
 /// The inherited sockets for `addr` that belong to `worker`, if any.
@@ -309,9 +375,36 @@ pub fn take_inherited_all(kind: Kind, addr: SocketAddr) -> Vec<OwnedFd> {
 /// binds. `HAProxy` does the same (`sock_drop_unused_old_sockets`, `src/haproxy.c:3738`).
 /// Returns how many were dropped.
 pub fn drop_unused_inherited() -> usize {
-    INHERITED.lock().map_or(0, |mut g| {
+    let inet = INHERITED.lock().map_or(0, |mut g| {
         let n = g.iter().map(|m| m.values().map(Vec::len).sum::<usize>()).sum();
         g.clear();
         n
-    })
+    });
+    let unix = INHERITED_UNIX.lock().map_or(0, |mut g| {
+        let n = g.len();
+        g.clear();
+        n
+    });
+    inet + unix
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetch_refuses_mismatched_descriptor_count() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let sock = dir.path().join("gs.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 64];
+            let _ = std::io::Read::read(&mut s, &mut buf);
+            let _ = s.write_all(b"ALCYONFD 1\nunix /tmp/missing.sock\nEND\n");
+        });
+        let err = fetch(&sock).err().expect("must fail on descriptor mismatch");
+        assert!(err.to_string().contains("1 addresses but 0 descriptors"), "{err}");
+        let _ = h.join();
+    }
 }

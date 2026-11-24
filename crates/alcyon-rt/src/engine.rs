@@ -1804,6 +1804,9 @@ pub struct ProxyIdInfo {
     pub checkcache: bool,
     /// `retry-on`, as the `alcyon_config::RE_*` bits: what a failed attempt is retried on.
     pub retry_on: u32,
+    /// First UNIX bind path of this proxy, if any (for HTML stats frontend listing when
+    /// the frontend has no inet bind). Kept in the boxed info so `Proxy` stays at its size.
+    pub first_unix_bind: Option<Box<str>>,
 }
 
 /// The proxies, built once by [`Engine::build_shared_state`] and shared by every worker,
@@ -2795,8 +2798,9 @@ impl Engine {
         let shared = crate::handover::handed_over();
         for l in &self.listeners {
             // One that cannot be disconnected (it cannot fail on a listening socket) is
-            // still no longer polled, as a shared one.
-            if !shared {
+            // still no longer polled, as a shared one. UNIX listeners are never disconnected
+            // either (HAProxy `uxst_suspend_receiver` only stops polling).
+            if !shared && !l.is_unix() {
                 let _ = l.pause();
             }
             let lfd = l.raw_fd();
@@ -2812,12 +2816,16 @@ impl Engine {
     /// (`global maxconn`, its frontend's `maxconn`) is left to the limit's own resume.
     fn resume_on_signal(&mut self) {
         let shared = crate::handover::handed_over();
+        let mut has_unix = false;
         self.sig_paused = false;
         let full = self.global_paused || self.accept_limited.is_some();
         for l in &self.listeners {
+            if l.is_unix() {
+                has_unix = true;
+            }
             // One that cannot listen again is not polled: a socket that is not listening
             // would be reported ready for ever.
-            let listening = shared || l.resume().is_ok();
+            let listening = shared || l.is_unix() || l.resume().is_ok();
             if !listening || full {
                 continue;
             }
@@ -2833,8 +2841,8 @@ impl Engine {
             let _ = self.poller.modify(l.borrowed_fd(), raw_fd_to_u64(lfd), true, false);
             self.fdtab.set_interest(lfd, Interest::READ);
         }
-        // Shared, they were only no longer polled: connections waited in their queues.
-        self.backlog_waits |= shared;
+        // Shared or UNIX, they were only no longer polled: connections waited in their queues.
+        self.backlog_waits |= shared || has_unix;
         // The proxies are reported before the stats sockets are bound back, so a name
         // refused is reported after them, as on `HAProxy` (measured).
         self.log_pause_or_resume("Resumed", false);
@@ -3054,6 +3062,86 @@ fn listeners_for(
         crate::handover::expose(l.addr(), l.borrowed_fd())?;
     }
     Ok(out)
+}
+
+static PREBOUND_UNIX: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, std::os::fd::OwnedFd>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Binds every enabled UNIX domain `bind` once before worker threads start, adopting any
+/// socket inherited through `-x` handover and exposing each socket for the next reload.
+/// Workers then clone (`dup`) the prebound descriptor in [`listeners_for_unix`], so
+/// `nbthread > 1` shares one listening socket on the path.
+///
+/// # Errors
+/// Fails on the first UNIX bind path that cannot be bound safely.
+pub fn prebind_unix(config: &Config) -> io::Result<()> {
+    let mut map = PREBOUND_UNIX.lock().map_err(|_| io::Error::other("poisoned"))?;
+    map.clear();
+    let listens = config
+        .listens
+        .iter()
+        .filter(|l| !l.disabled)
+        .map(|l| ("listen", l.name.as_str(), l.backlog, l.maxconn, l.binds.as_slice()));
+    let frontends = config
+        .frontends
+        .iter()
+        .filter(|f| !f.disabled)
+        .map(|f| ("frontend", f.name.as_str(), f.backlog, f.maxconn, f.binds.as_slice()));
+    for (kind, name, p_backlog, p_maxconn, binds) in listens.chain(frontends) {
+        for b in binds {
+            let Some(path) = b.unix_path() else { continue };
+            let backlog = crate::listener::listener_backlog(
+                b.sock.as_deref().and_then(|s| s.backlog),
+                p_backlog,
+                p_maxconn,
+            );
+            let listener = bind_or_adopt_unix(path, backlog, 0).map_err(|e| {
+                let why = e.to_string();
+                let why = why.split(" (os error").next().unwrap_or(&why).to_string();
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Binding for {kind} {name}: protocol unix_stream: cannot bind UNIX socket ({why}) [{}].",
+                        path.display()
+                    ),
+                )
+            })?;
+            crate::handover::expose_unix(path, listener.borrowed_fd())?;
+            let fd = listener.borrowed_fd().try_clone_to_owned()?;
+            map.insert(path.to_path_buf(), fd);
+        }
+    }
+    Ok(())
+}
+
+/// Drops the main thread's hold on prebound UNIX listeners once every worker has adopted
+/// its duplicate (or when startup aborts), so soft stop can close the listening socket.
+pub fn finish_prebind_unix() {
+    if let Ok(mut map) = PREBOUND_UNIX.lock() {
+        map.clear();
+    }
+}
+
+fn bind_or_adopt_unix(path: &Path, backlog: i32, proxy: u32) -> io::Result<Listener> {
+    if let Some(fd) = crate::handover::take_inherited_unix(path) {
+        match Listener::adopt_unix(fd, path, backlog, proxy) {
+            Ok(l) => return Ok(l),
+            Err(e) => crate::stderr_line!("[WARNING] {e}; binding a fresh UNIX socket instead"),
+        }
+    }
+    Listener::bind_unix(path, backlog, proxy)
+}
+
+fn listeners_for_unix(path: &Path, proxy: u32, backlog: i32) -> io::Result<Listener> {
+    if let Ok(map) = PREBOUND_UNIX.lock() {
+        if let Some(fd) = map.get(path) {
+            let dup = fd.try_clone()?;
+            return Listener::adopt_unix(dup, path, backlog, proxy);
+        }
+    }
+    let listener = bind_or_adopt_unix(path, backlog, proxy)?;
+    crate::handover::expose_unix(path, listener.borrowed_fd())?;
+    Ok(listener)
 }
 
 fn socket_file_ident(path: &Path) -> Option<(u64, u64)> {
@@ -3764,6 +3852,7 @@ fn session_log_data<'a>(s: &'a TcpSession, fe: &'a Proxy, be: &'a Proxy, pid: u3
     crate::logfmt::LogData {
         client: s.client_addr,
         frontend_addr: s.server_addr,
+        unix_luid: if s.flags.has(sess_flags::CLI_UNIX) { s.so_id } else { 0 },
         frontend: &fe.name,
         // QUIC is TLS, though the relayed stream the engine reads is not (T130).
         frontend_ssl: s.cli_is_tls() || s.client_proto == ClientProto::H3,
@@ -4740,7 +4829,8 @@ fn proxy_header_error_line(entry: &SessionEntry, proxies: &crate::table::Table, 
             let mut line = fe.log_format_sd().map_or_else(Vec::new, |sd| sd.render_bytes(&data, sample_registry(), &ctx));
             let sd_len = u32::try_from(line.len()).unwrap_or(0);
             let listener = s.so_name.as_deref().map_or_else(|| s.so_id.to_string(), str::to_string);
-            line.extend_from_slice(crate::logfmt::connection_error_line(s.client_addr, s.strm.log.date(), &fe.name, &listener, &failure.message).as_bytes());
+            let unix_luid = if s.flags.has(sess_flags::CLI_UNIX) { s.so_id } else { 0 };
+            line.extend_from_slice(crate::logfmt::connection_error_line(s.client_addr, unix_luid, s.strm.log.date(), &fe.name, &listener, &failure.message).as_bytes());
             (line, sd_len)
         }
     };
@@ -4896,21 +4986,13 @@ pub fn validate_tls(config: &Config) -> io::Result<()> {
             continue;
         }
         for bind in fe.binds.iter().filter(|b| b.ssl) {
-            if bind.quic {
-                bind_tls_quic(&fe.name, &fe.binds, bind.addr)?;
-            } else {
-                bind_tls(&fe.name, &fe.binds, bind.addr)?;
-            }
+            bind_tls_for(&fe.name, bind)?;
         }
     }
     // A `disabled` listen is checked too: `HAProxy` loads its certificates at parse time.
     for l in &config.listens {
         for bind in l.binds.iter().filter(|b| b.ssl) {
-            if bind.quic {
-                bind_tls_quic(&l.name, &l.binds, bind.addr)?;
-            } else {
-                bind_tls(&l.name, &l.binds, bind.addr)?;
-            }
+            bind_tls_for(&l.name, bind)?;
         }
     }
     // Servers: `ca-file`, `crl-file` and `crt` are opened, and the `sni` expression
@@ -4943,22 +5025,30 @@ pub fn validate_tls(config: &Config) -> io::Result<()> {
 /// and `Engine::new` propagates it.
 ///
 /// `ssl` with no `crt` is the same class of mistake and is refused for the same reason.
-fn bind_tls(
+fn bind_tls_for(
     section: &str,
-    binds: &[alcyon_config::ast::BindConfig],
-    addr: SocketAddr,
+    bind: &alcyon_config::ast::BindConfig,
 ) -> io::Result<Option<Arc<alcyon_tls::tcp::BindTls>>> {
-    bind_tls_with(section, binds, addr, false, alcyon_tls::tcp::from_bind_config)
-}
-
-/// [`bind_tls`] for a QUIC bind: the same rustls 0.24 configuration as TCP's, TLS 1.3 only
-/// (`BindPlan::versions` of a `quic` bind), on the provider a swap makes current (T461).
-fn bind_tls_quic(
-    section: &str,
-    binds: &[alcyon_config::ast::BindConfig],
-    addr: SocketAddr,
-) -> io::Result<Option<Arc<alcyon_tls::tcp::BindTls>>> {
-    bind_tls_with(section, binds, addr, true, alcyon_tls::tcp::from_bind_config)
+    if !bind.ssl {
+        return Ok(None);
+    }
+    if bind.crt.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "'{section}': bind {} has 'ssl' but no 'crt'; refusing to start \
+                 rather than serve cleartext on a port configured for TLS",
+                bind.display_addr()
+            ),
+        ));
+    }
+    let cfg = alcyon_tls::tcp::from_bind_config(bind).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("'{section}': bind {} ssl: {e}", bind.display_addr()),
+        )
+    })?;
+    Ok(Some(cfg))
 }
 
 /// Opens one `quic` bind of a frontend or a `listen` (T530): this worker's UDP socket, handed to
@@ -5031,37 +5121,6 @@ fn open_quic_bind(
     poller.add(ql.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
     quic_listeners.push(ql);
     Ok(())
-}
-
-/// The `ssl` bind at `addr` of the given transport: a TCP and a `quic` bind may share an
-/// ip:port, each with its own certificates, ALPN and TLS versions (T494).
-fn bind_tls_with<T>(
-    section: &str,
-    binds: &[alcyon_config::ast::BindConfig],
-    addr: SocketAddr,
-    quic: bool,
-    build: fn(&alcyon_config::ast::BindConfig) -> Result<T, String>,
-) -> io::Result<Option<T>> {
-    let Some(bind) = binds.iter().find(|b| b.addr == addr && b.ssl && b.quic == quic) else {
-        return Ok(None);
-    };
-
-    if bind.crt.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "'{section}': bind {addr} has 'ssl' but no 'crt'; refusing to start \
-                 rather than serve cleartext on a port configured for TLS"
-            ),
-        ));
-    }
-    let cfg = build(bind).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("'{section}': bind {addr} ssl: {e}"),
-        )
-    })?;
-    Ok(Some(cfg))
 }
 
 /// A section's timeouts. Its own `timeout` lines are in `own`; the legacy fields carry
@@ -5179,12 +5238,13 @@ fn listener_count(config: &Config) -> (usize, bool) {
 fn frontend_binds(frontend: &alcyon_config::FrontendSection) -> Vec<alcyon_config::ast::BindConfig> {
     let mut all_binds = frontend.binds.clone();
     if let Some(ba) = frontend.bind {
-        if !all_binds.iter().any(|b| b.addr == ba) {
+        if !all_binds.iter().any(|b| b.unix.is_none() && b.addr == ba) {
             all_binds.insert(0, alcyon_config::ast::BindConfig {
                 sock: None,
                 client_auth: None,
                 line: 0,
                 addr: ba,
+                unix: None,
                 quic: false,
                 ssl: false,
                 crt: vec![],
@@ -5276,6 +5336,7 @@ fn init_proxy_from_listen(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, li
             persist: listen.persist,
             checkcache: listen.checkcache,
             retry_on: listen.retry_on,
+            first_unix_bind: listen.binds.iter().find_map(|b| b.unix_path()).map(|p| p.display().to_string().into_boxed_str()),
             ..ProxyIdInfo::default()
         }),
         name: listen.name.clone(),
@@ -5456,6 +5517,7 @@ fn init_proxy_from_frontend(proxy_idx: usize, ids: alcyon_config::ast::ProxyId, 
             listener_ids: alcyon_config::ast::listener_ids(&frontend_binds(fe)),
             http_mode: fe.http_mode,
             retry_on: alcyon_config::RE_CONN_FAILED,
+            first_unix_bind: fe.binds.iter().find_map(|b| b.unix_path()).map(|p| p.display().to_string().into_boxed_str()),
             ..ProxyIdInfo::default()
         }),
         name: fe.name.clone(),
@@ -6128,6 +6190,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     client_auth: None,
                     line: 0,
                     addr: listen.addr,
+                    unix: None,
                     quic: false,
                     ssl: false,
                     crt: vec![],
@@ -6146,12 +6209,18 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             };
             for (bind_idx, b) in binds.iter().enumerate() {
                 if b.quic {
-                    let tls = bind_tls_quic(&listen.name, &binds, b.addr)?.expect("QUIC requires TLS");
+                    let tls = bind_tls_for(&listen.name, b)?.expect("QUIC requires TLS");
                     open_quic_bind(config, worker_id, bufsize, b, &tls, proxy_idx, &mut quic_listeners, &mut fdtab, &poller)?;
                     continue;
                 }
-                let tls = bind_tls(&listen.name, &binds, b.addr)?;
-                for mut listener in listeners_for(worker_id, b.addr, usize_to_u32(proxy_idx), b.sock.as_deref().unwrap_or(&alcyon_config::ast::SocketTuning::default()), crate::listener::listener_backlog(b.sock.as_deref().and_then(|s| s.backlog), listen.backlog, listen.maxconn))? {
+                let tls = bind_tls_for(&listen.name, b)?;
+                let backlog = crate::listener::listener_backlog(b.sock.as_deref().and_then(|s| s.backlog), listen.backlog, listen.maxconn);
+                let bound = if let Some(unix_path) = b.unix_path() {
+                    vec![listeners_for_unix(unix_path, usize_to_u32(proxy_idx), backlog)?]
+                } else {
+                    listeners_for(worker_id, b.addr, usize_to_u32(proxy_idx), b.sock.as_deref().unwrap_or(&alcyon_config::ast::SocketTuning::default()), backlog)?
+                };
+                for mut listener in bound {
                     listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
                     listener.maxconn = proxies[proxy_idx].maxconn.clone();
                     listener.name = b.name.as_deref().map(Into::into);
@@ -6162,7 +6231,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     listener.tls.clone_from(&tls);
                     let l_idx = listeners.len();
                     let lfd = listener.raw_fd();
-                    fdtab.insert(lfd, FdState::Listener { listener: usize_to_u32(l_idx) }, Interest::READ);
+                    let state = if listener.is_unix() {
+                        FdState::UnixListener { listener: usize_to_u32(l_idx) }
+                    } else {
+                        FdState::Listener { listener: usize_to_u32(l_idx) }
+                    };
+                    fdtab.insert(lfd, state, Interest::READ);
                     poller.add(listener.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
                     listeners.push(listener);
                 }
@@ -6177,18 +6251,23 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             if frontend.disabled { continue; }
             let all_binds = frontend_binds(frontend);
             for (bind_idx, b) in all_binds.iter().enumerate() {
-                let bind_addr = b.addr;
                 if b.quic {
                     // `tune.quic.listen off`: `protocol_may_bind_quic` is false, a QUIC bind gets
                     // no socket (T525); the frontend's other binds are served.
                     if config.global.as_ref().and_then(|g| g.quic_listen) == Some(false) {
                         continue;
                     }
-                    let tls = bind_tls_quic(&frontend.name, &frontend.binds, bind_addr)?.expect("QUIC requires TLS");
+                    let tls = bind_tls_for(&frontend.name, b)?.expect("QUIC requires TLS");
                     open_quic_bind(config, worker_id, bufsize, b, &tls, proxy_idx, &mut quic_listeners, &mut fdtab, &poller)?;
                 } else {
-                    let tls = bind_tls(&frontend.name, &frontend.binds, bind_addr)?;
-                    for mut listener in listeners_for(worker_id, bind_addr, usize_to_u32(proxy_idx), b.sock.as_deref().unwrap_or(&alcyon_config::ast::SocketTuning::default()), crate::listener::listener_backlog(b.sock.as_deref().and_then(|s| s.backlog), frontend.backlog, frontend.maxconn))? {
+                    let tls = bind_tls_for(&frontend.name, b)?;
+                    let backlog = crate::listener::listener_backlog(b.sock.as_deref().and_then(|s| s.backlog), frontend.backlog, frontend.maxconn);
+                    let bound = if let Some(unix_path) = b.unix_path() {
+                        vec![listeners_for_unix(unix_path, usize_to_u32(proxy_idx), backlog)?]
+                    } else {
+                        listeners_for(worker_id, b.addr, usize_to_u32(proxy_idx), b.sock.as_deref().unwrap_or(&alcyon_config::ast::SocketTuning::default()), backlog)?
+                    };
+                    for mut listener in bound {
                         listener.luid = proxies[proxy_idx].ids.listener_ids.get(bind_idx).copied().unwrap_or(0);
                         listener.maxconn = proxies[proxy_idx].maxconn.clone();
                         listener.name = b.name.as_deref().map(Into::into);
@@ -6199,7 +6278,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         listener.tls.clone_from(&tls);
                         let l_idx = listeners.len();
                         let lfd = listener.raw_fd();
-                        fdtab.insert(lfd, FdState::Listener { listener: usize_to_u32(l_idx) }, Interest::READ);
+                        let state = if listener.is_unix() {
+                            FdState::UnixListener { listener: usize_to_u32(l_idx) }
+                        } else {
+                            FdState::Listener { listener: usize_to_u32(l_idx) }
+                        };
+                        fdtab.insert(lfd, state, Interest::READ);
                         poller.add(listener.borrowed_fd(), raw_fd_to_u64(lfd), true, false)?;
                         listeners.push(listener);
                     }
@@ -6681,9 +6765,14 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 id: crate::mailbox::sess_id(wid, idx),
                 created: s.created_at,
                 since: if http { s.strm.log.first_byte.unwrap_or(s.strm.log.start) } else { s.strm.log.start },
-                // The listener's protocol in HAProxy; a stream here is TCP over the client's family.
-                proto: if s.client_addr.is_some_and(|a| a.is_ipv6()) { "tcpv6" } else { "tcpv4" },
+                // The listener's protocol in HAProxy; a stream here is TCP or UNIX.
+                proto: if s.flags.has(sess_flags::CLI_UNIX) {
+                    "unix_stream"
+                } else {
+                    if s.client_addr.is_some_and(|a| a.is_ipv6()) { "tcpv6" } else { "tcpv4" }
+                },
                 src: s.client_addr,
+                so_id: s.so_id,
                 fe: fe.map(|_| e.proxy_idx),
                 be,
                 srv,
@@ -6708,6 +6797,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 since: a.created,
                 proto: "unix_stream",
                 src: None,
+                so_id: 1,
                 fe: None,
                 be: None,
                 srv: None,
@@ -6882,7 +6972,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 let mut tracked: [Option<(usize, StickKey)>; 3] = [None, None, None];
                 let emit_val = LogEmit { targets: &self.log_targets, tag: &self.log_tag, pid: self.pid, any_connect: self.any_connect_log };
                 let step_emit = self.any_step_log.then_some(&emit_val);
-                let admitted = match eval_tcp_req_conn_rules(&self.proxies[proxy_idx], &self.proxies, sample_registry(), peer, local, Some(&mut tracked), step_emit, None) {
+                let admitted = match eval_tcp_req_conn_rules(&self.proxies[proxy_idx], &self.proxies, sample_registry(), Some(peer), Some(local), None, Some(&mut tracked), step_emit, None) {
                     ConnEvalOutcome::Accept(c, s, fs, fd, _, _) => Some((c, s, fs, fd)),
                     ConnEvalOutcome::Reject | ConnEvalOutcome::SilentDrop(_) => {
                         self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
@@ -6905,7 +6995,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         proxy_idx,
                         crate::proxy::ClientSide::Quic,
                         now,
-                        peer,
+                        Some(peer),
                         client_addr,
                         server_addr,
                         fc_src,
@@ -6920,6 +7010,9 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         false,
                         false,
                         (false, false, None),
+                        0,
+                        None,
+                        false,
                         lb_snap,
                         step_emit,
                     )
@@ -7330,6 +7423,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                         self.accept_from_listener(l_idx);
                     }
                 }
+                FdState::UnixListener { listener: l_idx } => {
+                    let l_idx = l_idx as usize;
+                    if l_idx < self.listeners.len() {
+                        self.accept_from_unix_listener(l_idx);
+                    }
+                }
                 FdState::CliListener => {
                     self.accept_from_cli_listener(None);
                 }
@@ -7697,8 +7796,20 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[inline]
     fn accept_from_listener(&mut self, l_idx: usize) {
+        self.accept_from_listener_impl::<false>(l_idx);
+    }
+
+    #[inline]
+    fn accept_from_unix_listener(&mut self, l_idx: usize) {
+        self.accept_from_listener_impl::<true>(l_idx);
+    }
+
+    /// Monomorphized over `UNIX`: the inet specialization (`UNIX = false`) eliminates the
+    /// unix branch at compile time and executes the exact inet `Listener::accept()` path.
+    #[allow(clippy::too_many_lines)]
+    fn accept_from_listener_impl<const UNIX: bool>(&mut self, l_idx: usize) {
         let proxy_idx = self.listeners[l_idx].proxy as usize;
         if proxy_idx >= self.proxies.len() {
             return;
@@ -7751,8 +7862,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 self.listeners[l_idx].maxconn.dec();
                 break;
             }
-            let accept_res = self.listeners[l_idx].accept();
-            let Some((cli_fd, peer_addr)) = (match accept_res {
+            let accepted = if UNIX {
+                self.listeners[l_idx].accept_unix().map(|opt| opt.map(|fd| (fd, None)))
+            } else {
+                self.listeners[l_idx].accept().map(|opt| opt.map(|(fd, peer)| (fd, Some(peer))))
+            };
+            let Some((cli_fd, peer_addr)) = (match accepted {
                 Ok(Some(pair)) => Some(pair),
                 Ok(None) => None,
                 Err(_) => {
@@ -7769,8 +7884,12 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 break;
             };
             crate::globalconn::note_accept();
-            let local_addr = self.listeners[l_idx].addr();
-            self.admit_connection(proxy_idx, Some(l_idx), cli_fd, peer_addr, local_addr, None);
+            if UNIX {
+                self.admit_connection_impl::<true>(proxy_idx, Some(l_idx), cli_fd, None, None, None);
+            } else {
+                let local_addr = self.listeners[l_idx].addr();
+                self.admit_connection_impl::<false>(proxy_idx, Some(l_idx), cli_fd, peer_addr, Some(local_addr), None);
+            }
         }
     }
 
@@ -7934,6 +8053,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
     /// connection` rules, counters, then the session. `l_idx` is the TCP listener that
     /// accepted it; `None` for an HTTP/3 request stream (`adopt_quic_streams`), which has
     /// no listener slot of its own to count against.
+    #[inline]
     fn admit_connection(
         &mut self,
         proxy_idx: usize,
@@ -7943,18 +8063,34 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
         local_addr: SocketAddr,
         quic_ack: Option<crate::proxy::QuicAckSrc>,
     ) {
+        self.admit_connection_impl::<false>(proxy_idx, l_idx, cli_fd, Some(peer_addr), Some(local_addr), quic_ack);
+    }
+
+    fn admit_connection_impl<const UNIX: bool>(
+        &mut self,
+        proxy_idx: usize,
+        l_idx: Option<usize>,
+        cli_fd: std::os::fd::OwnedFd,
+        peer_addr: Option<SocketAddr>,
+        local_addr: Option<SocketAddr>,
+        quic_ack: Option<crate::proxy::QuicAckSrc>,
+    ) {
         if l_idx.is_some() {
             count_global_conn();
         }
         {
             let mut tracked_sc: [Option<(usize, StickKey)>; 3] = [None, None, None];
+            let luid = l_idx.and_then(|i| self.listeners.get(i)).map(|l| l.luid).filter(|&id| id != 0);
+            let so_name = l_idx.and_then(|i| self.listeners.get(i)).and_then(|l| l.name.as_deref());
 
             let sample_ctx = SampleContext { phase: &alcyon_sample::PhaseCtx {
                 proxies: Some(&ProxiesView(&self.proxies)),
-                client_addr: Some(peer_addr),
-                server_addr: Some(local_addr),
-                fc_src: Some(peer_addr),
-                fc_dst: Some(local_addr),
+                client_addr: peer_addr,
+                server_addr: local_addr,
+                fc_src: peer_addr,
+                fc_dst: local_addr,
+                so_id: luid,
+                so_name,
                 act_conn: self.proxies[proxy_idx].counters().act_conn.load(Ordering::Relaxed),
                 ..Default::default()
             }, live: None };
@@ -7982,15 +8118,17 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
             // 2. `tcp-request connection` rules, `track-sc*` among them, in rule order.
             let emit_val = LogEmit { targets: &self.log_targets, tag: &self.log_tag, pid: self.pid, any_connect: self.any_connect_log };
             let step_emit = self.any_step_log.then_some(&emit_val);
+            let client_fd = (!UNIX).then(|| cli_fd.as_raw_fd());
             let (client_addr, server_addr, fc_src, fc_dst, expect_proxy, expect_cip) = match eval_tcp_req_conn_rules(
                 &self.proxies[proxy_idx],
                 &self.proxies,
                 sample_registry(),
                 peer_addr,
                 local_addr,
+                luid,
                 Some(&mut tracked_sc),
                 step_emit,
-                Some(cli_fd.as_raw_fd()),
+                client_fd,
             ) {
                 ConnEvalOutcome::Accept(c, s, fs, fd, ep, ec) => (c, s, fs, fd, ep, ec),
                 ConnEvalOutcome::Reject => {
@@ -8011,7 +8149,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                     return;
                 }
                 ConnEvalOutcome::SilentDrop(ttl) => {
-                    raw::silent_drop(cli_fd.as_fd(), peer_addr.is_ipv6(), ttl);
+                    raw::silent_drop(cli_fd.as_fd(), peer_addr.is_some_and(|a| a.is_ipv6()), ttl);
                     self.proxies[proxy_idx].counters().denied_conn.fetch_add(1, Ordering::Relaxed);
                     for (t_idx, ref key) in tracked_sc.iter().flatten() {
                         if let Some(ref tbl) = self.proxies[*t_idx].stick_table {
@@ -8081,6 +8219,7 @@ pub fn new(config: &Config, capacity: usize) -> io::Result<Self> {
                 expect_proxy,
                 expect_cip,
                 quic_ack,
+                UNIX,
             );
         }
     }
@@ -8439,7 +8578,7 @@ fn with_port(addr: Option<SocketAddr>, port: u16) -> SocketAddr {
 enum ConnEvalOutcome {
     /// Client, server, `fc_src`, `fc_dst`, and whether `expect-proxy` or
     /// `expect-netscaler-cip` matched.
-    Accept(SocketAddr, SocketAddr, SocketAddr, SocketAddr, bool, bool),
+    Accept(Option<SocketAddr>, Option<SocketAddr>, Option<SocketAddr>, Option<SocketAddr>, bool, bool),
     Reject,
     /// `silent-drop`; the TTL of the RST (`rst-ttl`, 0 without it: `TCP_REPAIR` first, then 1).
     SilentDrop(u8),
@@ -8483,13 +8622,15 @@ fn run_deferred_session_rules(proxy_idx: usize, proxies: &crate::table::Table, s
 fn emit_tcp_req_conn_do_log(
     proxy: &Proxy,
     emit: LogEmit<'_>,
-    client_addr: SocketAddr,
-    server_addr: SocketAddr,
+    client_addr: Option<SocketAddr>,
+    server_addr: Option<SocketAddr>,
+    unix_luid: u32,
     ctx: &mut alcyon_sample::PhaseCtx<'_>,
 ) {
     let data = crate::logfmt::LogData {
-        client: Some(client_addr),
-        frontend_addr: Some(server_addr),
+        client: client_addr,
+        frontend_addr: server_addr,
+        unix_luid,
         frontend: &proxy.name,
         backend: &proxy.name,
         backend_http: proxy.mode == Mode::Http,
@@ -8538,13 +8679,14 @@ fn emit_tcp_req_cont_do_log(
     ctx.log_origin = None;
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn eval_tcp_req_conn_rules(
     proxy: &Proxy,
     proxies: &crate::table::Table,
     registry: &Registry,
-    peer_addr: SocketAddr,
-    local_addr: SocketAddr,
+    peer_addr: Option<SocketAddr>,
+    local_addr: Option<SocketAddr>,
+    so_id: Option<u32>,
     mut tracked: Option<&mut [Option<(usize, StickKey)>; 3]>,
     step_emit: Option<&LogEmit<'_>>,
     client_fd: Option<i32>,
@@ -8560,12 +8702,13 @@ fn eval_tcp_req_conn_rules(
     let mut ctx = alcyon_sample::PhaseCtx {
         proxies: Some(&ProxiesView(proxies)),
         stick: Some(&stick),
-        client_addr: Some(client_addr),
-        server_addr: Some(server_addr),
-        fc_src: Some(fc_src),
-        fc_dst: Some(fc_dst),
+        client_addr,
+        server_addr,
+        fc_src,
+        fc_dst,
+        so_id,
         // `HAProxy` reads the client socket's TCP_INFO in `tcp-request connection` rules
-        // too (`s->conn_x`); the QUIC admission path has no TCP fd, so no sample there.
+        // too (`s->conn_x`); the QUIC and UNIX admission paths have no TCP fd, so no sample there.
         fc_tcp_fd: client_fd,
         tcp_info: client_fd.is_some().then_some(crate::raw::tcp_info_val),
         act_conn: proxy.counters().act_conn.load(Ordering::Relaxed),
@@ -8617,51 +8760,44 @@ fn eval_tcp_req_conn_rules(
             }
             alcyon_config::TcpReqConnAction::SetSrcPort { expr: _ } => {
                 if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
-                    client_addr = with_port(Some(client_addr), port);
-                    fc_src = client_addr;
-                    ctx.client_addr = Some(client_addr);
-                    ctx.fc_src = Some(fc_src);
+                    let next = Some(with_port(client_addr, port));
+                    client_addr = next;
+                    fc_src = next;
+                    ctx.client_addr = client_addr;
+                    ctx.fc_src = fc_src;
                 }
             }
             alcyon_config::TcpReqConnAction::SetDstPort { expr: _ } => {
                 if let Some(port) = eval_port_expr(rc.expr.as_ref(), registry, &ctx.as_ctx()) {
-                    server_addr = with_port(Some(server_addr), port);
-                    fc_dst = server_addr;
-                    ctx.server_addr = Some(server_addr);
-                    ctx.fc_dst = Some(fc_dst);
+                    let next = Some(with_port(server_addr, port));
+                    server_addr = next;
+                    fc_dst = next;
+                    ctx.server_addr = server_addr;
+                    ctx.fc_dst = fc_dst;
                 }
             }
             alcyon_config::TcpReqConnAction::SetSrc { expr: _ } => {
                 let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp)).unwrap_or_default();
-                if let Ok(ip) = val.parse::<IpAddr>() {
-                    client_addr = SocketAddr::new(ip, client_addr.port());
-                    ctx.client_addr = Some(client_addr);
+                if let Some(sa) = val.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, client_addr.map_or(0, |a| a.port()))).or_else(|| val.parse::<SocketAddr>().ok()) {
+                    client_addr = Some(sa);
+                    ctx.client_addr = client_addr;
                     fc_src = client_addr;
-                    ctx.fc_src = Some(fc_src);
-                } else if let Ok(sa) = val.parse::<SocketAddr>() {
-                    client_addr = sa;
-                    ctx.client_addr = Some(client_addr);
-                    fc_src = client_addr;
-                    ctx.fc_src = Some(fc_src);
+                    ctx.fc_src = fc_src;
                 }
             }
             alcyon_config::TcpReqConnAction::SetDst { expr: _ } => {
                 let val = rc.expr.as_ref().and_then(|e| e.eval_sample(registry, &ctx.as_ctx())).map(|smp| sample_to_string(&smp)).unwrap_or_default();
-                if let Ok(ip) = val.parse::<IpAddr>() {
-                    server_addr = SocketAddr::new(ip, server_addr.port());
-                    ctx.server_addr = Some(server_addr);
+                if let Some(sa) = val.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, server_addr.map_or(0, |a| a.port()))).or_else(|| val.parse::<SocketAddr>().ok()) {
+                    server_addr = Some(sa);
+                    ctx.server_addr = server_addr;
                     fc_dst = server_addr;
-                    ctx.fc_dst = Some(fc_dst);
-                } else if let Ok(sa) = val.parse::<SocketAddr>() {
-                    server_addr = sa;
-                    ctx.server_addr = Some(server_addr);
-                    fc_dst = server_addr;
-                    ctx.fc_dst = Some(fc_dst);
+                    ctx.fc_dst = fc_dst;
                 }
             }
             alcyon_config::TcpReqConnAction::DoLog => {
                 if let Some(emit) = step_emit {
-                    emit_tcp_req_conn_do_log(proxy, *emit, client_addr, server_addr, &mut ctx);
+                    let unix_luid = if peer_addr.is_none() { so_id.unwrap_or(0) } else { 0 };
+                    emit_tcp_req_conn_do_log(proxy, *emit, client_addr, server_addr, unix_luid, &mut ctx);
                 }
             }
             _ => {}
@@ -9521,26 +9657,30 @@ fn h3_mux(keyword: Option<bool>) -> bool {
     keyword.unwrap_or_else(|| std::env::var("ALCYON_H3_PATH").map_or(true, |v| v != "relay"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_new_session(
     engine: &mut Engine,
     proxy_idx: usize,
     listener_idx: Option<usize>,
     cli_fd: std::os::fd::OwnedFd,
-    peer_addr: SocketAddr,
-    client_addr: SocketAddr,
-    server_addr: SocketAddr,
-    fc_src: SocketAddr,
-    fc_dst: SocketAddr,
+    peer_addr: Option<SocketAddr>,
+    client_addr: Option<SocketAddr>,
+    server_addr: Option<SocketAddr>,
+    fc_src: Option<SocketAddr>,
+    fc_dst: Option<SocketAddr>,
     tracked_sc: [Option<(usize, StickKey)>; 3],
     expect_proxy: bool,
     expect_cip: bool,
     quic_ack: Option<crate::proxy::QuicAckSrc>,
+    is_unix: bool,
 ) {
     // Cloned out before `proxies` is borrowed mutably. TLS belongs to the bind that
     // accepted, not to the proxy, so it is read from the listener.
     let tls = listener_idx
         .and_then(|i| engine.listeners.get(i))
         .and_then(|l| l.tls.clone());
+    let so_name = listener_idx.and_then(|i| engine.listeners.get(i)).and_then(|l| l.name.clone());
+    let so_id = listener_idx.and_then(|i| engine.listeners.get(i)).map_or(0, |l| l.luid);
     let cli_raw_fd = cli_fd.as_raw_fd();
     // A client that reset while its connection waited at `maxconn`: `HAProxy` finds the
     // reset with the request, and the stream's state tells it (`client_left`, T231).
@@ -9549,9 +9689,10 @@ fn register_new_session(
     // `getsockopt(TCP_SAVED_SYN)` with its bytes only once — the read consumes them — so
     // it is made once here, at accept, and only for a bind that asked for the recording.
     // The bytes are kept on the session behind the `sess_addr` box.
-    let saved_syn = listener_idx
-        .and_then(|i| engine.listeners.get(i))
-        .is_some_and(|l| l.tcp_save_syn != 0)
+    let saved_syn = (!is_unix
+        && listener_idx
+            .and_then(|i| engine.listeners.get(i))
+            .is_some_and(|l| l.tcp_save_syn != 0))
         .then(|| crate::raw::saved_syn(cli_fd.as_fd()))
         .flatten();
     let emit_val = LogEmit { targets: &engine.log_targets, tag: &engine.log_tag, pid: engine.pid, any_connect: engine.any_connect_log };
@@ -9578,6 +9719,9 @@ fn register_new_session(
         listener_idx
             .and_then(|i| engine.listeners.get(i))
             .map_or((false, false, None), |l| (l.accept_proxy, l.accept_proxy_v2, l.accept_netscaler_cip)),
+        so_id,
+        so_name,
+        is_unix,
         &mut engine.lb_snap,
         step_emit,
     ) else {
@@ -9596,8 +9740,6 @@ fn register_new_session(
     if let Some(q) = quic_ack {
         sess.h2_role = Some(crate::proxy::relay_role(q));
     }
-    sess.so_name = listener_idx.and_then(|i| engine.listeners.get(i)).and_then(|l| l.name.clone());
-    sess.so_id = listener_idx.and_then(|i| engine.listeners.get(i)).map_or(0, |l| l.luid);
     if let Some(syn) = saved_syn {
         sess.sess_addr.get_or_insert_with(Box::default).saved_syn = Some(syn);
     }
@@ -9819,7 +9961,7 @@ fn proxy_header(fe: &Proxy, proxy: &Proxy, proxies: &crate::table::Table, sess: 
 
     if send_v2 {
         let src = sess.client_addr;
-        let dst = sess.server_addr.or(Some(proxy.addr));
+        let dst = sess.server_addr.or_else(|| (!sess.flags.has(sess_flags::CLI_UNIX)).then_some(proxy.addr));
         let mut tlv_data = sess.proxy_info.as_ref().map_or_else(Vec::new, |p| p.tlv_data.clone());
         if let Some(tlvs) = proxy.srv_set().pp_tlv_fmts_at(idx) {
             // `make_proxy_line_v2` appends the server's `pp_tlvs` first, in the order the
@@ -9869,7 +10011,7 @@ fn proxy_header(fe: &Proxy, proxy: &Proxy, proxies: &crate::table::Table, sess: 
         Some(alcyon_proto::encode_proxy_v2(alcyon_proto::ProxyCommand::Proxy, src, dst, &tlv_data))
     } else if send_v1 {
         let src = sess.client_addr;
-        let dst = sess.server_addr.or(Some(proxy.addr));
+        let dst = sess.server_addr.or_else(|| (!sess.flags.has(sess_flags::CLI_UNIX)).then_some(proxy.addr));
         Some(alcyon_proto::encode_proxy_v1(src, dst))
     } else {
         None
@@ -9882,11 +10024,11 @@ fn init_client_session(
     proxy_idx: usize,
     cli: crate::proxy::ClientSide,
     now: Tick,
-    peer_addr: SocketAddr,
-    client_addr: SocketAddr,
-    server_addr: SocketAddr,
-    fc_src: SocketAddr,
-    fc_dst: SocketAddr,
+    peer_addr: Option<SocketAddr>,
+    client_addr: Option<SocketAddr>,
+    server_addr: Option<SocketAddr>,
+    fc_src: Option<SocketAddr>,
+    fc_dst: Option<SocketAddr>,
     tls: Option<&Arc<alcyon_tls::tcp::BindTls>>,
     ssl_capture_size: usize,
     ssl_ja4_spec: bool,
@@ -9897,6 +10039,9 @@ fn init_client_session(
     expect_proxy: bool,
     expect_cip: bool,
     bind_proxy: (bool, bool, Option<u32>),
+    so_id: u32,
+    so_name: Option<Arc<str>>,
+    is_unix: bool,
     lb_snap: &mut crate::lb::LbSnapCache,
     step_emit: Option<&LogEmit<'_>>,
 ) -> Option<(TcpSession, Option<SocketAddr>, Option<RawFd>)> {
@@ -9921,10 +10066,13 @@ fn init_client_session(
         retries,
         now,
     );
-    sess.client_addr = Some(client_addr);
-    sess.server_addr = Some(server_addr);
-    sess.fc_src = Some(fc_src);
-    sess.fc_dst = Some(fc_dst);
+    sess.client_addr = client_addr;
+    sess.server_addr = server_addr;
+    sess.fc_src = fc_src;
+    sess.fc_dst = fc_dst;
+    sess.so_id = so_id;
+    sess.so_name = so_name;
+    sess.flags.set_to(sess_flags::CLI_UNIX, is_unix);
     sess.tracked_sc = tracked_sc;
     sess.h2_flood_config = global_h2_flood_config;
     let fe = &proxies[proxy_idx];
@@ -9991,7 +10139,7 @@ fn init_client_session(
             return None;
         }
         SessionEvalOutcome::SilentDrop(ttl) => {
-            let is_ipv6 = peer_addr.is_ipv6();
+            let is_ipv6 = peer_addr.is_some_and(|a| a.is_ipv6());
             sess.silent_drop_client(is_ipv6, ttl);
             proxies[proxy_idx].counters().denied_req.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -13010,17 +13158,26 @@ impl EngineDispatcher<'_> {
             if entry.sess.flags.has(sess_flags::RARE_ARMED) && entry.connect_log_due && !entry.sess.handshake_pending() && entry.sess.cli_xprt.is_ready() {
                 entry.connect_log_due = false;
                 let fe = &self.proxies[entry.proxy_idx];
-                let unknown = SocketAddr::from(([0, 0, 0, 0], 0));
-                let (src, dst) = (entry.sess.client_addr.unwrap_or(unknown), entry.sess.server_addr.unwrap_or(unknown));
-                let line = format!(
-                    "Connect from {}:{} to {}:{} ({}/{})",
-                    src.ip(),
-                    src.port(),
-                    dst.ip(),
-                    dst.port(),
-                    fe.name,
-                    if fe.mode == Mode::Http { "HTTP" } else { "TCP" }
-                );
+                let line = if entry.sess.client_addr.is_none() && entry.sess.flags.has(sess_flags::CLI_UNIX) {
+                    format!(
+                        "Connect to unix:{} ({}/{})",
+                        entry.sess.so_id,
+                        fe.name,
+                        if fe.mode == Mode::Http { "HTTP" } else { "TCP" }
+                    )
+                } else {
+                    let unknown = SocketAddr::from(([0, 0, 0, 0], 0));
+                    let (src, dst) = (entry.sess.client_addr.unwrap_or(unknown), entry.sess.server_addr.unwrap_or(unknown));
+                    format!(
+                        "Connect from {}:{} to {}:{} ({}/{})",
+                        src.ip(),
+                        src.port(),
+                        dst.ip(),
+                        dst.port(),
+                        fe.name,
+                        if fe.mode == Mode::Http { "HTTP" } else { "TCP" }
+                    )
+                };
                 connect_line = Some((entry.proxy_idx, line));
             }
 
@@ -16702,7 +16859,11 @@ impl EngineDispatcher<'_> {
 
         let xot_excepts: Vec<&str> = fe_be.iter().filter_map(|&i| proxies[i].stats_config.originalto.as_deref()).collect();
         if !xot_excepts.is_empty() {
-            let dst_ip = entry.sess.server_addr.or(entry.sess.target_addr).map(|a| a.ip());
+            let dst_ip = entry
+                .sess
+                .server_addr
+                .or_else(|| (!entry.sess.flags.has(sess_flags::CLI_UNIX)).then_some(entry.sess.target_addr).flatten())
+                .map(|a| a.ip());
             if let Some(ip) = dst_ip {
                 let in_except = xot_excepts.iter().any(|e| !e.is_empty() && ip_in_cidr(ip, e));
                 if !in_except {
@@ -17854,23 +18015,30 @@ pub(crate) fn push_sample(out: &mut String, smp: &Sample, push: &dyn Fn(&mut Str
 /// with nothing here to read stays text.
 pub(crate) fn push_alias(out: &mut String, name: &str, ctx: &SampleContext, push: &dyn Fn(&mut String, &str)) {
     use std::fmt::Write as _;
-    let addr = |out: &mut String, a: Option<SocketAddr>| {
-        if let Some(a) = a {
+    let addr = |out: &mut String, a: Option<SocketAddr>, unix: bool| match a {
+        Some(a) => {
             let _ = write!(out, "{}", a.ip());
         }
+        None if unix => out.push_str("unix"),
+        None => {}
     };
-    let port = |out: &mut String, a: Option<SocketAddr>| {
-        if let Some(a) = a {
+    let port = |out: &mut String, a: Option<SocketAddr>, unix_id: Option<u32>| match a {
+        Some(a) => {
             let _ = write!(out, "{}", a.port());
+        }
+        None => {
+            if let Some(id) = unix_id {
+                let _ = write!(out, "{id}");
+            }
         }
     };
     match name {
-        "ci" => addr(out, ctx.client_addr()),
-        "cp" => port(out, ctx.client_addr()),
-        "fi" => addr(out, ctx.server_addr()),
-        "fp" => port(out, ctx.server_addr()),
-        "si" => addr(out, ctx.bc_dst),
-        "sp" => port(out, ctx.bc_dst),
+        "ci" => addr(out, ctx.client_addr(), ctx.so_id.is_some()),
+        "cp" => port(out, ctx.client_addr(), ctx.so_id),
+        "fi" => addr(out, ctx.server_addr(), ctx.so_id.is_some()),
+        "fp" => port(out, ctx.server_addr(), ctx.so_id),
+        "si" => addr(out, ctx.bc_dst, false),
+        "sp" => port(out, ctx.bc_dst, None),
         "f" => push(out, ctx.fe_name.unwrap_or_default()),
         // Until a backend is chosen the stream's backend is its frontend (`s->be`).
         "b" => push(out, ctx.be_name.or(ctx.fe_name).unwrap_or_default()),
@@ -21398,6 +21566,47 @@ mod inherited_socket_tests {
         let got = listeners_for(0, addr, 3, &alcyon_config::ast::SocketTuning::default(), 128).expect("listeners");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].addr(), addr);
+    }
+
+    #[test]
+    fn a_mismatched_inherited_unix_socket_falls_back_to_a_fresh_bind() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("fb.sock");
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp");
+        let fd = rustix::io::dup(&udp).expect("dup");
+        crate::handover::distribute_fetched(
+            crate::handover::Fetched { inet: Vec::new(), unix: vec![(path.clone(), fd)] },
+            1,
+        );
+        let got = listeners_for_unix(&path, 3, 128).expect("unix listener fallback");
+        assert!(got.is_unix());
+        assert_eq!(got.unix_path(), Some(path.as_path()));
+    }
+
+    #[test]
+    fn push_alias_formats_unix_and_inet_addresses() {
+        let push = |out: &mut String, s: &str| out.push_str(s);
+        let inet_phase = alcyon_sample::PhaseCtx {
+            client_addr: Some("127.0.0.1:4321".parse().expect("addr")),
+            server_addr: Some("127.0.0.1:8080".parse().expect("addr")),
+            bc_dst: Some("127.0.0.1:9000".parse().expect("addr")),
+            fe_name: Some("fe"),
+            ..Default::default()
+        };
+        let unix_phase = alcyon_sample::PhaseCtx { so_id: Some(42), fe_name: Some("ux"), ..Default::default() };
+        let empty_phase = alcyon_sample::PhaseCtx::default();
+        let fmt = |phase: &alcyon_sample::PhaseCtx| {
+            let ctx = phase.as_ctx();
+            let mut s = String::new();
+            for (i, a) in ["ci", "cp", "fi", "fp", "si", "sp", "f"].into_iter().enumerate() {
+                if i > 0 { s.push(':'); }
+                push_alias(&mut s, a, &ctx, &push);
+            }
+            s
+        };
+        assert_eq!(fmt(&inet_phase), "127.0.0.1:4321:127.0.0.1:8080:127.0.0.1:9000:fe");
+        assert_eq!(fmt(&unix_phase), "unix:42:unix:42:::ux");
+        assert_eq!(fmt(&empty_phase), "::::::");
     }
 }
 

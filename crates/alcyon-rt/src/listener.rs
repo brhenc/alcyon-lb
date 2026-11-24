@@ -8,8 +8,27 @@ use rustix::io::Errno;
 use rustix::net::{self, AddressFamily, SocketFlags, SocketType};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// `sizeof(sockaddr_un.sun_path)` on Linux, including the trailing NUL byte.
+const UNIX_SUN_PATH_MAX: usize = 108;
+
+/// Unlinks a temporary UNIX bind socket on early error, only if `lstat` confirms it is
+/// still a socket (never removes a regular file, symlink, FIFO, or directory).
+struct TempSocketGuard<'a>(&'a Path, bool);
+
+impl Drop for TempSocketGuard<'_> {
+    fn drop(&mut self) {
+        if self.1 {
+            use std::os::unix::fs::FileTypeExt;
+            if std::fs::symlink_metadata(self.0).is_ok_and(|m| m.file_type().is_socket()) {
+                let _ = std::fs::remove_file(self.0);
+            }
+        }
+    }
+}
 
 /// A listening socket owned by one thread.
 ///
@@ -31,6 +50,8 @@ use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 pub struct Listener {
     fd: OwnedFd,
     addr: SocketAddr,
+    /// Path for a UNIX domain stream bind (`bind unix@<path>` or `/<path>`); `None` on inet.
+    unix_path: Option<Box<PathBuf>>,
     /// Index of the proxy configuration this listener belongs to.
     pub proxy: u32,
     /// Per-listener connection cap. Zero means unlimited. Shared with the proxy's
@@ -189,6 +210,7 @@ impl Listener {
         Ok(Listener {
             fd,
             addr: bound_addr,
+            unix_path: None,
             proxy,
             maxconn: crate::srv_rt::ConnLimit::default(),
             tls: None,
@@ -247,6 +269,7 @@ impl Listener {
         Ok(Listener {
             fd,
             addr,
+            unix_path: None,
             proxy,
             maxconn: crate::srv_rt::ConnLimit::default(),
             tls: None,
@@ -258,6 +281,144 @@ impl Listener {
             tcp_save_syn: tuning.tcp_save_syn,
             luid: 0,
             backlog: 1024,
+            rate_paused: false,
+        })
+    }
+
+    /// Binds a UNIX domain stream listening socket at `path` safely:
+    /// - refuses paths whose `<path>.<pid>.tmp` staging name does not fit `sun_path` (< 108 bytes);
+    /// - fails closed if `path` or `<path>.<pid>.tmp` already exists and is not a socket
+    ///   (regular file, symlink, FIFO, directory);
+    /// - binds and listens on `<path>.<pid>.tmp` (inheriting `0777 & ~umask`), then places it
+    ///   at `path` with `RENAME_NOREPLACE` when `path` was absent or atomic `rename` after
+    ///   re-checking that `path` is still a socket.
+    ///
+    /// # Errors
+    /// Refuses overlong paths, existing non-sockets, and OS socket/bind/listen/rename errors.
+    pub fn bind_unix(path: &Path, backlog: i32, proxy: u32) -> io::Result<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let mut temp_os = path.as_os_str().to_os_string();
+        temp_os.push(format!(".{}.tmp", std::process::id()));
+        if temp_os.as_bytes().len() >= UNIX_SUN_PATH_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "name too long for UNIX socket (limit usually 97)",
+            ));
+        }
+        let tempname = PathBuf::from(temp_os);
+
+        // Fail closed on any existing non-socket at the target path (regular file, symlink,
+        // FIFO, directory): never delete or replace anything that is not a socket.
+        let target_exists = match std::fs::symlink_metadata(path) {
+            Ok(meta) => {
+                if !meta.file_type().is_socket() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("cannot replace non-socket at '{}'", path.display()),
+                    ));
+                }
+                true
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e),
+        };
+
+        // Same fail-closed check for a pre-existing tempname (planted file, symlink, FIFO, dir).
+        if let Ok(meta) = std::fs::symlink_metadata(&tempname) {
+            if !meta.file_type().is_socket() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("cannot replace non-socket temp path '{}'", tempname.display()),
+                ));
+            }
+            std::fs::remove_file(&tempname)?;
+        }
+
+        let fd = net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+            None,
+        )?;
+        let addr = net::SocketAddrUnix::new(&tempname)?;
+        net::bind_unix(&fd, &addr)?;
+        let mut cleanup = TempSocketGuard(&tempname, true);
+        net::listen(&fd, backlog)?;
+
+        // Replace an existing socket atomically; if target was absent (or ceased to be a
+        // socket concurrently), require RENAME_NOREPLACE so a racing non-socket is never clobbered.
+        if target_exists && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket()) {
+            std::fs::rename(&tempname, path)?;
+        } else {
+            rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                &tempname,
+                rustix::fs::CWD,
+                path,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )?;
+        }
+        cleanup.1 = false;
+
+        Ok(Listener {
+            fd,
+            addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            unix_path: Some(Box::new(path.to_path_buf())),
+            proxy,
+            maxconn: crate::srv_rt::ConnLimit::default(),
+            tls: None,
+            name: None,
+            accept_proxy: false,
+            accept_proxy_v2: false,
+            accept_netscaler_cip: None,
+            proto_h2: false,
+            tcp_save_syn: 0,
+            luid: 0,
+            backlog,
+            rate_paused: false,
+        })
+    }
+
+    /// Adopts an existing listening UNIX stream socket (shared across worker threads from
+    /// prebinding or inherited over `-x` handover). Verifies the descriptor is a listening
+    /// `AF_UNIX` `SOCK_STREAM` socket before trusting it.
+    ///
+    /// # Errors
+    /// Refuses descriptors that are not listening UNIX stream sockets.
+    pub fn adopt_unix(fd: OwnedFd, path: &Path, backlog: i32, proxy: u32) -> io::Result<Self> {
+        let bad = |why: &str| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("inherited unix socket for {}: {why}", path.display()),
+            )
+        };
+        if net::sockopt::get_socket_type(&fd)? != SocketType::STREAM {
+            return Err(bad("not a stream socket"));
+        }
+        if !net::sockopt::get_socket_acceptconn(&fd)? {
+            return Err(bad("not listening"));
+        }
+        if !matches!(net::getsockname(&fd)?, rustix::net::SocketAddrAny::Unix(_)) {
+            return Err(bad("not a unix socket"));
+        }
+        rustix::io::ioctl_fionbio(&fd, true)?;
+        Ok(Listener {
+            fd,
+            addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            unix_path: Some(Box::new(path.to_path_buf())),
+            proxy,
+            maxconn: crate::srv_rt::ConnLimit::default(),
+            tls: None,
+            name: None,
+            accept_proxy: false,
+            accept_proxy_v2: false,
+            accept_netscaler_cip: None,
+            proto_h2: false,
+            tcp_save_syn: 0,
+            luid: 0,
+            backlog,
             rate_paused: false,
         })
     }
@@ -296,6 +457,18 @@ impl Listener {
     #[must_use]
     pub const fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// True when this listener is bound to a UNIX domain stream socket.
+    #[must_use]
+    pub const fn is_unix(&self) -> bool {
+        self.unix_path.is_some()
+    }
+
+    /// The bound filesystem path of a UNIX domain listener, or `None` on inet.
+    #[must_use]
+    pub fn unix_path(&self) -> Option<&Path> {
+        self.unix_path.as_deref().map(PathBuf::as_path)
     }
 
     /// True when this listener has reached its connection cap and should stop
@@ -347,6 +520,22 @@ impl Listener {
             //   Out of fds or memory is not here: the connection stays queued, and
             //   reporting "drained" left the caller polling a listener that is ready
             //   again at once (T237).
+            Err(Errno::AGAIN | Errno::CONNABORTED | Errno::INTR) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Accepts one connection on a UNIX domain stream listener.
+    ///
+    /// # Errors
+    /// Same pause-worthy error semantics as [`Listener::accept`].
+    pub fn accept_unix(&self) -> io::Result<Option<OwnedFd>> {
+        match net::accept_with(
+            self.fd.as_fd(),
+            SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        ) {
+            Ok(fd) if crate::globalconn::past_maxsock(fd.as_raw_fd()) => Err(Errno::MFILE.into()),
+            Ok(fd) => Ok(Some(fd)),
             Err(Errno::AGAIN | Errno::CONNABORTED | Errno::INTR) => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -469,5 +658,112 @@ mod tests {
         let fd = orig.borrowed_fd().try_clone_to_owned().expect("dup");
         let adopted = Listener::adopt(fd, addr, 0, &alcyon_config::ast::SocketTuning::default()).expect("adopt v6");
         assert_eq!(adopted.addr(), addr);
+    }
+
+    #[test]
+    fn unix_bind_accept_adopt_and_fail_closed_checks() {
+        use std::os::unix::fs::symlink;
+        use std::os::unix::net::UnixStream;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let sock = dir.path().join("fe.sock");
+
+        // Fresh bind, idle accept, active accept, adopt_unix.
+        let l = Listener::bind_unix(&sock, 16, 3).expect("bind_unix");
+        assert!(l.is_unix());
+        assert_eq!(l.unix_path(), Some(sock.as_path()));
+        assert!(l.accept_unix().expect("idle").is_none());
+
+        let dup = l.borrowed_fd().try_clone_to_owned().expect("dup");
+        let adopted = Listener::adopt_unix(dup, &sock, 16, 3).expect("adopt_unix");
+        assert!(adopted.is_unix());
+        let _c = UnixStream::connect(&sock).expect("connect");
+        assert!(adopted.accept_unix().expect("accept_unix").is_some(), "unix listener must accept");
+
+        // Stale temp socket is cleaned and existing socket is replaced atomically.
+        let tmp_sock = PathBuf::from(format!("{}.{}.tmp", sock.display(), std::process::id()));
+        let _stale_tmp = std::os::unix::net::UnixListener::bind(&tmp_sock).expect("bind stale tmp");
+        drop(_stale_tmp);
+        let replaced = Listener::bind_unix(&sock, 16, 3).expect("replace existing socket");
+        assert!(replaced.is_unix());
+        assert!(!tmp_sock.exists(), "tempname must be renamed away");
+        drop(replaced);
+        drop(adopted);
+        drop(l);
+
+        // Fail closed on regular file, symlink, directory, and planted non-socket tempname.
+        let reg = dir.path().join("regular");
+        std::fs::write(&reg, b"keep-me").expect("write");
+        assert!(Listener::bind_unix(&reg, 16, 0).is_err());
+        assert_eq!(std::fs::read(&reg).expect("read"), b"keep-me");
+
+        let link = dir.path().join("link");
+        symlink(&reg, &link).expect("symlink");
+        assert!(Listener::bind_unix(&link, 16, 0).is_err());
+        assert!(std::fs::symlink_metadata(&link).expect("lstat").file_type().is_symlink());
+
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir(&subdir).expect("mkdir");
+        assert!(Listener::bind_unix(&subdir, 16, 0).is_err());
+        assert!(subdir.is_dir());
+
+        let planted_target = dir.path().join("planted.sock");
+        let planted_tmp = PathBuf::from(format!("{}.{}.tmp", planted_target.display(), std::process::id()));
+        std::fs::write(&planted_tmp, b"sentinel").expect("write planted tmp");
+        assert!(Listener::bind_unix(&planted_target, 16, 0).is_err());
+        assert_eq!(std::fs::read(&planted_tmp).expect("read planted"), b"sentinel");
+        assert!(!planted_target.exists());
+
+        // Missing parent directory and non-directory parent (ENOTDIR) fail.
+        assert!(Listener::bind_unix(&dir.path().join("missing/s.sock"), 16, 0).is_err());
+        assert!(Listener::bind_unix(&reg.join("child.sock"), 16, 0).is_err());
+
+        // accept_unix propagates kernel errors on an unlistening descriptor.
+        let unlistening = Listener {
+            fd: net::socket_with(AddressFamily::UNIX, SocketType::STREAM, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK, None)
+                .expect("unlistening unix"),
+            addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            unix_path: Some(Box::new(sock.clone())),
+            proxy: 0,
+            maxconn: crate::srv_rt::ConnLimit::default(),
+            tls: None,
+            name: None,
+            accept_proxy: false,
+            accept_proxy_v2: false,
+            accept_netscaler_cip: None,
+            proto_h2: false,
+            tcp_save_syn: 0,
+            luid: 0,
+            backlog: 16,
+            rate_paused: false,
+        };
+        assert!(unlistening.accept_unix().is_err());
+
+        // Overlong path fails with HAProxy's length message.
+        let long = PathBuf::from(format!("/{}.sock", "a".repeat(100)));
+        let err = Listener::bind_unix(&long, 16, 0).err().expect("overlong");
+        assert!(err.to_string().contains("name too long"), "{err}");
+
+        // adopt_unix refuses datagram, non-listening, and inet sockets.
+        let dgram = net::socket_with(AddressFamily::UNIX, SocketType::DGRAM, SocketFlags::CLOEXEC, None).expect("dgram");
+        assert!(Listener::adopt_unix(dgram, &sock, 16, 0).is_err());
+        let idle_ux = net::socket_with(AddressFamily::UNIX, SocketType::STREAM, SocketFlags::CLOEXEC, None).expect("ux");
+        assert!(Listener::adopt_unix(idle_ux, &sock, 16, 0).is_err());
+        let tcp = Listener::bind(loopback0(), 16, 0).expect("tcp");
+        let tcp_dup = tcp.borrowed_fd().try_clone_to_owned().expect("dup tcp");
+        assert!(Listener::adopt_unix(tcp_dup, &sock, 16, 0).is_err());
+
+        // TempSocketGuard unlinks sockets and refuses to unlink non-sockets.
+        let g_sock = dir.path().join("guard.sock");
+        let _gl = std::os::unix::net::UnixListener::bind(&g_sock).expect("guard sock");
+        drop(_gl);
+        {
+            let _g = TempSocketGuard(&g_sock, true);
+        }
+        assert!(!g_sock.exists(), "TempSocketGuard must unlink a socket");
+        {
+            let _g = TempSocketGuard(&reg, true);
+        }
+        assert!(reg.exists(), "TempSocketGuard must not unlink a regular file");
     }
 }

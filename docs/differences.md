@@ -1050,3 +1050,29 @@ apply:
 | `UnsupportedDeltaCrl`, `UnsupportedRevocationReason` | `X509_V_ERR_UNSUPPORTED_EXTENSION_FEATURE` | 45 | coarse (CRL) |
 | `UnsupportedIndirectCrl`, `UnsupportedRevocationReasonsPartitioning`, `UnsupportedCrlIssuingDistributionPoint` | `X509_V_ERR_DIFFERENT_CRL_SCOPE` | 44 | coarse (CRL) |
 | `UnsupportedCertVersion`, `BadDer`, `TrailingData`, `InvalidSerialNumber`, `InvalidCrlNumber`, `UnsupportedCrlVersion`, `MaximumNameConstraintComparisonsExceeded`, other | `X509_V_ERR_UNSPECIFIED` | 1 | coarse (no OpenSSL twin; v1 certs land here) |
+
+## UNIX domain socket `bind` listeners (T655 U1)
+
+`frontend` and `listen` sections accept `bind unix@<path>`, bare `bind /<path>`,
+`bind stream+unix@<path>` and `bind stream+/<path>` (with `${VAR}` expansion) in `mode http`
+and `mode tcp`, plaintext and `ssl`, under any `nbthread`, including `-sf` and `-x -sf` reload.
+
+What stays refused at load (compared to HAProxy 3.5-dev11):
+
+* **Abstract and datagram UNIX addresses on `bind`:** `abns@`, `abnsz@`, `uxdg@`, `unix@@`,
+  empty `unix@`, and `quic+unix@` / `quic+/` (QUIC over UNIX). Note that HAProxy parses
+  `unix@@foo` as a relative path `@foo`; Alcyon refuses it explicitly.
+* **UNIX socket ownership and permission keywords on `bind`:** `mode`, `uid`, `gid`, `user`
+  and `group` are refused at load (`stats socket` still accepts `mode`). Fresh UNIX bind
+  sockets take the process `umask` (`0777 & ~umask`).
+* **UNIX `server` addresses:** `server s unix@<path>` and `server s /<path>` remain refused
+  until T655 U2.
+
+Deliberate security difference at bind time (stricter than HAProxy):
+
+* **Refusal to overwrite non-sockets:** HAProxy replaces an existing entry at the bind path
+  via `link` + `rename`, which overwrites regular files, symlinks (and dangling symlinks) and
+  FIFOs. Alcyon checks the path (and its `<path>.<pid>.tmp` staging name) with `lstat` before
+  binding and uses `RENAME_NOREPLACE` when the target was absent; it refuses to start and
+  leaves any existing non-socket untouched. Existing stale or live UNIX sockets are replaced
+  atomically.

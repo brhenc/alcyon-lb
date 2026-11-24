@@ -921,13 +921,14 @@ pub(crate) fn parse_bind(tokens: &[Token], kw: &Token, section: &str) -> Result<
             "<bind> expects <addr:port> as argument.",
         ));
     }
-    let (addr, quic) = parse_socket_addr(&tokens[1], None)?;
+    let parsed = parse_bind_addr(&tokens[1])?;
     let mut bind = BindConfig {
         sock: None,
         client_auth: None,
         line: kw.line,
-        addr,
-        quic,
+        addr: parsed.addr,
+        unix: parsed.unix.map(Box::new),
+        quic: parsed.quic,
         ssl: false,
         crt: Vec::new(),
         alpn: Vec::new(),
@@ -1169,7 +1170,8 @@ fn check_bind_id(binds: &[BindConfig], bind: &BindConfig, kw: &Token, section: &
             kw.col,
             format!(
                 "'bind {}' in section '{section}' : 'id' : custom id {id} already used by 'bind {}'",
-                bind.addr, other.addr
+                bind.display_addr(),
+                other.display_addr()
             ),
         ));
     }
@@ -1190,7 +1192,7 @@ pub(crate) fn parse_listen_bind(
     if bind.quic && bind.alpn.is_empty() {
         bind.alpn.push("h3".to_string());
     }
-    if proxy.binds.is_empty() {
+    if !bind.is_unix() && proxy.binds.iter().all(BindConfig::is_unix) {
         proxy.addr = bind.addr;
     }
     check_bind_id(&proxy.binds, &bind, kw, "listen")?;
@@ -1206,7 +1208,7 @@ pub(crate) fn parse_frontend_bind(
     kw: &Token,
 ) -> Result<(), ConfigError> {
     let mut bind = parse_bind(tokens, kw, "frontend")?;
-    if fe.bind.is_none() {
+    if !bind.is_unix() && fe.bind.is_none() {
         fe.bind = Some(bind.addr);
     }
     fe.accept_proxy |= bind.accept_proxy;

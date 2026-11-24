@@ -176,9 +176,14 @@ fn addr_is_local(ip: IpAddr) -> Option<bool> {
     }
 }
 
-/// A `*_is_local` sample of `addr`: none without an address, or when the test fails.
-fn is_local_sample(addr: Option<SocketAddr>) -> Option<Sample> {
-    addr.and_then(|a| addr_is_local(a.ip())).map(Sample::Bool)
+/// A `*_is_local` sample of `addr`: for an inet address, probes whether the IP is local to
+/// this host; for an `AF_UNIX` client connection (`addr` is `None` and `unix` is true),
+/// returns `true`, matching `HAProxy`'s `addr_is_local(AF_UNIX) == 1`.
+fn is_local_sample(addr: Option<SocketAddr>, unix: bool) -> Option<Sample> {
+    match addr {
+        Some(a) => addr_is_local(a.ip()).map(Sample::Bool),
+        None => unix.then_some(Sample::Bool(true)),
+    }
 }
 
 /// Set once the process is stopping (`when(stopping)`).
@@ -2269,10 +2274,10 @@ impl Registry {
 
         // T329: src_is_local, fc_src_is_local
         let src_is_local_fetch: FetchFn = |ctx, _args| {
-            is_local_sample(ctx.client_addr())
+            is_local_sample(ctx.client_addr(), ctx.so_id.is_some())
         };
         let fc_src_is_local_fetch: FetchFn = |ctx, _args| {
-            is_local_sample(ctx.fc_src.or(ctx.client_addr()))
+            is_local_sample(ctx.fc_src.or(ctx.client_addr()), ctx.so_id.is_some())
         };
         self.register_fetch(FetchDesc {
             name: "src_is_local",
@@ -2328,10 +2333,10 @@ impl Registry {
 
         // T329: dst_is_local, fc_dst_is_local
         let dst_is_local_fetch: FetchFn = |ctx, _args| {
-            is_local_sample(ctx.server_addr())
+            is_local_sample(ctx.server_addr(), ctx.so_id.is_some())
         };
         let fc_dst_is_local_fetch: FetchFn = |ctx, _args| {
-            is_local_sample(ctx.fc_dst.or(ctx.server_addr()))
+            is_local_sample(ctx.fc_dst.or(ctx.server_addr()), ctx.so_id.is_some())
         };
         self.register_fetch(FetchDesc {
             name: "dst_is_local",

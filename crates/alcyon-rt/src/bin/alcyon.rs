@@ -1055,9 +1055,13 @@ fn main() {
             match alcyon_rt::handover::fetch(old) {
                 Ok(socks) => {
                     if !opts.quiet {
-                        alcyon_rt::stderr_line!("[NOTICE] took over {} listening socket(s) from {}", socks.len(), old.display());
+                        alcyon_rt::stderr_line!(
+                            "[NOTICE] took over {} listening socket(s) from {}",
+                            socks.inet.len() + socks.unix.len(),
+                            old.display()
+                        );
                     }
-                    alcyon_rt::handover::distribute(socks, nbthread);
+                    alcyon_rt::handover::distribute_fetched(socks, nbthread);
                 }
                 Err(e) => {
                     // HAProxy's behaviour exactly (src/haproxy.c:2069): refuse to start. The
@@ -1088,6 +1092,11 @@ fn main() {
         alcyon_rt::stderr_line!("[ALERT] [haproxy.main()] Some protocols failed to start their listeners! Exiting.");
         process::exit(1);
     }
+    if let Err(err) = alcyon_rt::engine::prebind_unix(&config) {
+        alcyon_rt::stderr_line!("[ALERT] {err}");
+        alcyon_rt::stderr_line!("[ALERT] [haproxy.main()] Some protocols failed to start their listeners! Exiting.");
+        process::exit(1);
+    }
 
     // 12d. Every stats socket is bound here too (T220), so the file exists before any worker
     //      accepts a client and an unbindable path stops the start before any port listens
@@ -1113,6 +1122,7 @@ fn main() {
         for t in threads {
             let _ = t.join();
         }
+        alcyon_rt::engine::finish_prebind_unix();
         send_signals_to_pids(&replaced, Signal::Ttin, true);
         process::exit(1);
     };
@@ -1336,6 +1346,7 @@ fn main() {
     if !started {
         abort_start(&go, threads);
     }
+    alcyon_rt::engine::finish_prebind_unix();
     let unused = alcyon_rt::handover::drop_unused_inherited();
     if unused > 0 && !opts.quiet {
         alcyon_rt::stderr_line!("[NOTICE] closed {unused} inherited socket(s) that no bind in this configuration uses");
