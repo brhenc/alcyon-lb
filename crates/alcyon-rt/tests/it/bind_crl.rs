@@ -852,10 +852,167 @@ fn bind_ignore_expired_never_accepts_untrusted_disjoint_chain() {
     let log = recv_errlog(&udp, "evil inverted under exp_both");
     assert!(log.contains("used=1 verify=- err=18 ca_err=0"), "got:\n{log}");
 
-    // Under all_both -> 200 OK, used=1, err=18, ca_err=0 (oracle reports verify=10, webpki 14).
+    // Under all_both -> 200 OK, used=1, verify=10, err=18, ca_err=0 on both binaries.
     let out = s_client(fe_all_both, "-tls1_3", Some(&evil_inv), None);
-    let expected_verify = if is_oracle() { ("10", "X509_V_ERR_CERT_HAS_EXPIRED") } else { ("14", "X509_V_ERR_ERROR_IN_CERT_NOT_AFTER_FIELD") };
-    assert_ok_headers("evil inverted under all_both", &out, "1", expected_verify.0, expected_verify.1, "18", "0");
+    assert_ok_headers("evil inverted under all_both", &out, "1", "10", "X509_V_ERR_CERT_HAS_EXPIRED", "18", "0");
+
+    drop(daemon);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn format_fix2_cfg(
+    fx: &Path,
+    fe_10_20: SocketAddr,
+    fe_10_20_21: SocketAddr,
+    fe_20: SocketAddr,
+    fe_20_21: SocketAddr,
+    fe_18: SocketAddr,
+    fe_10_18: SocketAddr,
+    fe_crt_all: SocketAddr,
+    fe_ca_all: SocketAddr,
+    fe_ca_20: SocketAddr,
+    log_port: u16,
+    origin_port: u16,
+) -> String {
+    let srv = fx.join("common.pem");
+    let ca = fx.join("v3-ca.crt");
+    let (srv, ca) = (srv.display(), ca.display());
+    format!(
+        "global\n  nbthread 1\n\
+         defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\n\
+         \x20 log 127.0.0.1:{log_port} local0\n  option dontlognull\n\
+         \x20 error-log-format \"ERRLOG fe=%f used=%[ssl_c_used] verify=%[ssl_c_verify] err=%[ssl_c_err] ca_err=%[ssl_c_ca_err]\"\n\
+         frontend fe_10_20\n  bind {fe_10_20} ssl crt {srv} ca-file {ca} verify required crt-ignore-err 10,20\n  default_backend be\n\
+         frontend fe_10_20_21\n  bind {fe_10_20_21} ssl crt {srv} ca-file {ca} verify required crt-ignore-err 10,20,21\n  default_backend be\n\
+         frontend fe_20\n  bind {fe_20} ssl crt {srv} ca-file {ca} verify required crt-ignore-err 20\n  default_backend be\n\
+         frontend fe_20_21\n  bind {fe_20_21} ssl crt {srv} ca-file {ca} verify required crt-ignore-err 20,21\n  default_backend be\n\
+         frontend fe_18\n  bind {fe_18} ssl crt {srv} ca-file {ca} verify required crt-ignore-err 18\n  default_backend be\n\
+         frontend fe_10_18\n  bind {fe_10_18} ssl crt {srv} ca-file {ca} verify required crt-ignore-err 10,18\n  default_backend be\n\
+         frontend fe_crt_all\n  bind {fe_crt_all} ssl crt {srv} ca-file {ca} verify required crt-ignore-err all\n  default_backend be\n\
+         frontend fe_ca_all\n  bind {fe_ca_all} ssl crt {srv} ca-file {ca} verify required ca-ignore-err all\n  default_backend be\n\
+         frontend fe_ca_20\n  bind {fe_ca_20} ssl crt {srv} ca-file {ca} verify required ca-ignore-err 20\n  default_backend be\n\
+         backend be\n\
+         \x20 http-response set-header X-Used %[ssl_c_used]\n\
+         \x20 http-response set-header X-Verify %[ssl_c_verify]\n\
+         \x20 http-response set-header X-Verify-Str %[ssl_c_verify,x509_v_err_str]\n\
+         \x20 http-response set-header X-Err %[ssl_c_err]\n\
+         \x20 http-response set-header X-Ca-Err %[ssl_c_ca_err]\n\
+         \x20 server s1 127.0.0.1:{origin_port}\n"
+    )
+}
+
+#[test]
+fn bind_ignore_err_matches_openssl_untrusted_sequences_inverted_validity_and_trust_order() {
+    let fx = fixtures_dir();
+    let evil_leaf = fx.join("crl-evil-leaf.pem");
+    let evil_inter = fx.join("crl-evil-inter.crt");
+    let evil_inv = fx.join("crl-evil-inverted.pem");
+    let valid_miss_leaf = fx.join("crl-leaf-ok.pem");
+    let miss_inter = fx.join("crl-inter1.crt");
+    let trusted_exp = fx.join("v3-client-expired.pem");
+
+    let fe_10_20 = common::reserve_addr();
+    let fe_10_20_21 = common::reserve_addr();
+    let fe_20 = common::reserve_addr();
+    let fe_20_21 = common::reserve_addr();
+    let fe_18 = common::reserve_addr();
+    let fe_10_18 = common::reserve_addr();
+    let fe_crt_all = common::reserve_addr();
+    let fe_ca_all = common::reserve_addr();
+    let fe_ca_20 = common::reserve_addr();
+    let (origin_port, stop, origin_handle) = start_origin();
+    let udp = UdpSocket::bind("127.0.0.1:0").expect("bind udp log");
+    udp.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+    let log_port = udp.local_addr().expect("udp addr").port();
+
+    let dir = std::env::temp_dir().join(format!("alcyon-bind-fix2-{}-{}", std::process::id(), fe_10_20.port()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let cfg_path = dir.join("fix2.cfg");
+    let cfg = format_fix2_cfg(
+        &fx, fe_10_20, fe_10_20_21, fe_20, fe_20_21, fe_18, fe_10_18, fe_crt_all, fe_ca_all, fe_ca_20,
+        log_port, origin_port,
+    );
+    std::fs::write(&cfg_path, &cfg).expect("write cfg");
+
+    let child = Command::new(proxy_bin())
+        .arg("-f")
+        .arg(&cfg_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn proxy");
+    let daemon = Daemon { child, dir: dir.clone(), stop, origin: Some(origin_handle) };
+
+    assert!(common::wait_listening(fe_10_20), "fe_10_20 did not listen");
+    assert!(common::wait_listening(fe_ca_20), "fe_ca_20 did not listen");
+
+    // 1. Missing leaf issuer requires BOTH 20 and 21 (OpenSSL raises 20 then 21 at depth 0):
+    //    `crt-ignore-err 10,20` MUST FAIL alert 48 (`err=20`); `10,20,21` MUST PASS (`1/10/20/0`).
+    drain_udp(&udp);
+    let out = s_client(fe_10_20, "-tls1_3", Some(&evil_leaf), None);
+    assert_handshake_failed("el under crt 10,20", &out, Some(48));
+    let log = recv_errlog(&udp, "el under crt 10,20");
+    assert!(log.contains("used=1 verify=- err=20 ca_err=0"), "got:\n{log}");
+
+    let out = s_client(fe_10_20_21, "-tls1_3", Some(&evil_leaf), None);
+    assert_ok_headers("el under crt 10,20,21", &out, "1", "10", "X509_V_ERR_CERT_HAS_EXPIRED", "20", "0");
+
+    // Valid leaf with missing issuer: `crt 20` fails alert 48; `crt 20,21` passes with verify=21, err=20.
+    let out = s_client(fe_20, "-tls1_3", Some(&valid_miss_leaf), None);
+    assert_handshake_failed("valid_miss_leaf under crt 20", &out, Some(48));
+    let out = s_client(fe_20_21, "-tls1_3", Some(&valid_miss_leaf), None);
+    assert_ok_headers(
+        "valid_miss_leaf under crt 20,21",
+        &out,
+        "1",
+        "21",
+        "X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+        "20",
+        "0",
+    );
+
+    // Shape 4: valid leaf + valid intermediate whose own issuer is missing -> `ca-ignore-err 20` alone suffices.
+    let out = s_client(fe_ca_20, "-tls1_3", Some(&valid_miss_leaf), Some(&miss_inter));
+    assert_ok_headers(
+        "valid_miss_leaf + miss_inter under ca 20",
+        &out,
+        "1",
+        "20",
+        "X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+        "0",
+        "20",
+    );
+    let out = s_client(fe_20_21, "-tls1_3", Some(&valid_miss_leaf), Some(&miss_inter));
+    assert_handshake_failed("valid_miss_leaf + miss_inter under crt 20,21", &out, Some(48));
+
+    // 2. Inverted validity (`notBefore 2025 > notAfter 2020`, self-signed):
+    //    `crt 18` fails alert 45; `crt 10,18` and `crt all` both pass with 1/10/18/0.
+    let out = s_client(fe_18, "-tls1_3", Some(&evil_inv), None);
+    assert_handshake_failed("evil_inv under crt 18", &out, Some(45));
+    let out = s_client(fe_10_18, "-tls1_3", Some(&evil_inv), None);
+    assert_ok_headers("evil_inv under crt 10,18", &out, "1", "10", "X509_V_ERR_CERT_HAS_EXPIRED", "18", "0");
+    let out = s_client(fe_crt_all, "-tls1_3", Some(&evil_inv), None);
+    assert_ok_headers("evil_inv under crt all", &out, "1", "10", "X509_V_ERR_CERT_HAS_EXPIRED", "18", "0");
+
+    // 3. Trust errors before time errors (OpenSSL order):
+    for (label, addr, cert, chain, want_alert) in [
+        ("el under crt 18", fe_18, &evil_leaf, None, 48),
+        ("el under crt 20", fe_20, &evil_leaf, None, 48),
+        ("el under crt 20,21", fe_20_21, &evil_leaf, None, 45),
+        ("el under ca all", fe_ca_all, &evil_leaf, None, 48),
+        ("el+ei under crt 18", fe_18, &evil_leaf, Some(&evil_inter), 48),
+        ("el+ei under crt 20", fe_20, &evil_leaf, Some(&evil_inter), 48),
+        ("el+ei under crt 10,18", fe_10_18, &evil_leaf, Some(&evil_inter), 48),
+        ("el+ei under crt 10,20", fe_10_20, &evil_leaf, Some(&evil_inter), 48),
+        ("el+ei under crt all", fe_crt_all, &evil_leaf, Some(&evil_inter), 48),
+        ("el+ei under ca all", fe_ca_all, &evil_leaf, Some(&evil_inter), 45),
+        ("trusted expired under crt 18", fe_18, &trusted_exp, None, 45),
+        ("trusted expired under ca all", fe_ca_all, &trusted_exp, None, 45),
+    ] {
+        let out = s_client(addr, "-tls1_3", Some(cert), chain.map(std::path::PathBuf::as_path));
+        assert_handshake_failed(label, &out, Some(want_alert));
+    }
 
     drop(daemon);
 }
