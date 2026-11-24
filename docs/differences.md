@@ -1004,6 +1004,15 @@ apply:
   with `notBefore > notAfter` or invalid signature) fails with alert 48 (`unknown_ca`) unless the
   corresponding untrusted-issuer codes are also ignored (stricter than HAProxy, never more
   permissive).
+* **A forged chain that copies a trusted CA's name** (the client signs its leaf with its own key
+  under the subject of a CA in `ca-file`, optionally sending that self-made CA): webpki finds the
+  trusted CA by name, the signature check fails, and rustls sends alert 51 (`decrypt_error`)
+  where OpenSSL sends 48 (`unknown_ca`). Alcyon never accepts such a chain where HAProxy refuses
+  it (measured 2026-11-24 over eight ignore lists). Under `crt-ignore-err all ca-ignore-err all`
+  both accept, but `ssl_c_verify` can differ: 78 where OpenSSL reports 19 for the leaf sent with
+  its self-made CA, and 21 where OpenSSL reports 10 for an expired leaf sent alone. With
+  `crt-ignore-err 18,19,20,21` or `ca-ignore-err 19,20` (or `all`), HAProxy accepts some of
+  these chains and Alcyon refuses them.
 * **webpki → `X509_V_ERR` mapping table:** webpki variants with an exact OpenSSL twin map to
   that code; coarser webpki errors map to the closest OpenSSL code below. Where webpki does not
   expose chain depth (signature, name-constraint, or unknown-future errors), errors default to
