@@ -95,6 +95,7 @@ mod timeout_keywords;
 mod timer_overflow;
 mod tls_versions;
 mod tune_maxaccept;
+mod unix_bind;
 mod quic_retry;
 mod quic_tune;
 mod userlist_hashes;

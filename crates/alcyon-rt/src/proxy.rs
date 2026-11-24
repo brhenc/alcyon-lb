@@ -1072,6 +1072,8 @@ pub mod sess_flags {
     pub const SOCKS4_SENT_MASK: u32 = 0x1f << SOCKS4_SENT_SHIFT;
     /// Every `SOCKS4_*` flag bit.
     pub const SOCKS4_ALL: u32 = SOCKS4_SEND | SOCKS4_RECV | SOCKS4_FAILED | SOCKS4_SENT_MASK;
+    /// Client connection was accepted on an `AF_UNIX` stream bind (`bind unix@` or `/path`).
+    pub const CLI_UNIX: u32 = 1 << 27;
 }
 
 /// Packed boolean flags on [`TcpSession`].
@@ -1831,6 +1833,7 @@ impl TcpSession {
         }
         c.flags.set_to(sess_flags::CLOSE_CLIENT, owner.flags.has(sess_flags::CLOSE_CLIENT));
         c.flags.set_to(sess_flags::STOPPING, owner.flags.has(sess_flags::STOPPING));
+        c.flags.set_to(sess_flags::CLI_UNIX, owner.flags.has(sess_flags::CLI_UNIX));
         c.bytes_in = owner.bytes_in;
         c.bytes_out = owner.bytes_out;
         // The bytes not credited yet are the stream's to credit (with its request): the
@@ -1934,7 +1937,8 @@ impl TcpSession {
             | sess_flags::RARE_ARMED
             | sess_flags::TCP_INSPECT_DONE
             | sess_flags::RESET_WITH_REQUEST
-            | sess_flags::KEEP_REQUEST_LINE;
+            | sess_flags::KEEP_REQUEST_LINE
+            | sess_flags::CLI_UNIX;
         let TcpSession {
             // The connection's, the same for each of its streams (`h2_child_init` copies
             // the ones a stream may change).

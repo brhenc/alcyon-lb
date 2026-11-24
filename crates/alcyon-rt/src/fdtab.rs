@@ -47,8 +47,12 @@ impl Interest {
 pub enum FdState {
     /// Not in use.
     Closed,
-    /// A listening socket. Readiness means a connection is waiting to be accepted.
+    /// A listening inet socket. Readiness means a connection is waiting to be accepted.
     Listener { listener: u32 },
+    /// A listening `AF_UNIX` stream socket (`bind unix@<path>` or bare `/<path>`).
+    /// Separate from [`Self::Listener`] so the inet accept path takes no enum match or
+    /// extra branch per connection.
+    UnixListener { listener: u32 },
     /// A listening socket for CLI / stats. Readiness means a CLI client is waiting.
     CliListener,
     /// A further CLI socket (`stats socket` lines after the first), by index.

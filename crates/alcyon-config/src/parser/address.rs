@@ -34,6 +34,103 @@ fn expand_vars(s: &str) -> String {
     out
 }
 
+/// Maximum `AF_UNIX` bind path length after any `unix@` prefix (`str2sa_range` in
+/// `HAProxy` `src/tools.c`: `sizeof(sun_path) - 1 - strlen(".99999.tmp") = 97`).
+pub(crate) const UNIX_BIND_MAX_PATH: usize = 97;
+
+/// Parsed address of a `bind` line: either an inet `SocketAddr` (plain TCP or QUIC) or
+/// an `AF_UNIX` stream socket path.
+pub(crate) struct ParsedBindAddr {
+    pub addr: SocketAddr,
+    pub quic: bool,
+    pub unix: Option<std::path::PathBuf>,
+}
+
+/// Parses a `bind` line's address token in a `frontend` or `listen` section: accepts
+/// `unix@<path>`, bare `/<path>`, `stream+unix@<path>`, and `stream+/<path>`, while
+/// keeping `abns@`, `abnsz@`, `uxdg@`, `unix@@`, and QUIC-on-unix refused with `HAProxy`'s
+/// measured messages where it has one.
+pub(crate) fn parse_bind_addr(token: &Token) -> Result<ParsedBindAddr, ConfigError> {
+    let expanded = expand_vars(token.text.as_str());
+    if expanded.is_empty() && token.text.contains("${") {
+        return Err(ConfigError::new(
+            token.line,
+            token.col,
+            format!(
+                "'{}' resolves to an empty address (environment variable missing?)",
+                token.text
+            ),
+        ));
+    }
+
+    let mut s = expanded.as_str();
+    let mut is_quic_proto = false;
+    if let Some(stripped) = s.strip_prefix("stream+") {
+        s = stripped;
+    } else if let Some(stripped) = s.strip_prefix("quic+") {
+        s = stripped;
+        is_quic_proto = true;
+    }
+
+    // `uxdg@` is a datagram-only unix prefix: HAProxy refuses it on `bind` with this text.
+    if s.starts_with("uxdg@") {
+        return Err(ConfigError::new(
+            token.line,
+            token.col,
+            format!("'bind' : dgram-type address not acceptable in '{expanded}'"),
+        ));
+    }
+    // `unix@@` stays refused in U1 (abstract-looking form; check before `unix@`).
+    if s.starts_with("unix@@") {
+        return Err(ConfigError::new(
+            token.line,
+            token.col,
+            "address prefix 'unix@@' is not implemented".to_string(),
+        ));
+    }
+
+    if let Some(path) = s.strip_prefix("unix@").or_else(|| s.starts_with('/').then_some(s)) {
+        if is_quic_proto {
+            return Err(ConfigError::new(
+                token.line,
+                token.col,
+                format!("'bind' : unsupported stream protocol for datagram family 1 address '{expanded}'"),
+            ));
+        }
+        if path.is_empty() {
+            return Err(ConfigError::new(
+                token.line,
+                token.col,
+                format!("'bind' : empty unix socket path in '{expanded}'"),
+            ));
+        }
+        if path.as_bytes().contains(&0) {
+            return Err(ConfigError::new(
+                token.line,
+                token.col,
+                format!("'bind' : invalid NUL byte in socket path '{expanded}'"),
+            ));
+        }
+        if path.len() > UNIX_BIND_MAX_PATH {
+            return Err(ConfigError::new(
+                token.line,
+                token.col,
+                format!("'bind' : socket path '{expanded}' too long (max {UNIX_BIND_MAX_PATH})"),
+            ));
+        }
+        return Ok(ParsedBindAddr {
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            quic: false,
+            unix: Some(std::path::PathBuf::from(path)),
+        });
+    }
+
+    // `quic4@/<path>` and `quic6@/<path>`: IPv4/IPv6 family, so do not misclassify `/...` as
+    // unix; fall through to inet parsing, which reports missing port as HAProxy does.
+    let (addr, quic, _) = parse_addr(token, None, false)?;
+    Ok(ParsedBindAddr { addr, quic, unix: None })
+}
+
 pub(crate) fn parse_socket_addr(token: &Token, default_port: Option<u16>) -> Result<(SocketAddr, bool), ConfigError> {
     parse_addr(token, default_port, false).map(|(a, q, _)| (a, q))
 }
@@ -84,6 +181,7 @@ fn parse_addr(token: &Token, default_port: Option<u16>, allow_name: bool) -> Res
     let mut s = expanded.as_str();
 
     let mut is_quic = false;
+    let mut is_inet_quic = false;
     if let Some(stripped) = s.strip_prefix("stream+") {
         s = stripped;
     } else if let Some(stripped) = s.strip_prefix("quic+") {
@@ -92,9 +190,11 @@ fn parse_addr(token: &Token, default_port: Option<u16>, allow_name: bool) -> Res
     } else if let Some(stripped) = s.strip_prefix("quic4@") {
         s = stripped;
         is_quic = true;
+        is_inet_quic = true;
     } else if let Some(stripped) = s.strip_prefix("quic6@") {
         s = stripped;
         is_quic = true;
+        is_inet_quic = true;
     }
 
     let unsupported_prefixes = [
@@ -113,7 +213,7 @@ fn parse_addr(token: &Token, default_port: Option<u16>, allow_name: bool) -> Res
         }
     }
 
-    if s.starts_with('/') {
+    if !is_inet_quic && s.starts_with('/') {
         return Err(ConfigError::new(
             token.line,
             token.col,

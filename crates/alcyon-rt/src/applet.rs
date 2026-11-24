@@ -2103,9 +2103,9 @@ impl CliApplet {
             .srv
             .and_then(|sv| s.be.and_then(|b| ctx.proxies.get(b)).and_then(|p| p.srv_set().at(sv)))
             .map_or("<none>", |s| s.name());
-        let src = s.src.map_or_else(|| "unix:1".to_string(), |a| a.to_string());
+        let src = s.src.map_or_else(|| format!("unix:{}", s.so_id.max(1)), |a| a.to_string());
         let age = i64::try_from(now.saturating_duration_since(s.since).as_secs()).unwrap_or(i64::MAX);
-        let scb_state = if s.srv_fd >= 0 || s.src.is_none() { 8 } else { 0 };
+        let scb_state = if s.srv_fd >= 0 || s.fe.is_none() { 8 } else { 0 };
         let mut l = format!(
             "0x{:x}: proto={} src={src} fe={} be={} srv={srv} ts=00 epoch=0 age={} calls=0 rate=0 cpu=0 lat=0 \
              rq[f=000000h,i={},an=00h,ax=] rp[f=000000h,i={},an=00h,ax=] \

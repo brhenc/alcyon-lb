@@ -419,6 +419,10 @@ pub struct BindConfig {
     /// name it.
     pub line: usize,
     pub addr: SocketAddr,
+    /// `AF_UNIX` stream socket path (`unix@<path>` or bare `/<path>`); `None` for inet binds
+    /// (boxed so inet binds pay one pointer and zero heap allocation, keeping `addr` plain
+    /// `SocketAddr` all the way to inet `accept`).
+    pub unix: Option<Box<std::path::PathBuf>>,
     pub quic: bool,
     pub ssl: bool,
     pub crt: Vec<String>,
@@ -482,6 +486,27 @@ impl BindConfig {
     #[must_use]
     pub fn no_ca_names(&self) -> bool {
         self.client_auth.as_deref().is_some_and(|c| c.no_ca_names)
+    }
+
+    /// Configured `AF_UNIX` socket path, if this is a unix bind.
+    #[must_use]
+    pub fn unix_path(&self) -> Option<&std::path::Path> {
+        self.unix.as_deref().map(std::path::PathBuf::as_path)
+    }
+
+    /// Whether this bind listens on an `AF_UNIX` stream socket rather than an inet address.
+    #[must_use]
+    pub const fn is_unix(&self) -> bool {
+        self.unix.is_some()
+    }
+
+    /// Human-readable bind address for diagnostic messages (the unix path, or `ip:port`).
+    #[must_use]
+    pub fn display_addr(&self) -> String {
+        match self.unix.as_deref() {
+            Some(p) => p.display().to_string(),
+            None => self.addr.to_string(),
+        }
     }
 }
 

@@ -532,6 +532,7 @@ mod trailer_case;
 mod drop_trailers;
 mod trailer_values;
 mod tune_maxaccept;
+mod unix_bind;
 mod transport_edges;
 mod txn_log_actions;
 mod txn_variables_race;

@@ -68,6 +68,7 @@ fn test_sni_multi_cert_dispatch() {
         sock: None,
         client_auth: None,
         addr: "127.0.0.1:443".parse().expect("addr"),
+        unix: None,
         quic: false,
         ssl: true,
         crt,

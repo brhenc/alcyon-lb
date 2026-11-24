@@ -536,10 +536,15 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                     };
                     self.p += 1;
                     if proxy.addr.port() > 0
+                        || proxy.ids.first_unix_bind.is_some()
                         || proxy.default_backend.is_some()
                         || !proxy.use_backends.is_empty()
                     {
                         self.n += 1;
+                        let addr_display = match (proxy.addr.port(), proxy.ids.first_unix_bind.as_deref()) {
+                            (0, Some(u)) => u.to_string(),
+                            _ => proxy.addr.to_string(),
+                        };
                         let _ = write!(
                             out,
                             r#"          <tr id="fe-row-{name}">
@@ -564,7 +569,7 @@ tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
                             name = proxy.name,
                             desc = proxy_desc(proxy),
                             mode = proxy.mode,
-                            addr = proxy.addr,
+                            addr = addr_display,
                             act_conn = proxy.stats.iter().map(|s| s.act_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u32>(),
                             maxconn = proxy.maxconn,
                             cum_conn = proxy.stats.iter().map(|s| s.cum_conn.load(std::sync::atomic::Ordering::Relaxed)).sum::<u64>(),
