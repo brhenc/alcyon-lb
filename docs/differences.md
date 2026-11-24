@@ -995,6 +995,15 @@ apply:
   RFC 8446 §6.2) where OpenSSL sends alert 42 (`bad_certificate`). For an expired CRL
   (`X509_V_ERR_CRL_HAS_EXPIRED` = 12), rustls sends alert 48 (`unknown_ca`) where OpenSSL sends
   alert 45 (`certificate_expired`).
+* **Non-relaxable errors under `crt-ignore-err` / `ca-ignore-err`:** `BindClientVerifier` never
+  returns `Ok` unless `rustls-webpki` verified a chain to a configured trust anchor on some pass
+  or the untrusted-issuer code (`18`/`19`/`20`) at its OpenSSL depth is itself ignored. Consequently,
+  an ignored error that webpki cannot look past (such as disjoint expired leaf and intermediate
+  validity windows) fails with alert 48 (`unknown_ca`) unless the corresponding untrusted-issuer
+  code is also ignored. For a self-signed certificate with `notBefore > notAfter`, when both
+  `18` and validity errors are ignored (`all`), `ssl_c_verify` reports `14`
+  (`ERROR_IN_CERT_NOT_AFTER_FIELD`) where OpenSSL reports `10` (`CERT_HAS_EXPIRED`), while
+  `ssl_c_err` reports `18` on both.
 * **webpki → `X509_V_ERR` mapping table:** webpki variants with an exact OpenSSL twin map to
   that code; coarser webpki errors map to the closest OpenSSL code below. Where webpki does not
   expose chain depth (signature, name-constraint, or unknown-future errors), errors default to

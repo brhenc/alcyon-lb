@@ -90,3 +90,32 @@ rm -f v3-ca.srl
 # 6. Copy only the public CA certs, client cert+key PEM bundles, and CRL PEMs here; leave all
 #    CA private keys and OpenSSL CA DB files in /tmp.
 ```
+
+## Untrusted disjoint-expired chain and inverted-validity fixtures (T655 C1b fix 1)
+
+- `crl-evil-inter.crt` (public cert only; private key kept in `/tmp`), `crl-evil-leaf.pem`,
+  `crl-evil-inverted.pem`: generated with OpenSSL 4.0.3 to test that ignoring
+  `X509_V_ERR_CERT_HAS_EXPIRED` at both leaf and CA depths never accepts an untrusted chain.
+
+```sh
+# 1. Self-signed untrusted intermediate CA valid 2010-01-01..2011-01-01 (`CA:TRUE`).
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -keyout /tmp/evil_inter.key -out crl-evil-inter.crt \
+  -subj "/CN=Alcyon Test Evil Inter CA" -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -not_before 20100101000000Z -not_after 20110101000000Z
+
+# 2. Disjoint expired leaf valid 2024-01-01..2024-06-01 signed by crl-evil-inter.crt.
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+  -keyout /tmp/evil_leaf.key -out /tmp/evil_leaf.csr -subj "/CN=Alcyon Test Evil Leaf"
+openssl x509 -req -in /tmp/evil_leaf.csr -CA crl-evil-inter.crt -CAkey /tmp/evil_inter.key \
+  -CAcreateserial -extfile /tmp/evil_leaf.cnf \
+  -not_before 20240101000000Z -not_after 20240601000000Z -out /tmp/evil_leaf.crt
+cat /tmp/evil_leaf.crt /tmp/evil_leaf.key > crl-evil-leaf.pem
+rm -f crl-evil-inter.srl
+
+# 3. Untrusted self-signed cert with inverted validity (notBefore 2025-01-02 > notAfter 2020-01-01):
+#    OpenSSL CLI refuses `not_before > not_after`; generated via `rcgen` (same shape as
+#    `client_verify::tests` inverted validity fixture: `not_before = date_time_ymd(2025, 1, 2)`,
+#    `not_after = date_time_ymd(2020, 1, 1)`, self-signed EC P-256 `CA:TRUE`).
+```

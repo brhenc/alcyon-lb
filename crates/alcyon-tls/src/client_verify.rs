@@ -105,6 +105,20 @@ impl ClientVerifyCodes {
         self.verify = if self.crt_err != 0 { self.crt_err } else { self.ca_err };
     }
 
+    /// Records the untrusted-issuer code (`18`/`19`/`20`) at its depth, superseding any
+    /// provisional error recorded at that depth before trust-anchor checking ran, while
+    /// preserving a non-zero `verify` code (matching OpenSSL's `SSL_get_verify_result`).
+    fn record_untrusted(&mut self, code: i32, is_leaf: bool) {
+        if is_leaf {
+            self.crt_err = code;
+        } else {
+            self.ca_err = code;
+        }
+        if self.verify == 0 {
+            self.verify = code;
+        }
+    }
+
     /// Provider-neutral summary for [`alcyon_proto::transport::TlsInfo::peer_verify`].
     #[must_use]
     pub const fn to_verify_result(self) -> VerifyResult {
@@ -221,6 +235,27 @@ impl BindClientVerifier {
         self.verify_identity_at(identity.identity, identity.now)
     }
 
+    const fn is_ignored(&self, code: i32, is_leaf: bool) -> bool {
+        if is_leaf {
+            self.crt_ignore_err.contains(code)
+        } else {
+            self.ca_ignore_err.contains(code)
+        }
+    }
+
+    /// Verifies `identity` at `now`.
+    ///
+    /// Security invariant: this function returns `Ok` **only** if:
+    ///   (a) `EndEntityCert::verify_for_usage` succeeded (`Ok(path)`) on some pass (meaning
+    ///       `rustls-webpki` cryptographically verified a chain from the leaf to a trust anchor
+    ///       in `self.roots`), OR
+    ///   (b) the untrusted-issuer error that prevented reaching a trust anchor
+    ///       (`untrusted_issuer_for`: OpenSSL code 18/20 at depth 0, or 19/20 at depth > 0) is
+    ///       itself ignored at that depth (`crt_ignore_err` / `ca_ignore_err`).
+    ///
+    /// Any ignored error that cannot be relaxed — and any leaf-parse error before path building —
+    /// returns `Err(CertificateError::UnknownIssuer)` with the untrusted-issuer code recorded
+    /// unless (b) holds.
     fn verify_identity_at<'a>(
         &self,
         identity: &Identity<'a>,
@@ -238,11 +273,17 @@ impl BindClientVerifier {
             Ok(cert) => cert,
             Err(err) => {
                 let code = webpki_error_to_x509(&err);
-                let codes = ClientVerifyCodes::leaf_err(code);
-                if self.crt_ignore_err.contains(code) {
+                let mut codes = ClientVerifyCodes::leaf_err(code);
+                if !self.crt_ignore_err.contains(code) {
+                    return (Err(webpki_error_to_rustls(err)), codes);
+                }
+                // Invariant (b): leaf failed to parse before any trust anchor was verified.
+                let (u_code, u_is_leaf) = untrusted_issuer_for(leaf_der.as_ref(), &certificates.intermediates);
+                if self.is_ignored(u_code, u_is_leaf) {
                     return (Ok(VerifiedIdentity::assertion(identity.clone())), codes);
                 }
-                return (Err(webpki_error_to_rustls(err)), codes);
+                codes.record_untrusted(u_code, u_is_leaf);
+                return (Err(CertificateError::UnknownIssuer.into()), codes);
             }
         };
 
@@ -270,6 +311,7 @@ impl BindClientVerifier {
                 None,
             ) {
                 Ok(path) => {
+                    // Invariant (a): webpki verified a chain to a trust anchor in `self.roots`.
                     if state.shifted_time {
                         if let Some(err) = self.check_inter_now_validity(&path, now, &mut codes) {
                             return (Err(err), codes);
@@ -278,26 +320,14 @@ impl BindClientVerifier {
                     return (Ok(VerifiedIdentity::assertion(identity.clone())), codes);
                 }
                 Err(err) => {
-                    // webpki checks EKU before building the chain to a trust anchor; OpenSSL builds
-                    // the trust chain first. Re-check with a permissive EKU so an untrusted server
-                    // cert still reports `UnknownIssuer` (alert 48 / code 20) as HAProxy does.
-                    let effective = if !state.allow_any_eku && matches!(err, webpki::Error::RequiredEkuNotFound(_)) {
-                        let rev2 = build_revocation(&crl_refs, state.rev_mode, state.exp_policy);
-                        match cert.verify_for_usage(
-                            self.all_algs,
-                            &self.roots.roots,
-                            &certificates.intermediates,
-                            state.check_time,
-                            &AnyEku,
-                            rev2,
-                            None,
-                        ) {
-                            Ok(_) => err,
-                            Err(chain_err) => chain_err,
-                        }
-                    } else {
-                        err
-                    };
+                    let effective = self.refine_pre_chain_error(
+                        &cert,
+                        err,
+                        leaf_der,
+                        &certificates.intermediates,
+                        &crl_refs,
+                        &state,
+                    );
                     let (code, is_leaf) = self.classify_with_depth(
                         &cert,
                         &effective,
@@ -309,21 +339,74 @@ impl BindClientVerifier {
                         state.rev_mode,
                         state.exp_policy,
                     );
-                    codes.record(code, is_leaf);
-                    let ignored = if is_leaf {
-                        self.crt_ignore_err.contains(code)
+                    if matches!(effective, webpki::Error::UnknownIssuer) {
+                        codes.record_untrusted(code, is_leaf);
                     } else {
-                        self.ca_ignore_err.contains(code)
-                    };
-                    if !ignored {
+                        codes.record(code, is_leaf);
+                    }
+                    if !self.is_ignored(code, is_leaf) {
                         return (Err(webpki_error_to_rustls(effective)), codes);
                     }
-                    if !state.relax(&effective, is_leaf, leaf_der.as_ref(), &certificates.intermediates) {
+                    if state.relax(&effective, is_leaf, leaf_der.as_ref(), &certificates.intermediates) {
+                        continue;
+                    }
+                    // No pass reached a trust anchor and nothing remains to relax: enforce
+                    // invariant (b) before accepting.
+                    let (u_code, u_is_leaf) = if matches!(effective, webpki::Error::UnknownIssuer) {
+                        (code, is_leaf)
+                    } else {
+                        let pair = untrusted_issuer_for(leaf_der.as_ref(), &certificates.intermediates);
+                        codes.record_untrusted(pair.0, pair.1);
+                        pair
+                    };
+                    if self.is_ignored(u_code, u_is_leaf) {
                         return (Ok(VerifiedIdentity::assertion(identity.clone())), codes);
                     }
+                    return (Err(CertificateError::UnknownIssuer.into()), codes);
                 }
             }
         }
+    }
+
+    /// Re-orders webpki's pre-chain checks (`RequiredEkuNotFound`, self-signed
+    /// `InvalidCertValidity`) to match OpenSSL's trust-anchor-first error reporting.
+    fn refine_pre_chain_error(
+        &self,
+        cert: &EndEntityCert<'_>,
+        err: webpki::Error,
+        leaf_der: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        crl_refs: &[&CertRevocationList<'_>],
+        state: &VerifyState,
+    ) -> webpki::Error {
+        // webpki checks EKU before building the chain to a trust anchor; OpenSSL builds the
+        // trust chain first. Re-check with a permissive EKU so an untrusted server cert still
+        // reports `UnknownIssuer` (alert 48 / code 20) as HAProxy does.
+        if !state.allow_any_eku && matches!(err, webpki::Error::RequiredEkuNotFound(_)) {
+            let rev2 = build_revocation(crl_refs, state.rev_mode, state.exp_policy);
+            return match cert.verify_for_usage(
+                self.all_algs,
+                &self.roots.roots,
+                intermediates,
+                state.check_time,
+                &AnyEku,
+                rev2,
+                None,
+            ) {
+                Ok(_) => err,
+                Err(chain_err) => chain_err,
+            };
+        }
+        // OpenSSL reports `DEPTH_ZERO_SELF_SIGNED_CERT` (18, alert 48) before checking
+        // `notBefore > notAfter`; webpki reports `InvalidCertValidity` (alert 45). When code 18
+        // is not ignored on a self-signed leaf, report `UnknownIssuer` (alert 48) instead.
+        if matches!(err, webpki::Error::InvalidCertValidity)
+            && !self.crt_ignore_err.contains(x509_err::DEPTH_ZERO_SELF_SIGNED_CERT)
+            && x509::Cert::parse(leaf_der.as_ref()).is_some_and(|c| c.subject == c.issuer)
+        {
+            return webpki::Error::UnknownIssuer;
+        }
+        err
     }
 
     /// Attributes `effective` to leaf (depth 0) or CA chain (depth > 0), probing
@@ -761,6 +844,14 @@ fn classify_webpki_error(
         // expose chain depth).
         _ => ClientVerifyCodes::leaf_err(webpki_error_to_x509(err)),
     }
+}
+
+/// Returns `(code, is_leaf)` for the OpenSSL untrusted-issuer error (`18`/`19`/`20`) of an
+/// unverified chain (`DEPTH_ZERO_SELF_SIGNED_CERT`, `SELF_SIGNED_CERT_IN_CHAIN`, or
+/// `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`).
+fn untrusted_issuer_for(leaf_der: &[u8], intermediates: &[CertificateDer<'_>]) -> (i32, bool) {
+    let c = classify_unknown_issuer(leaf_der, intermediates);
+    (c.verify, c.crt_err != 0)
 }
 
 /// Refines `webpki::Error::UnknownIssuer` into OpenSSL's 18 / 19 / 20 and leaf vs CA depth.
@@ -1407,5 +1498,85 @@ mod tests {
         let (res, codes) = check(&v_ca_nocrl, rev_leaf);
         assert!(matches!(res, Err(Error::InvalidCertificate(CertificateError::Revoked))), "{res:?}");
         assert_eq!(codes, ClientVerifyCodes { verify: 23, crt_err: 23, ca_err: 3 });
+    }
+
+    #[test]
+    fn relax_exhausted_and_leaf_parse_errors_never_bypass_trust_anchor() {
+        let prov = provider::of(TlsCryptoProvider::Ring, true, true);
+        let fx = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../alcyon-rt/tests/data/client_auth");
+        let roots = Arc::new(crate::config::load_ca_file(&fx.join("v3-ca.crt")).expect("v3-ca"));
+        let make_v = |crt_ign: X509ErrMask, ca_ign: X509ErrMask| {
+            BindClientVerifier::from_opts(
+                BindClientVerifyOpts {
+                    roots: Arc::clone(&roots),
+                    root_hint_subjects: Vec::new(),
+                    crls: Vec::new(),
+                    mandatory: true,
+                    crt_ignore_err: crt_ign,
+                    ca_ignore_err: ca_ign,
+                },
+                TlsCryptoProvider::Ring,
+                &prov,
+            )
+        };
+
+        // Load untrusted disjoint-expired leaf (2024) + untrusted self-signed inter (2010..2011).
+        let (mut evil_chain, _) = crate::config::load_cert_file(&fx.join("crl-evil-leaf.pem")).expect("evil leaf");
+        let inter_pem = std::fs::read(fx.join("crl-evil-inter.crt")).expect("evil inter");
+        for item in rustls_pemfile::read_all(&mut std::io::BufReader::new(inter_pem.as_slice())) {
+            if let Ok(rustls_pemfile::Item::X509Certificate(c)) = item {
+                evil_chain.push(c);
+            }
+        }
+
+        // 1. Ignoring expiry at both depths MUST reject (relax exhausted without reaching trust anchor).
+        let mut mask_exp = X509ErrMask::EMPTY;
+        mask_exp.insert(10);
+        let (res, codes) = check(&make_v(mask_exp, mask_exp), evil_chain.clone());
+        assert!(
+            matches!(res, Err(Error::InvalidCertificate(CertificateError::UnknownIssuer))),
+            "relax-exhausted untrusted chain must fail with UnknownIssuer, got {res:?} ({codes:?})"
+        );
+        assert_eq!(codes.ca_err, x509_err::SELF_SIGNED_CERT_IN_CHAIN);
+
+        // 2. Ignoring 10+19 at the CA depth (or `all` at both depths) accepts with 10/10/19.
+        let mut mask_ca19 = mask_exp;
+        mask_ca19.insert(19);
+        let (res, codes) = check(&make_v(mask_exp, mask_ca19), evil_chain.clone());
+        assert!(res.is_ok(), "ignored 10 + ca 19 must pass: {res:?}");
+        assert_eq!(codes, ClientVerifyCodes { verify: 10, crt_err: 10, ca_err: 19 });
+
+        // 3. Leaf parse error (`UnsupportedCertVersion` = 1) with ONLY code 1 ignored (NOT 20)
+        //    must reject with UnknownIssuer; with `all` (includes 20) it returns Ok with err=1.
+        let (v1_chain, _) = crate::config::load_cert_file(&fx.join("client1.pem")).expect("v1");
+        let mut mask_unspec = X509ErrMask::EMPTY;
+        mask_unspec.insert(1);
+        let (res, codes) = check(&make_v(mask_unspec, X509ErrMask::EMPTY), v1_chain.clone());
+        assert!(
+            matches!(res, Err(Error::InvalidCertificate(CertificateError::UnknownIssuer))),
+            "ignoring only code 1 must not bypass trust anchor: {res:?} ({codes:?})"
+        );
+        assert_eq!(codes.crt_err, x509_err::UNABLE_TO_GET_ISSUER_CERT_LOCALLY);
+
+        let (res, codes) = check(&make_v(X509ErrMask::ALL, X509ErrMask::EMPTY), v1_chain);
+        assert!(res.is_ok(), "crt-ignore-err all includes both 1 and 20: {res:?}");
+        assert_eq!(codes, ClientVerifyCodes { verify: 1, crt_err: 1, ca_err: 0 });
+
+        // 4. Untrusted self-signed cert with notBefore > notAfter under exp_both -> UnknownIssuer (18);
+        //    under crt-ignore-err 18 only -> Expired (14); under all -> Ok with crt_err=18.
+        let (inv_chain, _) = crate::config::load_cert_file(&fx.join("crl-evil-inverted.pem")).expect("inv");
+        let (res, codes) = check(&make_v(mask_exp, mask_exp), inv_chain.clone());
+        assert!(matches!(res, Err(Error::InvalidCertificate(CertificateError::UnknownIssuer))), "{res:?}");
+        assert_eq!(codes, ClientVerifyCodes { verify: 18, crt_err: 18, ca_err: 0 });
+
+        let mut mask_ss = X509ErrMask::EMPTY;
+        mask_ss.insert(18);
+        let (res, codes) = check(&make_v(mask_ss, X509ErrMask::EMPTY), inv_chain.clone());
+        assert!(matches!(res, Err(Error::InvalidCertificate(CertificateError::Expired))), "{res:?}");
+        assert_eq!(codes, ClientVerifyCodes { verify: 14, crt_err: 14, ca_err: 0 });
+
+        let (res, codes) = check(&make_v(X509ErrMask::ALL, X509ErrMask::EMPTY), inv_chain);
+        assert!(res.is_ok(), "all must accept inverted self-signed: {res:?}");
+        assert_eq!(codes, ClientVerifyCodes { verify: 14, crt_err: 18, ca_err: 0 });
     }
 }

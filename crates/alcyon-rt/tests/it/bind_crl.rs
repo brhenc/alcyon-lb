@@ -743,3 +743,119 @@ fn bind_c1b_config_check_cli_matches_haproxy() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn format_evil_cfg(
+    fx: &Path,
+    ports: (SocketAddr, SocketAddr, SocketAddr, SocketAddr),
+    log_port: u16,
+    origin_port: u16,
+) -> String {
+    let srv = fx.join("common.pem");
+    let ca = fx.join("v3-ca.crt");
+    let (srv, ca) = (srv.display(), ca.display());
+    let (fe_exp_both, fe_all_both, fe_exp_ca19, fe_exp_crt19) = ports;
+    format!(
+        "global\n  nbthread 1\n\
+         defaults\n  mode http\n  timeout connect 5s\n  timeout client 5s\n  timeout server 5s\n\
+         \x20 log 127.0.0.1:{log_port} local0\n  option dontlognull\n\
+         \x20 error-log-format \"ERRLOG fe=%f used=%[ssl_c_used] verify=%[ssl_c_verify] err=%[ssl_c_err] ca_err=%[ssl_c_ca_err]\"\n\
+         frontend fe_exp_both\n  bind {fe_exp_both} ssl crt {srv} ca-file {ca} verify required crt-ignore-err X509_V_ERR_CERT_HAS_EXPIRED ca-ignore-err X509_V_ERR_CERT_HAS_EXPIRED\n  default_backend be\n\
+         frontend fe_all_both\n  bind {fe_all_both} ssl crt {srv} ca-file {ca} verify required crt-ignore-err all ca-ignore-err all\n  default_backend be\n\
+         frontend fe_exp_ca19\n  bind {fe_exp_ca19} ssl crt {srv} ca-file {ca} verify required crt-ignore-err 10 ca-ignore-err 10,19\n  default_backend be\n\
+         frontend fe_exp_crt19\n  bind {fe_exp_crt19} ssl crt {srv} ca-file {ca} verify required crt-ignore-err 10,19 ca-ignore-err 10\n  default_backend be\n\
+         backend be\n\
+         \x20 http-response set-header X-Used %[ssl_c_used]\n\
+         \x20 http-response set-header X-Verify %[ssl_c_verify]\n\
+         \x20 http-response set-header X-Verify-Str %[ssl_c_verify,x509_v_err_str]\n\
+         \x20 http-response set-header X-Err %[ssl_c_err]\n\
+         \x20 http-response set-header X-Ca-Err %[ssl_c_ca_err]\n\
+         \x20 server s1 127.0.0.1:{origin_port}\n"
+    )
+}
+
+#[test]
+fn bind_ignore_expired_never_accepts_untrusted_disjoint_chain() {
+    let fx = fixtures_dir();
+    let evil_leaf = fx.join("crl-evil-leaf.pem");
+    let evil_inter = fx.join("crl-evil-inter.crt");
+    let evil_inv = fx.join("crl-evil-inverted.pem");
+
+    let fe_exp_both = common::reserve_addr();
+    let fe_all_both = common::reserve_addr();
+    let fe_exp_ca19 = common::reserve_addr();
+    let fe_exp_crt19 = common::reserve_addr();
+    let (origin_port, stop, origin_handle) = start_origin();
+    let udp = UdpSocket::bind("127.0.0.1:0").expect("bind udp log");
+    udp.set_read_timeout(Some(Duration::from_secs(3))).expect("timeout");
+    let log_port = udp.local_addr().expect("udp addr").port();
+
+    let dir = std::env::temp_dir().join(format!("alcyon-bind-evil-{}-{}", std::process::id(), fe_exp_both.port()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let cfg_path = dir.join("evil.cfg");
+    let cfg = format_evil_cfg(&fx, (fe_exp_both, fe_all_both, fe_exp_ca19, fe_exp_crt19), log_port, origin_port);
+    std::fs::write(&cfg_path, &cfg).expect("write cfg");
+
+    let child = Command::new(proxy_bin())
+        .arg("-f")
+        .arg(&cfg_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn proxy");
+    let daemon = Daemon { child, dir: dir.clone(), stop, origin: Some(origin_handle) };
+
+    assert!(common::wait_listening(fe_exp_both), "fe_exp_both did not listen");
+    assert!(common::wait_listening(fe_exp_crt19), "fe_exp_crt19 did not listen");
+
+    // 1. Untrusted disjoint-expired chain (leaf 2024 + self-signed inter 2010..2011) under
+    //    crt-ignore-err 10 + ca-ignore-err 10 MUST FAIL with alert 48 and ca_err=19.
+    drain_udp(&udp);
+    let out = s_client(fe_exp_both, "-tls1_3", Some(&evil_leaf), Some(&evil_inter));
+    assert_handshake_failed("evil leaf+inter under exp_both", &out, Some(48));
+    let log = recv_errlog(&udp, "evil leaf+inter under exp_both");
+    assert!(
+        log.contains("used=1 verify=-") && log.contains("ca_err=19"),
+        "expected untrusted ca_err=19 in error log, got:\n{log}"
+    );
+
+    // Without intermediate chain, leaf alone also fails with alert 48 and err=20.
+    drain_udp(&udp);
+    let out = s_client(fe_exp_both, "-tls1_3", Some(&evil_leaf), None);
+    assert_handshake_failed("evil leaf alone under exp_both", &out, Some(48));
+    let log = recv_errlog(&udp, "evil leaf alone under exp_both");
+    assert!(log.contains("used=1 verify=- err=20 ca_err=0"), "got:\n{log}");
+
+    // 2. Same untrusted chain under `crt-ignore-err 10,19 ca-ignore-err 10` (19 at wrong depth)
+    //    MUST STILL FAIL with alert 48 and ca_err=19.
+    drain_udp(&udp);
+    let out = s_client(fe_exp_crt19, "-tls1_3", Some(&evil_leaf), Some(&evil_inter));
+    assert_handshake_failed("evil leaf+inter under exp_crt19", &out, Some(48));
+    let log = recv_errlog(&udp, "evil leaf+inter under exp_crt19");
+    assert!(log.contains("ca_err=19"), "got:\n{log}");
+
+    // 3. Same untrusted chain under `crt-ignore-err all ca-ignore-err all` AND under
+    //    `crt-ignore-err 10 ca-ignore-err 10,19` MUST PASS with 1/10/10/19 (measured on oracle).
+    for (label, addr) in [
+        ("evil leaf+inter under all_both", fe_all_both),
+        ("evil leaf+inter under exp_ca19", fe_exp_ca19),
+    ] {
+        let out = s_client(addr, "-tls1_3", Some(&evil_leaf), Some(&evil_inter));
+        assert_ok_headers(label, &out, "1", "10", "X509_V_ERR_CERT_HAS_EXPIRED", "10", "19");
+    }
+
+    // 4. Untrusted self-signed cert with inverted validity (notBefore > notAfter):
+    //    under exp_both -> MUST FAIL with alert 48 and err=18 ca_err=0 (matches HAProxy).
+    drain_udp(&udp);
+    let out = s_client(fe_exp_both, "-tls1_3", Some(&evil_inv), None);
+    assert_handshake_failed("evil inverted under exp_both", &out, Some(48));
+    let log = recv_errlog(&udp, "evil inverted under exp_both");
+    assert!(log.contains("used=1 verify=- err=18 ca_err=0"), "got:\n{log}");
+
+    // Under all_both -> 200 OK, used=1, err=18, ca_err=0 (oracle reports verify=10, webpki 14).
+    let out = s_client(fe_all_both, "-tls1_3", Some(&evil_inv), None);
+    let expected_verify = if is_oracle() { ("10", "X509_V_ERR_CERT_HAS_EXPIRED") } else { ("14", "X509_V_ERR_ERROR_IN_CERT_NOT_AFTER_FIELD") };
+    assert_ok_headers("evil inverted under all_both", &out, "1", expected_verify.0, expected_verify.1, "18", "0");
+
+    drop(daemon);
+}
