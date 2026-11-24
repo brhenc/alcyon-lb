@@ -229,6 +229,152 @@ pub struct SocketTuning {
     pub quic_force_retry: bool,
 }
 
+/// Maximum OpenSSL `X509_V_ERR_*` code accepted by `HAProxy`'s `crt-ignore-err` and
+/// `ca-ignore-err` (`SSL_MAX_VFY_ERROR_CODE` in `include/haproxy/listener-t.h`).
+pub const X509_V_ERR_MAX: i32 = 94;
+
+/// OpenSSL `X509_V_ERR_*` constant names indexed by code `0..=94` (`src/ssl_utils.c`).
+const X509_V_ERR_NAMES: [&str; 95] = [
+    "X509_V_OK",
+    "X509_V_ERR_UNSPECIFIED",
+    "X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT",
+    "X509_V_ERR_UNABLE_TO_GET_CRL",
+    "X509_V_ERR_UNABLE_TO_DECRYPT_CERT_SIGNATURE",
+    "X509_V_ERR_UNABLE_TO_DECRYPT_CRL_SIGNATURE",
+    "X509_V_ERR_UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY",
+    "X509_V_ERR_CERT_SIGNATURE_FAILURE",
+    "X509_V_ERR_CRL_SIGNATURE_FAILURE",
+    "X509_V_ERR_CERT_NOT_YET_VALID",
+    "X509_V_ERR_CERT_HAS_EXPIRED",
+    "X509_V_ERR_CRL_NOT_YET_VALID",
+    "X509_V_ERR_CRL_HAS_EXPIRED",
+    "X509_V_ERR_ERROR_IN_CERT_NOT_BEFORE_FIELD",
+    "X509_V_ERR_ERROR_IN_CERT_NOT_AFTER_FIELD",
+    "X509_V_ERR_ERROR_IN_CRL_LAST_UPDATE_FIELD",
+    "X509_V_ERR_ERROR_IN_CRL_NEXT_UPDATE_FIELD",
+    "X509_V_ERR_OUT_OF_MEM",
+    "X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT",
+    "X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN",
+    "X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+    "X509_V_ERR_UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "X509_V_ERR_CERT_CHAIN_TOO_LONG",
+    "X509_V_ERR_CERT_REVOKED",
+    "X509_V_ERR_NO_ISSUER_PUBLIC_KEY",
+    "X509_V_ERR_PATH_LENGTH_EXCEEDED",
+    "X509_V_ERR_INVALID_PURPOSE",
+    "X509_V_ERR_CERT_UNTRUSTED",
+    "X509_V_ERR_CERT_REJECTED",
+    "X509_V_ERR_SUBJECT_ISSUER_MISMATCH",
+    "X509_V_ERR_AKID_SKID_MISMATCH",
+    "X509_V_ERR_AKID_ISSUER_SERIAL_MISMATCH",
+    "X509_V_ERR_KEYUSAGE_NO_CERTSIGN",
+    "X509_V_ERR_UNABLE_TO_GET_CRL_ISSUER",
+    "X509_V_ERR_UNHANDLED_CRITICAL_EXTENSION",
+    "X509_V_ERR_KEYUSAGE_NO_CRL_SIGN",
+    "X509_V_ERR_UNHANDLED_CRITICAL_CRL_EXTENSION",
+    "X509_V_ERR_INVALID_NON_CA",
+    "X509_V_ERR_PROXY_PATH_LENGTH_EXCEEDED",
+    "X509_V_ERR_KEYUSAGE_NO_DIGITAL_SIGNATURE",
+    "X509_V_ERR_PROXY_CERTIFICATES_NOT_ALLOWED",
+    "X509_V_ERR_INVALID_EXTENSION",
+    "X509_V_ERR_INVALID_POLICY_EXTENSION",
+    "X509_V_ERR_NO_EXPLICIT_POLICY",
+    "X509_V_ERR_DIFFERENT_CRL_SCOPE",
+    "X509_V_ERR_UNSUPPORTED_EXTENSION_FEATURE",
+    "X509_V_ERR_UNNESTED_RESOURCE",
+    "X509_V_ERR_PERMITTED_VIOLATION",
+    "X509_V_ERR_EXCLUDED_VIOLATION",
+    "X509_V_ERR_SUBTREE_MINMAX",
+    "X509_V_ERR_APPLICATION_VERIFICATION",
+    "X509_V_ERR_UNSUPPORTED_CONSTRAINT_TYPE",
+    "X509_V_ERR_UNSUPPORTED_CONSTRAINT_SYNTAX",
+    "X509_V_ERR_UNSUPPORTED_NAME_SYNTAX",
+    "X509_V_ERR_CRL_PATH_VALIDATION_ERROR",
+    "X509_V_ERR_PATH_LOOP",
+    "X509_V_ERR_SUITE_B_INVALID_VERSION",
+    "X509_V_ERR_SUITE_B_INVALID_ALGORITHM",
+    "X509_V_ERR_SUITE_B_INVALID_CURVE",
+    "X509_V_ERR_SUITE_B_INVALID_SIGNATURE_ALGORITHM",
+    "X509_V_ERR_SUITE_B_LOS_NOT_ALLOWED",
+    "X509_V_ERR_SUITE_B_CANNOT_SIGN_P_384_WITH_P_256",
+    "X509_V_ERR_HOSTNAME_MISMATCH",
+    "X509_V_ERR_EMAIL_MISMATCH",
+    "X509_V_ERR_IP_ADDRESS_MISMATCH",
+    "X509_V_ERR_DANE_NO_MATCH",
+    "X509_V_ERR_EE_KEY_TOO_SMALL",
+    "X509_V_ERR_CA_KEY_TOO_SMALL",
+    "X509_V_ERR_CA_MD_TOO_WEAK",
+    "X509_V_ERR_INVALID_CALL",
+    "X509_V_ERR_STORE_LOOKUP",
+    "X509_V_ERR_NO_VALID_SCTS",
+    "X509_V_ERR_PROXY_SUBJECT_NAME_VIOLATION",
+    "X509_V_ERR_OCSP_VERIFY_NEEDED",
+    "X509_V_ERR_OCSP_VERIFY_FAILED",
+    "X509_V_ERR_OCSP_CERT_UNKNOWN",
+    "X509_V_ERR_UNSUPPORTED_SIGNATURE_ALGORITHM",
+    "X509_V_ERR_SIGNATURE_ALGORITHM_MISMATCH",
+    "X509_V_ERR_SIGNATURE_ALGORITHM_INCONSISTENCY",
+    "X509_V_ERR_INVALID_CA",
+    "X509_V_ERR_PATHLEN_INVALID_FOR_NON_CA",
+    "X509_V_ERR_PATHLEN_WITHOUT_KU_KEY_CERT_SIGN",
+    "X509_V_ERR_KU_KEY_CERT_SIGN_INVALID_FOR_NON_CA",
+    "X509_V_ERR_ISSUER_NAME_EMPTY",
+    "X509_V_ERR_SUBJECT_NAME_EMPTY",
+    "X509_V_ERR_MISSING_AUTHORITY_KEY_IDENTIFIER",
+    "X509_V_ERR_MISSING_SUBJECT_KEY_IDENTIFIER",
+    "X509_V_ERR_EMPTY_SUBJECT_ALT_NAME",
+    "X509_V_ERR_EMPTY_SUBJECT_SAN_NOT_CRITICAL",
+    "X509_V_ERR_CA_BCONS_NOT_CRITICAL",
+    "X509_V_ERR_AUTHORITY_KEY_IDENTIFIER_CRITICAL",
+    "X509_V_ERR_SUBJECT_KEY_IDENTIFIER_CRITICAL",
+    "X509_V_ERR_CA_CERT_MISSING_KEY_USAGE",
+    "X509_V_ERR_EXTENSIONS_REQUIRE_VERSION_3",
+    "X509_V_ERR_EC_KEY_EXPLICIT_PARAMS",
+];
+
+/// Resolves an OpenSSL `X509_V_ERR_*` (or `X509_V_OK`) constant name to its numeric code
+/// (`x509_v_err_str_to_int` in `HAProxy` `src/ssl_utils.c`).
+#[must_use]
+pub fn x509_v_err_code(name: &str) -> Option<i32> {
+    X509_V_ERR_NAMES.iter().position(|&n| n == name).and_then(|i| i32::try_from(i).ok())
+}
+
+/// Bitmask of ignored OpenSSL `X509_V_ERR_*` codes `1..=94` (`crt-ignore-err` / `ca-ignore-err`),
+/// matching `HAProxy`'s `cert_ignerr_bitfield`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct X509ErrMask(pub u128);
+
+impl X509ErrMask {
+    /// No errors ignored.
+    pub const EMPTY: Self = Self(0);
+    /// Every error `1..=94` ignored (`all`).
+    pub const ALL: Self = Self((1u128 << 95) - 2);
+
+    /// Whether no error code is marked ignored.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Marks error `code` (`1..=94`) as ignored.
+    pub fn insert(&mut self, code: u8) {
+        if i32::from(code) >= 1 && i32::from(code) <= X509_V_ERR_MAX {
+            self.0 |= 1u128 << code;
+        }
+    }
+
+    /// Combines another mask into `self` (repeated `crt-ignore-err`/`ca-ignore-err` keywords).
+    pub fn union_with(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+
+    /// Whether OpenSSL error `code` (`1..=94`) is ignored by this mask.
+    #[must_use]
+    pub const fn contains(self, code: i32) -> bool {
+        code >= 1 && code <= X509_V_ERR_MAX && (self.0 & (1u128 << code.cast_unsigned())) != 0
+    }
+}
+
 /// Client certificate verification mode on a `bind ... ssl` line (`verify none|optional|required`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BindVerify {
@@ -238,13 +384,24 @@ pub enum BindVerify {
     Required,
 }
 
-/// Client certificate authentication settings of a `bind` line (`verify`, `ca-file`).
+/// Client certificate authentication settings of a `bind` line (`verify`, `ca-file`,
+/// `ca-verify-file`, `crl-file`, `crt-ignore-err`, `ca-ignore-err`, `no-ca-names`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct BindClientAuth {
     /// `verify none|optional|required` (`None` when omitted).
     pub verify: BindVerify,
-    /// `ca-file <path>`: the trust anchors for client verification and CA hints.
+    /// `ca-file <path>`: trust anchors for client verification and `CertificateRequest` CA hints.
     pub ca_file: Option<String>,
+    /// `ca-verify-file <path>`: trust anchors for verification only (not advertised in CA hints).
+    pub ca_verify_file: Option<String>,
+    /// `crl-file <path>`: PEM-encoded certificate revocation lists checked across the whole chain.
+    pub crl_file: Option<String>,
+    /// `crt-ignore-err all|<list>`: ignored `X509_V_ERR_*` codes on the client leaf (depth 0).
+    pub crt_ignore_err: X509ErrMask,
+    /// `ca-ignore-err all|<list>`: ignored `X509_V_ERR_*` codes in the CA chain (depth > 0).
+    pub ca_ignore_err: X509ErrMask,
+    /// `no-ca-names`: omit CA subject hints from the `CertificateRequest`.
+    pub no_ca_names: bool,
     /// Raw bind address token as written (`:443`, `127.0.0.1:8443`), for `HAProxy`'s alert text.
     pub bind_arg: String,
 }
@@ -295,6 +452,36 @@ impl BindConfig {
     #[must_use]
     pub fn ca_file(&self) -> Option<&str> {
         self.client_auth.as_deref().and_then(|c| c.ca_file.as_deref())
+    }
+
+    /// Configured `ca-verify-file` path, if any.
+    #[must_use]
+    pub fn ca_verify_file(&self) -> Option<&str> {
+        self.client_auth.as_deref().and_then(|c| c.ca_verify_file.as_deref())
+    }
+
+    /// Configured `crl-file` path, if any.
+    #[must_use]
+    pub fn crl_file(&self) -> Option<&str> {
+        self.client_auth.as_deref().and_then(|c| c.crl_file.as_deref())
+    }
+
+    /// Ignored client-leaf verification error mask (`crt-ignore-err`).
+    #[must_use]
+    pub fn crt_ignore_err(&self) -> X509ErrMask {
+        self.client_auth.as_deref().map_or(X509ErrMask::EMPTY, |c| c.crt_ignore_err)
+    }
+
+    /// Ignored CA-chain verification error mask (`ca-ignore-err`).
+    #[must_use]
+    pub fn ca_ignore_err(&self) -> X509ErrMask {
+        self.client_auth.as_deref().map_or(X509ErrMask::EMPTY, |c| c.ca_ignore_err)
+    }
+
+    /// Whether `no-ca-names` suppresses CA hints in the `CertificateRequest`.
+    #[must_use]
+    pub fn no_ca_names(&self) -> bool {
+        self.client_auth.as_deref().is_some_and(|c| c.no_ca_names)
     }
 }
 

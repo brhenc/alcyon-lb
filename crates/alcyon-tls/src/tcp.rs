@@ -16,7 +16,7 @@
 //!   provider's factory, and [`Hint`] advertises the lifetime 0.23 advertised (twice the
 //!   rotation period: the time a key decrypts for).
 
-use crate::client_verify::BindClientVerifier;
+use crate::client_verify::{BindClientVerifier, BindClientVerifyOpts};
 use crate::config::{
     cert_covers_name, cert_names, key_mismatch, load_crl_file, load_server_ca, shared_key, spoken_versions, unix_now,
     versions_between, wrong_tag, BackendTlsOptions, BindPlan, SESSION_CACHE_SIZE, SESSION_LIFETIME,
@@ -324,13 +324,7 @@ impl BindTls {
         alpn: Vec<Vec<u8>>,
         kind: TlsCryptoProvider,
     ) -> Result<Arc<Self>, String> {
-        let plan = BindPlan {
-            alpn,
-            pairs: vec![(certs, key, std::path::PathBuf::from("(memory)"))],
-            verify: BindVerify::None,
-            ca_file: None,
-        };
-        build(&plan, kind, true, true).map(Arc::new)
+        build(&BindPlan::single(certs, key, alpn), kind, true, true).map(Arc::new)
     }
 
     /// [`Self::single`] for QUIC: TLS 1.3 only (RFC 9001), on the active provider. A swap does
@@ -343,13 +337,7 @@ impl BindTls {
         key: rustls24::pki_types::PrivateKeyDer<'static>,
         alpn: Vec<Vec<u8>>,
     ) -> Result<Arc<Self>, String> {
-        let plan = BindPlan {
-            alpn,
-            pairs: vec![(certs, key, std::path::PathBuf::from("(memory)"))],
-            verify: BindVerify::None,
-            ca_file: None,
-        };
-        build(&plan, provider::active(), false, true).map(Arc::new)
+        build(&BindPlan::single(certs, key, alpn), provider::active(), false, true).map(Arc::new)
     }
 }
 
@@ -383,13 +371,44 @@ fn build(plan: &BindPlan, kind: TlsCryptoProvider, tls12: bool, tls13: bool) -> 
     let (builder_with_auth, client_verifier) = match plan.verify {
         BindVerify::None => (ServerConfig::builder(prov).with_no_client_auth(), None),
         BindVerify::Optional | BindVerify::Required => {
-            let Some(ca_path) = plan.ca_file.as_deref() else {
+            if plan.ca_file.is_none() && plan.ca_verify_file.is_none() {
                 return Err("verify is enabled but no CA file specified".to_string());
+            }
+            let mut roots = rustls24::RootCertStore::empty();
+            let mut hint_subjects = Vec::new();
+            if let Some(ca_path) = plan.ca_file.as_deref() {
+                let ca_roots = load_server_ca(ca_path)
+                    .map_err(|_| format!("'ca-file' : unable to load {}", ca_path.display()))?;
+                if !plan.no_ca_names {
+                    hint_subjects = ca_roots.subjects();
+                }
+                roots.roots.extend(ca_roots.roots);
+            }
+            if let Some(cv_path) = plan.ca_verify_file.as_deref() {
+                let cv_roots = load_server_ca(cv_path)
+                    .map_err(|_| format!("'ca-verify-file' : unable to load {}", cv_path.display()))?;
+                roots.roots.extend(cv_roots.roots);
+            }
+            let mut crls = Vec::new();
+            if let Some(crl_path) = plan.crl_file.as_deref() {
+                let ders = load_crl_file(crl_path)
+                    .map_err(|_| format!("'crl-file' : unable to load {}", crl_path.display()))?;
+                for der in ders {
+                    let parsed = webpki::OwnedCertRevocationList::from_der(der.as_ref()).map_err(|e| {
+                        format!("'crl-file' : unable to load {} ({e:?})", crl_path.display())
+                    })?;
+                    crls.push(webpki::CertRevocationList::Owned(parsed));
+                }
+            }
+            let opts = BindClientVerifyOpts {
+                roots: Arc::new(roots),
+                root_hint_subjects: hint_subjects,
+                crls,
+                mandatory: plan.verify == BindVerify::Required,
+                crt_ignore_err: plan.crt_ignore_err,
+                ca_ignore_err: plan.ca_ignore_err,
             };
-            let roots = load_server_ca(ca_path)
-                .map_err(|_| format!("'ca-file' : unable to load {}", ca_path.display()))?;
-            let verifier =
-                BindClientVerifier::new(Arc::new(roots), plan.verify == BindVerify::Required, kind, &prov);
+            let verifier = BindClientVerifier::from_opts(opts, kind, &prov);
             let builder = ServerConfig::builder(prov)
                 .with_client_cert_verifier(Arc::clone(&verifier) as Arc<dyn ClientVerifier>);
             (builder, Some(verifier))

@@ -831,8 +831,10 @@ fn apply_ssl_bases(
             under_base(crt_base, crt);
         }
         if let Some(ca) = bind.client_auth.as_deref_mut() {
-            if let Some(p) = ca.ca_file.as_mut().filter(|p| !p.starts_with('@')) {
-                under_base(ca_base, p);
+            for slot in [&mut ca.ca_file, &mut ca.ca_verify_file, &mut ca.crl_file] {
+                if let Some(p) = slot.as_mut().filter(|p| !p.starts_with('@')) {
+                    under_base(ca_base, p);
+                }
             }
         }
     }
@@ -905,12 +907,9 @@ fn decode_pem_base64(body: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Checks that `path` is readable and contains at least one PEM X.509 certificate block
-/// (`ssl_store_load_locations_file` in `HAProxy` `src/cfgparse-ssl.c`).
-fn pem_ca_file_is_loadable(path: &str) -> bool {
-    if path == "@system-ca" {
-        return true;
-    }
+/// Checks that `path` is readable and contains at least one PEM block whose label is in `labels`
+/// with valid base64 DER starting with a SEQUENCE (`0x30`).
+fn pem_file_has_block(path: &str, labels: &[&str]) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
@@ -924,7 +923,7 @@ fn pem_ca_file_is_loadable(path: &str) -> bool {
         let Some(end_pos) = body_start.find(&end_marker) else { break };
         let body = &body_start[..end_pos];
         rest = &body_start[end_pos + end_marker.len()..];
-        if matches!(label, "CERTIFICATE" | "X509 CERTIFICATE" | "TRUSTED CERTIFICATE") {
+        if labels.contains(&label) {
             if let Some(der) = decode_pem_base64(body) {
                 if der.first() == Some(&0x30) {
                     return true;
@@ -935,9 +934,22 @@ fn pem_ca_file_is_loadable(path: &str) -> bool {
     false
 }
 
-/// Validates bind `ca-file` loadability and `verify optional|required` requiring a `ca-file`,
-/// matching `HAProxy`'s `bind_parse_ca_file` (`src/cfgparse-ssl.c`) and
-/// `ssl_sock_prepare_bind_conf` (`src/ssl_sock.c`).
+/// Checks that `path` is readable and contains at least one PEM X.509 certificate block
+/// (`ssl_store_load_locations_file` in `HAProxy` `src/cfgparse-ssl.c`).
+fn pem_ca_file_is_loadable(path: &str) -> bool {
+    path == "@system-ca"
+        || pem_file_has_block(path, &["CERTIFICATE", "X509 CERTIFICATE", "TRUSTED CERTIFICATE"])
+}
+
+/// Checks that `path` is readable and contains at least one PEM X.509 CRL block.
+fn pem_crl_file_is_loadable(path: &str) -> bool {
+    pem_file_has_block(path, &["X509 CRL"])
+}
+
+/// Validates bind `ca-file` / `ca-verify-file` / `crl-file` loadability, QUIC client-auth
+/// refusals, and `verify optional|required` requiring a CA file (`ca-file` or `ca-verify-file`),
+/// matching `HAProxy`'s `bind_parse_*` (`src/cfgparse-ssl.c`) and `ssl_sock_prepare_ctx`
+/// (`src/ssl_sock.c`).
 fn check_bind_client_auth(
     listens: &[ListenSection],
     frontends: &[FrontendSection],
@@ -948,27 +960,55 @@ fn check_bind_client_auth(
             return Ok(());
         };
         let bind_arg = if ca.bind_arg.is_empty() { bind.addr.to_string() } else { ca.bind_arg.clone() };
-        if let Some(path) = ca.ca_file.as_deref() {
-            if !pem_ca_file_is_loadable(path) {
+        for (kw, path) in [
+            ("ca-file", ca.ca_file.as_deref()),
+            ("ca-verify-file", ca.ca_verify_file.as_deref()),
+        ] {
+            if let Some(path) = path {
+                if !pem_ca_file_is_loadable(path) {
+                    return Err(ConfigError::new(
+                        bind.line,
+                        1,
+                        format!("'bind {bind_arg}' in section '{section}' : '{kw}' : unable to load {path}"),
+                    ));
+                }
+            }
+        }
+        if let Some(path) = ca.crl_file.as_deref() {
+            if !pem_crl_file_is_loadable(path) {
                 return Err(ConfigError::new(
                     bind.line,
                     1,
-                    format!("'bind {bind_arg}' in section '{section}' : 'ca-file' : unable to load {path}"),
+                    format!("'bind {bind_arg}' in section '{section}' : 'crl-file' : unable to load {path}"),
                 ));
             }
         }
-        if bind.quic
-            && matches!(ca.verify, crate::ast::BindVerify::Optional | crate::ast::BindVerify::Required)
-        {
-            return Err(ConfigError::new(
-                bind.line,
-                1,
-                format!("'bind {bind_arg}' in section '{section}' : 'verify' is not supported on QUIC binds yet"),
-            ));
+        if bind.quic {
+            let quic_unsupported = if matches!(ca.verify, crate::ast::BindVerify::Optional | crate::ast::BindVerify::Required) {
+                Some("verify")
+            } else if ca.ca_verify_file.is_some() {
+                Some("ca-verify-file")
+            } else if ca.crl_file.is_some() {
+                Some("crl-file")
+            } else if !ca.crt_ignore_err.is_empty() {
+                Some("crt-ignore-err")
+            } else if !ca.ca_ignore_err.is_empty() {
+                Some("ca-ignore-err")
+            } else {
+                None
+            };
+            if let Some(kw) = quic_unsupported {
+                return Err(ConfigError::new(
+                    bind.line,
+                    1,
+                    format!("'bind {bind_arg}' in section '{section}' : '{kw}' is not supported on QUIC binds yet"),
+                ));
+            }
         }
         if bind.ssl
             && matches!(ca.verify, crate::ast::BindVerify::Optional | crate::ast::BindVerify::Required)
             && ca.ca_file.is_none()
+            && ca.ca_verify_file.is_none()
         {
             return Err(ConfigError::alerts(vec![(
                 bind.line,
