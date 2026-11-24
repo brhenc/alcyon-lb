@@ -9305,6 +9305,24 @@ fn eval_tcp_res_content_rules(proxy: &Proxy, proxies: &crate::table::Table, regi
                 store_var(&mut sess.strm.vars, &rc.var(var_name), render_rule_fmt(rc, &ctx, registry));
             }
             alcyon_config::TcpResAction::UnsetVar { var_name } => unset_var(&mut sess.strm.vars, &rc.var(var_name)),
+            // The stick-counter actions, run where `set-var` runs: the request side's call
+            // on this session's tracked counters, the value sample read from the response
+            // (`src/stick_table.c` `action_inc_gpc0` et al).
+            alcyon_config::TcpResAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
+            alcyon_config::TcpResAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
+            alcyon_config::TcpResAction::ScSetGpt0 { sc, expr } => {
+                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx);
+                sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Zero, GpcOp::SetTag(val));
+            }
+            alcyon_config::TcpResAction::ScIncGpc { idx, sc } => sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Inc),
+            alcyon_config::TcpResAction::ScAddGpc { idx, sc, expr } => {
+                let n = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx);
+                sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Add(u64::from(n)));
+            }
+            alcyon_config::TcpResAction::ScSetGpt { idx, sc, expr } => {
+                let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, &ctx);
+                sc_gpc_rule(proxies, &sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::SetTag(val));
+            }
         }
     }
     ContentEvalResult::Done
@@ -14616,6 +14634,25 @@ impl EngineDispatcher<'_> {
                     }
                     alcyon_config::TcpResAction::UnsetVar { var_name } => {
                         unset_var(&mut entry.sess.strm.vars, &rc.var(var_name));
+                    }
+                    // The stick-counter actions run where `set-var` does: same call as the
+                    // request side (`TcpReqContentAction::Sc*` above), on the entry's tracked
+                    // counters, the value sample read from the response (`src/stick_table.c`
+                    // `action_inc_gpc0` et al take the sample direction from the rule set).
+                    alcyon_config::TcpResAction::ScIncGpc0 { sc } => sc_gpc_rule(proxies, &entry.sess.tracked_sc, *sc, Gpc::Zero, GpcOp::Inc),
+                    alcyon_config::TcpResAction::ScIncGpc1 { sc } => sc_gpc_rule(proxies, &entry.sess.tracked_sc, *sc, Gpc::One, GpcOp::Inc),
+                    alcyon_config::TcpResAction::ScSetGpt0 { sc, expr } => {
+                        let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, tcp_ctx);
+                        sc_gpc_rule(proxies, &entry.sess.tracked_sc, *sc, Gpc::Zero, GpcOp::SetTag(val));
+                    }
+                    alcyon_config::TcpResAction::ScIncGpc { idx, sc } => sc_gpc_rule(proxies, &entry.sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Inc),
+                    alcyon_config::TcpResAction::ScAddGpc { idx, sc, expr } => {
+                        let n = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, tcp_ctx);
+                        sc_gpc_rule(proxies, &entry.sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::Add(u64::from(n)));
+                    }
+                    alcyon_config::TcpResAction::ScSetGpt { idx, sc, expr } => {
+                        let val = resolve_gpt0_val(expr, rc.expr.as_ref(), registry, tcp_ctx);
+                        sc_gpc_rule(proxies, &entry.sess.tracked_sc, *sc, Gpc::Idx(*idx), GpcOp::SetTag(val));
                     }
                 }
             }

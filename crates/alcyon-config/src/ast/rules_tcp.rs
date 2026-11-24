@@ -124,6 +124,17 @@ pub enum TcpResAction {
     SetVar { var_name: String, expr: String },
     SetVarFmt { var_name: String, fmt: String },
     UnsetVar { var_name: String },
+    /// The stick-counter actions: parsed by the shared `tcp-request content` parser, run on
+    /// the response side, where they read and write the counters of the tracked entries with
+    /// the response samples as their values (`src/stick_table.c` `action_inc_gpc0` et al).
+    ScIncGpc0 { sc: u8 },
+    ScIncGpc1 { sc: u8 },
+    ScSetGpt0 { sc: u8, expr: String },
+    /// `sc-inc-gpc(<idx>,<sc>)`, `sc-add-gpc(<idx>,<sc>) <value>`, `sc-set-gpt(<idx>,<sc>) <value>`:
+    /// the array form of the general purpose storage.
+    ScIncGpc { idx: usize, sc: u8 },
+    ScAddGpc { idx: usize, sc: u8, expr: String },
+    ScSetGpt { idx: usize, sc: u8, expr: String },
 }
 
 /// Rule pairing a `tcp-response content` action with an optional condition.

@@ -354,8 +354,7 @@ fn parse_tcp_res_content_at(
     let name = act.split('(').next().unwrap_or(act);
     if matches!(
         name,
-        "close" | "send-spoe-group" | "set-log-level" | "set-nice" | "sc-add-gpc" | "sc-inc-gpc"
-            | "sc-inc-gpc0" | "sc-inc-gpc1" | "sc-set-gpt" | "sc-set-gpt0" | "set-vars-from-map"
+        "close" | "send-spoe-group" | "set-log-level" | "set-nice" | "set-vars-from-map"
             | "do-log" | "set-fc-mark" | "set-fc-tos" | "set-mark" | "set-tos" | "set-bandwidth-limit"
     ) {
         return Err(ConfigError::new(at.line, at.col, format!("'tcp-response content {name}' is not implemented")));
@@ -374,13 +373,22 @@ fn parse_tcp_res_content_at(
             TcpReqContentAction::SetVar { var_name, expr } => TcpResAction::SetVar { var_name, expr },
             TcpReqContentAction::SetVarFmt { var_name, fmt } => TcpResAction::SetVarFmt { var_name, fmt },
             TcpReqContentAction::UnsetVar { var_name } => TcpResAction::UnsetVar { var_name },
+            // The stick-counter actions run on the response side too; the request parser
+            // already checked them (gpc id, track id, value), so only the shape moves over.
+            TcpReqContentAction::ScIncGpc0 { sc } => TcpResAction::ScIncGpc0 { sc },
+            TcpReqContentAction::ScIncGpc1 { sc } => TcpResAction::ScIncGpc1 { sc },
+            TcpReqContentAction::ScSetGpt0 { sc, expr } => TcpResAction::ScSetGpt0 { sc, expr },
+            TcpReqContentAction::ScIncGpc { idx, sc } => TcpResAction::ScIncGpc { idx, sc },
+            TcpReqContentAction::ScAddGpc { idx, sc, expr } => TcpResAction::ScAddGpc { idx, sc, expr },
+            TcpReqContentAction::ScSetGpt { idx, sc, expr } => TcpResAction::ScSetGpt { idx, sc, expr },
             _ => {
                 return Err(ConfigError::new(
                     at.line,
                     at.col,
                     format!(
                         "'tcp-response content' expects 'accept', 'reject', 'silent-drop', 'set-var(*)', \
-                         'set-var-fmt(*)' or 'unset-var(*)' (got '{act}')"
+                         'set-var-fmt(*)', 'unset-var(*)', 'sc-inc-gpc0', 'sc-inc-gpc1', 'sc-set-gpt0', \
+                         'sc-inc-gpc(*)', 'sc-add-gpc(*)' or 'sc-set-gpt(*)' (got '{act}')"
                     ),
                 ))
             }
